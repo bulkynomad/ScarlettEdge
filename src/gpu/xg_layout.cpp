@@ -12,13 +12,14 @@ constexpr uint32_t kMode4KbS = XG_SWIZZLE_MODE_4KB_S;
 constexpr uint32_t kMode256BS = 1;
 constexpr uint32_t kMode64KbS = 9;
 constexpr uint32_t kMode64KbD = 10;
+constexpr uint32_t kMode64KbZX = 24;
 constexpr uint32_t kMode64KbRX = 25;
 constexpr uint32_t kBlockBytes = 4096;
 constexpr uint32_t kBlockBytes64K = 65536;
 constexpr uint32_t kMaxMips = 15;
 
 bool Is64KbAddressableMode(uint32_t mode) {
-    return mode == kMode64KbS || mode == kMode64KbD || mode == kMode64KbRX;
+    return mode == kMode64KbS || mode == kMode64KbD || mode == kMode64KbZX || mode == kMode64KbRX;
 }
 
 // Source of each offset bit inside a 4 KB block: 'x'/'y' and the coordinate bit.

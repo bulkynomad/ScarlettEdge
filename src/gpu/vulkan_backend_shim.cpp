@@ -78,6 +78,34 @@ struct VkPhysicalDevicePropertiesMin {
     uint8_t rest[600];  // pipelineCacheUUID + limits + sparseProperties
 };
 
+struct VkCommandPoolCreateInfoMin {
+    uint32_t sType;
+    const void* pNext;
+    uint32_t flags;
+    uint32_t queueFamilyIndex;
+};
+struct VkCommandBufferAllocateInfoMin {
+    uint32_t sType;
+    const void* pNext;
+    uint64_t commandPool;
+    uint32_t level;
+    uint32_t commandBufferCount;
+};
+struct VkDescriptorSetLayoutBindingMin {
+    uint32_t binding;
+    uint32_t descriptorType;
+    uint32_t descriptorCount;
+    uint32_t stageFlags;
+    const void* pImmutableSamplers;
+};
+struct VkDescriptorSetLayoutCreateInfoMin {
+    uint32_t sType;
+    const void* pNext;
+    uint32_t flags;
+    uint32_t bindingCount;
+    const VkDescriptorSetLayoutBindingMin* pBindings;
+};
+
 struct HostVulkanLoader {
 #if defined(_WIN32)
     using FnCreateInstance = VkResult (WINAPI*)(const VkInstanceCreateInfoMin*, const void*, VkHandle*);
@@ -86,6 +114,12 @@ struct HostVulkanLoader {
     using FnGetPhysProps = void (WINAPI*)(VkHandle, VkPhysicalDevicePropertiesMin*);
     using FnCreateDevice = VkResult (WINAPI*)(VkHandle, const VkDeviceCreateInfoMin*, const void*, VkHandle*);
     using FnDestroyDevice = void (WINAPI*)(VkHandle, const void*);
+    using FnGetDeviceQueue = void (WINAPI*)(VkHandle, uint32_t, uint32_t, VkHandle*);
+    using FnCreateCmdPool = VkResult (WINAPI*)(VkHandle, const VkCommandPoolCreateInfoMin*, const void*, uint64_t*);
+    using FnDestroyCmdPool = void (WINAPI*)(VkHandle, uint64_t, const void*);
+    using FnAllocCmdBufs = VkResult (WINAPI*)(VkHandle, const VkCommandBufferAllocateInfoMin*, VkHandle*);
+    using FnCreateDescLayout = VkResult (WINAPI*)(VkHandle, const VkDescriptorSetLayoutCreateInfoMin*, const void*, uint64_t*);
+    using FnDestroyDescLayout = void (WINAPI*)(VkHandle, uint64_t, const void*);
     using FnCreateShaderModule = VkResult (WINAPI*)(VkHandle, const VkShaderModuleCreateInfoMin*, const void*, VkShaderModuleHandle*);
     using FnDestroyShaderModule = void (WINAPI*)(VkHandle, VkShaderModuleHandle, const void*);
 
@@ -96,6 +130,12 @@ struct HostVulkanLoader {
     FnGetPhysProps get_phys_props = nullptr;
     FnCreateDevice create_device = nullptr;
     FnDestroyDevice destroy_device = nullptr;
+    FnGetDeviceQueue get_device_queue = nullptr;
+    FnCreateCmdPool create_cmd_pool = nullptr;
+    FnDestroyCmdPool destroy_cmd_pool = nullptr;
+    FnAllocCmdBufs alloc_cmd_bufs = nullptr;
+    FnCreateDescLayout create_desc_layout = nullptr;
+    FnDestroyDescLayout destroy_desc_layout = nullptr;
     FnCreateShaderModule create_shader_module = nullptr;
     FnDestroyShaderModule destroy_shader_module = nullptr;
 
@@ -108,6 +148,12 @@ struct HostVulkanLoader {
         get_phys_props = reinterpret_cast<FnGetPhysProps>(reinterpret_cast<void*>(GetProcAddress(dll, "vkGetPhysicalDeviceProperties")));
         create_device = reinterpret_cast<FnCreateDevice>(reinterpret_cast<void*>(GetProcAddress(dll, "vkCreateDevice")));
         destroy_device = reinterpret_cast<FnDestroyDevice>(reinterpret_cast<void*>(GetProcAddress(dll, "vkDestroyDevice")));
+        get_device_queue = reinterpret_cast<FnGetDeviceQueue>(reinterpret_cast<void*>(GetProcAddress(dll, "vkGetDeviceQueue")));
+        create_cmd_pool = reinterpret_cast<FnCreateCmdPool>(reinterpret_cast<void*>(GetProcAddress(dll, "vkCreateCommandPool")));
+        destroy_cmd_pool = reinterpret_cast<FnDestroyCmdPool>(reinterpret_cast<void*>(GetProcAddress(dll, "vkDestroyCommandPool")));
+        alloc_cmd_bufs = reinterpret_cast<FnAllocCmdBufs>(reinterpret_cast<void*>(GetProcAddress(dll, "vkAllocateCommandBuffers")));
+        create_desc_layout = reinterpret_cast<FnCreateDescLayout>(reinterpret_cast<void*>(GetProcAddress(dll, "vkCreateDescriptorSetLayout")));
+        destroy_desc_layout = reinterpret_cast<FnDestroyDescLayout>(reinterpret_cast<void*>(GetProcAddress(dll, "vkDestroyDescriptorSetLayout")));
         create_shader_module = reinterpret_cast<FnCreateShaderModule>(reinterpret_cast<void*>(GetProcAddress(dll, "vkCreateShaderModule")));
         destroy_shader_module = reinterpret_cast<FnDestroyShaderModule>(reinterpret_cast<void*>(GetProcAddress(dll, "vkDestroyShaderModule")));
     }
@@ -130,6 +176,10 @@ struct VulkanBackendState {
     VULKAN_XS_STATS stats{};
     VkHandle vk_instance = nullptr;
     VkHandle vk_device = nullptr;
+    VkHandle vk_queue = nullptr;
+    uint64_t vk_cmd_pool = 0;
+    VkHandle vk_cmd_buf = nullptr;
+    uint64_t vk_default_desc_layout = 0;
     std::string vk_device_name;
     uint32_t vk_api_major = 1;
     uint32_t vk_api_minor = 3;
@@ -194,7 +244,34 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
                     dci.sType = 3;  // VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
                     dci.queueCreateInfoCount = 1;
                     dci.pQueueCreateInfos = &qci;
-                    (void)vk.create_device(devs[0], &dci, nullptr, &b->vk_device);
+                    if (vk.create_device(devs[0], &dci, nullptr, &b->vk_device) == 0 && b->vk_device) {
+                        if (vk.get_device_queue) vk.get_device_queue(b->vk_device, 0, 0, &b->vk_queue);
+                        if (vk.create_cmd_pool) {
+                            VkCommandPoolCreateInfoMin cpci{};
+                            cpci.sType = 39;  // VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO
+                            cpci.flags = 2;   // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+                            cpci.queueFamilyIndex = 0;
+                            if (vk.create_cmd_pool(b->vk_device, &cpci, nullptr, &b->vk_cmd_pool) == 0 &&
+                                b->vk_cmd_pool && vk.alloc_cmd_bufs) {
+                                VkCommandBufferAllocateInfoMin cbai{};
+                                cbai.sType = 40;  // VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO
+                                cbai.commandPool = b->vk_cmd_pool;
+                                cbai.level = 0;   // VK_COMMAND_BUFFER_LEVEL_PRIMARY
+                                cbai.commandBufferCount = 1;
+                                (void)vk.alloc_cmd_bufs(b->vk_device, &cbai, &b->vk_cmd_buf);
+                            }
+                        }
+                        if (vk.create_desc_layout) {
+                            VkDescriptorSetLayoutBindingMin bindings[2]{};
+                            bindings[0] = {0u, 6u, 1u, 0x0000001Fu, nullptr};  // UBO (all stages)
+                            bindings[1] = {1u, 1u, 1u, 0x0000001Fu, nullptr};  // CombinedImageSampler
+                            VkDescriptorSetLayoutCreateInfoMin dslci{};
+                            dslci.sType = 32;  // VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+                            dslci.bindingCount = 2;
+                            dslci.pBindings = bindings;
+                            (void)vk.create_desc_layout(b->vk_device, &dslci, nullptr, &b->vk_default_desc_layout);
+                        }
+                    }
                 }
             }
         }
@@ -210,7 +287,15 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsDestroyBackend(VULKAN_XS_BACKEND_HANDLE ba
 #if defined(_WIN32)
     const auto& vk = VkLoader();
     if (vk.Available()) {
-        if (b->vk_device) vk.destroy_device(b->vk_device, nullptr);
+        if (b->vk_device) {
+            if (b->vk_default_desc_layout && vk.destroy_desc_layout) {
+                vk.destroy_desc_layout(b->vk_device, b->vk_default_desc_layout, nullptr);
+            }
+            if (b->vk_cmd_pool && vk.destroy_cmd_pool) {
+                vk.destroy_cmd_pool(b->vk_device, b->vk_cmd_pool, nullptr);
+            }
+            vk.destroy_device(b->vk_device, nullptr);
+        }
         if (b->vk_instance) vk.destroy_instance(b->vk_instance, nullptr);
     }
 #endif

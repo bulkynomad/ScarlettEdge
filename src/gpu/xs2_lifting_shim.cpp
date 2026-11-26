@@ -3,7 +3,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -364,9 +367,15 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToSpirv(
     // SPIR-V ExecutionModel: 0 = Vertex, 4 = Fragment, 5 = GLCompute
     const uint32_t exec_model = (info.stage == 1) ? 0u : ((info.stage == 2) ? 4u : 5u);
     const bool has_output_var = (exec_model == 0u || exec_model == 4u);
+    bool has_smem = false, has_mimg = false, has_vinterp = false;
+    for (const auto& inst : insts) {
+        if (inst.inst_class == Rdna2InstClass::SALU && inst.mnemonic == "s_load_dwordx4") has_smem = true;
+        if (inst.inst_class == Rdna2InstClass::MIMG && inst.mnemonic == "image_sample") has_mimg = true;
+        if (inst.inst_class == Rdna2InstClass::VINTRP) has_vinterp = true;
+    }
 
     std::vector<uint32_t> spv;
-    spv.reserve(128 + insts.size() * 8);
+    spv.reserve(160 + insts.size() * 8);
     auto emit = [&](uint16_t opcode, std::initializer_list<uint32_t> operands) {
         const uint32_t wc = static_cast<uint32_t>(1 + operands.size());
         spv.push_back((wc << 16) | opcode);
@@ -384,24 +393,42 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToSpirv(
     constexpr uint32_t kIdFnType = 2;
     constexpr uint32_t kIdMain = 3;
     constexpr uint32_t kIdF32 = 4;
-    constexpr uint32_t kIdVec4 = 5;
-    constexpr uint32_t kIdBool = 6;
-    constexpr uint32_t kIdConst0 = 7;
-    constexpr uint32_t kIdConst1 = 8;
-    constexpr uint32_t kIdConstTrue = 9;
-    constexpr uint32_t kIdPtrOutVec4 = 10;
-    constexpr uint32_t kIdPtrFnF32 = 11;
-    constexpr uint32_t kIdOutVar = 12;
-    constexpr uint32_t kIdEntryLabel = 13;
-    constexpr uint32_t kIdScratchVar = 14;
-    uint32_t next_id = 15;
+    constexpr uint32_t kIdVec2 = 5;
+    constexpr uint32_t kIdVec4 = 6;
+    constexpr uint32_t kIdBool = 7;
+    constexpr uint32_t kIdI32 = 8;
+    constexpr uint32_t kIdConst0 = 9;
+    constexpr uint32_t kIdConst1 = 10;
+    constexpr uint32_t kIdConstTrue = 11;
+    constexpr uint32_t kIdConstI0 = 12;
+    constexpr uint32_t kIdPtrOutVec4 = 13;
+    constexpr uint32_t kIdPtrInVec4 = 14;
+    constexpr uint32_t kIdPtrFnF32 = 15;
+    constexpr uint32_t kIdOutVar = 16;
+    constexpr uint32_t kIdInVar = 17;
+    constexpr uint32_t kIdUboStruct = 18;
+    constexpr uint32_t kIdPtrUbo = 19;
+    constexpr uint32_t kIdPtrUboVec4 = 20;
+    constexpr uint32_t kIdUboVar = 21;
+    constexpr uint32_t kIdImage2D = 22;
+    constexpr uint32_t kIdSampledImage = 23;
+    constexpr uint32_t kIdPtrSampler = 24;
+    constexpr uint32_t kIdSamplerVar = 25;
+    constexpr uint32_t kIdEntryLabel = 26;
+    constexpr uint32_t kIdScratchVar = 27;
+    uint32_t next_id = 28;
 
     emit(17, {1u});                                       // OpCapability Shader
     emit(14, {0u, 1u});                                   // OpMemoryModel Logical GLSL450
-    if (has_output_var) {
-        emit(15, {exec_model, kIdMain, 0x6E69616Du, 0u, kIdOutVar});  // OpEntryPoint with interface var
-    } else {
-        emit(15, {exec_model, kIdMain, 0x6E69616Du, 0u});
+    // Build OpEntryPoint interface list (SPIR-V 1.5 requires all used Input/Output/Uniform vars)
+    {
+        std::vector<uint32_t> ep = {exec_model, kIdMain, 0x6E69616Du, 0u};
+        if (has_output_var) ep.push_back(kIdOutVar);
+        if (has_vinterp && exec_model == 4u) ep.push_back(kIdInVar);
+        if (has_smem) ep.push_back(kIdUboVar);
+        if (has_mimg) ep.push_back(kIdSamplerVar);
+        spv.push_back((static_cast<uint32_t>(1 + ep.size()) << 16) | 15u);
+        for (uint32_t w : ep) spv.push_back(w);
     }
     if (exec_model == 5u) {
         emit(16, {kIdMain, 17u, 8u, 8u, 1u});             // OpExecutionMode %main LocalSize 8 8 1
@@ -409,26 +436,52 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToSpirv(
         emit(16, {kIdMain, 7u});                          // OpExecutionMode %main OriginUpperLeft
     }
 
-    // Decorations for stage Output variable
+    // Decorations
     if (exec_model == 0u) {
         emit(71, {kIdOutVar, 11u, 0u});                   // OpDecorate %out_pos BuiltIn Position
     } else if (exec_model == 4u) {
         emit(71, {kIdOutVar, 30u, 0u});                   // OpDecorate %out_mrt0 Location 0
+        if (has_vinterp) emit(71, {kIdInVar, 30u, 0u});   // OpDecorate %in_attr0 Location 0
+    }
+    if (has_smem) {
+        emit(71, {kIdUboStruct, 2u});                     // OpDecorate %Ubo Block
+        emit(72, {kIdUboStruct, 0u, 35u, 0u});            // OpMemberDecorate %Ubo 0 Offset 0
+        emit(71, {kIdUboVar, 34u, 0u});                   // DescriptorSet 0
+        emit(71, {kIdUboVar, 33u, 0u});                   // Binding 0
+    }
+    if (has_mimg) {
+        emit(71, {kIdSamplerVar, 34u, 0u});               // DescriptorSet 0
+        emit(71, {kIdSamplerVar, 33u, 1u});               // Binding 1
     }
 
     // Types & Constants
     emit(19, {kIdVoid});                                  // OpTypeVoid
     emit(33, {kIdFnType, kIdVoid});                       // OpTypeFunction
     emit(22, {kIdF32, 32u});                              // OpTypeFloat 32
+    emit(23, {kIdVec2, kIdF32, 2u});                      // OpTypeVector vec2
     emit(23, {kIdVec4, kIdF32, 4u});                      // OpTypeVector vec4
     emit(20, {kIdBool});                                  // OpTypeBool
+    emit(21, {kIdI32, 32u, 1u});                          // OpTypeInt 32 signed
     emit(43, {kIdF32, kIdConst0, 0x00000000u});           // OpConstant 0.0f
     emit(43, {kIdF32, kIdConst1, 0x3F800000u});           // OpConstant 1.0f
     emit(41, {kIdBool, kIdConstTrue});                    // OpConstantTrue
+    emit(43, {kIdI32, kIdConstI0, 0u});                   // OpConstant i32 0
     emit(32, {kIdPtrOutVec4, 3u, kIdVec4});               // OpTypePointer Output vec4
+    emit(32, {kIdPtrInVec4, 1u, kIdVec4});                // OpTypePointer Input vec4
     emit(32, {kIdPtrFnF32, 7u, kIdF32});                  // OpTypePointer Function f32
-    if (has_output_var) {
-        emit(59, {kIdPtrOutVec4, kIdOutVar, 3u});         // OpVariable Output
+    if (has_output_var) emit(59, {kIdPtrOutVec4, kIdOutVar, 3u});
+    if (has_vinterp && exec_model == 4u) emit(59, {kIdPtrInVec4, kIdInVar, 1u});
+    if (has_smem) {
+        emit(30, {kIdUboStruct, kIdVec4});                // OpTypeStruct { vec4 }
+        emit(32, {kIdPtrUbo, 2u, kIdUboStruct});          // OpTypePointer Uniform %Ubo
+        emit(32, {kIdPtrUboVec4, 2u, kIdVec4});           // OpTypePointer Uniform vec4
+        emit(59, {kIdPtrUbo, kIdUboVar, 2u});             // OpVariable Uniform
+    }
+    if (has_mimg) {
+        emit(25, {kIdImage2D, kIdF32, 1u, 0u, 0u, 0u, 1u, 0u});  // OpTypeImage 2D f32 sampled
+        emit(27, {kIdSampledImage, kIdImage2D});          // OpTypeSampledImage
+        emit(32, {kIdPtrSampler, 0u, kIdSampledImage});   // OpTypePointer UniformConstant
+        emit(59, {kIdPtrSampler, kIdSamplerVar, 0u});     // OpVariable UniformConstant
     }
 
     // Function body with 256-VGPR SSA register file
@@ -445,7 +498,40 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToSpirv(
 
     for (const auto& inst : insts) {
         const uint32_t w0 = inst.raw_word0;
-        if (inst.mnemonic == "v_add_f32") {
+        if (inst.mnemonic == "s_load_dwordx4" && has_smem) {
+            const uint32_t ptr_v4 = next_id++;
+            const uint32_t val_v4 = next_id++;
+            emit(65, {kIdPtrUboVec4, ptr_v4, kIdUboVar, kIdConstI0});     // OpAccessChain
+            emit(61, {kIdVec4, val_v4, ptr_v4});                          // OpLoad vec4
+            for (uint32_t c = 0; c < 4; ++c) {
+                const uint32_t comp = next_id++;
+                emit(81, {kIdF32, comp, val_v4, c});                      // OpCompositeExtract
+                vgpr_ssa[c] = comp;
+            }
+        } else if (inst.mnemonic == "image_sample" && has_mimg) {
+            const uint32_t vdata = (inst.raw_word1 >> 8) & 0xFFu;
+            const uint32_t vaddr = inst.raw_word1 & 0xFFu;
+            const uint32_t uv_id = next_id++;
+            const uint32_t samp_id = next_id++;
+            const uint32_t texel_id = next_id++;
+            emit(80, {kIdVec2, uv_id, read_vgpr(vaddr), read_vgpr(vaddr + 1)});  // OpCompositeConstruct vec2
+            emit(61, {kIdSampledImage, samp_id, kIdSamplerVar});                 // OpLoad sampled image
+            emit(87, {kIdVec4, texel_id, samp_id, uv_id});                       // OpImageSampleImplicitLod
+            for (uint32_t c = 0; c < 4; ++c) {
+                const uint32_t comp = next_id++;
+                emit(81, {kIdF32, comp, texel_id, c});                           // OpCompositeExtract
+                vgpr_ssa[(vdata + c) & 0xFFu] = comp;
+            }
+        } else if ((inst.mnemonic == "v_interp_p1_f32" || inst.mnemonic == "v_interp_p2_f32") &&
+                   has_vinterp && exec_model == 4u) {
+            const uint32_t vdst = (w0 >> 18) & 0xFFu;
+            const uint32_t chan = (w0 >> 8) & 0x3u;
+            const uint32_t in_v4 = next_id++;
+            const uint32_t comp = next_id++;
+            emit(61, {kIdVec4, in_v4, kIdInVar});                                // OpLoad Input vec4
+            emit(81, {kIdF32, comp, in_v4, chan});                               // OpCompositeExtract
+            vgpr_ssa[vdst] = comp;
+        } else if (inst.mnemonic == "v_add_f32") {
             const uint32_t vdst = (w0 >> 17) & 0xFFu;
             const uint32_t vsrc1 = (w0 >> 9) & 0xFFu;
             const uint32_t src0 = w0 & 0xFFu;
@@ -617,6 +703,27 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderTranslateCached(
         return kSuccess;
     }
 
+    // Optional persistent on-disk shader cache when SCARLETTX_SHADER_CACHE_DIR is set
+    std::filesystem::path disk_cache_path;
+    if (const char* cache_dir = std::getenv("SCARLETTX_SHADER_CACHE_DIR"); cache_dir && cache_dir[0] != '\0') {
+        std::ostringstream fname;
+        fname << std::hex << std::setw(16) << std::setfill('0') << h << ".dxil";
+        disk_cache_path = std::filesystem::path(cache_dir) / fname.str();
+        std::ifstream ifs(disk_cache_path, std::ios::binary);
+        if (ifs) {
+            std::vector<uint8_t> cached((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            if (!cached.empty()) {
+                p->stats.cacheHits++;
+                p->cache[h] = cached;
+                auto* buf = new uint8_t[cached.size()];
+                std::memcpy(buf, cached.data(), cached.size());
+                *outBytecode = buf;
+                *outBytecodeSize = cached.size();
+                return kSuccess;
+            }
+        }
+    }
+
     p->stats.cacheMisses++;
     p->stats.totalShadersTranslated++;
 
@@ -629,6 +736,12 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderTranslateCached(
     delete[] static_cast<uint8_t*>(lifted_code);
 
     p->cache[h] = lifted;
+    if (!disk_cache_path.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(disk_cache_path.parent_path(), ec);
+        std::ofstream ofs(disk_cache_path, std::ios::binary);
+        if (ofs) ofs.write(reinterpret_cast<const char*>(lifted.data()), static_cast<std::streamsize>(lifted.size()));
+    }
 
     auto* buf = new uint8_t[lifted.size()];
     std::memcpy(buf, lifted.data(), lifted.size());

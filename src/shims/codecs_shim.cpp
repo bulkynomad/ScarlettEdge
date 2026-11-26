@@ -2,9 +2,11 @@
 #include "scarlettx/media/codecs_abi.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -132,28 +134,64 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateDecompress(
             (static_cast<uint32_t>(in[7]) << 24);
         const size_t table_end = 8u + static_cast<size_t>(num_tiles) * 4u;
         if (num_tiles > 0 && compressedSize >= table_end && expected_total <= decompressedSize) {
-            size_t in_off = table_end;
-            size_t out_off = 0;
-            bool ok = true;
+            std::vector<size_t> tile_in_off(num_tiles, 0);
+            std::vector<uint32_t> tile_comp_sz(num_tiles, 0);
+            std::vector<size_t> tile_out_off(num_tiles, 0);
+            std::vector<size_t> tile_out_cap(num_tiles, 0);
+            size_t cur_in = table_end;
+            bool valid_table = true;
             for (uint16_t t = 0; t < num_tiles; ++t) {
                 const size_t toff = 8u + static_cast<size_t>(t) * 4u;
-                const uint32_t tile_comp_sz =
+                const uint32_t csz =
                     static_cast<uint32_t>(in[toff]) |
                     (static_cast<uint32_t>(in[toff + 1]) << 8) |
                     (static_cast<uint32_t>(in[toff + 2]) << 16) |
                     (static_cast<uint32_t>(in[toff + 3]) << 24);
-                if (in_off + tile_comp_sz > compressedSize) { ok = false; break; }
-                size_t tile_written = 0;
-                if (!Lz77DecompressTile(in + in_off, tile_comp_sz, out + out_off, decompressedSize - out_off, tile_written)) {
-                    ok = false;
-                    break;
-                }
-                in_off += tile_comp_sz;
-                out_off += tile_written;
+                if (cur_in + csz > compressedSize) { valid_table = false; break; }
+                tile_in_off[t] = cur_in;
+                tile_comp_sz[t] = csz;
+                tile_out_off[t] = static_cast<size_t>(t) * kGDeflateTileSize;
+                tile_out_cap[t] = std::min<size_t>(kGDeflateTileSize, expected_total - tile_out_off[t]);
+                cur_in += csz;
             }
-            if (ok && out_off == expected_total) {
-                if (bytesWritten) *bytesWritten = out_off;
-                return kSuccess;
+            if (valid_table) {
+                std::atomic<bool> all_ok{true};
+                std::atomic<size_t> total_written{0};
+                if (num_tiles == 1) {
+                    size_t tw = 0;
+                    if (Lz77DecompressTile(in + tile_in_off[0], tile_comp_sz[0], out, tile_out_cap[0], tw)) {
+                        total_written.store(tw, std::memory_order_relaxed);
+                    } else {
+                        all_ok.store(false, std::memory_order_relaxed);
+                    }
+                } else {
+                    const size_t num_workers = std::min<size_t>(
+                        num_tiles, std::max<size_t>(2u, std::thread::hardware_concurrency()));
+                    std::atomic<uint16_t> next_tile{0};
+                    std::vector<std::thread> pool;
+                    pool.reserve(num_workers);
+                    for (size_t w = 0; w < num_workers; ++w) {
+                        pool.emplace_back([&]() {
+                            for (;;) {
+                                const uint16_t t = next_tile.fetch_add(1, std::memory_order_relaxed);
+                                if (t >= num_tiles) break;
+                                size_t tw = 0;
+                                if (Lz77DecompressTile(in + tile_in_off[t], tile_comp_sz[t],
+                                                       out + tile_out_off[t], tile_out_cap[t], tw)) {
+                                    total_written.fetch_add(tw, std::memory_order_relaxed);
+                                } else {
+                                    all_ok.store(false, std::memory_order_relaxed);
+                                }
+                            }
+                        });
+                    }
+                    for (auto& th : pool) th.join();
+                }
+                if (all_ok.load(std::memory_order_relaxed) &&
+                    total_written.load(std::memory_order_relaxed) == expected_total) {
+                    if (bytesWritten) *bytesWritten = expected_total;
+                    return kSuccess;
+                }
             }
         }
     }

@@ -180,13 +180,19 @@ void TestRoundTrip() {
     RoundTrip(Desc(128, 64, 8, 49));  // R8G8
     RoundTrip(Desc(48, 80, 7, 10));   // R16G16B16A16_FLOAT
 
-    // 64KB_S (mode 9) and 64KB_R_X (mode 25) RDNA2 macro-tile addressing round-trips
+    // 64KB_S (mode 9), 64KB_Z_X depth (mode 24), 64KB_R_X (mode 25) & 6-slice CubeMap addressing
     auto d64s = Desc(256, 256, 1, kRgba8);
     d64s.SwizzleMode = 9;
     RoundTrip(d64s);
+    auto d64zx = Desc(256, 256, 1, 40);  // D32_FLOAT depth
+    d64zx.SwizzleMode = 24;
+    RoundTrip(d64zx);
     auto d64rx = Desc(512, 256, 1, kBc3);
     d64rx.SwizzleMode = 25;
     RoundTrip(d64rx);
+    auto cube = Desc(128, 128, 1, kRgba8, 6);  // 6-face CubeMap array
+    cube.SwizzleMode = 9;
+    RoundTrip(cube);
 }
 
 // The texture computer as a title uses it: through its vtable.

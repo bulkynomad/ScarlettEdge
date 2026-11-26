@@ -207,14 +207,15 @@ int main() {
         SX_CHECK(Xs2ShaderDisassembleRdna2(vs_kernel, sizeof(vs_kernel), vs_disasm, sizeof(vs_disasm), nullptr) == 0);
         SX_CHECK(std::strstr(vs_disasm, "exp pos0") != nullptr);
 
-        // Verify lifted SPIR-V 1.5 Vertex & Pixel modules contain OpCompositeConstruct (80) & OpStore (62)
-        auto check_spv_export = [&](const void* kernel, size_t sz) -> bool {
+        // Verify lifted SPIR-V 1.5 Vertex & Pixel modules contain OpCompositeConstruct (80), OpStore (62),
+        // and Pixel Shader emits OpImageSampleImplicitLod (87) + Fragment Input OpLoad (61)
+        auto check_spv_export = [&](const void* kernel, size_t sz, bool require_sample) -> bool {
             void* spv = nullptr;
             size_t spv_sz = 0;
             if (Xs2ShaderLiftToSpirv(kernel, sz, &opts, &spv, &spv_sz) != 0 || !spv || spv_sz < 20) return false;
             const auto* w = static_cast<const uint32_t*>(spv);
             const size_t n = spv_sz / 4;
-            bool has_cc = false, has_store = false, has_dec = false;
+            bool has_cc = false, has_store = false, has_dec = false, has_sample = false, has_access = false;
             for (size_t i = 5; i < n; ) {
                 const uint32_t wc = w[i] >> 16;
                 const uint32_t op = w[i] & 0xFFFFu;
@@ -222,13 +223,15 @@ int main() {
                 if (op == 71u) has_dec = true;     // OpDecorate
                 if (op == 80u) has_cc = true;      // OpCompositeConstruct
                 if (op == 62u) has_store = true;   // OpStore
+                if (op == 87u) has_sample = true;  // OpImageSampleImplicitLod
+                if (op == 65u) has_access = true;  // OpAccessChain (UBO)
                 i += wc;
             }
             Xs2ShaderFreeBytecode(spv);
-            return has_dec && has_cc && has_store;
+            return has_dec && has_cc && has_store && (!require_sample || has_sample) && (require_sample || has_access);
         };
-        SX_CHECK(check_spv_export(ps_kernel, sizeof(ps_kernel)));
-        SX_CHECK(check_spv_export(vs_kernel, sizeof(vs_kernel)));
+        SX_CHECK(check_spv_export(ps_kernel, sizeof(ps_kernel), true));
+        SX_CHECK(check_spv_export(vs_kernel, sizeof(vs_kernel), false));
     }
 
     std::cout << "[test_xs2_lifting] All 16 Xs2Shader APIs verified successfully!\n";

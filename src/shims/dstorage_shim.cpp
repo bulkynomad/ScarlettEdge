@@ -350,6 +350,15 @@ int32_t ExecuteRequest(const DSTORAGE_REQUEST& req) {
 }
 
 void QueueWorkerLoop(std::shared_ptr<QueueObject> q) {
+#if defined(_WIN32)
+    int win_prio = THREAD_PRIORITY_NORMAL;
+    if (q->desc.Priority == DSTORAGE_PRIORITY_REALTIME || q->desc.Priority == DSTORAGE_PRIORITY_HIGH) {
+        win_prio = THREAD_PRIORITY_ABOVE_NORMAL;
+    } else if (q->desc.Priority == DSTORAGE_PRIORITY_LOW) {
+        win_prio = THREAD_PRIORITY_BELOW_NORMAL;
+    }
+    SetThreadPriority(GetCurrentThread(), win_prio);
+#endif
     for (;;) {
         QueueItem item;
         {
