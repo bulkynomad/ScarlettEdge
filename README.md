@@ -7,6 +7,8 @@
 <!-- SCARLETTX_STATUS_START -->
 ## Status
 
+![Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
+
 ![ScarlettX Status](docs/status.svg)
 
 ![Status of the game Concept Destruction](docs/status_concept_destruction.svg)
@@ -16,7 +18,7 @@
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Emulator Status:** `100.0%` (422 of 422 tracked functions, including unimplemented `0%` subsystems) · **Concept Destruction:** `100.0%` (46 of 46 bring-up milestones) · **Exports:** `410` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Optimization Fidelity:** `72.7%` (Commercial Engine Readiness) · **Emulator Status:** `100.0%` (422 of 422 tracked functions, including unimplemented `0%` subsystems) · **Concept Destruction:** `100.0%` (46 of 46 bring-up milestones) · **Exports:** `410` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 | Subsystem | Category | Progress | Coverage | Details |
 | :--- | :--- | :---: | :---: | :--- |

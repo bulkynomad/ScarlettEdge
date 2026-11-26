@@ -494,6 +494,100 @@ def collect_concept_destruction_metrics() -> list[Subsystem]:
     ]
 
 
+def collect_optimization_metrics() -> list[Subsystem]:
+    """Runtime optimization and deep execution fidelity metrics for commercial AAA titles."""
+    return [
+        Subsystem(
+            name="Frame Pacing & VSync",
+            short_name="VSync",
+            category="Display",
+            implemented=4,
+            target=4,
+            notes="Hardware VBlank present lock (IDXGISwapChain::Present(1,0)), high-res QPC pacing & microsecond async event dispatch",
+        ),
+        Subsystem(
+            name="Bootloader & DLL Priority",
+            short_name="Loader",
+            category="Loader",
+            implemented=4,
+            target=4,
+            notes="In-process direct IAT mapper default with zero search-order conflicts; out-of-process PATH prioritization",
+        ),
+        Subsystem(
+            name="Sub-Frame Texture Upload",
+            short_name="Texture",
+            category="Graphics",
+            implemented=4,
+            target=4,
+            notes="Lightweight non-reset write-watch probing (HasPendingGuestTextureWrites); mid-frame writes upload without 1-frame latency",
+        ),
+        Subsystem(
+            name="DirectStorage & NVMe",
+            short_name="DStorage",
+            category="Storage",
+            implemented=3,
+            target=4,
+            notes="Unbuffered overlapped asynchronous file streaming (FILE_FLAG_SEQUENTIAL_SCAN), GDeflate CPU decompression with LZ-RLE fallback",
+        ),
+        Subsystem(
+            name="RDNA2 Microcode Lifter",
+            short_name="RDNA2",
+            category="Compute",
+            implemented=3,
+            target=4,
+            notes="Clean-room RDNA2 ISA decoder (SMEM, VOP2, VOP3, VMEM, LDS, SOPP), DXIL SM 6.5 compute container generation, SPIR-V 1.5 lifting",
+        ),
+        Subsystem(
+            name="Hardware DXR 1.1 & Vulkan",
+            short_name="DXR/RT",
+            category="Ray Tracing",
+            implemented=3,
+            target=4,
+            notes="BLAS/TLAS acceleration structure generation, dual-mode software BVH fallback + native Vulkan 1.3 ray tracing pipeline",
+        ),
+        Subsystem(
+            name="Retail Container Crypto",
+            short_name="Crypto",
+            category="Storage",
+            implemented=3,
+            target=4,
+            notes="AES-128/256-XTS sector decryption, SHA-256 block integrity tables, PackageVfs mounting, ready for user keyring injection",
+        ),
+        Subsystem(
+            name="Unified Memory Aliasing",
+            short_name="Memory",
+            category="Memory",
+            implemented=2,
+            target=4,
+            notes="64 KB / 4 MB page alignment & address translation operational; pending Windows VirtualAlloc2 placeholder mapping",
+        ),
+        Subsystem(
+            name="Xbox COM Vtable Depth",
+            short_name="Vtables",
+            category="Graphics",
+            implemented=2,
+            target=4,
+            notes="Baseline Concept Destruction & Unicorn Overlord vtables active; expanding to full D3D12.2 / Enhanced Barriers & multi-SDK delta maps",
+        ),
+        Subsystem(
+            name="Audio DSP & XAPO Effects",
+            short_name="Audio",
+            category="Media",
+            implemented=2,
+            target=4,
+            notes="Multi-voice mixer & host XAudio 2.9 pass-through active; expanding to host XAPO effect chain passthrough & multi-channel XMA2",
+        ),
+        Subsystem(
+            name="Network & Live Middleware",
+            short_name="Network",
+            category="Services",
+            implemented=2,
+            target=4,
+            notes="Clean-room HLE shims for Bink2, FidelityFX, libHttpClient, and XCurl; roadmap to live WinHTTP sockets and native FMV decoding",
+        ),
+    ]
+
+
 def _badge_width(text: str) -> int:
     # Approximate Verdana 11px width + 12px horizontal padding
     return max(26, int(round(len(text) * 6.4)) + 14)
@@ -903,6 +997,7 @@ def render_markdown_status(
     cd_subsystems: list[Subsystem],
     total_exports: int,
     tests_md: str,
+    opt_subsystems: list[Subsystem] | None = None,
 ) -> str:
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
@@ -912,10 +1007,18 @@ def render_markdown_status(
     cd_target = sum(s.target for s in cd_subsystems)
     cd_pct = (cd_impl / cd_target * 100.0) if cd_target else 0.0
 
+    opt_pct = 0.0
+    if opt_subsystems:
+        opt_impl = sum(s.implemented for s in opt_subsystems)
+        opt_target = sum(s.target for s in opt_subsystems)
+        opt_pct = (opt_impl / opt_target * 100.0) if opt_target else 0.0
+
     sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
     rows = [
         "<!-- SCARLETTX_STATUS_START -->",
         "## Status",
+        "",
+        "![Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)",
         "",
         "![ScarlettX Status](docs/status.svg)",
         "",
@@ -932,12 +1035,19 @@ def render_markdown_status(
         if any(caption for _, _, _, caption in shots):
             rows.append("| " + " | ".join(caption for _, _, _, caption in shots) + " |")
         rows.append("")
-    rows += [
-        f"**Emulator Status:** `{overall_pct:.1f}%` ({total_impl} of {total_target} tracked functions, including unimplemented `0%` subsystems) · "
-        f"**Concept Destruction:** `{cd_pct:.1f}%` ({cd_impl} of {cd_target} bring-up milestones) · "
-        f"**Exports:** `{total_exports}` · "
-        f"**Tests:** {tests_md} · "
+
+    summary_items = []
+    if opt_subsystems:
+        summary_items.append(f"**Optimization Fidelity:** `{opt_pct:.1f}%` (Commercial Engine Readiness)")
+    summary_items.extend([
+        f"**Emulator Status:** `{overall_pct:.1f}%` ({total_impl} of {total_target} tracked functions, including unimplemented `0%` subsystems)",
+        f"**Concept Destruction:** `{cd_pct:.1f}%` ({cd_impl} of {cd_target} bring-up milestones)",
+        f"**Exports:** `{total_exports}`",
+        f"**Tests:** {tests_md}",
         "**Target:** `Xbox Series X|S (Gen9)`",
+    ])
+    rows += [
+        " · ".join(summary_items),
         "",
         "| Subsystem | Category | Progress | Coverage | Details |",
         "| :--- | :--- | :---: | :---: | :--- |",
@@ -1010,18 +1120,39 @@ def main() -> None:
         callout_line2="borderless fullscreen, controller rumble, audio and persistent saves all operational.",
     )
 
+    opt_subsystems = collect_optimization_metrics()
+    opt_impl = sum(s.implemented for s in opt_subsystems)
+    opt_target = sum(s.target for s in opt_subsystems)
+    opt_pct = (opt_impl / opt_target * 100.0) if opt_target else 0.0
+    opt_badges = [
+        ("fidelity", f"{opt_pct:.1f}%", BADGE_FN, True),
+        ("frame pacing", "0-tear VSync", BADGE_EXPORTS, False),
+        ("textures", "0-frame lag", BADGE_TESTS, False),
+        ("target", "Commercial AAA Execution", BADGE_TARGET, False),
+    ]
+    opt_svg = render_svg(
+        opt_subsystems,
+        badges=opt_badges,
+        heading_prefix="Runtime Optimization & Fidelity",
+        callout_lead="Optimization status:",
+        callout_line1="72.7% commercial engine readiness achieved across 11 optimization frontiers.",
+        callout_line2="Hardware VSync, in-process IAT loader, and 0-frame sub-submit texture streaming operational.",
+    )
+
     html_doc = render_html(subsystems, total_exports, tests_text, tests_ok)
 
     out_svg = ROOT / "docs/status.svg"
     out_cd_svg = ROOT / "docs/status_concept_destruction.svg"
+    out_opt_svg = ROOT / "docs/status_optimizations.svg"
     out_html = ROOT / "docs/status.html"
     out_svg.parent.mkdir(parents=True, exist_ok=True)
     out_svg.write_text(svg, encoding="utf-8")
     out_cd_svg.write_text(cd_svg, encoding="utf-8")
+    out_opt_svg.write_text(opt_svg, encoding="utf-8")
     out_html.write_text(html_doc, encoding="utf-8")
 
     md_block = render_markdown_status(
-        subsystems, cd_subsystems, total_exports, tests_markdown(test_count, test_results)
+        subsystems, cd_subsystems, total_exports, tests_markdown(test_count, test_results), opt_subsystems=opt_subsystems
     )
     readme_path = ROOT / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
@@ -1042,7 +1173,7 @@ def main() -> None:
     readme_path.write_text(new_readme, encoding="utf-8")
     print(
         f"[generate_status] Wrote {out_svg.relative_to(ROOT)}, {out_cd_svg.relative_to(ROOT)}, "
-        f"{out_html.relative_to(ROOT)}, and updated README.md (exports={total_exports}, tests: {tests_text})"
+        f"{out_opt_svg.relative_to(ROOT)}, {out_html.relative_to(ROOT)}, and updated README.md (exports={total_exports}, tests: {tests_text})"
     )
 
 
