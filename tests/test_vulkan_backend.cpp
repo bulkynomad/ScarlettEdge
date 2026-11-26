@@ -24,9 +24,25 @@ int main() {
     SX_CHECK(caps.maxRayRecursionDepth == 31);
     SX_CHECK(std::strlen(caps.deviceName) > 0);
 
-    // 3. RT Pipeline
+    // 3. RT Pipeline (with real minimal valid SPIR-V 1.5 shader module to exercise host vulkan-1.dll)
+    const uint32_t minimal_spirv[] = {
+        0x07230203u, 0x00010500u, 0x53585332u, 6u, 0u,
+        (2u << 16) | 17u, 1u,                              // OpCapability Shader
+        (3u << 16) | 14u, 0u, 1u,                          // OpMemoryModel Logical GLSL450
+        (5u << 16) | 15u, 5u, 3u, 0x6E69616Du, 0u,         // OpEntryPoint GLCompute %3 "main"
+        (6u << 16) | 16u, 3u, 17u, 1u, 1u, 1u,             // OpExecutionMode %3 LocalSize 1 1 1
+        (2u << 16) | 19u, 1u,                              // OpTypeVoid %1
+        (3u << 16) | 33u, 2u, 1u,                          // OpTypeFunction %2 %1
+        (5u << 16) | 54u, 1u, 3u, 0u, 2u,                  // OpFunction
+        (2u << 16) | 248u, 4u,                             // OpLabel %4
+        (1u << 16) | 253u,                                 // OpReturn
+        (1u << 16) | 56u                                   // OpFunctionEnd
+    };
     VULKAN_XS_RT_PIPELINE_DESC pipe_desc{};
     pipe_desc.maxRecursionDepth = 2;
+    pipe_desc.shaderStageCount = 1;
+    pipe_desc.raygenSpirv = minimal_spirv;
+    pipe_desc.raygenSize = sizeof(minimal_spirv);
     VULKAN_XS_RT_PIPELINE_HANDLE rt_pipe = nullptr;
     SX_CHECK(VulkanXsCreateRaytracingPipeline(backend, &pipe_desc, &rt_pipe) == 0);
     SX_CHECK(rt_pipe != nullptr);

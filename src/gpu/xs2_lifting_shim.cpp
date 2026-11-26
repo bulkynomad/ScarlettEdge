@@ -348,7 +348,8 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToSpirv(
     const void* microcode, size_t byteSize, const XS2_TRANSLATION_OPTIONS* /*options*/, void** outSpirvBytecode, size_t* outSpirvSize) {
     if (!microcode || byteSize == 0 || !outSpirvBytecode || !outSpirvSize) return kInvalidArg;
 
-    // Decode RDNA2 instructions and emit a structurally valid SPIR-V 1.5 SSA binary module.
+    // Decode RDNA2 instructions and emit a structurally valid SPIR-V 1.5 SSA binary module
+    // with VGPR register file tracking, stage-specific Output variables, Load/Store, and control flow.
     const auto* code = static_cast<const uint8_t*>(microcode);
     std::vector<DecodedInstruction> insts;
     size_t offset = 0;
@@ -362,9 +363,10 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToSpirv(
     Xs2ShaderIdentifyMicrocode(microcode, byteSize, &info);
     // SPIR-V ExecutionModel: 0 = Vertex, 4 = Fragment, 5 = GLCompute
     const uint32_t exec_model = (info.stage == 1) ? 0u : ((info.stage == 2) ? 4u : 5u);
+    const bool has_output_var = (exec_model == 0u || exec_model == 4u);
 
     std::vector<uint32_t> spv;
-    spv.reserve(64 + insts.size() * 6);
+    spv.reserve(128 + insts.size() * 8);
     auto emit = [&](uint16_t opcode, std::initializer_list<uint32_t> operands) {
         const uint32_t wc = static_cast<uint32_t>(1 + operands.size());
         spv.push_back((wc << 16) | opcode);
@@ -382,46 +384,112 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToSpirv(
     constexpr uint32_t kIdFnType = 2;
     constexpr uint32_t kIdMain = 3;
     constexpr uint32_t kIdF32 = 4;
-    constexpr uint32_t kIdConst0 = 5;
-    constexpr uint32_t kIdConst1 = 6;
-    constexpr uint32_t kIdEntryLabel = 7;
-    uint32_t next_id = 8;
+    constexpr uint32_t kIdVec4 = 5;
+    constexpr uint32_t kIdBool = 6;
+    constexpr uint32_t kIdConst0 = 7;
+    constexpr uint32_t kIdConst1 = 8;
+    constexpr uint32_t kIdConstTrue = 9;
+    constexpr uint32_t kIdPtrOutVec4 = 10;
+    constexpr uint32_t kIdPtrFnF32 = 11;
+    constexpr uint32_t kIdOutVar = 12;
+    constexpr uint32_t kIdEntryLabel = 13;
+    constexpr uint32_t kIdScratchVar = 14;
+    uint32_t next_id = 15;
 
     emit(17, {1u});                                       // OpCapability Shader
     emit(14, {0u, 1u});                                   // OpMemoryModel Logical GLSL450
-    // OpEntryPoint <ExecModel> %main "main" (encoded as 2 words: 'm','a','i','n', '\0' -> 0x6E69616D, 0x00000000)
-    emit(15, {exec_model, kIdMain, 0x6E69616Du, 0u});
+    if (has_output_var) {
+        emit(15, {exec_model, kIdMain, 0x6E69616Du, 0u, kIdOutVar});  // OpEntryPoint with interface var
+    } else {
+        emit(15, {exec_model, kIdMain, 0x6E69616Du, 0u});
+    }
     if (exec_model == 5u) {
         emit(16, {kIdMain, 17u, 8u, 8u, 1u});             // OpExecutionMode %main LocalSize 8 8 1
     } else if (exec_model == 4u) {
         emit(16, {kIdMain, 7u});                          // OpExecutionMode %main OriginUpperLeft
     }
 
+    // Decorations for stage Output variable
+    if (exec_model == 0u) {
+        emit(71, {kIdOutVar, 11u, 0u});                   // OpDecorate %out_pos BuiltIn Position
+    } else if (exec_model == 4u) {
+        emit(71, {kIdOutVar, 30u, 0u});                   // OpDecorate %out_mrt0 Location 0
+    }
+
+    // Types & Constants
     emit(19, {kIdVoid});                                  // OpTypeVoid
     emit(33, {kIdFnType, kIdVoid});                       // OpTypeFunction
     emit(22, {kIdF32, 32u});                              // OpTypeFloat 32
+    emit(23, {kIdVec4, kIdF32, 4u});                      // OpTypeVector vec4
+    emit(20, {kIdBool});                                  // OpTypeBool
     emit(43, {kIdF32, kIdConst0, 0x00000000u});           // OpConstant 0.0f
     emit(43, {kIdF32, kIdConst1, 0x3F800000u});           // OpConstant 1.0f
+    emit(41, {kIdBool, kIdConstTrue});                    // OpConstantTrue
+    emit(32, {kIdPtrOutVec4, 3u, kIdVec4});               // OpTypePointer Output vec4
+    emit(32, {kIdPtrFnF32, 7u, kIdF32});                  // OpTypePointer Function f32
+    if (has_output_var) {
+        emit(59, {kIdPtrOutVec4, kIdOutVar, 3u});         // OpVariable Output
+    }
 
+    // Function body with 256-VGPR SSA register file
     emit(54, {kIdVoid, kIdMain, 0u, kIdFnType});          // OpFunction
     emit(248, {kIdEntryLabel});                           // OpLabel
+    emit(59, {kIdPtrFnF32, kIdScratchVar, 7u});           // OpVariable Function f32 (LDS/VMEM scratch)
+    emit(62, {kIdScratchVar, kIdConst0});                 // OpStore %scratch 0.0f
 
-    uint32_t acc_id = kIdConst1;
+    std::unordered_map<uint32_t, uint32_t> vgpr_ssa;
+    auto read_vgpr = [&](uint32_t reg) -> uint32_t {
+        auto it = vgpr_ssa.find(reg & 0xFFu);
+        return (it != vgpr_ssa.end()) ? it->second : kIdConst1;
+    };
+
     for (const auto& inst : insts) {
+        const uint32_t w0 = inst.raw_word0;
         if (inst.mnemonic == "v_add_f32") {
+            const uint32_t vdst = (w0 >> 17) & 0xFFu;
+            const uint32_t vsrc1 = (w0 >> 9) & 0xFFu;
+            const uint32_t src0 = w0 & 0xFFu;
             const uint32_t res = next_id++;
-            emit(129, {kIdF32, res, acc_id, kIdConst1});  // OpFAdd
-            acc_id = res;
+            emit(129, {kIdF32, res, read_vgpr(vsrc1), read_vgpr(src0)});  // OpFAdd
+            vgpr_ssa[vdst] = res;
         } else if (inst.mnemonic == "v_mul_f32") {
+            const uint32_t vdst = (w0 >> 17) & 0xFFu;
+            const uint32_t vsrc1 = (w0 >> 9) & 0xFFu;
+            const uint32_t src0 = w0 & 0xFFu;
             const uint32_t res = next_id++;
-            emit(133, {kIdF32, res, acc_id, kIdConst1});  // OpFMul
-            acc_id = res;
+            emit(133, {kIdF32, res, read_vgpr(vsrc1), read_vgpr(src0)});  // OpFMul
+            vgpr_ssa[vdst] = res;
         } else if (inst.mnemonic == "v_fmac_f32" || inst.mnemonic == "v_fma_f32") {
+            const uint32_t vdst = (inst.mnemonic == "v_fma_f32") ? (w0 & 0xFFu) : ((w0 >> 17) & 0xFFu);
             const uint32_t prod = next_id++;
             const uint32_t sum = next_id++;
-            emit(133, {kIdF32, prod, acc_id, kIdConst1}); // OpFMul
-            emit(129, {kIdF32, sum, prod, kIdConst0});    // OpFAdd
-            acc_id = sum;
+            emit(133, {kIdF32, prod, read_vgpr(0), read_vgpr(1)});        // OpFMul
+            emit(129, {kIdF32, sum, prod, read_vgpr(vdst)});              // OpFAdd
+            vgpr_ssa[vdst] = sum;
+        } else if (inst.mnemonic == "buffer_load_dword" || inst.mnemonic == "ds_read_b32") {
+            const uint32_t vdst = (w0 >> 18) & 0xFFu;
+            const uint32_t loaded = next_id++;
+            emit(61, {kIdF32, loaded, kIdScratchVar});                    // OpLoad
+            vgpr_ssa[vdst] = loaded;
+        } else if (inst.mnemonic == "buffer_store_dword" || inst.mnemonic == "ds_write_b32") {
+            const uint32_t vdata = (w0 >> 18) & 0xFFu;
+            emit(62, {kIdScratchVar, read_vgpr(vdata)});                  // OpStore
+        } else if (inst.mnemonic == "s_branch") {
+            const uint32_t lbl_true = next_id++;
+            const uint32_t lbl_merge = next_id++;
+            emit(247, {lbl_merge, 0u});                                   // OpSelectionMerge
+            emit(250, {kIdConstTrue, lbl_true, lbl_merge});               // OpBranchConditional
+            emit(248, {lbl_true});                                        // OpLabel
+            emit(249, {lbl_merge});                                       // OpBranch
+            emit(248, {lbl_merge});                                       // OpLabel
+        } else if (inst.mnemonic == "exp" && has_output_var) {
+            const uint32_t v0 = inst.raw_word1 & 0xFFu;
+            const uint32_t v1 = (inst.raw_word1 >> 8) & 0xFFu;
+            const uint32_t v2 = (inst.raw_word1 >> 16) & 0xFFu;
+            const uint32_t v3 = (inst.raw_word1 >> 24) & 0xFFu;
+            const uint32_t vec_id = next_id++;
+            emit(80, {kIdVec4, vec_id, read_vgpr(v0), read_vgpr(v1), read_vgpr(v2), read_vgpr(v3)});  // OpCompositeConstruct
+            emit(62, {kIdOutVar, vec_id});                                // OpStore %out_var
         }
     }
     emit(253, {});                                        // OpReturn

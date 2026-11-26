@@ -206,6 +206,29 @@ int main() {
         char vs_disasm[512]{};
         SX_CHECK(Xs2ShaderDisassembleRdna2(vs_kernel, sizeof(vs_kernel), vs_disasm, sizeof(vs_disasm), nullptr) == 0);
         SX_CHECK(std::strstr(vs_disasm, "exp pos0") != nullptr);
+
+        // Verify lifted SPIR-V 1.5 Vertex & Pixel modules contain OpCompositeConstruct (80) & OpStore (62)
+        auto check_spv_export = [&](const void* kernel, size_t sz) -> bool {
+            void* spv = nullptr;
+            size_t spv_sz = 0;
+            if (Xs2ShaderLiftToSpirv(kernel, sz, &opts, &spv, &spv_sz) != 0 || !spv || spv_sz < 20) return false;
+            const auto* w = static_cast<const uint32_t*>(spv);
+            const size_t n = spv_sz / 4;
+            bool has_cc = false, has_store = false, has_dec = false;
+            for (size_t i = 5; i < n; ) {
+                const uint32_t wc = w[i] >> 16;
+                const uint32_t op = w[i] & 0xFFFFu;
+                if (wc < 1 || i + wc > n) { Xs2ShaderFreeBytecode(spv); return false; }
+                if (op == 71u) has_dec = true;     // OpDecorate
+                if (op == 80u) has_cc = true;      // OpCompositeConstruct
+                if (op == 62u) has_store = true;   // OpStore
+                i += wc;
+            }
+            Xs2ShaderFreeBytecode(spv);
+            return has_dec && has_cc && has_store;
+        };
+        SX_CHECK(check_spv_export(ps_kernel, sizeof(ps_kernel)));
+        SX_CHECK(check_spv_export(vs_kernel, sizeof(vs_kernel)));
     }
 
     std::cout << "[test_xs2_lifting] All 16 Xs2Shader APIs verified successfully!\n";
