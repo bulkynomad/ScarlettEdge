@@ -22,18 +22,18 @@ While Phase 1 foundations and ABI coverage are at `100%`, running unmodified hea
 
 ![ScarlettEdge Phase 2: Retail AAA Execution Roadmap](docs/status_aaa_roadmap.svg)
 
-**Phase 2 AAA Readiness:** `25.0%` (8 of 32 milestones) · **Active Focus:** `RDNA2 SPIR-V Compiler, Vulkan GPU Execution, DCC/HTILE & Native Media`
+**Phase 2 AAA Readiness:** `25.0%` (18 of 72 milestones) · **Active Focus:** `RDNA2 SPIR-V Compiler, Vulkan GPU Execution, DCC/HTILE & Native Media`
 
 | Phase 2 Milestone | Category | Progress | Readiness | Remaining Work |
 | :--- | :--- | :---: | :---: | :--- |
-| **XG Tiling, MSAA & DCC** | `Graphics` | `2 of 4` | `50%` | 4KB_S, 256B_S, 64KB_S/D/R_X done; next: 3D/cube/MSAA arrays, DCC color & HTILE depth metadata decompression |
-| **D3D12.2 & MEM_GRAPHICS** | `Graphics` | `1 of 4` | `25%` | 128-slot vtables, CL7::Barrier & VirtualAlloc2 done; next: CreatePlacedResourceX on guest GPUVA, Work Graphs & VRS |
-| **DirectStorage GPU Codecs** | `Storage` | `1 of 4` | `25%` | OVERLAPPED NVMe & LZ77 GDeflate/BCPack done; next: RFC 1951 Huffman DEFLATE, GPU compute GDeflate & hardware BC1-BC7 unpack |
-| **GDK 2022-2026 & WinRT** | `Platform` | `1 of 4` | `25%` | Live WinHTTP & offline XSAPI done; next: newer GDK QueryApiImpl COM tables, RoActivateInstance broker & title storage |
-| **Retail XMA2 & Bink2 Media** | `Media` | `1 of 4` | `25%` | KB2/BT.709 YUV-RGBA & XMA2 packet framing done; next: full XMA2 MDCT/WMA Pro decode, 5.1/7.1 spatial audio & real Bink2/MF video |
-| **Vulkan 1.3 & DXR GPU Exec** | `Graphics` | `1 of 4` | `25%` | Live vulkan-1.dll VkInstance/VkDevice/VkShaderModule active; next: VkPipeline/VkCommandBuffer exec, GPU BLAS/TLAS & swapchain |
-| **XS2 -> GPU Shader Compiler** | `Compiler` | `1 of 4` | `25%` | 256-VGPR SPIR-V 1.5 SSA & vkCreateShaderModule done; next: DescriptorSet/ImageSample bindings, d3d12_xs auto-intercept & disk cache |
-| **AAA Retail Title Bring-Up** | `Titles` | `0 of 4` | `0%` | Phase 1 titles playable; Phase 2 targets: UE5/Open-World/Creation Engine retail titles -> boot, menus, 3D in-game & 60 FPS stability |
+| **XG Tiling, MSAA & DCC** | `Graphics` | `4 of 10` | `40%` | **Done (4):** 4KB_S, 256B_S, 64KB_S/D, 64KB_R_X · **Next (6):** 64KB_Z_X depth, 3D volumes, Cube/2D arrays, 2x/4x/8x MSAA, DCC color & HTILE depth decompression |
+| **D3D12.2 & MEM_GRAPHICS** | `Graphics` | `3 of 10` | `30%` | **Done (3):** 128-slot vtables, CL7::Barrier, VirtualAlloc2 aliasing · **Next (7):** CreatePlacedResourceX on guest GPUVA, 2 MB large pages, Mesh PSOs, VRS, Sampler Feedback/Tiled, ExecuteIndirect counts, Work Graphs |
+| **XS2 -> GPU Shader Compiler** | `Compiler` | `3 of 12` | `25%` | **Done (3):** RDNA2 ISA decode, 256-VGPR SPIR-V 1.5 SSA, stage Output exports · **Next (9):** SMEM UBOs, SSBO Load/Store, MIMG OpImageSample, v_interp Fragment inputs, CFG reconvergence, Wave32 subgroups, d3d12_xs auto-intercept, SPIR-V->DXIL bridge, disk cache |
+| **DirectStorage GPU Codecs** | `Storage` | `2 of 8` | `25%` | **Done (2):** OVERLAPPED NVMe I/O, LZ77 GDeflate (0x04FB) & BCPK · **Next (6):** RFC 1951 Huffman DEFLATE, multi-thread tile pool, GPU compute GDeflate, hardware BC1-BC7 unpack, direct TextureRegion GPU upload, priority preemption |
+| **GDK 2022-2026 & WinRT** | `Platform` | `2 of 8` | `25%` | **Done (2):** Live WinHTTP (libHttpClient & XCurl), baseline QueryApiImpl & XSAPI · **Next (6):** GDK 2022-2026 COM GUIDs, RoActivateInstance broker, XStore/DLC mount, live/local token bridge, XblTitleStorage sync, WebSocket/PlayFab bridge |
+| **Retail XMA2 & Bink2 Media** | `Media` | `2 of 8` | `25%` | **Done (2):** KB2/BIK header + BT.709 YUV-RGBA, XMA2 packet framing + PCM16 · **Next (6):** XMA2 bitstream parser, MDCT/WMA Pro decode, 5.1/7.1 spatial + X3DAudio, host CLSID_FXReverb/FXEQ, real Bink2/MF video decode, A/V PTS lip-sync |
+| **Vulkan 1.3 & DXR GPU Exec** | `Graphics` | `2 of 10` | `20%` | **Done (2):** Dynamic vulkan-1.dll loader, live vkCreateShaderModule · **Next (8):** VkQueue/CmdBuffer submit, DescriptorSet root-sig layout, Graphics/Compute VkPipeline, Win32 swapchain, GPU BLAS build, GPU TLAS update, vkCmdTraceRaysKHR SBT, timeline semaphores |
+| **AAA Retail Title Bring-Up** | `Titles` | `0 of 6` | `0%` | **Next (6):** User-key encrypted retail XVC mount, UE5 boot to logos, Open-World/Creation boot to logos, 3D main menu stability, open-world asset/shader streaming, sustained 30-60 FPS gameplay |
 
 ---
 
