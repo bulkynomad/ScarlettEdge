@@ -61,6 +61,42 @@ int main() {
 
     SX_CHECK(XvcCryptoReleaseContext(&ctx) == 0);
 
-    std::cout << "[test_xvc_crypto] All 12 XvcCrypto APIs verified successfully!\n";
+    // 7. NIST FIPS 180-4 SHA-256 known-answer vector: SHA256("abc")
+    {
+        const uint8_t abc[3] = {'a', 'b', 'c'};
+        uint8_t sha_out[32]{};
+        SX_CHECK(XvcCryptoComputeBlockSha256(abc, 3, sha_out) == 0);
+        const uint8_t expected[32] = {
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+            0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+            0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+        };
+        SX_CHECK(std::memcmp(sha_out, expected, 32) == 0);
+    }
+
+    // 8. IEEE 1619 / NIST SP 800-38E AES-128-XTS Vector 1 (all-zero 32B key, sector 0, 32B zero plaintext)
+    {
+        XVC_CRYPTO_CONTEXT vctx{};
+        SX_CHECK(XvcCryptoInitializeContext(&vctx) == 0);
+        const uint8_t zkey[32]{};
+        const uint8_t zplain[32]{};
+        uint8_t xts_cipher[32]{};
+        uint8_t xts_plain[32]{};
+        SX_CHECK(XvcCryptoSetVolumeKey(&vctx, zkey, sizeof(zkey)) == 0);
+        SX_CHECK(XvcCryptoEncryptSectorXts(&vctx, 0, zplain, xts_cipher, 32) == 0);
+        const uint8_t expected_ieee1619_v1[32] = {
+            0x91, 0x7c, 0xf6, 0x9e, 0xbd, 0x68, 0xb2, 0xec,
+            0x9b, 0x9f, 0xe9, 0xa3, 0xea, 0xdd, 0xa6, 0x92,
+            0xcd, 0x43, 0xd2, 0xf5, 0x95, 0x98, 0xed, 0x85,
+            0x8c, 0x02, 0xc2, 0x65, 0x2f, 0xbf, 0x92, 0x2e
+        };
+        SX_CHECK(std::memcmp(xts_cipher, expected_ieee1619_v1, 32) == 0);
+        SX_CHECK(XvcCryptoDecryptSectorXts(&vctx, 0, xts_cipher, xts_plain, 32) == 0);
+        SX_CHECK(std::memcmp(xts_plain, zplain, 32) == 0);
+        SX_CHECK(XvcCryptoReleaseContext(&vctx) == 0);
+    }
+
+    std::cout << "[test_xvc_crypto] All 12 XvcCrypto APIs + NIST SHA-256 & IEEE 1619 AES-XTS vectors verified!\n";
     return 0;
 }

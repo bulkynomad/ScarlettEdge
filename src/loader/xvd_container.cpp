@@ -1,4 +1,5 @@
 #include "scarlettx/loader/xvd_container.h"
+#include "scarlettx/loader/aes_xts_cng.h"
 
 #include <algorithm>
 #include <cstring>
@@ -43,16 +44,16 @@ constexpr size_t kOffUserDataOffset = 0x250;
 constexpr size_t kOffUserDataLength = 0x258;
 
 void TransformSectorXts(
+    bool do_encrypt,
     uint64_t sector_index,
     const uint8_t* in_buf,
     uint8_t* out_buf,
     size_t len,
-    const std::array<uint8_t, 32>& volume_key) {
-    for (size_t i = 0; i < len; ++i) {
-        const uint8_t tweak = static_cast<uint8_t>((sector_index >> ((i % 8) * 8)) & 0xFFu);
-        const uint8_t key_byte = volume_key[i % 32];
-        out_buf[i] = static_cast<uint8_t>(in_buf[i] ^ key_byte ^ tweak);
-    }
+    const std::array<uint8_t, 32>& volume_key,
+    uint32_t key_len) {
+    const size_t effective_len = key_len >= 16 ? key_len : 32;
+    scarlettx::crypto::AesXtsTransformSector(
+        do_encrypt, volume_key.data(), effective_len, sector_index, in_buf, out_buf, len);
 }
 
 int HexNibble(char c) {
@@ -247,7 +248,7 @@ Status XvdContainer::ReadUserData(
         if (!st.ok()) {
             return st;
         }
-        TransformSectorXts(sector, cipher_sector.data(), plain_sector.data(), sector_avail, volume_key_);
+        TransformSectorXts(false, sector, cipher_sector.data(), plain_sector.data(), sector_avail, volume_key_, volume_key_len_);
 
         const uint64_t copy_start = std::max<uint64_t>(offset, sector_start);
         const uint64_t copy_end = std::min<uint64_t>(offset + size, sector_start + sector_avail);
@@ -302,7 +303,8 @@ std::vector<uint8_t> XvdContainer::BuildEncryptedSyntheticXvd(
     for (uint64_t s = 0; s < num_sectors; ++s) {
         const size_t start = static_cast<size_t>(s * kSectorSize);
         const size_t len = std::min<size_t>(kSectorSize, user_data.size() - start);
-        TransformSectorXts(s, user_data.data() + start, encrypted.data() + start, len, key);
+        TransformSectorXts(true, s, user_data.data() + start, encrypted.data() + start, len, key,
+                           static_cast<uint32_t>(std::min<size_t>(key_len, key.size())));
     }
     return BuildSyntheticXvd(encrypted, content_type, true);
 }

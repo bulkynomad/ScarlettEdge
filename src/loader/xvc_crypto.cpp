@@ -1,5 +1,6 @@
 #define SCARLETTX_BUILDING_XVC_CRYPTO 1
 #include "scarlettx/io/xvc_crypto_abi.h"
+#include "scarlettx/loader/aes_xts_cng.h"
 
 #include <algorithm>
 #include <cstring>
@@ -11,21 +12,9 @@ constexpr int32_t kSuccess = 0;
 constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
 constexpr int32_t kFail = static_cast<int32_t>(0x80004005u);
 
-// Lightweight clean-room FNV-1a / SHA-style 256-bit block accumulator for testing
 void ComputeDigest256(const uint8_t* data, uint64_t len, uint8_t* outDigest) {
     if (!outDigest) return;
-    std::memset(outDigest, 0, 32);
-    uint64_t h[4] = {
-        0x6a09e667f3bcc908ull,
-        0xbb67ae8584caa73bull,
-        0x3c6ef372fe94f82bull,
-        0xa54ff53a5f1d36f1ull
-    };
-    for (uint64_t i = 0; i < len; ++i) {
-        const uint64_t byte = data ? data[i] : 0;
-        h[i % 4] = (h[i % 4] ^ byte) * 1099511628211ull;
-    }
-    std::memcpy(outDigest, h, 32);
+    scarlettx::crypto::ComputeSha256(data, static_cast<size_t>(len), outDigest);
 }
 
 }  // namespace
@@ -60,10 +49,10 @@ int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoSetVolumeKey(
 int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoDecryptSectorXts(
     XVC_CRYPTO_CONTEXT* context, uint64_t sectorIndex, const uint8_t* inCipher, uint8_t* outPlain, uint32_t sectorSize) {
     if (!context || !inCipher || !outPlain || sectorSize == 0) return kInvalidArg;
-    for (uint32_t i = 0; i < sectorSize; ++i) {
-        const uint8_t tweak = static_cast<uint8_t>((sectorIndex >> ((i % 8) * 8)) & 0xFF);
-        const uint8_t key_byte = context->volumeKey[i % 32];
-        outPlain[i] = inCipher[i] ^ key_byte ^ tweak;
+    const size_t key_len = context->keyLength >= 16 ? context->keyLength : 32;
+    if (!scarlettx::crypto::AesXtsTransformSector(
+            false, context->volumeKey, key_len, sectorIndex, inCipher, outPlain, sectorSize)) {
+        return kFail;
     }
     context->sectorsProcessed++;
     return kSuccess;
@@ -72,10 +61,10 @@ int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoDecryptSectorXts(
 int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoEncryptSectorXts(
     XVC_CRYPTO_CONTEXT* context, uint64_t sectorIndex, const uint8_t* inPlain, uint8_t* outCipher, uint32_t sectorSize) {
     if (!context || !inPlain || !outCipher || sectorSize == 0) return kInvalidArg;
-    for (uint32_t i = 0; i < sectorSize; ++i) {
-        const uint8_t tweak = static_cast<uint8_t>((sectorIndex >> ((i % 8) * 8)) & 0xFF);
-        const uint8_t key_byte = context->volumeKey[i % 32];
-        outCipher[i] = inPlain[i] ^ key_byte ^ tweak;
+    const size_t key_len = context->keyLength >= 16 ? context->keyLength : 32;
+    if (!scarlettx::crypto::AesXtsTransformSector(
+            true, context->volumeKey, key_len, sectorIndex, inPlain, outCipher, sectorSize)) {
+        return kFail;
     }
     context->sectorsProcessed++;
     return kSuccess;

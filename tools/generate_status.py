@@ -1133,10 +1133,10 @@ def main() -> None:
     opt_svg = render_svg(
         opt_subsystems,
         badges=opt_badges,
-        heading_prefix="Runtime Optimization & Fidelity",
+        heading_prefix="ScarlettEdge Runtime Optimization & Fidelity",
         callout_lead="Optimization status:",
         callout_line1=f"{opt_pct:.1f}% commercial engine readiness achieved across 11 optimization frontiers ({opt_impl}/{opt_target} milestones).",
-        callout_line2="VirtualAlloc2 aliasing, 128-slot D3D12.2/DXR vtables, RDNA2 graphics+compute, XAPO DSP, XVD XTS & live WinHTTP operational.",
+        callout_line2="FIPS-197 AES-XTS/SHA-256 CNG crypto, VirtualAlloc2 aliasing, 128-slot D3D12.2/DXR vtables, RDNA2 graphics & WinHTTP active.",
     )
 
     html_doc = render_html(subsystems, total_exports, tests_text, tests_ok)
