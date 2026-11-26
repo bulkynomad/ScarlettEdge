@@ -35,7 +35,10 @@ Status PackageVfs::MountDirectory(const std::string& virtual_root, const std::st
     return Status::Ok();
 }
 
-Status PackageVfs::MountXvd(const std::string& virtual_path, const std::string& xvd_host_path) {
+Status PackageVfs::MountXvd(
+    const std::string& virtual_path,
+    const std::string& xvd_host_path,
+    const std::string& volume_key_hex) {
     if (virtual_path.empty() || xvd_host_path.empty()) {
         return Status::Error(StatusCode::InvalidArgument, "Empty virtual_path or xvd_host_path");
     }
@@ -44,10 +47,16 @@ Status PackageVfs::MountXvd(const std::string& virtual_path, const std::string& 
     if (!st.ok()) {
         return st;
     }
-    if (container->Header().is_encrypted) {
+    if (!volume_key_hex.empty()) {
+        st = container->SetVolumeKeyHex(volume_key_hex);
+        if (!st.ok()) {
+            return st;
+        }
+    }
+    if (container->Header().is_encrypted && !container->HasVolumeKey()) {
         return Status::Error(
             StatusCode::UnsupportedFormat,
-            "Encrypted XVD containers cannot be mounted without decryption");
+            "Encrypted XVD containers cannot be mounted without a volume key");
     }
     xvd_mounts_[NormalizeKey(virtual_path)] = std::move(container);
     return Status::Ok();

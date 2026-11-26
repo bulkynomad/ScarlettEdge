@@ -102,6 +102,8 @@ int main(int argc, char** argv) {
                 cfg.rt_dump_path = argv[++i];
             } else if (arg == "--raster-dump" && i + 1 < argc) {
                 cfg.raster_dump_path = argv[++i];
+            } else if (arg == "--volume-key" && i + 1 < argc) {
+                cfg.volume_key = argv[++i];
             } else {
                 std::cerr << "[boot] Unknown or incomplete option: " << arg << "\n";
                 PrintUsage();

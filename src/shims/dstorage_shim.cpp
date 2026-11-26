@@ -266,11 +266,35 @@ int32_t ExecuteRequest(const DSTORAGE_REQUEST& req) {
             if (!st.ok()) return kE_FAIL;
         } else {
             raw.resize(req.SourceSize);
-            std::ifstream ifs(file->path, std::ios::binary);
-            if (!ifs) return kE_DSTORAGE_FILE_NOT_FOUND;
-            ifs.seekg(static_cast<std::streamoff>(req.SourceFileOffset), std::ios::beg);
-            ifs.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(req.SourceSize));
-            if (static_cast<uint32_t>(ifs.gcount()) != req.SourceSize) return kE_FAIL;
+            bool read_done = false;
+#if defined(_WIN32)
+            if (file->hFile && file->hFile != INVALID_HANDLE_VALUE && req.SourceSize > 0) {
+                HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (ev) {
+                    OVERLAPPED ov{};
+                    ov.Offset = static_cast<DWORD>(req.SourceFileOffset & 0xFFFFFFFFull);
+                    ov.OffsetHigh = static_cast<DWORD>(req.SourceFileOffset >> 32);
+                    ov.hEvent = ev;
+                    DWORD bytes_read = 0;
+                    BOOL ok = ReadFile(static_cast<HANDLE>(file->hFile), raw.data(),
+                                       static_cast<DWORD>(req.SourceSize), &bytes_read, &ov);
+                    if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                        ok = GetOverlappedResult(static_cast<HANDLE>(file->hFile), &ov, &bytes_read, TRUE);
+                    }
+                    CloseHandle(ev);
+                    if (ok && bytes_read == req.SourceSize) {
+                        read_done = true;
+                    }
+                }
+            }
+#endif
+            if (!read_done) {
+                std::ifstream ifs(file->path, std::ios::binary);
+                if (!ifs) return kE_DSTORAGE_FILE_NOT_FOUND;
+                ifs.seekg(static_cast<std::streamoff>(req.SourceFileOffset), std::ios::beg);
+                ifs.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(req.SourceSize));
+                if (static_cast<uint32_t>(ifs.gcount()) != req.SourceSize) return kE_FAIL;
+            }
         }
     } else if (req.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY) {
         if (!req.SourceMemory) return kE_INVALIDARG;
@@ -453,8 +477,11 @@ int32_t DStorageOpenFile(uint64_t factory, const char* path, uint64_t* out_file)
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN,
         nullptr);
+    if (obj->hFile == INVALID_HANDLE_VALUE) {
+        obj->hFile = nullptr;
+    }
 #endif
 
     std::lock_guard<std::mutex> lk(State().mu);
@@ -476,7 +503,14 @@ int32_t DStorageOpenXvdFile(uint64_t factory, const char* xvd_path, uint64_t* ou
     obj->path = xvd_path;
     auto st = obj->xvd.OpenFile(xvd_path);
     if (!st.ok()) return kE_FAIL;
-    if (obj->xvd.Header().is_encrypted) return kE_NOTIMPL;
+    if (obj->xvd.Header().is_encrypted) {
+        if (const char* env_key = std::getenv("SCARLETTX_VOLUME_KEY"); env_key && env_key[0] != '\0') {
+            if (!obj->xvd.SetVolumeKeyHex(env_key).ok()) {
+                (void)obj->xvd.LoadVolumeKeyFile(env_key);
+            }
+        }
+        if (!obj->xvd.HasVolumeKey()) return kE_NOTIMPL;
+    }
     obj->size = obj->xvd.Header().user_data_length;
 
     std::lock_guard<std::mutex> lk(State().mu);

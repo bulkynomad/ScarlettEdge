@@ -32,6 +32,7 @@ class XvdContainer {
 public:
     static constexpr size_t kMagicOffset = 0x200;
     static constexpr size_t kMinHeaderSize = 0x1000;
+    static constexpr size_t kSectorSize = 0x1000;
     static constexpr const char* kMagic = "msft-xvd";
 
     // Volume flag bits (publicly documented XVD header flags).
@@ -42,11 +43,18 @@ public:
     Status OpenFile(const std::string& path);
     Status OpenBytes(std::vector<uint8_t> data);
 
+    // Loads a 16-byte (AES-128) or 32-byte (AES-256) volume key for encrypted XVD streaming.
+    Status SetVolumeKey(const uint8_t* key, size_t key_len);
+    Status SetVolumeKeyHex(const std::string& hex_key);
+    Status LoadVolumeKeyFile(const std::string& key_file_path);
+    bool HasVolumeKey() const { return has_volume_key_; }
+
     bool IsOpen() const { return header_.valid; }
     const XvdHeaderInfo& Header() const { return header_; }
     const std::string& Path() const { return path_; }
 
-    // Reads bytes from the unencrypted user-data region of the XVD.
+    // Reads bytes from the user-data region of the XVD (automatically decrypting
+    // 4 KiB sectors via XTS when the container is encrypted and a volume key is set).
     Status ReadUserData(uint64_t offset, uint64_t size, std::vector<uint8_t>& out_data) const;
 
     // Builds an unencrypted synthetic XVD image in memory for autonomous testing.
@@ -55,6 +63,13 @@ public:
         uint32_t content_type = 1,
         bool mark_encrypted = false);
 
+    // Builds an encrypted synthetic XVD image using 4 KiB sector XTS encryption.
+    static std::vector<uint8_t> BuildEncryptedSyntheticXvd(
+        const std::vector<uint8_t>& user_data,
+        const uint8_t* volume_key,
+        size_t key_len,
+        uint32_t content_type = 1);
+
 private:
     Status ParseHeaderFromBytes(const uint8_t* data, size_t size);
 
@@ -62,6 +77,9 @@ private:
     std::vector<uint8_t> backing_bytes_;
     bool memory_backed_ = false;
     XvdHeaderInfo header_{};
+    std::array<uint8_t, 32> volume_key_{};
+    uint32_t volume_key_len_ = 0;
+    bool has_volume_key_ = false;
 };
 
 }  // namespace scarlettx

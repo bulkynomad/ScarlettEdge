@@ -175,13 +175,57 @@ int main() {
         SX_CHECK_EQ(slice.size(), 256u);
         SX_CHECK(std::memcmp(slice.data(), payload.data() + 128, 256) == 0);
 
-        // Encrypted XVD must parse header cleanly but reject user-data reads
+        // Encrypted XVD must parse header cleanly but reject user-data reads without a key
         auto enc_bytes = scarlettx::XvdContainer::BuildSyntheticXvd(payload, 1, true);
         scarlettx::XvdContainer enc_xvd;
         SX_CHECK(enc_xvd.OpenBytes(enc_bytes).ok());
         SX_CHECK(enc_xvd.Header().is_encrypted);
         std::vector<uint8_t> denied;
         SX_CHECK(!enc_xvd.ReadUserData(0, 64, denied).ok());
+
+        // Encrypted XVD with 4 KiB sector XTS decryption across multi-sector unaligned boundaries
+        std::vector<uint8_t> large_payload(10000);
+        for (size_t i = 0; i < large_payload.size(); ++i) {
+            large_payload[i] = static_cast<uint8_t>((i * 17 + 31) & 0xFFu);
+        }
+        std::array<uint8_t, 32> vol_key{};
+        for (size_t i = 0; i < vol_key.size(); ++i) {
+            vol_key[i] = static_cast<uint8_t>(0x30u + i);
+        }
+        auto xts_img = scarlettx::XvdContainer::BuildEncryptedSyntheticXvd(
+            large_payload, vol_key.data(), vol_key.size(), 1);
+        scarlettx::XvdContainer xts_xvd;
+        SX_CHECK(xts_xvd.OpenBytes(xts_img).ok());
+        SX_CHECK(xts_xvd.Header().is_encrypted);
+        SX_CHECK(!xts_xvd.ReadUserData(0, 64, denied).ok());
+        SX_CHECK(xts_xvd.SetVolumeKey(vol_key.data(), vol_key.size()).ok());
+        SX_CHECK(xts_xvd.HasVolumeKey());
+
+        std::vector<uint8_t> decrypted_slice;
+        SX_CHECK(xts_xvd.ReadUserData(137, 5000, decrypted_slice).ok());
+        SX_CHECK_EQ(decrypted_slice.size(), 5000u);
+        SX_CHECK(std::memcmp(decrypted_slice.data(), large_payload.data() + 137, 5000) == 0);
+
+        // Verify PackageVfs::MountXvd with hex volume key
+        const auto enc_xvd_path = (tmp_dir / "encrypted_assets.xvd").string();
+        {
+            std::ofstream ofs(enc_xvd_path, std::ios::binary);
+            SX_CHECK(ofs.good());
+            ofs.write(reinterpret_cast<const char*>(xts_img.data()), static_cast<std::streamsize>(xts_img.size()));
+        }
+        std::string hex_key;
+        static const char kHex[] = "0123456789abcdef";
+        for (uint8_t b : vol_key) {
+            hex_key.push_back(kHex[b >> 4]);
+            hex_key.push_back(kHex[b & 0xF]);
+        }
+        scarlettx::PackageVfs enc_vfs;
+        SX_CHECK(!enc_vfs.MountXvd("G:\\enc_assets", enc_xvd_path).ok());
+        SX_CHECK(enc_vfs.MountXvd("G:\\enc_assets", enc_xvd_path, hex_key).ok());
+        std::vector<uint8_t> vfs_plain;
+        SX_CHECK(enc_vfs.ReadFileBytes("G:\\enc_assets", vfs_plain).ok());
+        SX_CHECK_EQ(vfs_plain.size(), large_payload.size());
+        SX_CHECK(std::memcmp(vfs_plain.data(), large_payload.data(), large_payload.size()) == 0);
     }
 
     // 2. DirectStorage configuration, factory, queue, status array

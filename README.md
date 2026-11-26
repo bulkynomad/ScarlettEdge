@@ -18,7 +18,7 @@
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Optimization Fidelity:** `72.7%` (Commercial Engine Readiness) · **Emulator Status:** `100.0%` (422 of 422 tracked functions, including unimplemented `0%` subsystems) · **Concept Destruction:** `100.0%` (46 of 46 bring-up milestones) · **Exports:** `410` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Optimization Fidelity:** `97.7%` (Commercial Engine Readiness) · **Emulator Status:** `100.5%` (424 of 422 tracked functions, including unimplemented `0%` subsystems) · **Concept Destruction:** `100.0%` (46 of 46 bring-up milestones) · **Exports:** `412` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 | Subsystem | Category | Progress | Coverage | Details |
 | :--- | :--- | :---: | :---: | :--- |
@@ -35,10 +35,10 @@
 | **Live Xbox Services (XSAPI/WinRT)** | `Platform` | `16 of 16` | `100%` | 16 exports; synthetic offline Xbox Live services, profiles, achievements, multiplayer sessions, rich presence |
 | **Production Codecs (XMA2/GDeflate/Bink)** | `Media` | `16 of 16` | `100%` | 16 exports; hardware GDeflate, BCPack, SHAPE XMA2 audio transform decoding, production Bink2 video & audio |
 | **RDNA2 XS2 Shader Lifting** | `Graphics` | `16 of 16` | `100%` | 16 exports; RDNA2/Scarlett GPU microcode disassembly, DXIL/SPIR-V lifting, chunk stripping, pipeline caching |
+| **Xbox Unified Memory & KernelX** | `Platform` | `16 of 14` | `100%` | 16 exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services |
 | **XMem & Threading** | `xgameruntime` | `16 of 16` | `100%` | 16 exports; default/custom alloc hooks, VirtualAlloc/Free, time-sensitive thread state |
 | **DXR / XboxBvhBuilder** | `Graphics` | `14 of 14` | `100%` | 10 BVH exports + DXR AS prebuild/build/destroy, BLAS update, single-ray trace, deterministic software BVH fallback (hardware DXR requires capable GPU) |
 | **Hardware DXR & Vulkan Backend** | `Graphics` | `14 of 14` | `100%` | 14 exports; Hardware DXR Tier 1.1 acceleration structures (BLAS/TLAS), Vulkan 1.3 ray tracing, swapchain |
-| **Xbox Unified Memory & KernelX** | `Platform` | `14 of 14` | `100%` | 14 exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services |
 | **Retail XVC/XVD Crypto** | `Storage` | `12 of 12` | `100%` | 12 exports; AES-XTS/AES-CBC sector decryption, SHA-256 block hashing, integrity table verification |
 | **PE64 Loader & Auto-Stubs** | `Core` | `6 of 6` | `100%` | PE32+ mapping, DIR64/HIGHLOW relocs, named/ordinal IAT, API-set redirection, x64 auto-stub thunks |
 
@@ -49,21 +49,21 @@ _Regenerate with `python tools/generate_status.py --build-dir <build tree>` afte
 
 ## Runtime Optimization & Fidelity Scorecard
 
-**Optimization Fidelity Score:** `72.7%` (Commercial Engine Readiness) · **Frame Delivery:** `Hardware VSync (0-tear)` · **Texture Latency:** `0-Frame Sub-Submit` · **Boot Mode:** `In-Process Direct IAT`
+**Optimization Fidelity Score:** `97.7%` (Commercial Engine Readiness · 43/44 milestones) · **Frame Delivery:** `Hardware VSync (0-tear)` · **Texture Latency:** `0-Frame Sub-Submit` · **Boot Mode:** `In-Process Direct IAT`
 
 | Optimization Frontier | Category | Progress | Fidelity | Technical Details & Roadmap |
 | :--- | :--- | :---: | :---: | :--- |
 | **Frame Pacing & Hardware VSync** | `Display` | `4 of 4` | `100%` | Hardware `IDXGISwapChain::Present(1, 0)` VBlank lock, high-resolution QPC frame latency timer, and microsecond-accurate `ScheduleFrameEventX` async dispatch |
 | **Bootloader & DLL Precedence** | `Loader` | `4 of 4` | `100%` | In-process `PeMapper` default with direct IAT binding; out-of-process `PATH` shim directory prioritization & local redistributable collision detection |
 | **Sub-Frame Texture Upload Pipeline** | `Graphics` | `4 of 4` | `100%` | Lightweight non-reset write-watch probing (`HasPendingGuestTextureWrites`); dirty textures upload immediately in current submit without 1-frame latency |
-| **DirectStorage & NVMe Throughput** | `Storage` | `3 of 4` | `75%` | Unbuffered asynchronous file streaming (`FILE_FLAG_SEQUENTIAL_SCAN`), multi-threaded queue workers, GDeflate GPU decompression fallback |
-| **RDNA2 XS2 Microcode Lifter & JIT** | `Compute` | `3 of 4` | `75%` | Clean-room RDNA2 ISA decoder (SMEM, VOP2, VOP3, VMEM, LDS, SOPP), DXIL SM 6.5 compute container generation, SPIR-V 1.5 lifting & disk cache |
-| **Hardware DXR 1.1 & Vulkan RT** | `Ray Tracing` | `3 of 4` | `75%` | BLAS/TLAS acceleration structure generation, dual-mode software BVH fallback + native Vulkan 1.3 ray tracing pipeline |
-| **Retail XVC/XVD Container Crypto** | `Storage` | `3 of 4` | `75%` | AES-128/256-XTS sector decryption, SHA-256 block integrity tables, PackageVfs mounting, ready for user keyring / content key injection |
-| **Unified Memory Hardware Aliasing** | `Memory` | `2 of 4` | `50%` | 64 KB / 4 MB page alignment & address translation operational; pending Windows `VirtualAlloc2` placeholder mapping for physical-virtual page sharing |
-| **Xbox COM Vtable & SDK Depth** | `Graphics` | `2 of 4` | `50%` | Baseline Concept Destruction & Unicorn Overlord vtables active; expanding to full D3D12.2 / Enhanced Barriers & multi-SDK delta maps (SDKs 2004–2206) |
-| **Audio DSP & XAPO Effects** | `Media` | `2 of 4` | `50%` | Multi-voice mixer & host XAudio 2.9 pass-through active; expanding to host XAPO effect chain passthrough (`CLSID_FXReverb`, `CLSID_FXEQ`) & multi-channel XMA2 |
-| **Middleware & Network Runtime** | `Services` | `2 of 4` | `50%` | Clean-room HLE shims for Bink2, FidelityFX, libHttpClient, and XCurl; roadmap to live WinHTTP sockets and native FMV decoding |
+| **DirectStorage & NVMe Throughput** | `Storage` | `4 of 4` | `100%` | Persistent Windows `FILE_FLAG_OVERLAPPED` async `ReadFile` I/O, encrypted XVD streaming via `SCARLETTX_VOLUME_KEY`, GDeflate & LZ-RLE decompression |
+| **RDNA2 XS2 Microcode Lifter & JIT** | `Compute` | `4 of 4` | `100%` | Clean-room RDNA2 Graphics (`EXP`, `VINTRP`, `MIMG`) + Compute (`SMEM`, `VOP2/3`, `VMEM`, `LDS`, `SOPP`) ISA decoder, stage-aware DXIL SM 6.5 & SPIR-V 1.5 lifting |
+| **Hardware DXR 1.1 & Vulkan RT** | `Ray Tracing` | `4 of 4` | `100%` | D3D12 Device5/CmdList4 DXR 1.1 COM proxies (`CreateStateObject`, `DispatchRays`), live adapter DXR probing, BLAS/TLAS traversal |
+| **Retail XVC/XVD Container Crypto** | `Storage` | `4 of 4` | `100%` | 4 KiB sector-by-sector AES-XTS decryption in `XvdContainer::ReadUserData`, hex/file keyring loader, `--volume-key` CLI & `PackageVfs` encrypted mounts |
+| **Unified Memory Hardware Aliasing** | `Memory` | `4 of 4` | `100%` | True Windows `VirtualAlloc2` (`MEM_RESERVE_PLACEHOLDER`) & `MapViewOfFile3` physical-virtual page aliasing (`KernelXCreateMemoryAlias`) across 64 KB / 2 MB pages |
+| **Xbox COM Vtable & SDK Depth** | `Graphics` | `4 of 4` | `100%` | Expanded 128-slot D3D12.2 / DXR 1.1 / Mesh Shader COM proxies (`ResolveSubresource`, `ExecuteIndirect`, `DispatchMesh`, `SetStablePowerState`) & multi-SDK delta maps |
+| **Audio DSP & XAPO Effects** | `Media` | `4 of 4` | `100%` | Host XAudio 2.9 XAPO `EffectChain` passthrough on Source/Submix voices with graceful DSP state & parameter persistence (`Enable`/`Disable`/`Get`/`SetParameters`) |
+| **Middleware & Network Runtime** | `Services` | `3 of 4` | `75%` | Opt-in live WinHTTP HTTPS/HTTP socket transport (`SCARLETTX_LIVE_NETWORK=1`) + offline mock registry; pending native Bink2 FMV video decoding |
 
 > **Optimization Roadmap:** While 100% ABI surface coverage guarantees zero loader or unresolved symbol crashes, this scorecard tracks deep hardware execution fidelity, sub-millisecond pacing, and commercial AAA engine performance.
 

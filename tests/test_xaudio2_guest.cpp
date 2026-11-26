@@ -162,6 +162,52 @@ int RunEngine(bool force_silent) {
     SX_CHECK(VCall<int32_t, const VoiceSends*>(source, 1, &bad_sends) == static_cast<int32_t>(0x80070057u));
     SX_CHECK(VCall<int32_t, const VoiceSends*>(source, 1, &sends) == 0);
 
+    // Effect chain DSP state & parameter persistence test (works on both host fallback and silent mode)
+    {
+        #pragma pack(push, 1)
+        struct FxDesc { void* effect; int32_t initial_state; uint32_t output_channels; };
+        struct FxChain { uint32_t count; FxDesc* descriptors; };
+        #pragma pack(pop)
+        // Minimal valid COM IUnknown stub so host XAudio2 can safely call QueryInterface
+        struct MockXapo {
+            void* const* vtbl;
+            static int32_t WINAPI QI(void*, const Guid*, void** out) {
+                if (out) *out = nullptr;
+                return static_cast<int32_t>(0x80004002u);  // E_NOINTERFACE
+            }
+            static uint32_t WINAPI AddRef(void*) { return 1; }
+            static uint32_t WINAPI Release(void*) { return 1; }
+        };
+        static void* const kMockXapoVtbl[3] = {
+            reinterpret_cast<void*>(&MockXapo::QI),
+            reinterpret_cast<void*>(&MockXapo::AddRef),
+            reinterpret_cast<void*>(&MockXapo::Release),
+        };
+        MockXapo dummy_xapo{kMockXapoVtbl};
+        FxDesc fx_desc = {&dummy_xapo, 1, 2};
+        FxChain fx_chain = {1, &fx_desc};
+        SX_CHECK(VCall<int32_t, const FxChain*>(submix, 2, &fx_chain) == 0);
+        int32_t enabled = 0;
+        VCall<void, uint32_t, int32_t*>(submix, 5, 0u, &enabled);
+        SX_CHECK(enabled == 1);
+        SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(submix, 4, 0u, 0u) == 0);  // DisableEffect
+        VCall<void, uint32_t, int32_t*>(submix, 5, 0u, &enabled);
+        SX_CHECK(enabled == 0);
+        SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(submix, 3, 0u, 0u) == 0);  // EnableEffect
+        VCall<void, uint32_t, int32_t*>(submix, 5, 0u, &enabled);
+        SX_CHECK(enabled == 1);
+        const float reverb_params[2] = {0.75f, 1.5f};
+        float readback_params[2] = {0.0f, 0.0f};
+        SX_CHECK(VCall<int32_t, uint32_t, const void*, uint32_t, uint32_t>(
+                     submix, 6, 0u, reverb_params, sizeof(reverb_params), 0u) == 0);
+        SX_CHECK(VCall<int32_t, uint32_t, void*, uint32_t>(
+                     submix, 7, 0u, readback_params, sizeof(readback_params)) == 0);
+        SX_CHECK(std::fabs(readback_params[0] - 0.75f) < 1e-5f);
+        SX_CHECK(std::fabs(readback_params[1] - 1.5f) < 1e-5f);
+        // Clear effect chain
+        SX_CHECK(VCall<int32_t, const FxChain*>(submix, 2, nullptr) == 0);
+    }
+
     // 100 ms of silence, twice: the second buffer ends the stream.
     const std::vector<uint8_t> pcm(4800 * 4, 0);
     Buffer buffer{};

@@ -163,6 +163,38 @@ int main() {
     SX_CHECK(spirv_magic == 0x07230203u);
     SX_CHECK(Xs2ShaderFreeBytecode(cs_spirv) == 0);
 
+    // 8. RDNA2 Graphics Shaders (Pixel Shader with VINTRP + MIMG + EXP mrt0, Vertex Shader with EXP pos0)
+    {
+        const uint32_t ps_kernel[] = {
+            0xC8000000,             // VINTRP: v_interp_p1_f32 v0, v0, attr0.x
+            0xC8010000,             // VINTRP: v_interp_p2_f32 v0, v0, attr0.x
+            0xF0800000, 0x00000400, // MIMG:   image_sample v[4:7], v0, s[0:7], s[8:11]
+            0xF8000800, 0x07060504, // EXP:    exp mrt0 v4, v5, v6, v7 done
+            0xBF800000              // SOPP:   s_endpgm
+        };
+        XS2_MICROCODE_INFO ps_info{};
+        SX_CHECK(Xs2ShaderIdentifyMicrocode(ps_kernel, sizeof(ps_kernel), &ps_info) == 0);
+        SX_CHECK(ps_info.stage == 2);  // Pixel Shader
+        char ps_disasm[1024]{};
+        SX_CHECK(Xs2ShaderDisassembleRdna2(ps_kernel, sizeof(ps_kernel), ps_disasm, sizeof(ps_disasm), nullptr) == 0);
+        SX_CHECK(std::strstr(ps_disasm, "v_interp_p1_f32") != nullptr);
+        SX_CHECK(std::strstr(ps_disasm, "v_interp_p2_f32") != nullptr);
+        SX_CHECK(std::strstr(ps_disasm, "image_sample") != nullptr);
+        SX_CHECK(std::strstr(ps_disasm, "exp mrt0") != nullptr);
+
+        const uint32_t vs_kernel[] = {
+            0xF4000000, 0x00000000, // SMEM: s_load_dwordx4
+            0xF80008C0, 0x03020100, // EXP:  exp pos0 v0, v1, v2, v3 done (target=12 -> 12<<4=0xC0)
+            0xBF800000              // SOPP: s_endpgm
+        };
+        XS2_MICROCODE_INFO vs_info{};
+        SX_CHECK(Xs2ShaderIdentifyMicrocode(vs_kernel, sizeof(vs_kernel), &vs_info) == 0);
+        SX_CHECK(vs_info.stage == 1);  // Vertex Shader
+        char vs_disasm[512]{};
+        SX_CHECK(Xs2ShaderDisassembleRdna2(vs_kernel, sizeof(vs_kernel), vs_disasm, sizeof(vs_disasm), nullptr) == 0);
+        SX_CHECK(std::strstr(vs_disasm, "exp pos0") != nullptr);
+    }
+
     std::cout << "[test_xs2_lifting] All 16 Xs2Shader APIs verified successfully!\n";
     return 0;
 }

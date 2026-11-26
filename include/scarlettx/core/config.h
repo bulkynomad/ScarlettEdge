@@ -25,6 +25,7 @@ struct EmulatorConfig {
     std::string in_process_entry = "ScarlettGuestMain";
     std::string rt_dump_path;
     std::string raster_dump_path;
+    std::string volume_key;  // Hex key or path to key file for encrypted XVD streaming
 };
 
 }  // namespace scarlettx

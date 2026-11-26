@@ -63,6 +63,14 @@ SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXMapVirtualToGpu(
 SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXMapGpuToVirtual(
     uint64_t gpuAddress, void** outVirtualAddress);
 
+// Creates a hardware-aliased virtual address view backed by the same physical
+// pages as an existing KernelX allocation (via VirtualAlloc2 + MapViewOfFile3).
+SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXCreateMemoryAlias(
+    void* existingVirtualAddress, uint64_t offset, uint64_t size, void** outAliasVirtualAddress);
+
+SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXFreeMemoryAlias(
+    void* aliasVirtualAddress);
+
 SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXProtectMemory(
     void* virtualAddress, uint64_t size, uint32_t protectFlags);
 

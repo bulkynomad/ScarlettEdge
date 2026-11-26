@@ -3,7 +3,10 @@
 
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
+
+#include "scarlettx/gpu/d3d12_backend.h"
 
 namespace {
 
@@ -55,10 +58,19 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsQueryCapabilities(
     if (!backend || !outCaps) return kInvalidArg;
     outCaps->apiVersionMajor = 1;
     outCaps->apiVersionMinor = 3;
-    outCaps->hardwareRaytracingSupported = 1; // Vulkan VK_KHR_ray_tracing_pipeline
+    outCaps->hardwareRaytracingSupported = 1; // Vulkan VK_KHR_ray_tracing_pipeline / DXR 1.1
     outCaps->maxRayRecursionDepth = 31;
     outCaps->maxRayDispatchInvocationCount = 1024 * 1024;
-    std::strncpy(outCaps->deviceName, "ScarlettX Hardware DXR / Vulkan 1.3 Translation Backend", sizeof(outCaps->deviceName) - 1);
+    std::string label = "ScarlettX Hardware DXR 1.1 / Vulkan 1.3 Translation Backend";
+    scarlettx::D3D12Backend probe;
+    if (probe.Initialize(true, false).ok()) {
+        const auto& info = probe.AdapterInfo();
+        if (!info.description.empty()) {
+            label = "ScarlettX DXR 1.1 / Vulkan 1.3 (" + info.description + ")";
+        }
+    }
+    std::memset(outCaps->deviceName, 0, sizeof(outCaps->deviceName));
+    std::strncpy(outCaps->deviceName, label.c_str(), sizeof(outCaps->deviceName) - 1);
     return kSuccess;
 }
 

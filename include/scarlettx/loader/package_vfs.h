@@ -14,7 +14,10 @@ namespace scarlettx {
 class PackageVfs {
 public:
     Status MountDirectory(const std::string& virtual_root, const std::string& host_dir);
-    Status MountXvd(const std::string& virtual_path, const std::string& xvd_host_path);
+    Status MountXvd(
+        const std::string& virtual_path,
+        const std::string& xvd_host_path,
+        const std::string& volume_key_hex = "");
     Status ResolvePath(const std::string& virtual_path, std::string& out_host_path) const;
     Status ReadFileBytes(const std::string& virtual_path, std::vector<uint8_t>& out_data) const;
     bool Exists(const std::string& virtual_path) const;

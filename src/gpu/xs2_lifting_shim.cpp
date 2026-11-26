@@ -20,7 +20,10 @@ enum class Rdna2InstClass {
     SALU,
     VALU,
     VMEM,
+    MIMG,
     LDS,
+    VINTRP,
+    EXPORT,
     RAYTRACING,
     CONTROL,
     UNKNOWN
@@ -132,6 +135,64 @@ DecodedInstruction DecodeRdna2Instruction(const uint8_t* code, size_t remaining,
         return inst;
     }
 
+    // Check EXP (Export: pos0..3, mrt0..7, mrtz, param0..31): bits 31..26 == 0b111110 (0xF8000000)
+    if ((w0 & 0xFC000000u) == 0xF8000000u) {
+        inst.inst_class = Rdna2InstClass::EXPORT;
+        inst.is_64bit = (remaining >= 8);
+        if (inst.is_64bit) std::memcpy(&inst.raw_word1, code + 4, 4);
+        const uint32_t target = (w0 >> 4) & 0x3Fu;
+        const uint32_t vsrc0 = inst.raw_word1 & 0xFFu;
+        const uint32_t vsrc1 = (inst.raw_word1 >> 8) & 0xFFu;
+        const uint32_t vsrc2 = (inst.raw_word1 >> 16) & 0xFFu;
+        const uint32_t vsrc3 = (inst.raw_word1 >> 24) & 0xFFu;
+        inst.mnemonic = "exp";
+        std::ostringstream ss;
+        if (target < 8) ss << "mrt" << target;
+        else if (target == 8) ss << "mrtz";
+        else if (target >= 12 && target <= 15) ss << "pos" << (target - 12);
+        else if (target >= 32) ss << "param" << (target - 32);
+        else ss << "target" << target;
+        ss << " v" << vsrc0 << ", v" << vsrc1 << ", v" << vsrc2 << ", v" << vsrc3;
+        if (w0 & (1u << 11)) ss << " done";
+        inst.operands = ss.str();
+        return inst;
+    }
+
+    // Check VINTRP (Pixel Shader Attribute Interpolation): bits 31..26 == 0b110010 (0xC8000000)
+    if ((w0 & 0xFC000000u) == 0xC8000000u) {
+        inst.inst_class = Rdna2InstClass::VINTRP;
+        const uint32_t vdst = (w0 >> 18) & 0xFFu;
+        const uint32_t op = (w0 >> 16) & 0x3u;
+        const uint32_t attr = (w0 >> 10) & 0x3Fu;
+        const uint32_t attrchan = (w0 >> 8) & 0x3u;
+        const uint32_t vsrc = w0 & 0xFFu;
+        static const char kChan[4] = {'x', 'y', 'z', 'w'};
+        if (op == 0) inst.mnemonic = "v_interp_p1_f32";
+        else if (op == 1) inst.mnemonic = "v_interp_p2_f32";
+        else inst.mnemonic = "v_interp_mov_f32";
+        std::ostringstream ss;
+        ss << "v" << vdst << ", v" << vsrc << ", attr" << attr << "." << kChan[attrchan];
+        inst.operands = ss.str();
+        return inst;
+    }
+
+    // Check MIMG (Image / Texture Sample & Load/Store): bits 31..26 == 0b111100 (0xF0000000)
+    if ((w0 & 0xFC000000u) == 0xF0000000u) {
+        inst.inst_class = Rdna2InstClass::MIMG;
+        inst.is_64bit = (remaining >= 8);
+        if (inst.is_64bit) std::memcpy(&inst.raw_word1, code + 4, 4);
+        const uint32_t op = (w0 >> 18) & 0xFFu;
+        const uint32_t vdata = (inst.raw_word1 >> 8) & 0xFFu;
+        const uint32_t vaddr = inst.raw_word1 & 0xFFu;
+        if (op >= 0x20) inst.mnemonic = "image_sample";
+        else if (op >= 0x08) inst.mnemonic = "image_store";
+        else inst.mnemonic = "image_load";
+        std::ostringstream ss;
+        ss << "v[" << vdata << ":" << (vdata + 3) << "], v" << vaddr << ", s[0:7], s[8:11] dmask:0xf";
+        inst.operands = ss.str();
+        return inst;
+    }
+
     // Check LDS (Local Data Share): bits 31..26 == 0b110110
     if ((w0 & 0xFC000000u) == 0xD8000000u) {
         inst.inst_class = Rdna2InstClass::LDS;
@@ -180,6 +241,8 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderIdentifyMicrocode(
     uint32_t max_sgpr = 0;
     uint32_t lds_bytes = 0;
     bool has_vmem = false;
+    bool has_vs_export = false;
+    bool has_ps_export_or_interp = false;
 
     while (offset < byteSize) {
         DecodedInstruction inst = DecodeRdna2Instruction(code + offset, byteSize - offset, static_cast<uint32_t>(offset));
@@ -188,10 +251,20 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderIdentifyMicrocode(
         if (inst.inst_class == Rdna2InstClass::SALU) max_sgpr = std::max(max_sgpr, 64u);
         if (inst.inst_class == Rdna2InstClass::LDS) lds_bytes = std::max(lds_bytes, 1024u);
         if (inst.inst_class == Rdna2InstClass::VMEM) has_vmem = true;
+        if (inst.inst_class == Rdna2InstClass::VINTRP) has_ps_export_or_interp = true;
+        if (inst.inst_class == Rdna2InstClass::EXPORT) {
+            if (inst.operands.rfind("pos", 0) == 0 || inst.operands.rfind("param", 0) == 0) {
+                has_vs_export = true;
+            } else {
+                has_ps_export_or_interp = true;
+            }
+        }
         offset += inst.is_64bit ? 8 : 4;
     }
 
-    outInfo->stage = has_vmem ? 3 : 2; // 3 = Compute, 2 = Pixel
+    if (has_vs_export) outInfo->stage = 1;           // Vertex Shader
+    else if (has_ps_export_or_interp) outInfo->stage = 2; // Pixel Shader
+    else outInfo->stage = has_vmem ? 3 : 2;          // 3 = Compute, 2 = Pixel
     outInfo->instructionCount = inst_count;
     outInfo->vgprCount = std::max(32u, max_vgpr);
     outInfo->sgprCount = std::max(64u, max_sgpr);
@@ -254,11 +327,16 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToDxil(
     *reinterpret_cast<uint32_t*>(buf + chunk0_off + 8) = target_sm;
 
     // Chunk 1: DXIL
+    XS2_MICROCODE_INFO detected{};
+    Xs2ShaderIdentifyMicrocode(microcode, byteSize, &detected);
+    const uint32_t stage_prefix = (detected.stage == 1) ? 0x00010000u :  // VS
+                                  (detected.stage == 2) ? 0x00000000u :  // PS
+                                                          0x00050000u;   // CS
     const size_t chunk1_off = chunk0_off + 24;
     u32_buf[10] = static_cast<uint32_t>(chunk1_off);
     std::memcpy(buf + chunk1_off, "DXIL", 4);
     *reinterpret_cast<uint32_t*>(buf + chunk1_off + 4) = static_cast<uint32_t>(byteSize + 8);
-    *reinterpret_cast<uint32_t*>(buf + chunk1_off + 8) = 0x00050000u | (target_sm & 0xFFFFu); // CS token
+    *reinterpret_cast<uint32_t*>(buf + chunk1_off + 8) = stage_prefix | (target_sm & 0xFFFFu);
     std::memcpy(buf + chunk1_off + 16, microcode, byteSize);
 
     *outDxilBytecode = buf;
@@ -307,6 +385,9 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderExtractResourceBindings(
         DecodedInstruction inst = DecodeRdna2Instruction(code + offset, byteSize - offset, static_cast<uint32_t>(offset));
         if (inst.mnemonic.find("buffer_store") != std::string::npos || inst.mnemonic.find("image_store") != std::string::npos) {
             uavs++;
+        } else if (inst.mnemonic.find("image_sample") != std::string::npos) {
+            srvs++;
+            samplers++;
         } else if (inst.mnemonic.find("buffer_load") != std::string::npos || inst.mnemonic.find("image_load") != std::string::npos) {
             srvs++;
         } else if (inst.mnemonic.find("s_load") != std::string::npos) {
@@ -318,7 +399,7 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderExtractResourceBindings(
     outBindings->srvCount = std::max(4u, srvs);
     outBindings->uavCount = std::max(1u, uavs);
     outBindings->cbvCount = std::max(2u, cbvs);
-    outBindings->samplerCount = 2;
+    outBindings->samplerCount = std::max(2u, samplers);
     return kSuccess;
 }
 

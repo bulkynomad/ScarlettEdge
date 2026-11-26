@@ -132,6 +132,12 @@ void Check(const Layout& layout) {
     SX_REQUIRE(Call(list, layout.flush_pipeline_x, uintptr_t{0}, uintptr_t{0}, uintptr_t{0}) == 0);
     SX_REQUIRE(Call(list, layout.other_flush_slot, uintptr_t{0}, uintptr_t{0}, uintptr_t{0}) == kNotImplemented);
 
+    // Verify extended D3D12.2 device & command list COM slots
+    SX_REQUIRE(Call(device, 40, uintptr_t{0}) == 0);  // SetStablePowerState
+    LUID adapter_luid{};
+    Call(device, 44, &adapter_luid);  // GetAdapterLuid
+    SX_REQUIRE(adapter_luid.LowPart != 0 || adapter_luid.HighPart != 0);
+
     // Upload with CopyTextureRegionX, flags 0, as the title does.
     Call(list, layout.copy_texture_region_x, &in_texture, uintptr_t{0}, uintptr_t{0}, uintptr_t{0}, &in_buffer,
          static_cast<void*>(nullptr), uintptr_t{0});
@@ -176,6 +182,7 @@ int main() {
 
     Check({0x20001, 83, 85, 14, 67, 69});
     Check({0x20004, 85, 83, 16, 69, 67});
+    Check({0x20006, 85, 83, 16, 69, 67});
 
     std::printf("test_d3d12_list_layout: OK\n");
     return 0;

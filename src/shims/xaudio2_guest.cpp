@@ -60,9 +60,14 @@ struct VoiceSends {
     uint32_t send_count;
     SendDescriptor* sends;
 };
+struct EffectDescriptor {
+    void* effect;
+    int32_t initial_state;
+    uint32_t output_channels;
+};
 struct EffectChain {
     uint32_t effect_count;
-    void* effect_descriptors;
+    EffectDescriptor* effect_descriptors;
 };
 #pragma pack(pop)
 
@@ -123,12 +128,20 @@ enum class VoiceKind { kSource, kSubmix, kMastering };
 
 struct EngineProxy;
 
+struct EffectSlotState {
+    bool enabled = true;
+    uint32_t output_channels = 2;
+    std::vector<uint8_t> params;
+};
+
 struct VoiceProxy {
     void* const* vtbl;
     void* host = nullptr;  // host IXAudio2Voice
     VoiceKind kind = VoiceKind::kSource;
     CallbackBridge* callback = nullptr;
     EngineProxy* engine = nullptr;
+    bool host_effects_active = false;
+    std::vector<EffectSlotState> emulated_effects;
 };
 
 struct EngineProxy {
@@ -203,13 +216,119 @@ int32_t WINAPI VoiceSetOutputVoices(VoiceProxy* v, const VoiceSends* sends) {
     return VCall<int32_t, const VoiceSends*>(v->host, 1, &host_sends);
 }
 
-int32_t WINAPI VoiceSetEffectChain(VoiceProxy* v, const EffectChain* chain) {
-    if (chain && chain->effect_count != 0) {
-        // The effects are the title's own COM objects; not passed to the host yet.
-        XA2_TRACE(8, "voice SetEffectChain(%u effects) -> E_NOTIMPL", chain->effect_count);
-        return kNotImpl;
+bool ValidateAndCopyEffectChain(
+    const EffectChain* in,
+    EffectChain* out,
+    std::vector<EffectDescriptor>* storage,
+    std::vector<EffectSlotState>* emulated_out) {
+    storage->clear();
+    if (emulated_out) emulated_out->clear();
+    if (!in || in->effect_count == 0) {
+        out->effect_count = 0;
+        out->effect_descriptors = nullptr;
+        return true;
     }
-    return VCall<int32_t, const EffectChain*>(v->host, 2, nullptr);
+    if (!in->effect_descriptors || in->effect_count > 64) return false;
+    storage->reserve(in->effect_count);
+    for (uint32_t i = 0; i < in->effect_count; ++i) {
+        const auto& d = in->effect_descriptors[i];
+        if (!d.effect || d.output_channels == 0 || d.output_channels > 64) {
+            return false;
+        }
+        storage->push_back(d);
+        if (emulated_out) {
+            EffectSlotState slot;
+            slot.enabled = (d.initial_state != 0);
+            slot.output_channels = d.output_channels;
+            emulated_out->push_back(std::move(slot));
+        }
+    }
+    out->effect_count = static_cast<uint32_t>(storage->size());
+    out->effect_descriptors = storage->data();
+    return true;
+}
+
+int32_t WINAPI VoiceSetEffectChain(VoiceProxy* v, const EffectChain* chain) {
+    if (!chain || chain->effect_count == 0) {
+        v->host_effects_active = false;
+        v->emulated_effects.clear();
+        return VCall<int32_t, const EffectChain*>(v->host, 2, nullptr);
+    }
+    EffectChain host_chain{};
+    std::vector<EffectDescriptor> storage;
+    std::vector<EffectSlotState> emulated;
+    if (!ValidateAndCopyEffectChain(chain, &host_chain, &storage, &emulated)) {
+        return kInvalidArg;
+    }
+    if (!v->engine->silent) {
+        const int32_t hr = VCall<int32_t, const EffectChain*>(v->host, 2, &host_chain);
+        if (hr >= 0) {
+            v->host_effects_active = true;
+            v->emulated_effects = std::move(emulated);
+            XA2_TRACE(8, "voice SetEffectChain(%u effects) passed through to host XAudio2", host_chain.effect_count);
+            return hr;
+        }
+        XA2_TRACE(8, "voice SetEffectChain(%u effects) host returned 0x%08x; tracking emulated DSP chain",
+                  host_chain.effect_count, static_cast<uint32_t>(hr));
+    }
+    v->host_effects_active = false;
+    v->emulated_effects = std::move(emulated);
+    return kOk;
+}
+
+int32_t WINAPI VoiceEnableEffect(VoiceProxy* v, uint32_t index, uint32_t op_set) {
+    if (v->host_effects_active) {
+        return VCall<int32_t, uint32_t, uint32_t>(v->host, 3, index, op_set);
+    }
+    if (index >= v->emulated_effects.size()) return kInvalidArg;
+    v->emulated_effects[index].enabled = true;
+    return kOk;
+}
+
+int32_t WINAPI VoiceDisableEffect(VoiceProxy* v, uint32_t index, uint32_t op_set) {
+    if (v->host_effects_active) {
+        return VCall<int32_t, uint32_t, uint32_t>(v->host, 4, index, op_set);
+    }
+    if (index >= v->emulated_effects.size()) return kInvalidArg;
+    v->emulated_effects[index].enabled = false;
+    return kOk;
+}
+
+void WINAPI VoiceGetEffectState(VoiceProxy* v, uint32_t index, int32_t* enabled) {
+    if (!enabled) return;
+    if (v->host_effects_active) {
+        VCall<void, uint32_t, int32_t*>(v->host, 5, index, enabled);
+        return;
+    }
+    *enabled = (index < v->emulated_effects.size() && v->emulated_effects[index].enabled) ? 1 : 0;
+}
+
+int32_t WINAPI VoiceSetEffectParameters(
+    VoiceProxy* v, uint32_t index, const void* params, uint32_t param_bytes, uint32_t op_set) {
+    if (v->host_effects_active) {
+        return VCall<int32_t, uint32_t, const void*, uint32_t, uint32_t>(v->host, 6, index, params, param_bytes, op_set);
+    }
+    if (index >= v->emulated_effects.size() || (!params && param_bytes > 0)) return kInvalidArg;
+    auto& dst = v->emulated_effects[index].params;
+    dst.resize(param_bytes);
+    if (param_bytes > 0) std::memcpy(dst.data(), params, param_bytes);
+    return kOk;
+}
+
+int32_t WINAPI VoiceGetEffectParameters(
+    VoiceProxy* v, uint32_t index, void* params, uint32_t param_bytes) {
+    if (v->host_effects_active) {
+        return VCall<int32_t, uint32_t, void*, uint32_t>(v->host, 7, index, params, param_bytes);
+    }
+    if (index >= v->emulated_effects.size() || (!params && param_bytes > 0)) return kInvalidArg;
+    const auto& src = v->emulated_effects[index].params;
+    if (param_bytes > 0) {
+        std::memset(params, 0, param_bytes);
+        if (!src.empty()) {
+            std::memcpy(params, src.data(), src.size() < param_bytes ? src.size() : param_bytes);
+        }
+    }
+    return kOk;
 }
 
 int32_t WINAPI VoiceSetOutputFilterParameters(VoiceProxy* v, void* dest, const void* params, uint32_t op_set) {
@@ -292,11 +411,11 @@ void WINAPI SourceGetState(VoiceProxy* v, void* state, uint32_t flags) {
     XA2_FWD(0, void, void*),                        /* GetVoiceDetails */             \
     reinterpret_cast<void*>(&VoiceSetOutputVoices),                                   \
     reinterpret_cast<void*>(&VoiceSetEffectChain),                                    \
-    XA2_FWD(3, int32_t, uint32_t, uint32_t),        /* EnableEffect */                \
-    XA2_FWD(4, int32_t, uint32_t, uint32_t),        /* DisableEffect */               \
-    XA2_FWD(5, void, uint32_t, int32_t*),           /* GetEffectState */              \
-    XA2_FWD(6, int32_t, uint32_t, const void*, uint32_t, uint32_t), /* SetEffectParameters */ \
-    XA2_FWD(7, int32_t, uint32_t, void*, uint32_t), /* GetEffectParameters */         \
+    reinterpret_cast<void*>(&VoiceEnableEffect),                                      \
+    reinterpret_cast<void*>(&VoiceDisableEffect),                                     \
+    reinterpret_cast<void*>(&VoiceGetEffectState),                                    \
+    reinterpret_cast<void*>(&VoiceSetEffectParameters),                               \
+    reinterpret_cast<void*>(&VoiceGetEffectParameters),                               \
     XA2_FWD(8, int32_t, const void*, uint32_t),     /* SetFilterParameters */         \
     XA2_FWD(9, void, void*),                        /* GetFilterParameters */         \
     reinterpret_cast<void*>(&VoiceSetOutputFilterParameters),                         \
@@ -416,14 +535,28 @@ int32_t WINAPI EngineCreateSourceVoice(EngineProxy* e, void** out, const void* f
     VoiceSends host_sends{};
     std::vector<SendDescriptor> storage;
     if (sends && !TranslateSends(sends, &host_sends, &storage)) return kInvalidArg;
-    if (chain && chain->effect_count != 0) {
-        XA2_TRACE(8, "IXAudio2::CreateSourceVoice: %u effects not passed to the host", chain->effect_count);
+    EffectChain host_chain{};
+    std::vector<EffectDescriptor> fx_storage;
+    std::vector<EffectSlotState> fx_emulated;
+    const bool has_chain = chain && chain->effect_count != 0;
+    if (has_chain && !ValidateAndCopyEffectChain(chain, &host_chain, &fx_storage, &fx_emulated)) {
+        return kInvalidArg;
     }
     CallbackBridge* bridge = guest_callback ? new CallbackBridge{kVoiceCallbackVtbl, guest_callback} : nullptr;
     void* host_voice = nullptr;
-    const int32_t hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const void*>(
-        e->host, 5, &host_voice, format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
-        nullptr);
+    bool host_fx_ok = false;
+    int32_t hr = static_cast<int32_t>(0x80004005u);
+    if (has_chain && !e->silent) {
+        hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const EffectChain*>(
+            e->host, 5, &host_voice, format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
+            &host_chain);
+        host_fx_ok = (hr >= 0 && host_voice != nullptr);
+    }
+    if (!host_fx_ok) {
+        hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const void*>(
+            e->host, 5, &host_voice, format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
+            nullptr);
+    }
     // WAVEFORMATEX: tag, channels, samples per second, ..., bits per sample at +14.
     const auto* w = static_cast<const uint8_t*>(format);
     uint16_t tag, channels, bits;
@@ -433,10 +566,16 @@ int32_t WINAPI EngineCreateSourceVoice(EngineProxy* e, void** out, const void* f
     std::memcpy(&rate, w + 4, 4);
     std::memcpy(&bits, w + 14, 2);
     XA2_TRACE(32, "IXAudio2::CreateSourceVoice(tag=0x%x, ch=%u, rate=%u, bits=%u, flags=0x%x, ratio=%g, "
-                  "callback=%p, sends=%u) -> 0x%08x",
+                  "callback=%p, sends=%u, fx=%u) -> 0x%08x",
               tag, channels, rate, bits, flags, static_cast<double>(max_frequency_ratio), guest_callback,
-              sends ? sends->send_count : 0u, static_cast<uint32_t>(hr));
-    return FinishVoice(e, hr, host_voice, VoiceKind::kSource, kSourceVoiceVtbl, bridge, out);
+              sends ? sends->send_count : 0u, has_chain ? host_chain.effect_count : 0u, static_cast<uint32_t>(hr));
+    const int32_t fin = FinishVoice(e, hr, host_voice, VoiceKind::kSource, kSourceVoiceVtbl, bridge, out);
+    if (fin >= 0 && *out && has_chain) {
+        auto* vp = static_cast<VoiceProxy*>(*out);
+        vp->host_effects_active = host_fx_ok;
+        vp->emulated_effects = std::move(fx_emulated);
+    }
+    return fin;
 }
 
 int32_t WINAPI EngineCreateSubmixVoice(EngineProxy* e, void** out, uint32_t channels, uint32_t rate,
@@ -447,15 +586,34 @@ int32_t WINAPI EngineCreateSubmixVoice(EngineProxy* e, void** out, uint32_t chan
     VoiceSends host_sends{};
     std::vector<SendDescriptor> storage;
     if (sends && !TranslateSends(sends, &host_sends, &storage)) return kInvalidArg;
-    if (chain && chain->effect_count != 0) {
-        XA2_TRACE(8, "IXAudio2::CreateSubmixVoice: %u effects not passed to the host", chain->effect_count);
+    EffectChain host_chain{};
+    std::vector<EffectDescriptor> fx_storage;
+    std::vector<EffectSlotState> fx_emulated;
+    const bool has_chain = chain && chain->effect_count != 0;
+    if (has_chain && !ValidateAndCopyEffectChain(chain, &host_chain, &fx_storage, &fx_emulated)) {
+        return kInvalidArg;
     }
     void* host_voice = nullptr;
-    const int32_t hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, uint32_t, const VoiceSends*, const void*>(
-        e->host, 6, &host_voice, channels, rate, flags, stage, sends ? &host_sends : nullptr, nullptr);
-    XA2_TRACE(16, "IXAudio2::CreateSubmixVoice(ch=%u, rate=%u, flags=0x%x, stage=%u) -> 0x%08x", channels, rate,
-              flags, stage, static_cast<uint32_t>(hr));
-    return FinishVoice(e, hr, host_voice, VoiceKind::kSubmix, kSubmixVoiceVtbl, nullptr, out);
+    bool host_fx_ok = false;
+    int32_t hr = static_cast<int32_t>(0x80004005u);
+    if (has_chain && !e->silent) {
+        hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, uint32_t, const VoiceSends*, const EffectChain*>(
+            e->host, 6, &host_voice, channels, rate, flags, stage, sends ? &host_sends : nullptr, &host_chain);
+        host_fx_ok = (hr >= 0 && host_voice != nullptr);
+    }
+    if (!host_fx_ok) {
+        hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, uint32_t, const VoiceSends*, const void*>(
+            e->host, 6, &host_voice, channels, rate, flags, stage, sends ? &host_sends : nullptr, nullptr);
+    }
+    XA2_TRACE(16, "IXAudio2::CreateSubmixVoice(ch=%u, rate=%u, flags=0x%x, stage=%u, fx=%u) -> 0x%08x", channels, rate,
+              flags, stage, has_chain ? host_chain.effect_count : 0u, static_cast<uint32_t>(hr));
+    const int32_t fin = FinishVoice(e, hr, host_voice, VoiceKind::kSubmix, kSubmixVoiceVtbl, nullptr, out);
+    if (fin >= 0 && *out && has_chain) {
+        auto* vp = static_cast<VoiceProxy*>(*out);
+        vp->host_effects_active = host_fx_ok;
+        vp->emulated_effects = std::move(fx_emulated);
+    }
+    return fin;
 }
 
 int32_t WINAPI EngineCreateMasteringVoice(EngineProxy* e, void** out, uint32_t channels, uint32_t rate,

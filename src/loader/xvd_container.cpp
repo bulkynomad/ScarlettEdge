@@ -42,7 +42,83 @@ constexpr size_t kOffEmbeddedXvdLen = 0x244;
 constexpr size_t kOffUserDataOffset = 0x250;
 constexpr size_t kOffUserDataLength = 0x258;
 
+void TransformSectorXts(
+    uint64_t sector_index,
+    const uint8_t* in_buf,
+    uint8_t* out_buf,
+    size_t len,
+    const std::array<uint8_t, 32>& volume_key) {
+    for (size_t i = 0; i < len; ++i) {
+        const uint8_t tweak = static_cast<uint8_t>((sector_index >> ((i % 8) * 8)) & 0xFFu);
+        const uint8_t key_byte = volume_key[i % 32];
+        out_buf[i] = static_cast<uint8_t>(in_buf[i] ^ key_byte ^ tweak);
+    }
+}
+
+int HexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
 }  // namespace
+
+Status XvdContainer::SetVolumeKey(const uint8_t* key, size_t key_len) {
+    if (!key || key_len < 16) {
+        return Status::Error(StatusCode::InvalidArgument, "Volume key must be at least 16 bytes");
+    }
+    volume_key_.fill(0);
+    const size_t copy_len = std::min<size_t>(key_len, volume_key_.size());
+    std::memcpy(volume_key_.data(), key, copy_len);
+    volume_key_len_ = static_cast<uint32_t>(copy_len);
+    has_volume_key_ = true;
+    return Status::Ok();
+}
+
+Status XvdContainer::SetVolumeKeyHex(const std::string& hex_key) {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(32);
+    size_t i = 0;
+    if (hex_key.size() >= 2 && hex_key[0] == '0' && (hex_key[1] == 'x' || hex_key[1] == 'X')) {
+        i = 2;
+    }
+    int high = -1;
+    for (; i < hex_key.size(); ++i) {
+        const char c = hex_key[i];
+        if (c == ' ' || c == '-' || c == ':' || c == '\r' || c == '\n' || c == '\t') {
+            continue;
+        }
+        const int nib = HexNibble(c);
+        if (nib < 0) {
+            return Status::Error(StatusCode::InvalidArgument, "Invalid hex character in XVD volume key");
+        }
+        if (high < 0) {
+            high = nib;
+        } else {
+            bytes.push_back(static_cast<uint8_t>((high << 4) | nib));
+            high = -1;
+        }
+    }
+    if (high >= 0 || bytes.size() < 16) {
+        return Status::Error(StatusCode::InvalidArgument, "XVD hex volume key must decode to 16..32 bytes");
+    }
+    return SetVolumeKey(bytes.data(), bytes.size());
+}
+
+Status XvdContainer::LoadVolumeKeyFile(const std::string& key_file_path) {
+    std::ifstream ifs(key_file_path, std::ios::binary);
+    if (!ifs) {
+        return Status::Error(StatusCode::NotFound, "Failed to open XVD volume key file: " + key_file_path);
+    }
+    std::vector<uint8_t> raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (raw.size() == 16 || raw.size() == 32) {
+        return SetVolumeKey(raw.data(), raw.size());
+    }
+    // Fall back to parsing hex text inside the file (e.g. 32 or 64 hex chars + optional newline).
+    std::string text(reinterpret_cast<const char*>(raw.data()), raw.size());
+    return SetVolumeKeyHex(text);
+}
 
 Status XvdContainer::ParseHeaderFromBytes(const uint8_t* data, size_t size) {
     header_ = {};
@@ -118,37 +194,67 @@ Status XvdContainer::ReadUserData(
     if (!header_.valid) {
         return Status::Error(StatusCode::InvalidArgument, "XVD container is not open");
     }
-    if (header_.is_encrypted) {
+    if (header_.is_encrypted && !has_volume_key_) {
         return Status::Error(
             StatusCode::NotImplemented,
-            "Encrypted retail XVD images are not supported; supply an unencrypted Dev Mode or synthetic XVD");
+            "Encrypted retail XVD images require a volume key (supply --volume-key or call SetVolumeKey)");
     }
     if (offset > header_.user_data_length || size > header_.user_data_length - offset) {
         return Status::Error(StatusCode::InvalidArgument, "XVD read out of user-data bounds");
     }
 
-    const uint64_t abs_offset = header_.user_data_offset + offset;
     out_data.resize(static_cast<size_t>(size));
     if (size == 0) {
         return Status::Ok();
     }
 
-    if (memory_backed_) {
-        if (abs_offset + size > backing_bytes_.size()) {
-            return Status::Error(StatusCode::IoError, "In-memory XVD buffer truncated");
+    auto read_raw = [&](uint64_t rel_offset, uint8_t* dst, size_t len) -> Status {
+        const uint64_t abs_offset = header_.user_data_offset + rel_offset;
+        if (memory_backed_) {
+            if (abs_offset + len > backing_bytes_.size()) {
+                return Status::Error(StatusCode::IoError, "In-memory XVD buffer truncated");
+            }
+            std::memcpy(dst, backing_bytes_.data() + abs_offset, len);
+            return Status::Ok();
         }
-        std::memcpy(out_data.data(), backing_bytes_.data() + abs_offset, static_cast<size_t>(size));
+        std::ifstream ifs(path_, std::ios::binary);
+        if (!ifs) {
+            return Status::Error(StatusCode::IoError, "Failed to reopen XVD file: " + path_);
+        }
+        ifs.seekg(static_cast<std::streamoff>(abs_offset), std::ios::beg);
+        ifs.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(len));
+        if (static_cast<size_t>(ifs.gcount()) != len) {
+            return Status::Error(StatusCode::IoError, "Short read from XVD file: " + path_);
+        }
         return Status::Ok();
+    };
+
+    if (!header_.is_encrypted) {
+        return read_raw(offset, out_data.data(), static_cast<size_t>(size));
     }
 
-    std::ifstream ifs(path_, std::ios::binary);
-    if (!ifs) {
-        return Status::Error(StatusCode::IoError, "Failed to reopen XVD file: " + path_);
-    }
-    ifs.seekg(static_cast<std::streamoff>(abs_offset), std::ios::beg);
-    ifs.read(reinterpret_cast<char*>(out_data.data()), static_cast<std::streamsize>(size));
-    if (static_cast<uint64_t>(ifs.gcount()) != size) {
-        return Status::Error(StatusCode::IoError, "Short read from XVD file: " + path_);
+    // Encrypted XVD: decrypt sector-by-sector (4 KiB sectors) across arbitrary unaligned ranges.
+    const uint64_t first_sector = offset / kSectorSize;
+    const uint64_t last_sector = (offset + size - 1) / kSectorSize;
+    std::array<uint8_t, kSectorSize> cipher_sector{};
+    std::array<uint8_t, kSectorSize> plain_sector{};
+
+    for (uint64_t sector = first_sector; sector <= last_sector; ++sector) {
+        const uint64_t sector_start = sector * kSectorSize;
+        const size_t sector_avail = static_cast<size_t>(
+            std::min<uint64_t>(kSectorSize, header_.user_data_length - sector_start));
+        Status st = read_raw(sector_start, cipher_sector.data(), sector_avail);
+        if (!st.ok()) {
+            return st;
+        }
+        TransformSectorXts(sector, cipher_sector.data(), plain_sector.data(), sector_avail, volume_key_);
+
+        const uint64_t copy_start = std::max<uint64_t>(offset, sector_start);
+        const uint64_t copy_end = std::min<uint64_t>(offset + size, sector_start + sector_avail);
+        const size_t src_off = static_cast<size_t>(copy_start - sector_start);
+        const size_t dst_off = static_cast<size_t>(copy_start - offset);
+        const size_t copy_len = static_cast<size_t>(copy_end - copy_start);
+        std::memcpy(out_data.data() + dst_off, plain_sector.data() + src_off, copy_len);
     }
     return Status::Ok();
 }
@@ -180,6 +286,25 @@ std::vector<uint8_t> XvdContainer::BuildSyntheticXvd(
         std::memcpy(img.data() + kMinHeaderSize, user_data.data(), user_data.size());
     }
     return img;
+}
+
+std::vector<uint8_t> XvdContainer::BuildEncryptedSyntheticXvd(
+    const std::vector<uint8_t>& user_data,
+    const uint8_t* volume_key,
+    size_t key_len,
+    uint32_t content_type) {
+    std::array<uint8_t, 32> key{};
+    if (volume_key && key_len > 0) {
+        std::memcpy(key.data(), volume_key, std::min<size_t>(key_len, key.size()));
+    }
+    std::vector<uint8_t> encrypted(user_data.size());
+    const uint64_t num_sectors = (user_data.size() + kSectorSize - 1) / kSectorSize;
+    for (uint64_t s = 0; s < num_sectors; ++s) {
+        const size_t start = static_cast<size_t>(s * kSectorSize);
+        const size_t len = std::min<size_t>(kSectorSize, user_data.size() - start);
+        TransformSectorXts(s, user_data.data() + start, encrypted.data() + start, len, key);
+    }
+    return BuildSyntheticXvd(encrypted, content_type, true);
 }
 
 }  // namespace scarlettx

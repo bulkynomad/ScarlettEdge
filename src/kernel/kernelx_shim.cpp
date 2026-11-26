@@ -27,7 +27,66 @@ struct MemBlock {
     uint64_t size = 0;
     uint32_t page_size = 0;
     uint32_t flags = 0;
+#if defined(_WIN32)
+    HANDLE section = nullptr;
+    bool mapped_view = false;
+#endif
 };
+
+#if defined(_WIN32)
+struct AliasBlock {
+    void* va = nullptr;
+    HANDLE section = nullptr;
+    uint64_t size = 0;
+};
+
+using VirtualAlloc2Fn = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+using MapViewOfFile3Fn = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+
+struct Win32MemApi {
+    VirtualAlloc2Fn virtual_alloc2 = nullptr;
+    MapViewOfFile3Fn map_view3 = nullptr;
+    Win32MemApi() {
+        HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+        if (!kb) kb = LoadLibraryW(L"kernelbase.dll");
+        if (kb) {
+            virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(
+                reinterpret_cast<void*>(GetProcAddress(kb, "VirtualAlloc2")));
+            map_view3 = reinterpret_cast<MapViewOfFile3Fn>(
+                reinterpret_cast<void*>(GetProcAddress(kb, "MapViewOfFile3")));
+        }
+    }
+};
+
+const Win32MemApi& MemApi() {
+    static Win32MemApi api;
+    return api;
+}
+
+void* MapSectionWithPlaceholder(HANDLE section, uint64_t offset, uint64_t size) {
+    const auto& api = MemApi();
+    if (api.virtual_alloc2 && api.map_view3) {
+        constexpr ULONG kMemReservePlaceholder = 0x00040000u;
+        constexpr ULONG kMemReplacePlaceholder = 0x00004000u;
+        void* placeholder = api.virtual_alloc2(
+            GetCurrentProcess(), nullptr, static_cast<SIZE_T>(size),
+            MEM_RESERVE | kMemReservePlaceholder, PAGE_NOACCESS, nullptr, 0);
+        if (placeholder) {
+            void* mapped = api.map_view3(
+                section, GetCurrentProcess(), placeholder, offset, static_cast<SIZE_T>(size),
+                kMemReplacePlaceholder, PAGE_READWRITE, nullptr, 0);
+            if (mapped) {
+                return mapped;
+            }
+            VirtualFree(placeholder, 0, MEM_RELEASE);
+        }
+    }
+    return MapViewOfFile(
+        section, FILE_MAP_ALL_ACCESS,
+        static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset & 0xFFFFFFFFu),
+        static_cast<SIZE_T>(size));
+}
+#endif
 
 struct KernelXState {
     std::mutex mu;
@@ -36,6 +95,9 @@ struct KernelXState {
     uint64_t peak_allocated = 0;
     std::unordered_map<uintptr_t, MemBlock> by_va;
     std::unordered_map<uint64_t, uintptr_t> by_gpu_va;
+#if defined(_WIN32)
+    std::unordered_map<uintptr_t, AliasBlock> aliases;
+#endif
 };
 
 KernelXState& State() {
@@ -66,7 +128,23 @@ int32_t SCARLETTX_KERNELX_CALL KernelXAllocateMemory(
 
     void* mem = nullptr;
 #if defined(_WIN32)
-    mem = VirtualAlloc(nullptr, aligned_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    HANDLE section = CreateFileMappingW(
+        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+        static_cast<DWORD>(aligned_size >> 32),
+        static_cast<DWORD>(aligned_size & 0xFFFFFFFFu), nullptr);
+    bool mapped_view = false;
+    if (section) {
+        mem = MapSectionWithPlaceholder(section, 0, aligned_size);
+        if (mem) {
+            mapped_view = true;
+        } else {
+            CloseHandle(section);
+            section = nullptr;
+        }
+    }
+    if (!mem) {
+        mem = VirtualAlloc(nullptr, aligned_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    }
 #else
     if (posix_memalign(&mem, align, aligned_size) != 0) mem = nullptr;
 #endif
@@ -87,6 +165,10 @@ int32_t SCARLETTX_KERNELX_CALL KernelXAllocateMemory(
     b.size = aligned_size;
     b.page_size = align;
     b.flags = flags;
+#if defined(_WIN32)
+    b.section = section;
+    b.mapped_view = mapped_view;
+#endif
     State().by_va[reinterpret_cast<uintptr_t>(mem)] = b;
     State().by_gpu_va[gpu_addr] = reinterpret_cast<uintptr_t>(mem);
 
@@ -105,7 +187,14 @@ int32_t SCARLETTX_KERNELX_CALL KernelXFreeMemory(void* virtualAddress) {
                               State().total_allocated - it->second.size : 0;
     State().by_gpu_va.erase(it->second.gpu_va);
 #if defined(_WIN32)
-    VirtualFree(virtualAddress, 0, MEM_RELEASE);
+    if (it->second.mapped_view) {
+        UnmapViewOfFile(virtualAddress);
+        if (it->second.section) {
+            CloseHandle(it->second.section);
+        }
+    } else {
+        VirtualFree(virtualAddress, 0, MEM_RELEASE);
+    }
 #else
     std::free(virtualAddress);
 #endif
@@ -138,6 +227,53 @@ int32_t SCARLETTX_KERNELX_CALL KernelXMapGpuToVirtual(uint64_t gpuAddress, void*
         }
     }
     return kInvalidArg;
+}
+
+int32_t SCARLETTX_KERNELX_CALL KernelXCreateMemoryAlias(
+    void* existingVirtualAddress, uint64_t offset, uint64_t size, void** outAliasVirtualAddress) {
+    if (!existingVirtualAddress || !outAliasVirtualAddress || size == 0) return kInvalidArg;
+    *outAliasVirtualAddress = nullptr;
+#if defined(_WIN32)
+    HANDLE dup_section = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(State().mu);
+        auto it = State().by_va.find(reinterpret_cast<uintptr_t>(existingVirtualAddress));
+        if (it == State().by_va.end() || !it->second.section) return kInvalidArg;
+        if (offset > it->second.size || size > it->second.size - offset) return kInvalidArg;
+        if (!DuplicateHandle(GetCurrentProcess(), it->second.section, GetCurrentProcess(),
+                             &dup_section, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            return kOutOfMemory;
+        }
+    }
+    void* alias_va = MapSectionWithPlaceholder(dup_section, offset, size);
+    if (!alias_va) {
+        CloseHandle(dup_section);
+        return kOutOfMemory;
+    }
+    {
+        std::lock_guard<std::mutex> lk(State().mu);
+        State().aliases[reinterpret_cast<uintptr_t>(alias_va)] = AliasBlock{alias_va, dup_section, size};
+    }
+    *outAliasVirtualAddress = alias_va;
+    return kSuccess;
+#else
+    return kInvalidArg;
+#endif
+}
+
+int32_t SCARLETTX_KERNELX_CALL KernelXFreeMemoryAlias(void* aliasVirtualAddress) {
+    if (!aliasVirtualAddress) return kSuccess;
+#if defined(_WIN32)
+    std::lock_guard<std::mutex> lk(State().mu);
+    auto it = State().aliases.find(reinterpret_cast<uintptr_t>(aliasVirtualAddress));
+    if (it == State().aliases.end()) return kInvalidArg;
+    UnmapViewOfFile(aliasVirtualAddress);
+    if (it->second.section) CloseHandle(it->second.section);
+    State().aliases.erase(it);
+    return kSuccess;
+#else
+    return kInvalidArg;
+#endif
 }
 
 int32_t SCARLETTX_KERNELX_CALL KernelXProtectMemory(void* virtualAddress, uint64_t size, uint32_t protectFlags) {

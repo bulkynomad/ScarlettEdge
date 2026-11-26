@@ -19,6 +19,19 @@ int main() {
     std::memset(va1, 0xAB, 65536);
     SX_CHECK(static_cast<uint8_t*>(va1)[0] == 0xAB);
 
+    // 1b. Hardware physical-virtual page aliasing via VirtualAlloc2 + MapViewOfFile3
+    void* alias_va = nullptr;
+    SX_CHECK(KernelXCreateMemoryAlias(va1, 0, 65536, &alias_va) == 0);
+    SX_CHECK(alias_va != nullptr);
+    SX_CHECK(alias_va != va1);
+    // Data written to va1 is instantaneously visible in alias_va (same physical pages)
+    SX_CHECK(static_cast<uint8_t*>(alias_va)[0] == 0xAB);
+    SX_CHECK(static_cast<uint8_t*>(alias_va)[65535] == 0xAB);
+    // Writing through alias_va is instantaneously visible in va1
+    static_cast<uint8_t*>(alias_va)[1234] = 0x5E;
+    SX_CHECK(static_cast<uint8_t*>(va1)[1234] == 0x5E);
+    SX_CHECK(KernelXFreeMemoryAlias(alias_va) == 0);
+
     // 2. Dual VA <-> GPU VA mapping lookup
     uint64_t mapped_gpu = 0;
     SX_CHECK(KernelXMapVirtualToGpu(va1, &mapped_gpu) == 0);
