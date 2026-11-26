@@ -571,7 +571,7 @@ def collect_optimization_metrics() -> list[Subsystem]:
             category="Compute",
             implemented=4,
             target=4,
-            notes="RDNA2 Graphics (EXP, VINTRP, MIMG) + Compute ISA decoder emitting real SPIR-V 1.5 SSA IR (OpFAdd/OpFMul) & DXIL SM 6.5 containers",
+            notes="256-VGPR RDNA2 Graphics+Compute SPIR-V 1.5 SSA compiler (stage exports, Load/Store, control flow) & DXIL SM 6.5",
         ),
         Subsystem(
             name="Hardware DXR 1.1 & Vulkan",
@@ -579,7 +579,7 @@ def collect_optimization_metrics() -> list[Subsystem]:
             category="Ray Tracing",
             implemented=4,
             target=4,
-            notes="D3D12 Device5/CmdList4 DXR 1.1 COM proxies (CreateStateObject, DispatchRays), live adapter probing & BLAS/TLAS traversal",
+            notes="Live host vulkan-1.dll VkShaderModule SPIR-V compilation, D3D12 Device5/CmdList4 DXR 1.1 proxies & BLAS/TLAS",
         ),
         Subsystem(
             name="Retail Container Crypto",
