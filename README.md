@@ -16,13 +16,34 @@
 <!-- SCARLETTX_STATUS_START -->
 ## Status
 
-### ScarlettEdge Progress (This Fork)
+### Phase 2: Retail AAA Execution Roadmap (Active Next Wave)
 
-Tracks the new runtime fidelity, hardware virtualization, cryptography, and performance work built in **ScarlettEdge** on top of the original ScarlettX foundation:
+While Phase 1 foundations and ABI coverage are at `100%`, running unmodified heavy commercial AAA retail titles (UE5, Open-World, Creation Engine) requires deeper silicon-level compiler, GPU execution, and codec milestones tracked honestly below:
+
+![ScarlettEdge Phase 2: Retail AAA Execution Roadmap](docs/status_aaa_roadmap.svg)
+
+**Phase 2 AAA Readiness:** `25.0%` (8 of 32 milestones) · **Active Focus:** `RDNA2 SPIR-V Compiler, Vulkan GPU Execution, DCC/HTILE & Native Media`
+
+| Phase 2 Milestone | Category | Progress | Readiness | Remaining Work |
+| :--- | :--- | :---: | :---: | :--- |
+| **XG Tiling, MSAA & DCC** | `Graphics` | `2 of 4` | `50%` | 4KB_S, 256B_S, 64KB_S/D/R_X done; next: 3D/cube/MSAA arrays, DCC color & HTILE depth metadata decompression |
+| **D3D12.2 & MEM_GRAPHICS** | `Graphics` | `1 of 4` | `25%` | 128-slot vtables, CL7::Barrier & VirtualAlloc2 done; next: CreatePlacedResourceX on guest GPUVA, Work Graphs & VRS |
+| **DirectStorage GPU Codecs** | `Storage` | `1 of 4` | `25%` | OVERLAPPED NVMe & LZ77 GDeflate/BCPack done; next: RFC 1951 Huffman DEFLATE, GPU compute GDeflate & hardware BC1-BC7 unpack |
+| **GDK 2022-2026 & WinRT** | `Platform` | `1 of 4` | `25%` | Live WinHTTP & offline XSAPI done; next: newer GDK QueryApiImpl COM tables, RoActivateInstance broker & title storage |
+| **Retail XMA2 & Bink2 Media** | `Media` | `1 of 4` | `25%` | KB2/BT.709 YUV-RGBA & XMA2 packet framing done; next: full XMA2 MDCT/WMA Pro decode, 5.1/7.1 spatial audio & real Bink2/MF video |
+| **Vulkan 1.3 & DXR GPU Exec** | `Graphics` | `1 of 4` | `25%` | Live vulkan-1.dll VkInstance/VkDevice/VkShaderModule active; next: VkPipeline/VkCommandBuffer exec, GPU BLAS/TLAS & swapchain |
+| **XS2 -> GPU Shader Compiler** | `Compiler` | `1 of 4` | `25%` | 256-VGPR SPIR-V 1.5 SSA & vkCreateShaderModule done; next: DescriptorSet/ImageSample bindings, d3d12_xs auto-intercept & disk cache |
+| **AAA Retail Title Bring-Up** | `Titles` | `0 of 4` | `0%` | Phase 1 titles playable; Phase 2 targets: UE5/Open-World/Creation Engine retail titles -> boot, menus, 3D in-game & 60 FPS stability |
+
+---
+
+### Phase 1: ScarlettEdge Fork Foundations (Completed)
+
+Tracks the runtime fidelity, cryptography, memory aliasing, and tooling foundations built in **ScarlettEdge** on top of upstream ScarlettX:
 
 ![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
 
-**ScarlettEdge Optimization Fidelity:** `100.0%` (44 of 44 milestones) · **Exports:** `412` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `412` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 ---
 

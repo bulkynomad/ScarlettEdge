@@ -624,6 +624,76 @@ def collect_optimization_metrics() -> list[Subsystem]:
     ]
 
 
+def collect_aaa_roadmap_metrics() -> list[Subsystem]:
+    """Phase 2: Next-wave deep silicon & commercial AAA retail execution milestones."""
+    return [
+        Subsystem(
+            name="XG Tiling, MSAA & DCC",
+            short_name="XG/DCC",
+            category="Graphics",
+            implemented=2,
+            target=4,
+            notes="4KB_S, 256B_S, 64KB_S/D/R_X done; next: 3D/cube/MSAA arrays, DCC color & HTILE depth metadata decompression",
+        ),
+        Subsystem(
+            name="XS2 -> GPU Shader Compiler",
+            short_name="XS2-IR",
+            category="Compiler",
+            implemented=1,
+            target=4,
+            notes="256-VGPR SPIR-V 1.5 SSA & vkCreateShaderModule done; next: DescriptorSet/ImageSample bindings, d3d12_xs auto-intercept & disk cache",
+        ),
+        Subsystem(
+            name="Vulkan 1.3 & DXR GPU Exec",
+            short_name="VkExec",
+            category="Graphics",
+            implemented=1,
+            target=4,
+            notes="Live vulkan-1.dll VkInstance/VkDevice/VkShaderModule active; next: VkPipeline/VkCommandBuffer exec, GPU BLAS/TLAS & swapchain",
+        ),
+        Subsystem(
+            name="D3D12.2 & MEM_GRAPHICS",
+            short_name="D3D12.2",
+            category="Graphics",
+            implemented=1,
+            target=4,
+            notes="128-slot vtables, CL7::Barrier & VirtualAlloc2 done; next: CreatePlacedResourceX on guest GPUVA, Work Graphs & VRS",
+        ),
+        Subsystem(
+            name="DirectStorage GPU Codecs",
+            short_name="DS-GPU",
+            category="Storage",
+            implemented=1,
+            target=4,
+            notes="OVERLAPPED NVMe & LZ77 GDeflate/BCPack done; next: RFC 1951 Huffman DEFLATE, GPU compute GDeflate & hardware BC1-BC7 unpack",
+        ),
+        Subsystem(
+            name="Retail XMA2 & Bink2 Media",
+            short_name="Media",
+            category="Media",
+            implemented=1,
+            target=4,
+            notes="KB2/BT.709 YUV-RGBA & XMA2 packet framing done; next: full XMA2 MDCT/WMA Pro decode, 5.1/7.1 spatial audio & real Bink2/MF video",
+        ),
+        Subsystem(
+            name="GDK 2022-2026 & WinRT",
+            short_name="WinRT",
+            category="Platform",
+            implemented=1,
+            target=4,
+            notes="Live WinHTTP & offline XSAPI done; next: newer GDK QueryApiImpl COM tables, RoActivateInstance broker & title storage",
+        ),
+        Subsystem(
+            name="AAA Retail Title Bring-Up",
+            short_name="AAA",
+            category="Titles",
+            implemented=0,
+            target=4,
+            notes="Phase 1 titles playable; Phase 2 targets: UE5/Open-World/Creation Engine retail titles -> boot, menus, 3D in-game & 60 FPS stability",
+        ),
+    ]
+
+
 def _badge_width(text: str) -> int:
     # Approximate Verdana 11px width + 12px horizontal padding
     return max(26, int(round(len(text) * 6.4)) + 14)
@@ -1061,6 +1131,7 @@ def render_markdown_status(
     total_exports: int,
     tests_md: str,
     opt_subsystems: list[Subsystem] | None = None,
+    aaa_subsystems: list[Subsystem] | None = None,
 ) -> str:
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
@@ -1074,18 +1145,43 @@ def render_markdown_status(
     opt_target = sum(s.target for s in opt_subsystems) if opt_subsystems else 0
     opt_pct = (opt_impl / opt_target * 100.0) if opt_target else 0.0
 
+    aaa_impl = sum(s.implemented for s in aaa_subsystems) if aaa_subsystems else 0
+    aaa_target = sum(s.target for s in aaa_subsystems) if aaa_subsystems else 0
+    aaa_pct = (aaa_impl / aaa_target * 100.0) if aaa_target else 0.0
+
     sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
     rows = [
         "<!-- SCARLETTX_STATUS_START -->",
         "## Status",
         "",
-        "### ScarlettEdge Progress (This Fork)",
+        "### Phase 2: Retail AAA Execution Roadmap (Active Next Wave)",
         "",
-        "Tracks the new runtime fidelity, hardware virtualization, cryptography, and performance work built in **ScarlettEdge** on top of the original ScarlettX foundation:",
+        "While Phase 1 foundations and ABI coverage are at `100%`, running unmodified heavy commercial AAA retail titles (UE5, Open-World, Creation Engine) requires deeper silicon-level compiler, GPU execution, and codec milestones tracked honestly below:",
+        "",
+        "![ScarlettEdge Phase 2: Retail AAA Execution Roadmap](docs/status_aaa_roadmap.svg)",
+        "",
+        f"**Phase 2 AAA Readiness:** `{aaa_pct:.1f}%` ({aaa_impl} of {aaa_target} milestones) · "
+        f"**Active Focus:** `RDNA2 SPIR-V Compiler, Vulkan GPU Execution, DCC/HTILE & Native Media`",
+        "",
+        "| Phase 2 Milestone | Category | Progress | Readiness | Remaining Work |",
+        "| :--- | :--- | :---: | :---: | :--- |",
+    ]
+    if aaa_subsystems:
+        for s in sorted(aaa_subsystems, key=lambda x: (-x.ratio, -x.implemented, x.name.lower())):
+            rows.append(
+                f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` | `{round(s.pct)}%` | {s.notes} |"
+            )
+    rows += [
+        "",
+        "---",
+        "",
+        "### Phase 1: ScarlettEdge Fork Foundations (Completed)",
+        "",
+        "Tracks the runtime fidelity, cryptography, memory aliasing, and tooling foundations built in **ScarlettEdge** on top of upstream ScarlettX:",
         "",
         "![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)",
         "",
-        f"**ScarlettEdge Optimization Fidelity:** `{opt_pct:.1f}%` ({opt_impl} of {opt_target} milestones) · "
+        f"**Phase 1 Fork Foundations:** `{opt_pct:.1f}%` ({opt_impl} of {opt_target} milestones) · "
         f"**Exports:** `{total_exports}` · "
         f"**Tests:** {tests_md} · "
         "**Target:** `Xbox Series X|S (Gen9)`",
@@ -1233,20 +1329,46 @@ def main() -> None:
         callout_line2="FIPS-197 AES-XTS/SHA-256 CNG crypto, VirtualAlloc2 aliasing, 128-slot D3D12.2/DXR vtables, RDNA2 graphics & WinHTTP active.",
     )
 
+    aaa_subsystems = collect_aaa_roadmap_metrics()
+    aaa_impl = sum(s.implemented for s in aaa_subsystems)
+    aaa_target = sum(s.target for s in aaa_subsystems)
+    aaa_pct = (aaa_impl / aaa_target * 100.0) if aaa_target else 0.0
+    aaa_badges = [
+        ("phase 2 AAA", f"{aaa_pct:.1f}% ({aaa_impl}/{aaa_target})", LV1, False),
+        ("stage", "Active Development", BADGE_EXPORTS, False),
+        ("CI tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
+        ("target", "Unmodified Retail AAA Titles", BADGE_TARGET, False),
+    ]
+    aaa_svg = render_svg(
+        aaa_subsystems,
+        badges=aaa_badges,
+        heading_prefix="Phase 2: Retail AAA Execution Roadmap",
+        callout_lead="Next wave (in progress):",
+        callout_line1=f"{aaa_pct:.1f}% complete ({aaa_impl}/{aaa_target} deep silicon milestones) — real GPU shader execution, DCC/HTILE, and native media ahead.",
+        callout_line2="Phase 1 ABI & core foundations are 100% done; this chart tracks the remaining engineering wall to full retail AAA playability.",
+    )
+
     html_doc = render_html(subsystems, total_exports, tests_text, tests_ok)
 
     out_svg = ROOT / "docs/status.svg"
     out_cd_svg = ROOT / "docs/status_concept_destruction.svg"
     out_opt_svg = ROOT / "docs/status_optimizations.svg"
+    out_aaa_svg = ROOT / "docs/status_aaa_roadmap.svg"
     out_html = ROOT / "docs/status.html"
     out_svg.parent.mkdir(parents=True, exist_ok=True)
     out_svg.write_text(svg, encoding="utf-8")
     out_cd_svg.write_text(cd_svg, encoding="utf-8")
     out_opt_svg.write_text(opt_svg, encoding="utf-8")
+    out_aaa_svg.write_text(aaa_svg, encoding="utf-8")
     out_html.write_text(html_doc, encoding="utf-8")
 
     md_block = render_markdown_status(
-        subsystems, cd_subsystems, total_exports, tests_markdown(test_count, test_results), opt_subsystems=opt_subsystems
+        subsystems,
+        cd_subsystems,
+        total_exports,
+        tests_markdown(test_count, test_results),
+        opt_subsystems=opt_subsystems,
+        aaa_subsystems=aaa_subsystems,
     )
     readme_path = ROOT / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
