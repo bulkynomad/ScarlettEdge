@@ -1,0 +1,25 @@
+LIBRARY xaudio2_9
+EXPORTS
+    XAudio2Create @1
+    XAudio2CreateEngine @2
+    XAudio2DestroyEngine @3
+    XAudio2StartEngine @4
+    XAudio2StopEngine @5
+    XAudio2GetPerformanceData @6
+    XAudio2CreateMasteringVoice @7
+    XAudio2CreateSubmixVoice @8
+    XAudio2CreateSourceVoice @9
+    XAudio2DestroyVoice @10
+    XAudio2VoiceStart @11
+    XAudio2VoiceStop @12
+    XAudio2VoiceSubmitSourceBuffer @13
+    XAudio2VoiceFlushSourceBuffers @14
+    XAudio2VoiceGetState @15
+    XAudio2VoiceSetVolume @16
+    XAudio2VoiceGetVolume @17
+    XAudio2VoiceSetFrequencyRatio @18
+    XAudio2VoiceGetFrequencyRatio @19
+    XAudio2VoiceSetOutputMatrix @20
+    XAudio2RenderAudioFrames @21
+    XAudio2WriteWavFile @22
+    Xma2DecodePacket @23

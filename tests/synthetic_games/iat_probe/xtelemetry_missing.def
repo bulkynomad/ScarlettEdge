@@ -1,0 +1,3 @@
+LIBRARY xtelemetry_missing.dll
+EXPORTS
+    XTelemetryRecord @42 NONAME

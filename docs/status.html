@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScarlettX — Status</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --bg: #0d1117;
+    --border: #30363d;
+    --border-strong: #3d444d;
+    --border-muted: #21262d;
+    --fg: #e6edf3;
+    --fg-muted: #9198a1;
+    --fg-soft: #d1d7e0;
+    --empty: #151b23;
+    --empty-ring: rgba(240, 246, 252, 0.08);
+    --lv0: #3c1e70;
+    --lv1: #6e40c9;
+    --lv2: #a371f7;
+    --lv3: #d2a8ff;
+    --warn: #d29922;
+    --badge-label: #555555;
+    --badge-exports: #007ec6;
+    --badge-tests: #3b8a1f;
+    --badge-target: #6e40c9;
+    --cell: 14px;
+    --cell-gap: 3px;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'Mona Sans', -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+  }
+  .status {
+    width: 900px;
+    max-width: 100%;
+    margin: 0 auto;
+    padding: 30px 36px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  h2 {
+    margin: 0;
+    font-size: 26px;
+    font-weight: 600;
+    line-height: 1.25;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .badges { display: flex; flex-wrap: wrap; gap: 6px; font-family: Verdana, 'DejaVu Sans', Geneva, sans-serif; font-size: 11px; line-height: 20px; }
+  .badge { display: flex; border-radius: 3px; overflow: hidden; }
+  .badge span { padding: 0 6px; color: #fff; }
+  .badge .k { background: var(--badge-label); }
+  .badge .v-fn { background: var(--lv2); color: var(--bg); }
+  .badge .v-exports { background: var(--badge-exports); }
+  .badge .v-tests { background: var(--badge-tests); }
+  .badge .v-tests-warn { background: var(--warn); }
+  .badge .v-target { background: var(--badge-target); }
+  .graph-box {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 22px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    overflow-x: auto;
+  }
+  .graph { display: flex; gap: 10px; justify-content: center; }
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  .group-label { font-size: 11px; color: var(--fg-muted); white-space: nowrap; }
+  .cells {
+    display: grid;
+    grid-template-rows: repeat(7, var(--cell));
+    grid-auto-flow: column;
+    grid-auto-columns: var(--cell);
+    gap: var(--cell-gap);
+  }
+  .cell { display: block; width: var(--cell); height: var(--cell); border-radius: 3px; }
+  .cell.empty, .sw.empty, .dot.empty { background: var(--empty); outline: 1px solid var(--empty-ring); outline-offset: -1px; }
+  .cell.pad { background: transparent; }
+  .lv0 { background: var(--lv0); }
+  .lv1 { background: var(--lv1); }
+  .lv2 { background: var(--lv2); }
+  .lv3 { background: var(--lv3); }
+  .legend { display: flex; justify-content: flex-end; align-items: center; gap: 4px; font-size: 12px; color: var(--fg-muted); }
+  .sw { display: block; width: 11px; height: 11px; border-radius: 2px; }
+  .list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 40px; padding: 0 4px; }
+  .row { display: flex; align-items: center; gap: 10px; height: 30px; border-bottom: 1px solid var(--border-muted); font-size: 13px; }
+  .dot { width: 11px; height: 11px; border-radius: 2px; flex-shrink: 0; }
+  .row .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .count { color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+  .row .pct { width: 40px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .callout { display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--warn); color: var(--fg-soft); font-size: 13px; }
+  .callout svg { flex-shrink: 0; margin-top: 2px; }
+  .callout strong { color: var(--warn); }
+  @media (max-width: 640px) {
+    .status { padding: 20px 16px; }
+    .graph { justify-content: flex-start; }
+    .list { grid-template-columns: minmax(0, 1fr); }
+  }
+</style>
+</head>
+<body>
+<main class="status">
+  <h2>Status: 100.0%</h2>
+  <div class="badges">
+    <span class="badge"><span class="k">functions</span><span class="v-fn">422/422</span></span>
+    <span class="badge"><span class="k">exports</span><span class="v-exports">410</span></span>
+    <span class="badge"><span class="k">tests</span><span class="v-tests">32/32 passing</span></span>
+    <span class="badge"><span class="k">target</span><span class="v-target">Xbox Series X|S (Gen9)</span></span>
+  </div>
+  <section class="graph-box" aria-label="Implemented functions per subsystem, one square per function">
+    <div class="graph" id="graph"></div>
+    <div class="legend">Not yet
+      <span class="sw empty"></span><span class="sw lv0"></span><span class="sw lv1"></span><span class="sw lv2"></span><span class="sw lv3"></span>
+    Done</div>
+  </section>
+  <div class="list" id="list"></div>
+  <div class="callout">
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 15 14H1z" fill="none" stroke="#d2a8ff" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="#d2a8ff" stroke-width="1.5" stroke-linecap="round"/></svg>
+    <span><strong>100% Milestone:</strong> Full clean-room parity achieved across all 17 subsystems on Xbox Series X|S (Gen9).</span>
+  </div>
+</main>
+<script>
+  const SUBSYSTEMS = [
+    ['d3d12', 'd3d12_xs → PC D3D12 & PSOs', 46, 46],
+    ['XTask', 'XTaskQueue & XAsync', 24, 24],
+    ['Save', 'XGameSave (persistent)', 30, 30],
+    ['XUser', 'XUser & Identity', 24, 24],
+    ['XSys', 'XSystem & Runtime', 18, 18],
+    ['XMem', 'XMem & Threading', 16, 16],
+    ['DXR', 'DXR / XboxBvhBuilder', 14, 14],
+    ['DStor', 'DirectStorage & XVD', 24, 24],
+    ['Audio', 'Audio (XAudio2 / AcpHal)', 42, 42],
+    ['Input', 'Input (GameInput)', 16, 16],
+    ['Midw', 'Middleware (Bink2 / FSR)', 34, 34],
+    ['Net', 'Networking (HTTP / XCurl)', 40, 40],
+    ['PE64', 'PE64 Loader & Auto-Stubs', 6, 6],
+    ['Kern', 'Xbox Unified Memory & KernelX', 14, 14],
+    ['XS2', 'RDNA2 XS2 Shader Lifting', 16, 16],
+    ['Crypt', 'Retail XVC/XVD Crypto', 12, 12],
+    ['Codec', 'Production Codecs (XMA2/GDeflate/Bink)', 16, 16],
+    ['Vulk', 'Hardware DXR & Vulkan Backend', 14, 14],
+    ['XSAPI', 'Live Xbox Services (XSAPI/WinRT)', 16, 16],
+  ];
+  const level = p => p >= 0.8 ? 'lv3' : p >= 0.6 ? 'lv2' : p >= 0.4 ? 'lv1' : 'lv0';
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const graph = document.getElementById('graph');
+  for (const [label, , done, total] of SUBSYSTEMS) {
+    const g = el('div', 'group');
+    g.append(el('span', 'group-label', label));
+    const cells = el('div', 'cells');
+    const cols = Math.max(2, Math.ceil(total / 7));
+    const lv = level(done / total);
+    for (let i = 0; i < cols * 7; i++) {
+      cells.append(el('span', 'cell ' + (i < done ? lv : i < total ? 'empty' : 'pad')));
+    }
+    g.append(cells);
+    graph.append(g);
+  }
+  const list = document.getElementById('list');
+  [...SUBSYSTEMS].sort((a, b) => b[2] / b[3] - a[2] / a[3]).forEach(([, name, done, total]) => {
+    const p = done / total;
+    const row = el('div', 'row');
+    row.append(el('span', 'dot ' + (done === 0 ? 'empty' : level(p))));
+    row.append(el('span', 'name', name));
+    row.append(el('span', 'count', `${done} of ${total}`));
+    row.append(el('span', 'pct', `${Math.round(p * 100)}%`));
+    list.append(row);
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,3 @@
+LIBRARY xordinal_hle.dll
+EXPORTS
+    XOrdinalCompute @7 NONAME
