@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# Design DNA: ScarlettX Status, variant E (purple)
+# Design DNA: ScarlettEdge Status (GitHub dark / Xbox emerald green gradient)
 BG = "#0d1117"
 BORDER = "#30363d"
 BORDER_STRONG = "#3d444d"
@@ -30,16 +30,16 @@ FG_MUTED = "#9198a1"
 FG_SOFT = "#d1d7e0"
 EMPTY_FILL = "#151b23"
 EMPTY_STROKE = "rgba(240,246,252,0.08)"
-LV0 = "#3c1e70"  # < 40%
-LV1 = "#6e40c9"  # 40-59%
-LV2 = "#a371f7"  # 60-79%
-LV3 = "#d2a8ff"  # >= 80%
+LV0 = "#0e4429"  # < 40%
+LV1 = "#006d32"  # 40-59%
+LV2 = "#26a641"  # 60-79%
+LV3 = "#39d353"  # >= 80%
 WARN = "#d29922"
 BADGE_LABEL = "#555555"
-BADGE_FN = "#a371f7"
+BADGE_FN = "#39d353"
 BADGE_EXPORTS = "#007ec6"
-BADGE_TESTS = "#3b8a1f"
-BADGE_TARGET = "#6e40c9"
+BADGE_TESTS = "#26a641"
+BADGE_TARGET = "#107c10"
 
 
 @dataclass
@@ -1007,20 +1007,33 @@ def render_markdown_status(
     cd_target = sum(s.target for s in cd_subsystems)
     cd_pct = (cd_impl / cd_target * 100.0) if cd_target else 0.0
 
-    opt_pct = 0.0
-    if opt_subsystems:
-        opt_impl = sum(s.implemented for s in opt_subsystems)
-        opt_target = sum(s.target for s in opt_subsystems)
-        opt_pct = (opt_impl / opt_target * 100.0) if opt_target else 0.0
+    opt_impl = sum(s.implemented for s in opt_subsystems) if opt_subsystems else 0
+    opt_target = sum(s.target for s in opt_subsystems) if opt_subsystems else 0
+    opt_pct = (opt_impl / opt_target * 100.0) if opt_target else 0.0
 
     sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
     rows = [
         "<!-- SCARLETTX_STATUS_START -->",
         "## Status",
         "",
-        "![Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)",
+        "### ScarlettEdge Progress (This Fork)",
         "",
-        "![ScarlettX Status](docs/status.svg)",
+        "Tracks the new runtime fidelity, hardware virtualization, cryptography, and performance work built in **ScarlettEdge** on top of the original ScarlettX foundation:",
+        "",
+        "![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)",
+        "",
+        f"**ScarlettEdge Optimization Fidelity:** `{opt_pct:.1f}%` ({opt_impl} of {opt_target} milestones) · "
+        f"**Exports:** `{total_exports}` · "
+        f"**Tests:** {tests_md} · "
+        "**Target:** `Xbox Series X|S (Gen9)`",
+        "",
+        "---",
+        "",
+        "### Upstream Foundation (Original ScarlettX Authors)",
+        "",
+        "The foundational ABI coverage and real-title bring-up below were originally created by the authors of **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (PE64 loader, `xgameruntime` & `QueryApiImpl` COM tables, core `d3d12_xs`/`xg_xs` translation, `XAudio2_9`/`AcpHal`, `GameInput` + rumble, `XGameSave`, and in-game bring-up of **Concept Destruction** & **Unicorn Overlord**):",
+        "",
+        "![ScarlettX Upstream ABI Status](docs/status.svg)",
         "",
         "![Status of the game Concept Destruction](docs/status_concept_destruction.svg)",
         "",
@@ -1036,18 +1049,11 @@ def render_markdown_status(
             rows.append("| " + " | ".join(caption for _, _, _, caption in shots) + " |")
         rows.append("")
 
-    summary_items = []
-    if opt_subsystems:
-        summary_items.append(f"**Optimization Fidelity:** `{opt_pct:.1f}%` (Commercial Engine Readiness)")
-    summary_items.extend([
-        f"**Emulator Status:** `{overall_pct:.1f}%` ({total_impl} of {total_target} tracked functions, including unimplemented `0%` subsystems)",
-        f"**Concept Destruction:** `{cd_pct:.1f}%` ({cd_impl} of {cd_target} bring-up milestones)",
-        f"**Exports:** `{total_exports}`",
-        f"**Tests:** {tests_md}",
-        "**Target:** `Xbox Series X|S (Gen9)`",
-    ])
     rows += [
-        " · ".join(summary_items),
+        f"**Upstream ABI Coverage:** `{overall_pct:.1f}%` ({total_impl} of {total_target} tracked functions) · "
+        f"**Concept Destruction (Upstream Bring-Up):** `{cd_pct:.1f}%` ({cd_impl} of {cd_target} milestones) · "
+        f"**Exports:** `{total_exports}` · "
+        f"**Tests:** {tests_md}",
         "",
         "| Subsystem | Category | Progress | Coverage | Details |",
         "| :--- | :--- | :---: | :---: | :--- |",

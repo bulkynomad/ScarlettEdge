@@ -4,12 +4,31 @@
 
 > **Legal notice:** ScarlettEdge does not include or distribute any proprietary Microsoft/Xbox binaries, cryptographic keys, firmware, or commercial game assets. Optional encrypted container support uses standard public cryptographic algorithms (FIPS-197 AES-XTS / FIPS 180-4 SHA-256) and requires keys supplied independently by the user for legally owned software. All automated tests run against synthetic x86-64 PE titles built from source in this repository.
 
+## Origin & Credits
+
+**ScarlettEdge** is an independent fork of **[ScarlettX](https://github.com/Freminet/ScarlettX)** by **Freminet** and the original ScarlettX contributors. All credit for the foundational emulator architecture belongs to the original authors, including:
+
+- **Original ScarlettX Authors (`Freminet/ScarlettX`):** Core PE64 loader & implicit TLS, `MicrosoftGame.Config` parser, `xgameruntime` C ABI & `QueryApiImpl` COM tables, foundational `d3d12_xs`/`xg_xs` translation & `4KB_S` texture deswizzling, guest-facing `XAudio2_9`/`AcpHal` & silent output engine, `GameInput` + rumble, persistent `XGameSave`, base `dstorage_xs`/`xcrdapi` queues, offline HLE shims (`Bink2`, `FidelityFX`, `libHttpClient`, `XCurl`), and the real-title bring-up of **Concept Destruction** and **Unicorn Overlord**.
+- **ScarlettEdge Fork Additions (`bulkynomad/ScarlettEdge`):** Real FIPS-197 AES-XTS & FIPS 180-4 SHA-256 via Windows CNG (`bcrypt.dll`) with keyring-backed encrypted XVD streaming, hardware VSync (`Present(1, 0)`) & async `ScheduleFrameEventX`, 0-frame sub-submit write-watch texture uploads, in-process direct IAT boot default, Windows `VirtualAlloc2`/`MapViewOfFile3` physical-virtual memory aliasing, 128-slot D3D12.2 / DXR 1.1 / Mesh Shader COM proxies, RDNA2 graphics+compute ISA lifting (`EXP`, `VINTRP`, `MIMG`, `SMEM`, `VOP2/3`, `VMEM`, `LDS`, `SOPP`), XAudio2 XAPO effect chain passthrough, persistent `FILE_FLAG_OVERLAPPED` DirectStorage NVMe I/O, and opt-in live `WinHTTP` transport.
+
 <!-- SCARLETTX_STATUS_START -->
 ## Status
 
-![Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
+### ScarlettEdge Progress (This Fork)
 
-![ScarlettX Status](docs/status.svg)
+Tracks the new runtime fidelity, hardware virtualization, cryptography, and performance work built in **ScarlettEdge** on top of the original ScarlettX foundation:
+
+![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
+
+**ScarlettEdge Optimization Fidelity:** `97.7%` (43 of 44 milestones) · **Exports:** `412` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
+
+---
+
+### Upstream Foundation (Original ScarlettX Authors)
+
+The foundational ABI coverage and real-title bring-up below were originally created by the authors of **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (PE64 loader, `xgameruntime` & `QueryApiImpl` COM tables, core `d3d12_xs`/`xg_xs` translation, `XAudio2_9`/`AcpHal`, `GameInput` + rumble, `XGameSave`, and in-game bring-up of **Concept Destruction** & **Unicorn Overlord**):
+
+![ScarlettX Upstream ABI Status](docs/status.svg)
 
 ![Status of the game Concept Destruction](docs/status_concept_destruction.svg)
 
@@ -18,7 +37,7 @@
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Optimization Fidelity:** `97.7%` (Commercial Engine Readiness) · **Emulator Status:** `100.5%` (424 of 422 tracked functions, including unimplemented `0%` subsystems) · **Concept Destruction:** `100.0%` (46 of 46 bring-up milestones) · **Exports:** `412` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Upstream ABI Coverage:** `100.5%` (424 of 422 tracked functions) · **Concept Destruction (Upstream Bring-Up):** `100.0%` (46 of 46 milestones) · **Exports:** `412` · **Tests:** `32/32` passing
 
 | Subsystem | Category | Progress | Coverage | Details |
 | :--- | :--- | :---: | :---: | :--- |

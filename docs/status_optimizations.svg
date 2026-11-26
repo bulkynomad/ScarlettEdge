@@ -22,7 +22,7 @@
   <clipPath id="bclip0"><rect x="36" y="82" width="111" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip0)">
     <rect x="36" y="82" width="65" height="20" fill="#555555"/>
-    <rect x="101" y="82" width="46" height="20" fill="#a371f7"/>
+    <rect x="101" y="82" width="46" height="20" fill="#39d353"/>
     <text class="badge-txt" x="68.5" y="96" text-anchor="middle">fidelity</text>
     <text class="badge-txt-dark" x="124.0" y="96" text-anchor="middle">97.7%</text>
   </g>
@@ -36,14 +36,14 @@
   <clipPath id="bclip2"><rect x="341" y="82" width="149" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip2)">
     <rect x="341" y="82" width="65" height="20" fill="#555555"/>
-    <rect x="406" y="82" width="84" height="20" fill="#3b8a1f"/>
+    <rect x="406" y="82" width="84" height="20" fill="#26a641"/>
     <text class="badge-txt" x="373.5" y="96" text-anchor="middle">textures</text>
     <text class="badge-txt" x="448.0" y="96" text-anchor="middle">0-frame lag</text>
   </g>
   <clipPath id="bclip3"><rect x="496" y="82" width="220" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip3)">
     <rect x="496" y="82" width="52" height="20" fill="#555555"/>
-    <rect x="548" y="82" width="168" height="20" fill="#6e40c9"/>
+    <rect x="548" y="82" width="168" height="20" fill="#107c10"/>
     <text class="badge-txt" x="522.0" y="96" text-anchor="middle">target</text>
     <text class="badge-txt" x="632.0" y="96" text-anchor="middle">Commercial AAA Execution</text>
   </g>
@@ -51,120 +51,120 @@
   <!-- 3. Contribution graph box -->
   <rect x="36" y="118" width="828" height="202" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
   <text class="g-label" x="229.5" y="148">VSync</text>
-  <rect x="229.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="229.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="229.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="229.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="229.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="229.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="229.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="229.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="270.5" y="148">Loader</text>
-  <rect x="270.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="270.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="270.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="270.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="270.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="270.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="270.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="270.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="311.5" y="148">Texture</text>
-  <rect x="311.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="311.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="311.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="311.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="311.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="311.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="311.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="311.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="352.5" y="148">DStorage</text>
-  <rect x="352.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="352.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="352.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="352.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="352.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="352.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="352.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="352.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="393.5" y="148">RDNA2</text>
-  <rect x="393.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="393.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="393.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="393.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="393.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="393.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="393.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="393.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="434.5" y="148">DXR/RT</text>
-  <rect x="434.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="434.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="434.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="434.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="434.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="434.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="434.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="434.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="475.5" y="148">Crypto</text>
-  <rect x="475.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="475.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="475.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="475.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="475.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="475.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="475.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="475.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="516.5" y="148">Memory</text>
-  <rect x="516.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="516.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="516.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="516.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="516.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="516.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="516.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="516.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="557.5" y="148">Vtables</text>
-  <rect x="557.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="557.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="557.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="557.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="557.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="557.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="557.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="557.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="598.5" y="148">Audio</text>
-  <rect x="598.5" y="158.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="598.5" y="175.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="598.5" y="192.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
-  <rect x="598.5" y="209.0" width="14" height="14" rx="3" fill="#d2a8ff"/>
+  <rect x="598.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="598.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="598.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="598.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="639.5" y="148">Network</text>
-  <rect x="639.5" y="158.0" width="14" height="14" rx="3" fill="#a371f7"/>
-  <rect x="639.5" y="175.0" width="14" height="14" rx="3" fill="#a371f7"/>
-  <rect x="639.5" y="192.0" width="14" height="14" rx="3" fill="#a371f7"/>
+  <rect x="639.5" y="158.0" width="14" height="14" rx="3" fill="#26a641"/>
+  <rect x="639.5" y="175.0" width="14" height="14" rx="3" fill="#26a641"/>
+  <rect x="639.5" y="192.0" width="14" height="14" rx="3" fill="#26a641"/>
   <rect x="640.0" y="209.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
   <text class="legend-txt" x="842" y="299" text-anchor="end">Done</text>
-  <rect x="795.0" y="289.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
-  <rect x="780.0" y="289.0" width="11" height="11" rx="2" fill="#a371f7"/>
-  <rect x="765.0" y="289.0" width="11" height="11" rx="2" fill="#6e40c9"/>
-  <rect x="750.0" y="289.0" width="11" height="11" rx="2" fill="#3c1e70"/>
+  <rect x="795.0" y="289.0" width="11" height="11" rx="2" fill="#39d353"/>
+  <rect x="780.0" y="289.0" width="11" height="11" rx="2" fill="#26a641"/>
+  <rect x="765.0" y="289.0" width="11" height="11" rx="2" fill="#006d32"/>
+  <rect x="750.0" y="289.0" width="11" height="11" rx="2" fill="#0e4429"/>
   <rect x="735.5" y="289.5" width="10" height="10" rx="2" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
   <text class="legend-txt" x="731" y="299" text-anchor="end">Not yet</text>
 
   <!-- 4. Two-column subsystem list -->
-  <rect x="40.0" y="345.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="40.0" y="345.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="61.0" y="355">Audio DSP &amp; XAPO Effects</text>
   <text class="r-count" x="382.0" y="355" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="430.0" y="355" text-anchor="end">100%</text>
   <line x1="40.0" y1="366" x2="430.0" y2="366" stroke="#21262d" stroke-width="1"/>
-  <rect x="470.0" y="345.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="470.0" y="345.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="491.0" y="355">Bootloader &amp; DLL Priority</text>
   <text class="r-count" x="812.0" y="355" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="860.0" y="355" text-anchor="end">100%</text>
   <line x1="470.0" y1="366" x2="860.0" y2="366" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="375.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="40.0" y="375.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="61.0" y="385">DirectStorage &amp; NVMe</text>
   <text class="r-count" x="382.0" y="385" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="430.0" y="385" text-anchor="end">100%</text>
   <line x1="40.0" y1="396" x2="430.0" y2="396" stroke="#21262d" stroke-width="1"/>
-  <rect x="470.0" y="375.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="470.0" y="375.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="491.0" y="385">Frame Pacing &amp; VSync</text>
   <text class="r-count" x="812.0" y="385" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="860.0" y="385" text-anchor="end">100%</text>
   <line x1="470.0" y1="396" x2="860.0" y2="396" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="405.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="40.0" y="405.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="61.0" y="415">Hardware DXR 1.1 &amp; Vulkan</text>
   <text class="r-count" x="382.0" y="415" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="430.0" y="415" text-anchor="end">100%</text>
   <line x1="40.0" y1="426" x2="430.0" y2="426" stroke="#21262d" stroke-width="1"/>
-  <rect x="470.0" y="405.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="470.0" y="405.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="491.0" y="415">RDNA2 Microcode Lifter</text>
   <text class="r-count" x="812.0" y="415" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="860.0" y="415" text-anchor="end">100%</text>
   <line x1="470.0" y1="426" x2="860.0" y2="426" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="435.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="40.0" y="435.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="61.0" y="445">Retail Container Crypto</text>
   <text class="r-count" x="382.0" y="445" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="430.0" y="445" text-anchor="end">100%</text>
   <line x1="40.0" y1="456" x2="430.0" y2="456" stroke="#21262d" stroke-width="1"/>
-  <rect x="470.0" y="435.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="470.0" y="435.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="491.0" y="445">Sub-Frame Texture Upload</text>
   <text class="r-count" x="812.0" y="445" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="860.0" y="445" text-anchor="end">100%</text>
   <line x1="470.0" y1="456" x2="860.0" y2="456" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="465.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="40.0" y="465.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="61.0" y="475">Unified Memory Aliasing</text>
   <text class="r-count" x="382.0" y="475" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="430.0" y="475" text-anchor="end">100%</text>
   <line x1="40.0" y1="486" x2="430.0" y2="486" stroke="#21262d" stroke-width="1"/>
-  <rect x="470.0" y="465.0" width="11" height="11" rx="2" fill="#d2a8ff"/>
+  <rect x="470.0" y="465.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="491.0" y="475">Xbox COM Vtable Depth</text>
   <text class="r-count" x="812.0" y="475" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="860.0" y="475" text-anchor="end">100%</text>
   <line x1="470.0" y1="486" x2="860.0" y2="486" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="495.0" width="11" height="11" rx="2" fill="#a371f7"/>
+  <rect x="40.0" y="495.0" width="11" height="11" rx="2" fill="#26a641"/>
   <text class="r-name" x="61.0" y="505">Network &amp; Live Middleware</text>
   <text class="r-count" x="382.0" y="505" text-anchor="end">3 of 4</text>
   <text class="r-pct" x="430.0" y="505" text-anchor="end">75%</text>
