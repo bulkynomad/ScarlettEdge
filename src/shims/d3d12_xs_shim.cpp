@@ -2174,6 +2174,22 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListDispatchMesh(
 #endif
     return 0;
 }
+intptr_t SCARLETTX_GDK_CALLBACK CmdListBarrier(
+    void* self, uintptr_t numBarrierGroups, uintptr_t pBarrierGroups, uintptr_t) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
+    if (obj && obj->pc_list && numBarrierGroups > 0 && pBarrierGroups) {
+        ID3D12GraphicsCommandList7* cl7 = nullptr;
+        if (SUCCEEDED(obj->pc_list->QueryInterface(IID_PPV_ARGS(&cl7))) && cl7) {
+            cl7->Barrier(
+                static_cast<UINT32>(numBarrierGroups),
+                reinterpret_cast<const D3D12_BARRIER_GROUP*>(pBarrierGroups));
+            cl7->Release();
+        }
+    }
+#endif
+    return 0;
+}
 intptr_t SCARLETTX_GDK_CALLBACK CmdListFlushPipelineX(void* self, uintptr_t flags, uintptr_t a2, uintptr_t a3) {
 #if defined(_WIN32)
     if (TraceEnabled()) {
@@ -2280,6 +2296,7 @@ std::array<ComVtableFn, 128> BuildCmdListVtable() {
     vtbl[70] = &CmdListSetPipelineState1;
     vtbl[71] = &CmdListDispatchRays;
     vtbl[76] = &CmdListDispatchMesh;
+    vtbl[90] = &CmdListBarrier;
     return vtbl;
 }
 const auto kXboxCmdListProxyVtbl = BuildCmdListVtable();

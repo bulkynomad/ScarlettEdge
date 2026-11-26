@@ -153,14 +153,27 @@ int main() {
     SX_CHECK(cs_dxil_valid == 1);
     SX_CHECK(Xs2ShaderFreeBytecode(cs_dxil) == 0);
 
-    // Lift to SPIR-V and validate magic header
+    // Lift to SPIR-V and validate SPIR-V 1.5 SSA instruction stream
     void* cs_spirv = nullptr;
     size_t cs_spirv_size = 0;
     SX_CHECK(Xs2ShaderLiftToSpirv(openworld_compute_kernel, openworld_kernel_bytes, &opts, &cs_spirv, &cs_spirv_size) == 0);
-    SX_CHECK(cs_spirv != nullptr && cs_spirv_size >= 20);
-    uint32_t spirv_magic = 0;
-    std::memcpy(&spirv_magic, cs_spirv, sizeof(spirv_magic));
-    SX_CHECK(spirv_magic == 0x07230203u);
+    SX_CHECK(cs_spirv != nullptr && cs_spirv_size >= 20 && (cs_spirv_size % 4) == 0);
+    const auto* spv_words = static_cast<const uint32_t*>(cs_spirv);
+    const size_t spv_count = cs_spirv_size / 4;
+    SX_CHECK(spv_words[0] == 0x07230203u);  // SPIR-V Magic
+    SX_CHECK(spv_words[1] == 0x00010500u);  // SPIR-V 1.5
+    bool has_fadd = false, has_fmul = false, has_ret = false, has_fn_end = false;
+    for (size_t wi = 5; wi < spv_count; ) {
+        const uint32_t wc = spv_words[wi] >> 16;
+        const uint32_t op = spv_words[wi] & 0xFFFFu;
+        SX_CHECK(wc >= 1 && wi + wc <= spv_count);
+        if (op == 129u) has_fadd = true;     // OpFAdd
+        if (op == 133u) has_fmul = true;     // OpFMul
+        if (op == 253u) has_ret = true;      // OpReturn
+        if (op == 56u) has_fn_end = true;    // OpFunctionEnd
+        wi += wc;
+    }
+    SX_CHECK(has_fadd && has_fmul && has_ret && has_fn_end);
     SX_CHECK(Xs2ShaderFreeBytecode(cs_spirv) == 0);
 
     // 8. RDNA2 Graphics Shaders (Pixel Shader with VINTRP + MIMG + EXP mrt0, Vertex Shader with EXP pos0)

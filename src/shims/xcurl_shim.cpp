@@ -14,6 +14,11 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <winhttp.h>
+#endif
+
 namespace {
 
 struct XCurlEasyHandle {
@@ -51,6 +56,92 @@ bool g_global_inited = false;
 std::unordered_map<void*, std::unique_ptr<XCurlEasyHandle>> g_handles;
 std::unordered_map<void*, std::unique_ptr<XCurlMultiHandle>> g_multis;
 std::vector<XCurlMockRule> g_mocks;
+
+bool XCurlLiveNetworkEnabled() {
+    const char* v = std::getenv("SCARLETTX_LIVE_NETWORK");
+    return v && v[0] == '1';
+}
+
+#if defined(_WIN32)
+bool XCurlPerformWinHttp(
+    const std::string& method,
+    const std::string& url,
+    const std::vector<uint8_t>& post_data,
+    int64_t timeout_sec,
+    int64_t& out_code,
+    std::vector<uint8_t>& out_body) {
+    static HMODULE wh = LoadLibraryW(L"winhttp.dll");
+    if (!wh) return false;
+    auto fnOpen = reinterpret_cast<decltype(&WinHttpOpen)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpOpen")));
+    auto fnCrack = reinterpret_cast<decltype(&WinHttpCrackUrl)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpCrackUrl")));
+    auto fnConnect = reinterpret_cast<decltype(&WinHttpConnect)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpConnect")));
+    auto fnOpenReq = reinterpret_cast<decltype(&WinHttpOpenRequest)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpOpenRequest")));
+    auto fnSetTimeouts = reinterpret_cast<decltype(&WinHttpSetTimeouts)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpSetTimeouts")));
+    auto fnSend = reinterpret_cast<decltype(&WinHttpSendRequest)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpSendRequest")));
+    auto fnRecv = reinterpret_cast<decltype(&WinHttpReceiveResponse)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpReceiveResponse")));
+    auto fnQueryHdr = reinterpret_cast<decltype(&WinHttpQueryHeaders)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpQueryHeaders")));
+    auto fnQueryAvail = reinterpret_cast<decltype(&WinHttpQueryDataAvailable)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpQueryDataAvailable")));
+    auto fnRead = reinterpret_cast<decltype(&WinHttpReadData)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpReadData")));
+    auto fnClose = reinterpret_cast<decltype(&WinHttpCloseHandle)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpCloseHandle")));
+    if (!fnOpen || !fnCrack || !fnConnect || !fnOpenReq || !fnSend || !fnRecv || !fnQueryHdr || !fnQueryAvail || !fnRead || !fnClose) {
+        return false;
+    }
+
+    std::wstring wurl(url.begin(), url.end());
+    std::wstring wmethod(method.begin(), method.end());
+    URL_COMPONENTS uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[256] = {};
+    wchar_t path[2048] = {};
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = 2048;
+    if (!fnCrack(wurl.c_str(), static_cast<DWORD>(wurl.size()), 0, &uc)) return false;
+
+    HINTERNET hSession = fnOpen(L"ScarlettEdge-XCurl/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
+    if (!hSession) return false;
+    if (fnSetTimeouts) {
+        const int ms = static_cast<int>(timeout_sec > 0 ? timeout_sec * 1000 : 15000);
+        fnSetTimeouts(hSession, ms, ms, ms, ms);
+    }
+    HINTERNET hConnect = fnConnect(hSession, host, uc.nPort, 0);
+    if (!hConnect) { fnClose(hSession); return false; }
+
+    const DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hReq = fnOpenReq(hConnect, wmethod.c_str(), path[0] ? path : L"/", nullptr, nullptr, nullptr, flags);
+    if (!hReq) { fnClose(hConnect); fnClose(hSession); return false; }
+
+    BOOL ok = fnSend(hReq, nullptr, 0,
+                     post_data.empty() ? nullptr : const_cast<uint8_t*>(post_data.data()),
+                     static_cast<DWORD>(post_data.size()),
+                     static_cast<DWORD>(post_data.size()), 0);
+    if (ok) ok = fnRecv(hReq, nullptr);
+    if (ok) {
+        DWORD status = 0;
+        DWORD status_sz = sizeof(status);
+        fnQueryHdr(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &status_sz, nullptr);
+        out_code = static_cast<int64_t>(status);
+        out_body.clear();
+        for (;;) {
+            DWORD avail = 0;
+            if (!fnQueryAvail(hReq, &avail) || avail == 0) break;
+            const size_t cur = out_body.size();
+            out_body.resize(cur + avail);
+            DWORD read = 0;
+            if (!fnRead(hReq, out_body.data() + cur, avail, &read) || read == 0) {
+                out_body.resize(cur);
+                break;
+            }
+            out_body.resize(cur + read);
+        }
+    }
+    fnClose(hReq);
+    fnClose(hConnect);
+    fnClose(hSession);
+    return ok != FALSE;
+}
+#endif
 
 // Caller holds g_mutex. Messages already handed out stay readable.
 void DetachLocked(XCurlMultiHandle& m, CURL* curl) {
@@ -197,6 +288,19 @@ CURLcode curl_easy_perform(CURL* curl) {
                 matched = true;
                 break;
             }
+        }
+        if (!matched) {
+#if defined(_WIN32)
+            int64_t live_code = 0;
+            std::vector<uint8_t> live_body;
+            if (XCurlLiveNetworkEnabled() &&
+                XCurlPerformWinHttp(h.method, h.url, h.post_data, h.timeout_sec, live_code, live_body)) {
+                h.response_code = live_code;
+                h.content_type = "application/octet-stream";
+                body = std::move(live_body);
+                matched = true;
+            }
+#endif
         }
         if (!matched) {
             h.response_code = 503;

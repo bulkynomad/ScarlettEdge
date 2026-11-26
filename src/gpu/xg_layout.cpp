@@ -10,8 +10,16 @@ namespace {
 
 constexpr uint32_t kMode4KbS = XG_SWIZZLE_MODE_4KB_S;
 constexpr uint32_t kMode256BS = 1;
+constexpr uint32_t kMode64KbS = 9;
+constexpr uint32_t kMode64KbD = 10;
+constexpr uint32_t kMode64KbRX = 25;
 constexpr uint32_t kBlockBytes = 4096;
+constexpr uint32_t kBlockBytes64K = 65536;
 constexpr uint32_t kMaxMips = 15;
+
+bool Is64KbAddressableMode(uint32_t mode) {
+    return mode == kMode64KbS || mode == kMode64KbD || mode == kMode64KbRX;
+}
 
 // Source of each offset bit inside a 4 KB block: 'x'/'y' and the coordinate bit.
 struct BitSource {
@@ -92,10 +100,13 @@ uint32_t BlockBytesForMode(uint32_t mode) {
 struct MipView {
     const XG_MIPLEVEL_LAYOUT* ml = nullptr;
     const BlockEquation* eq = nullptr;
-    uint32_t block_w = 0, block_h = 0;
+    uint32_t block_bytes = kBlockBytes;
+    uint32_t micro_w = 0, micro_h = 0;  // 4KB micro-tile width/height
+    uint32_t block_w = 0, block_h = 0;  // macro-tile width/height (4KB or 64KB)
     uint32_t origin_x = 0, origin_y = 0;  // position inside the tail block
     uint32_t pitch_blocks = 0;
     uint64_t base = 0;
+    bool is_64k = false;
 };
 
 bool ViewMip(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, MipView* view) {
@@ -106,8 +117,12 @@ bool ViewMip(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, Mip
     const BlockEquation* eq = FindEquation(plane.BytesPerElement);
     view->ml = &ml;
     view->eq = eq;
-    view->block_w = 1u << AxisBits(*eq, 'x', 12);
-    view->block_h = 1u << AxisBits(*eq, 'y', 12);
+    view->micro_w = 1u << AxisBits(*eq, 'x', 12);
+    view->micro_h = 1u << AxisBits(*eq, 'y', 12);
+    view->is_64k = Is64KbAddressableMode(ml.SwizzleMode) && !ml.Reserved64;
+    view->block_bytes = view->is_64k ? kBlockBytes64K : kBlockBytes;
+    view->block_w = view->is_64k ? (view->micro_w * 4u) : view->micro_w;
+    view->block_h = view->is_64k ? (view->micro_h * 4u) : view->micro_h;
     view->base = static_cast<uint64_t>(slice) * plane.Reserved10;
     if (ml.Reserved64) {
         const uint32_t in_block = static_cast<uint32_t>(ml.OffsetBytes) & (kBlockBytes - 1);
@@ -116,7 +131,7 @@ bool ViewMip(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, Mip
         view->pitch_blocks = 1;
         view->base += ml.OffsetBytes - in_block;
     } else {
-        view->pitch_blocks = ml.PaddedWidthElements / view->block_w;
+        view->pitch_blocks = std::max<uint32_t>(1, ml.PaddedWidthElements / view->block_w);
         view->base += ml.OffsetBytes;
     }
     return true;
@@ -124,12 +139,30 @@ bool ViewMip(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, Mip
 
 uint64_t XOffset(const MipView& v, uint32_t x) {
     x += v.origin_x;
-    return static_cast<uint64_t>(x / v.block_w) * kBlockBytes + AxisOffset(*v.eq, 'x', x % v.block_w);
+    if (!v.is_64k) {
+        return static_cast<uint64_t>(x / v.block_w) * kBlockBytes + AxisOffset(*v.eq, 'x', x % v.block_w);
+    }
+    const uint32_t macro_x = x / v.block_w;
+    const uint32_t in_macro_x = x % v.block_w;
+    const uint32_t sub_x = in_macro_x / v.micro_w;  // 0..3 -> bits 13, 15
+    const uint64_t sub_off = (static_cast<uint64_t>(sub_x & 1u) << 13) |
+                             (static_cast<uint64_t>((sub_x >> 1) & 1u) << 15);
+    return static_cast<uint64_t>(macro_x) * kBlockBytes64K + sub_off +
+           AxisOffset(*v.eq, 'x', in_macro_x % v.micro_w);
 }
 uint64_t YOffset(const MipView& v, uint32_t y) {
     y += v.origin_y;
-    return static_cast<uint64_t>(y / v.block_h) * v.pitch_blocks * kBlockBytes +
-           AxisOffset(*v.eq, 'y', y % v.block_h);
+    if (!v.is_64k) {
+        return static_cast<uint64_t>(y / v.block_h) * v.pitch_blocks * kBlockBytes +
+               AxisOffset(*v.eq, 'y', y % v.block_h);
+    }
+    const uint32_t macro_y = y / v.block_h;
+    const uint32_t in_macro_y = y % v.block_h;
+    const uint32_t sub_y = in_macro_y / v.micro_h;  // 0..3 -> bits 12, 14
+    const uint64_t sub_off = (static_cast<uint64_t>(sub_y & 1u) << 12) |
+                             (static_cast<uint64_t>((sub_y >> 1) & 1u) << 14);
+    return static_cast<uint64_t>(macro_y) * v.pitch_blocks * kBlockBytes64K + sub_off +
+           AxisOffset(*v.eq, 'y', in_macro_y % v.micro_h);
 }
 
 template <typename Fn>
@@ -189,7 +222,8 @@ bool IsAddressable(const XG_RESOURCE_LAYOUT& layout) {
     const XG_PLANE_LAYOUT& plane = layout.Plane[0];
     if (!FindEquation(plane.BytesPerElement)) return false;
     const uint32_t mode = plane.MipLayout[0].SwizzleMode;
-    return mode == kMode4KbS || (plane.MipLayout[0].Reserved64 && mode == kMode256BS);
+    return mode == kMode4KbS || Is64KbAddressableMode(mode) ||
+           (plane.MipLayout[0].Reserved64 && mode == kMode256BS);
 }
 
 bool TexelElementOffset(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice,
@@ -250,15 +284,18 @@ void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* o
     const uint32_t bpe = FormatBytesPerElement(desc.Format);
     const bool bc = IsBlockCompressed(desc.Format);
     const BlockEquation* eq = FindEquation(bpe);
+    const bool is_64k = Is64KbAddressableMode(desc.SwizzleMode) && eq != nullptr;
     const bool swizzled = desc.SwizzleMode == kMode4KbS && eq != nullptr;
 
-    // Block shape in elements. For modes without texel addressing only the
-    // padding is modelled, with a near-square block of the mode's size.
-    const uint32_t block_bytes = swizzled ? kBlockBytes : BlockBytesForMode(desc.SwizzleMode);
+    // Block shape in elements. Both 4KB_S and 64KB_S/D/R_X use exact texel addressing.
+    const uint32_t block_bytes = swizzled ? kBlockBytes : (is_64k ? kBlockBytes64K : BlockBytesForMode(desc.SwizzleMode));
     uint32_t block_w = 0, block_h = 0;
     if (swizzled) {
         block_w = 1u << AxisBits(*eq, 'x', 12);
         block_h = 1u << AxisBits(*eq, 'y', 12);
+    } else if (is_64k) {
+        block_w = (1u << AxisBits(*eq, 'x', 12)) * 4u;
+        block_h = (1u << AxisBits(*eq, 'y', 12)) * 4u;
     } else {
         const uint32_t elems_log2 = Log2(std::max<uint32_t>(1, block_bytes / std::max<uint32_t>(1, bpe)));
         block_w = 1u << ((elems_log2 + 1) / 2);

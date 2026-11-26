@@ -23,6 +23,24 @@ int main() {
     SX_CHECK(decomp_written == raw_len);
     SX_CHECK(std::memcmp(raw_data, decomp.data(), raw_len) == 0);
 
+    // 1b. Real GDeflate tile compression ratio & lossless roundtrip on 8 KiB structured asset
+    {
+        std::vector<uint8_t> asset(8192);
+        for (size_t i = 0; i < asset.size(); ++i) {
+            asset[i] = static_cast<uint8_t>((i / 16) % 7 + ((i % 16) < 4 ? 0xA0 : 0x20));
+        }
+        std::vector<uint8_t> gdef_out(8192 + 128, 0);
+        size_t gdef_sz = 0;
+        SX_CHECK(XboxCodecGDeflateCompress(asset.data(), asset.size(), gdef_out.data(), gdef_out.size(), &gdef_sz) == 0);
+        SX_CHECK(gdef_out[0] == 0x04u && gdef_out[1] == 0xFBu);  // Microsoft GDeflate tile magic
+        SX_CHECK(gdef_sz < asset.size() / 2);                   // Real compression (> 2:1 ratio)
+        std::vector<uint8_t> restored(asset.size(), 0);
+        size_t restored_sz = 0;
+        SX_CHECK(XboxCodecGDeflateDecompress(gdef_out.data(), gdef_sz, restored.data(), restored.size(), &restored_sz) == 0);
+        SX_CHECK(restored_sz == asset.size());
+        SX_CHECK(std::memcmp(asset.data(), restored.data(), asset.size()) == 0);
+    }
+
     // 2. BCPack compress & decompress
     std::vector<uint8_t> bc_comp(128, 0);
     size_t bc_comp_len = 0;

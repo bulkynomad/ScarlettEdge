@@ -179,6 +179,14 @@ void TestRoundTrip() {
     RoundTrip(Desc(40, 24, 6, kR8, 2));
     RoundTrip(Desc(128, 64, 8, 49));  // R8G8
     RoundTrip(Desc(48, 80, 7, 10));   // R16G16B16A16_FLOAT
+
+    // 64KB_S (mode 9) and 64KB_R_X (mode 25) RDNA2 macro-tile addressing round-trips
+    auto d64s = Desc(256, 256, 1, kRgba8);
+    d64s.SwizzleMode = 9;
+    RoundTrip(d64s);
+    auto d64rx = Desc(512, 256, 1, kBc3);
+    d64rx.SwizzleMode = 25;
+    RoundTrip(d64rx);
 }
 
 // The texture computer as a title uses it: through its vtable.

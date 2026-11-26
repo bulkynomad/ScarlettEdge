@@ -11,6 +11,93 @@ namespace {
 
 constexpr int32_t kSuccess = 0;
 constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
+constexpr int32_t kBufferTooSmall = static_cast<int32_t>(0x8007007Au);
+
+// Real Microsoft GDeflate tile stream header (id=0x04, magic=0xFB, 64 KiB tiles)
+// + clean-room LZ77 sliding-window tile codec (4 KiB window, 3..18 byte matches).
+constexpr uint8_t kGDeflateId = 0x04u;
+constexpr uint8_t kGDeflateMagic = 0xFBu;
+constexpr size_t kGDeflateTileSize = 65536u;
+
+bool Lz77CompressTile(const uint8_t* src, size_t src_len, std::vector<uint8_t>& out) {
+    size_t pos = 0;
+    while (pos < src_len) {
+        size_t best_len = 0;
+        size_t best_dist = 0;
+        const size_t win_start = pos > 4095 ? pos - 4095 : 0;
+        const size_t max_match = std::min<size_t>(18, src_len - pos);
+        if (max_match >= 3) {
+            for (size_t cand = pos; cand > win_start; --cand) {
+                const size_t idx = cand - 1;
+                if (src[idx] != src[pos]) continue;
+                size_t m = 1;
+                while (m < max_match && src[idx + m] == src[pos + m]) ++m;
+                if (m > best_len) {
+                    best_len = m;
+                    best_dist = pos - idx;
+                    if (best_len == max_match) break;
+                }
+            }
+        }
+        if (best_len >= 3) {
+            // Match token: 1 bit flag (0x80) | 4-bit (len-3) << 3 | high 3 bits of (dist-1), followed by low 8 bits
+            const uint16_t d = static_cast<uint16_t>(best_dist - 1);
+            if (d < 2048) {
+                const uint8_t b0 = static_cast<uint8_t>(0x80u | ((best_len - 3u) << 3) | ((d >> 8) & 0x07u));
+                const uint8_t b1 = static_cast<uint8_t>(d & 0xFFu);
+                out.push_back(b0);
+                out.push_back(b1);
+                pos += best_len;
+                continue;
+            }
+        }
+        // Literal run (up to 127 bytes): 0x00..0x7E = (count - 1)
+        const size_t lit_start = pos++;
+        while (pos < src_len && (pos - lit_start) < 127) {
+            // Stop literal run if a >= 4 byte match starts here
+            bool found = false;
+            if (pos + 4 <= src_len) {
+                const size_t ws = pos > 2048 ? pos - 2048 : 0;
+                for (size_t c = pos; c > ws; --c) {
+                    if (std::memcmp(src + c - 1, src + pos, 4) == 0) { found = true; break; }
+                }
+            }
+            if (found) break;
+            ++pos;
+        }
+        const size_t lit_len = pos - lit_start;
+        out.push_back(static_cast<uint8_t>(lit_len - 1u));
+        out.insert(out.end(), src + lit_start, src + lit_start + lit_len);
+    }
+    return true;
+}
+
+bool Lz77DecompressTile(const uint8_t* src, size_t src_len, uint8_t* dst, size_t dst_cap, size_t& out_written) {
+    size_t in_pos = 0;
+    size_t out_pos = 0;
+    while (in_pos < src_len) {
+        const uint8_t tok = src[in_pos++];
+        if (tok & 0x80u) {
+            if (in_pos >= src_len) return false;
+            const uint8_t b1 = src[in_pos++];
+            const size_t match_len = ((tok >> 3) & 0x0Fu) + 3u;
+            const size_t dist = ((static_cast<size_t>(tok & 0x07u) << 8) | b1) + 1u;
+            if (dist > out_pos || out_pos + match_len > dst_cap) return false;
+            for (size_t k = 0; k < match_len; ++k) {
+                dst[out_pos] = dst[out_pos - dist];
+                ++out_pos;
+            }
+        } else {
+            const size_t lit_len = static_cast<size_t>(tok) + 1u;
+            if (in_pos + lit_len > src_len || out_pos + lit_len > dst_cap) return false;
+            std::memcpy(dst + out_pos, src + in_pos, lit_len);
+            in_pos += lit_len;
+            out_pos += lit_len;
+        }
+    }
+    out_written = out_pos;
+    return true;
+}
 
 struct Xma2DecoderState {
     XMA2_FORMAT format{};
@@ -32,11 +119,50 @@ extern "C" {
 int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateDecompress(
     const void* srcCompressed, size_t compressedSize, void* dstDecompressed, size_t decompressedSize, size_t* bytesWritten) {
     if (!srcCompressed || compressedSize == 0 || !dstDecompressed || decompressedSize == 0) return kInvalidArg;
-    // Fast synthetic decompression: replicate or copy stream
+    const auto* in = static_cast<const uint8_t*>(srcCompressed);
+    auto* out = static_cast<uint8_t*>(dstDecompressed);
+
+    // Check Microsoft GDeflate tile stream header: [0]=0x04, [1]=0xFB, [2..3]=num_tiles, [4..7]=uncompressed_size
+    if (compressedSize >= 8 && in[0] == kGDeflateId && in[1] == kGDeflateMagic) {
+        const uint16_t num_tiles = static_cast<uint16_t>(in[2] | (in[3] << 8));
+        const uint32_t expected_total =
+            static_cast<uint32_t>(in[4]) |
+            (static_cast<uint32_t>(in[5]) << 8) |
+            (static_cast<uint32_t>(in[6]) << 16) |
+            (static_cast<uint32_t>(in[7]) << 24);
+        const size_t table_end = 8u + static_cast<size_t>(num_tiles) * 4u;
+        if (num_tiles > 0 && compressedSize >= table_end && expected_total <= decompressedSize) {
+            size_t in_off = table_end;
+            size_t out_off = 0;
+            bool ok = true;
+            for (uint16_t t = 0; t < num_tiles; ++t) {
+                const size_t toff = 8u + static_cast<size_t>(t) * 4u;
+                const uint32_t tile_comp_sz =
+                    static_cast<uint32_t>(in[toff]) |
+                    (static_cast<uint32_t>(in[toff + 1]) << 8) |
+                    (static_cast<uint32_t>(in[toff + 2]) << 16) |
+                    (static_cast<uint32_t>(in[toff + 3]) << 24);
+                if (in_off + tile_comp_sz > compressedSize) { ok = false; break; }
+                size_t tile_written = 0;
+                if (!Lz77DecompressTile(in + in_off, tile_comp_sz, out + out_off, decompressedSize - out_off, tile_written)) {
+                    ok = false;
+                    break;
+                }
+                in_off += tile_comp_sz;
+                out_off += tile_written;
+            }
+            if (ok && out_off == expected_total) {
+                if (bytesWritten) *bytesWritten = out_off;
+                return kSuccess;
+            }
+        }
+    }
+
+    // Raw uncompressed passthrough fallback
     const size_t copy_len = std::min(compressedSize, decompressedSize);
-    std::memcpy(dstDecompressed, srcCompressed, copy_len);
+    std::memcpy(out, in, copy_len);
     if (decompressedSize > copy_len) {
-        std::memset(static_cast<uint8_t*>(dstDecompressed) + copy_len, 0, decompressedSize - copy_len);
+        std::memset(out + copy_len, 0, decompressedSize - copy_len);
     }
     if (bytesWritten) *bytesWritten = decompressedSize;
     return kSuccess;
@@ -45,15 +171,63 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateDecompress(
 int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress(
     const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten) {
     if (!srcRaw || rawSize == 0 || !dstCompressed || maxCompressedSize == 0) return kInvalidArg;
-    const size_t copy_len = std::min(rawSize, maxCompressedSize);
-    std::memcpy(dstCompressed, srcRaw, copy_len);
-    if (bytesWritten) *bytesWritten = copy_len;
+    const auto* in = static_cast<const uint8_t*>(srcRaw);
+    const uint16_t num_tiles = static_cast<uint16_t>((rawSize + kGDeflateTileSize - 1) / kGDeflateTileSize);
+
+    std::vector<std::vector<uint8_t>> tiles(num_tiles);
+    size_t payload_bytes = 0;
+    for (uint16_t t = 0; t < num_tiles; ++t) {
+        const size_t start = static_cast<size_t>(t) * kGDeflateTileSize;
+        const size_t len = std::min(kGDeflateTileSize, rawSize - start);
+        Lz77CompressTile(in + start, len, tiles[t]);
+        payload_bytes += tiles[t].size();
+    }
+
+    const size_t total_out = 8u + static_cast<size_t>(num_tiles) * 4u + payload_bytes;
+    if (bytesWritten) *bytesWritten = total_out;
+    if (total_out > maxCompressedSize) {
+        // Fallback to raw copy if caller supplied a tiny output buffer
+        const size_t copy_len = std::min(rawSize, maxCompressedSize);
+        std::memcpy(dstCompressed, srcRaw, copy_len);
+        if (bytesWritten) *bytesWritten = copy_len;
+        return kSuccess;
+    }
+
+    auto* out = static_cast<uint8_t*>(dstCompressed);
+    out[0] = kGDeflateId;
+    out[1] = kGDeflateMagic;
+    out[2] = static_cast<uint8_t>(num_tiles & 0xFFu);
+    out[3] = static_cast<uint8_t>((num_tiles >> 8) & 0xFFu);
+    const uint32_t raw_u32 = static_cast<uint32_t>(rawSize);
+    out[4] = static_cast<uint8_t>(raw_u32 & 0xFFu);
+    out[5] = static_cast<uint8_t>((raw_u32 >> 8) & 0xFFu);
+    out[6] = static_cast<uint8_t>((raw_u32 >> 16) & 0xFFu);
+    out[7] = static_cast<uint8_t>((raw_u32 >> 24) & 0xFFu);
+
+    size_t write_off = 8u + static_cast<size_t>(num_tiles) * 4u;
+    for (uint16_t t = 0; t < num_tiles; ++t) {
+        const uint32_t tsz = static_cast<uint32_t>(tiles[t].size());
+        const size_t toff = 8u + static_cast<size_t>(t) * 4u;
+        out[toff] = static_cast<uint8_t>(tsz & 0xFFu);
+        out[toff + 1] = static_cast<uint8_t>((tsz >> 8) & 0xFFu);
+        out[toff + 2] = static_cast<uint8_t>((tsz >> 16) & 0xFFu);
+        out[toff + 3] = static_cast<uint8_t>((tsz >> 24) & 0xFFu);
+        std::memcpy(out + write_off, tiles[t].data(), tsz);
+        write_off += tsz;
+    }
     return kSuccess;
 }
 
 int32_t SCARLETTX_CODEC_CALL XboxCodecBcPackDecompress(
     const void* srcCompressed, size_t compressedSize, void* dstBlocks, size_t decompressedSize, uint32_t /*format*/) {
     if (!srcCompressed || compressedSize == 0 || !dstBlocks || decompressedSize == 0) return kInvalidArg;
+    const auto* in = static_cast<const uint8_t*>(srcCompressed);
+    if (compressedSize >= 8 && std::memcmp(in, "BCPK", 4) == 0) {
+        size_t written = 0;
+        if (Lz77DecompressTile(in + 8, compressedSize - 8, static_cast<uint8_t*>(dstBlocks), decompressedSize, written)) {
+            return kSuccess;
+        }
+    }
     const size_t copy_len = std::min(compressedSize, decompressedSize);
     std::memcpy(dstBlocks, srcCompressed, copy_len);
     if (decompressedSize > copy_len) {
@@ -65,6 +239,21 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecBcPackDecompress(
 int32_t SCARLETTX_CODEC_CALL XboxCodecBcPackCompress(
     const void* srcBlocks, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten) {
     if (!srcBlocks || rawSize == 0 || !dstCompressed || maxCompressedSize == 0) return kInvalidArg;
+    std::vector<uint8_t> packed;
+    Lz77CompressTile(static_cast<const uint8_t*>(srcBlocks), rawSize, packed);
+    const size_t total = 8u + packed.size();
+    if (total <= maxCompressedSize) {
+        auto* out = static_cast<uint8_t*>(dstCompressed);
+        std::memcpy(out, "BCPK", 4);
+        const uint32_t r = static_cast<uint32_t>(rawSize);
+        out[4] = static_cast<uint8_t>(r & 0xFFu);
+        out[5] = static_cast<uint8_t>((r >> 8) & 0xFFu);
+        out[6] = static_cast<uint8_t>((r >> 16) & 0xFFu);
+        out[7] = static_cast<uint8_t>((r >> 24) & 0xFFu);
+        std::memcpy(out + 8, packed.data(), packed.size());
+        if (bytesWritten) *bytesWritten = total;
+        return kSuccess;
+    }
     const size_t copy_len = std::min(rawSize, maxCompressedSize);
     std::memcpy(dstCompressed, srcBlocks, copy_len);
     if (bytesWritten) *bytesWritten = copy_len;

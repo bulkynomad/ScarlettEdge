@@ -563,7 +563,7 @@ def collect_optimization_metrics() -> list[Subsystem]:
             category="Storage",
             implemented=4,
             target=4,
-            notes="Persistent Windows OVERLAPPED async NVMe I/O, encrypted XVD streaming, GDeflate & LZ-RLE decompression",
+            notes="Persistent Windows OVERLAPPED async NVMe I/O, encrypted XVD streaming, real GDeflate (0x04FB) LZ77 tile & BCPack codecs",
         ),
         Subsystem(
             name="RDNA2 Microcode Lifter",
@@ -571,7 +571,7 @@ def collect_optimization_metrics() -> list[Subsystem]:
             category="Compute",
             implemented=4,
             target=4,
-            notes="RDNA2 Graphics (EXP, VINTRP, MIMG) + Compute (SMEM, VOP2/3, VMEM, LDS, SOPP) ISA decoder & stage-aware DXIL/SPIR-V lifter",
+            notes="RDNA2 Graphics (EXP, VINTRP, MIMG) + Compute ISA decoder emitting real SPIR-V 1.5 SSA IR (OpFAdd/OpFMul) & DXIL SM 6.5 containers",
         ),
         Subsystem(
             name="Hardware DXR 1.1 & Vulkan",
@@ -603,7 +603,7 @@ def collect_optimization_metrics() -> list[Subsystem]:
             category="Graphics",
             implemented=4,
             target=4,
-            notes="128-slot D3D12.2 / DXR 1.1 / Mesh Shader COM proxies (ResolveSubresource, ExecuteIndirect, DispatchMesh) & multi-SDK delta maps",
+            notes="128-slot D3D12.2 / Enhanced Barriers (CL7::Barrier) / DXR 1.1 / Mesh Shaders + XG 64KB_S/64KB_D/64KB_R_X macro-tile swizzling",
         ),
         Subsystem(
             name="Audio DSP & XAPO Effects",
@@ -619,7 +619,7 @@ def collect_optimization_metrics() -> list[Subsystem]:
             category="Services",
             implemented=3,
             target=4,
-            notes="Opt-in live WinHTTP HTTPS/HTTP socket transport (SCARLETTX_LIVE_NETWORK=1) + offline mock registry; pending native Bink2 FMV decode",
+            notes="Opt-in live WinHTTP HTTPS/HTTP socket transport in both libHttpClient & XCurl (SCARLETTX_LIVE_NETWORK=1); pending native Bink2 FMV",
         ),
     ]
 

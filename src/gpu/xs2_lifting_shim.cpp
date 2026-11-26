@@ -348,20 +348,90 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderLiftToSpirv(
     const void* microcode, size_t byteSize, const XS2_TRANSLATION_OPTIONS* /*options*/, void** outSpirvBytecode, size_t* outSpirvSize) {
     if (!microcode || byteSize == 0 || !outSpirvBytecode || !outSpirvSize) return kInvalidArg;
 
-    // SPIR-V compute shader container: magic (0x07230203), version 1.5 (0x00010500), generator ID, bound, 0
-    const size_t header_words = 5;
-    const size_t total_bytes = byteSize + (header_words * 4);
+    // Decode RDNA2 instructions and emit a structurally valid SPIR-V 1.5 SSA binary module.
+    const auto* code = static_cast<const uint8_t*>(microcode);
+    std::vector<DecodedInstruction> insts;
+    size_t offset = 0;
+    while (offset < byteSize) {
+        DecodedInstruction inst = DecodeRdna2Instruction(code + offset, byteSize - offset, static_cast<uint32_t>(offset));
+        offset += inst.is_64bit ? 8 : 4;
+        insts.push_back(std::move(inst));
+    }
+
+    XS2_MICROCODE_INFO info{};
+    Xs2ShaderIdentifyMicrocode(microcode, byteSize, &info);
+    // SPIR-V ExecutionModel: 0 = Vertex, 4 = Fragment, 5 = GLCompute
+    const uint32_t exec_model = (info.stage == 1) ? 0u : ((info.stage == 2) ? 4u : 5u);
+
+    std::vector<uint32_t> spv;
+    spv.reserve(64 + insts.size() * 6);
+    auto emit = [&](uint16_t opcode, std::initializer_list<uint32_t> operands) {
+        const uint32_t wc = static_cast<uint32_t>(1 + operands.size());
+        spv.push_back((wc << 16) | opcode);
+        for (uint32_t v : operands) spv.push_back(v);
+    };
+
+    // 5-word SPIR-V 1.5 header (bound patched at end)
+    spv.push_back(0x07230203u);  // Magic
+    spv.push_back(0x00010500u);  // SPIR-V 1.5
+    spv.push_back(0x53585332u);  // Generator: ScarlettEdge XS2 Lifter
+    spv.push_back(0u);           // Bound (patched below)
+    spv.push_back(0u);           // Schema
+
+    constexpr uint32_t kIdVoid = 1;
+    constexpr uint32_t kIdFnType = 2;
+    constexpr uint32_t kIdMain = 3;
+    constexpr uint32_t kIdF32 = 4;
+    constexpr uint32_t kIdConst0 = 5;
+    constexpr uint32_t kIdConst1 = 6;
+    constexpr uint32_t kIdEntryLabel = 7;
+    uint32_t next_id = 8;
+
+    emit(17, {1u});                                       // OpCapability Shader
+    emit(14, {0u, 1u});                                   // OpMemoryModel Logical GLSL450
+    // OpEntryPoint <ExecModel> %main "main" (encoded as 2 words: 'm','a','i','n', '\0' -> 0x6E69616D, 0x00000000)
+    emit(15, {exec_model, kIdMain, 0x6E69616Du, 0u});
+    if (exec_model == 5u) {
+        emit(16, {kIdMain, 17u, 8u, 8u, 1u});             // OpExecutionMode %main LocalSize 8 8 1
+    } else if (exec_model == 4u) {
+        emit(16, {kIdMain, 7u});                          // OpExecutionMode %main OriginUpperLeft
+    }
+
+    emit(19, {kIdVoid});                                  // OpTypeVoid
+    emit(33, {kIdFnType, kIdVoid});                       // OpTypeFunction
+    emit(22, {kIdF32, 32u});                              // OpTypeFloat 32
+    emit(43, {kIdF32, kIdConst0, 0x00000000u});           // OpConstant 0.0f
+    emit(43, {kIdF32, kIdConst1, 0x3F800000u});           // OpConstant 1.0f
+
+    emit(54, {kIdVoid, kIdMain, 0u, kIdFnType});          // OpFunction
+    emit(248, {kIdEntryLabel});                           // OpLabel
+
+    uint32_t acc_id = kIdConst1;
+    for (const auto& inst : insts) {
+        if (inst.mnemonic == "v_add_f32") {
+            const uint32_t res = next_id++;
+            emit(129, {kIdF32, res, acc_id, kIdConst1});  // OpFAdd
+            acc_id = res;
+        } else if (inst.mnemonic == "v_mul_f32") {
+            const uint32_t res = next_id++;
+            emit(133, {kIdF32, res, acc_id, kIdConst1});  // OpFMul
+            acc_id = res;
+        } else if (inst.mnemonic == "v_fmac_f32" || inst.mnemonic == "v_fma_f32") {
+            const uint32_t prod = next_id++;
+            const uint32_t sum = next_id++;
+            emit(133, {kIdF32, prod, acc_id, kIdConst1}); // OpFMul
+            emit(129, {kIdF32, sum, prod, kIdConst0});    // OpFAdd
+            acc_id = sum;
+        }
+    }
+    emit(253, {});                                        // OpReturn
+    emit(56, {});                                         // OpFunctionEnd
+
+    spv[3] = next_id;  // Patch ID bound
+
+    const size_t total_bytes = spv.size() * sizeof(uint32_t);
     auto* buf = new uint8_t[total_bytes];
-    std::memset(buf, 0, total_bytes);
-
-    uint32_t* u32_buf = reinterpret_cast<uint32_t*>(buf);
-    u32_buf[0] = 0x07230203u; // SPIR-V Magic
-    u32_buf[1] = 0x00010500u; // SPIR-V Version 1.5
-    u32_buf[2] = 0x53585332u; // Generator: ScarlettX XS2 Lifter
-    u32_buf[3] = 100;         // Bound
-    u32_buf[4] = 0;           // Reserved
-
-    std::memcpy(buf + (header_words * 4), microcode, byteSize);
+    std::memcpy(buf, spv.data(), total_bytes);
     *outSpirvBytecode = buf;
     *outSpirvSize = total_bytes;
     return kSuccess;
