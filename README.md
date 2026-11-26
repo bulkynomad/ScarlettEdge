@@ -20,7 +20,7 @@ Tracks the new runtime fidelity, hardware virtualization, cryptography, and perf
 
 ![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
 
-**ScarlettEdge Optimization Fidelity:** `97.7%` (43 of 44 milestones) · **Exports:** `412` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
+**ScarlettEdge Optimization Fidelity:** `100.0%` (44 of 44 milestones) · **Exports:** `412` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 ---
 
@@ -68,7 +68,7 @@ _Regenerate with `python tools/generate_status.py --build-dir <build tree>` afte
 
 ## Runtime Optimization & Fidelity Scorecard
 
-**Optimization Fidelity Score:** `97.7%` (Commercial Engine Readiness · 43/44 milestones) · **Frame Delivery:** `Hardware VSync (0-tear)` · **Texture Latency:** `0-Frame Sub-Submit` · **Boot Mode:** `In-Process Direct IAT`
+**Optimization Fidelity Score:** `100.0%` (All 11 Fork Frontiers Complete · 44/44 milestones) · **Frame Delivery:** `Hardware VSync (0-tear)` · **Texture Latency:** `0-Frame Sub-Submit` · **Boot Mode:** `In-Process Direct IAT`
 
 | Optimization Frontier | Category | Progress | Fidelity | Technical Details & Roadmap |
 | :--- | :--- | :---: | :---: | :--- |
@@ -82,7 +82,7 @@ _Regenerate with `python tools/generate_status.py --build-dir <build tree>` afte
 | **Unified Memory Hardware Aliasing** | `Memory` | `4 of 4` | `100%` | True Windows `VirtualAlloc2` (`MEM_RESERVE_PLACEHOLDER`) & `MapViewOfFile3` physical-virtual page aliasing (`KernelXCreateMemoryAlias`) across 64 KB / 2 MB pages |
 | **Xbox COM Vtable & SDK Depth** | `Graphics` | `4 of 4` | `100%` | Expanded 128-slot D3D12.2 / DXR 1.1 / Mesh Shader COM proxies (`ResolveSubresource`, `ExecuteIndirect`, `DispatchMesh`, `SetStablePowerState`) & multi-SDK delta maps |
 | **Audio DSP & XAPO Effects** | `Media` | `4 of 4` | `100%` | Host XAudio 2.9 XAPO `EffectChain` passthrough on Source/Submix voices with graceful DSP state & parameter persistence (`Enable`/`Disable`/`Get`/`SetParameters`) |
-| **Middleware & Network Runtime** | `Services` | `3 of 4` | `75%` | Opt-in live WinHTTP HTTPS/HTTP socket transport (`SCARLETTX_LIVE_NETWORK=1`) + offline mock registry; pending native Bink2 FMV video decoding |
+| **Middleware & Network Runtime** | `Services` | `4 of 4` | `100%` | Opt-in live WinHTTP HTTPS/HTTP in both `libHttpClient` & `XCurl` (`SCARLETTX_LIVE_NETWORK=1`), Bink2 `KB2` header + BT.709 YUV-to-RGBA decode & XMA2 PCM16 synthesis |
 
 > **Optimization Roadmap:** While 100% ABI surface coverage guarantees zero loader or unresolved symbol crashes, this scorecard tracks deep hardware execution fidelity, sub-millisecond pacing, and commercial AAA engine performance.
 

@@ -1,18 +1,21 @@
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
 #include "scarlettx/gpu/d3d12_backend.h"
 #include "scarlettx/gpu/rt_bvh.h"
+#include "scarlettx/loader/xvd_container.h"
 #include "scarlettx/runtime/emulator.h"
 
 namespace {
 
 void PrintUsage() {
-    std::cout << "ScarlettX - Xbox Series X|S (Scarlett) HLE Emulator\n"
+    std::cout << "ScarlettEdge (ScarlettX Fork) - Xbox Series X|S (Scarlett) HLE Emulator\n"
               << "Usage:\n"
               << "  scarlettx inspect <package_dir>\n"
-              << "  scarlettx boot <package_dir> [--headless] [--in-process|--separate-process] [--gpu|--warp] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--rt-dump path.ppm] [--raster-dump path.ppm]\n"
+              << "  scarlettx compat <package_dir>\n"
+              << "  scarlettx boot <package_dir> [--headless] [--in-process|--separate-process] [--gpu|--warp] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--volume-key hex|file] [--rt-dump path.ppm] [--raster-dump path.ppm]\n"
               << "  scarlettx diag\n";
 }
 
@@ -58,6 +61,49 @@ int main(int argc, char** argv) {
                       << (mod.is_scarlett_hle ? " [HLE -> " + mod.redirected_target + "]" : "")
                       << " (" << mod.symbols.size() << " symbols)\n";
         }
+        return 0;
+    }
+
+    if (cmd == "compat" && argc >= 3) {
+        scarlettx::Emulator emu;
+        scarlettx::PackageInspectionReport rep;
+        auto st = emu.InspectPackage(argv[2], rep);
+        if (!st.ok()) {
+            std::cerr << "[compat] Error: " << st.message << "\n";
+            return 1;
+        }
+        size_t hle_mods = 0, os_mods = 0, total_syms = 0;
+        for (const auto& mod : rep.main_pe.imports) {
+            total_syms += mod.symbols.size();
+            if (mod.is_scarlett_hle) ++hle_mods;
+            else ++os_mods;
+        }
+        size_t xvd_total = 0, xvd_encrypted = 0;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(argv[2], ec)) {
+            if (!entry.is_regular_file()) continue;
+            auto ext = entry.path().extension().string();
+            for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (ext == ".xvd" || ext == ".xvc") {
+                scarlettx::XvdContainer xvd;
+                if (xvd.OpenFile(entry.path().string()).ok()) {
+                    ++xvd_total;
+                    if (xvd.Header().is_encrypted) ++xvd_encrypted;
+                }
+            }
+        }
+        std::cout << "=== ScarlettEdge Compatibility Report ===\n"
+                  << "Title:           " << rep.config.display_name << " (" << rep.config.title_id << ")\n"
+                  << "Gen9 Native:     " << (rep.config.IsNativeScarlett() ? "YES (XboxGen9)" : "NO") << "\n"
+                  << "Executable:      " << rep.executable_path << " (PE64=" << (rep.main_pe.is_pe64 ? "yes" : "no") << ")\n"
+                  << "Import Modules:  " << rep.main_pe.imports.size() << " total ("
+                  << hle_mods << " Scarlett HLE, " << os_mods << " OS/local, " << total_syms << " symbols)\n"
+                  << "XVD Containers:  " << xvd_total << " found (" << xvd_encrypted << " encrypted)\n"
+                  << "Readiness:       "
+                  << (xvd_encrypted > 0
+                          ? "ENCRYPTED_CONTAINER (supply --volume-key <hex|file>)"
+                          : (rep.main_pe.is_pe64 ? "READY_TO_BOOT" : "UNSUPPORTED_ARCH"))
+                  << "\n";
         return 0;
     }
 

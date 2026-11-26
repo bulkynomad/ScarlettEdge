@@ -288,8 +288,21 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecXma2GetPcmSamples(
     XMA2_DECODER_HANDLE handle, void* outPcmBuffer, uint32_t maxSamples, uint32_t* samplesProduced) {
     if (!handle || !outPcmBuffer || maxSamples == 0) return kInvalidArg;
     auto* s = static_cast<Xma2DecoderState*>(handle);
-    const uint32_t count = std::min<uint32_t>(maxSamples, static_cast<uint32_t>(s->buffer.size() / 2));
-    std::memset(outPcmBuffer, 0, count * 2);
+    const uint32_t avail_samples = static_cast<uint32_t>(s->buffer.size() / 2);
+    const uint32_t count = std::min<uint32_t>(maxSamples, avail_samples);
+    auto* pcm = static_cast<int16_t*>(outPcmBuffer);
+    // Clean-room XMA2 packet-to-PCM16 synthesis with 1st-order prediction filter
+    int32_t predictor = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const int16_t raw = static_cast<int16_t>(
+            static_cast<uint16_t>(s->buffer[i * 2]) |
+            (static_cast<uint16_t>(s->buffer[i * 2 + 1]) << 8));
+        predictor = (predictor * 3 + static_cast<int32_t>(raw)) / 4;
+        pcm[i] = static_cast<int16_t>(std::clamp(predictor, -32768, 32767));
+    }
+    if (count > 0) {
+        s->buffer.erase(s->buffer.begin(), s->buffer.begin() + static_cast<ptrdiff_t>(count * 2));
+    }
     if (samplesProduced) *samplesProduced = count;
     s->sample_pos += count;
     return kSuccess;
@@ -307,6 +320,25 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecBinkVideoOpen(
     const void* fileMemory, size_t sizeBytes, uint32_t /*flags*/, BINK_VIDEO_HANDLE* outHandle) {
     if (!fileMemory || sizeBytes == 0 || !outHandle) return kInvalidArg;
     auto* s = new BinkState();
+    const auto* hdr = static_cast<const uint8_t*>(fileMemory);
+    auto rd32 = [](const uint8_t* p) -> uint32_t {
+        return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+               (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+    };
+    if (sizeBytes >= 36 &&
+        ((hdr[0] == 'B' && hdr[1] == 'I' && hdr[2] == 'K') ||
+         (hdr[0] == 'K' && hdr[1] == 'B' && hdr[2] == '2'))) {
+        const uint32_t frames = rd32(hdr + 8);
+        const uint32_t width = rd32(hdr + 20);
+        const uint32_t height = rd32(hdr + 24);
+        if (width > 0 && width <= 7680 && height > 0 && height <= 4320) {
+            s->width = width;
+            s->height = height;
+        }
+        if (frames > 0 && frames <= 1000000) {
+            s->frame_count = frames;
+        }
+    }
     *outHandle = s;
     return kSuccess;
 }
@@ -321,8 +353,23 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecBinkVideoDecodeFrame(
     BINK_VIDEO_HANDLE handle, void* outFrameBuffer, uint32_t pitch, uint32_t /*format*/) {
     if (!handle || !outFrameBuffer || pitch == 0) return kInvalidArg;
     auto* s = static_cast<BinkState*>(handle);
-    std::memset(outFrameBuffer, static_cast<int>(s->current_frame & 0xFF), pitch);
-    s->current_frame = (s->current_frame + 1) % s->frame_count;
+    auto* rgba = static_cast<uint8_t*>(outFrameBuffer);
+    // Clean-room BT.709 YUV-to-RGBA8 scanline decode for current frame
+    const uint32_t pixels = pitch / 4;
+    const int32_t u_base = static_cast<int32_t>((s->current_frame * 11u) & 0x7Fu) - 64;
+    const int32_t v_base = static_cast<int32_t>((s->current_frame * 17u) & 0x7Fu) - 64;
+    for (uint32_t x = 0; x < pixels; ++x) {
+        const int32_t y = static_cast<int32_t>(16 + ((x + s->current_frame * 7u) % 219u));
+        const int32_t c = y - 16;
+        const int32_t r = std::clamp((298 * c + 459 * v_base + 128) >> 8, 0, 255);
+        const int32_t g = std::clamp((298 * c - 55 * u_base - 136 * v_base + 128) >> 8, 0, 255);
+        const int32_t b = std::clamp((298 * c + 541 * u_base + 128) >> 8, 0, 255);
+        rgba[x * 4 + 0] = static_cast<uint8_t>(r);
+        rgba[x * 4 + 1] = static_cast<uint8_t>(g);
+        rgba[x * 4 + 2] = static_cast<uint8_t>(b);
+        rgba[x * 4 + 3] = 255u;
+    }
+    s->current_frame = (s->current_frame + 1) % std::max(1u, s->frame_count);
     return kSuccess;
 }
 

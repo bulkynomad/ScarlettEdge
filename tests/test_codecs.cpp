@@ -63,21 +63,29 @@ int main() {
     uint8_t pcm_out[256]{};
     uint32_t samples = 0;
     SX_CHECK(XboxCodecXma2GetPcmSamples(xma, pcm_out, 64, &samples) == 0);
+    SX_CHECK(samples == 64);
+    SX_CHECK(pcm_out[0] != 0 || pcm_out[1] != 0);  // Real non-zero PCM16 output
     SX_CHECK(XboxCodecXma2Reset(xma) == 0);
     SX_CHECK(XboxCodecXma2DestroyDecoder(xma) == 0);
 
-    // 4. Bink video & audio
-    uint8_t bink_file_mem[256]{'B', 'I', 'K', '2'};
+    // 4. Bink video & audio (including KB2 header parsing & BT.709 YUV-to-RGBA decode)
+    uint8_t bink_file_mem[256]{'K', 'B', '2', 'i'};
+    // Set frames=120 at +8, width=1280 at +20, height=720 at +24
+    uint32_t kb2_frames = 120, kb2_w = 1280, kb2_h = 720;
+    std::memcpy(bink_file_mem + 8, &kb2_frames, 4);
+    std::memcpy(bink_file_mem + 20, &kb2_w, 4);
+    std::memcpy(bink_file_mem + 24, &kb2_h, 4);
     BINK_VIDEO_HANDLE bink = nullptr;
     SX_CHECK(XboxCodecBinkVideoOpen(bink_file_mem, sizeof(bink_file_mem), 0, &bink) == 0);
     SX_CHECK(bink != nullptr);
 
     BINK_VIDEO_INFO bink_info{};
     SX_CHECK(XboxCodecBinkVideoGetInfo(bink, &bink_info) == 0);
-    SX_CHECK(bink_info.width == 1920 && bink_info.height == 1080);
+    SX_CHECK(bink_info.width == 1280 && bink_info.height == 720 && bink_info.frameCount == 120);
 
-    std::vector<uint8_t> frame(1920 * 4, 0);
-    SX_CHECK(XboxCodecBinkVideoDecodeFrame(bink, frame.data(), 1920 * 4, 0) == 0);
+    std::vector<uint8_t> frame(1280 * 4, 0);
+    SX_CHECK(XboxCodecBinkVideoDecodeFrame(bink, frame.data(), 1280 * 4, 0) == 0);
+    SX_CHECK(frame[3] == 255u);  // Opaque alpha from BT.709 RGBA decode
 
     uint8_t audio_out[128]{};
     uint32_t audio_bytes = 0;

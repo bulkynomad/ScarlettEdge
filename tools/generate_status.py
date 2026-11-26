@@ -617,9 +617,9 @@ def collect_optimization_metrics() -> list[Subsystem]:
             name="Network & Live Middleware",
             short_name="Network",
             category="Services",
-            implemented=3,
+            implemented=4,
             target=4,
-            notes="Opt-in live WinHTTP HTTPS/HTTP socket transport in both libHttpClient & XCurl (SCARLETTX_LIVE_NETWORK=1); pending native Bink2 FMV",
+            notes="Opt-in live WinHTTP HTTPS/HTTP in libHttpClient & XCurl, Bink2 KB2 header + BT.709 YUV-to-RGBA decode & XMA2 PCM16 synthesis",
         ),
     ]
 

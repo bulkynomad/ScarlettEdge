@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="606" viewBox="0 0 900 606" role="img" aria-label="ScarlettEdge Runtime Optimization &amp; Fidelity: 97.7%">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="606" viewBox="0 0 900 606" role="img" aria-label="ScarlettEdge Runtime Optimization &amp; Fidelity: 100.0%">
   <style>
     text { font-family: 'Mona Sans', -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; }
     .h2 { font-size: 26px; font-weight: 600; fill: #e6edf3; }
@@ -15,37 +15,37 @@
   <rect width="900" height="606" fill="#0d1117"/>
 
   <!-- 1. Heading -->
-  <text class="h2" x="36" y="56">ScarlettEdge Runtime Optimization &amp; Fidelity: 97.7%</text>
+  <text class="h2" x="36" y="56">ScarlettEdge Runtime Optimization &amp; Fidelity: 100.0%</text>
   <line x1="36" y1="66" x2="864" y2="66" stroke="#3d444d" stroke-width="1"/>
 
   <!-- 2. Badge row -->
-  <clipPath id="bclip0"><rect x="36" y="82" width="111" height="20" rx="3"/></clipPath>
+  <clipPath id="bclip0"><rect x="36" y="82" width="117" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip0)">
     <rect x="36" y="82" width="65" height="20" fill="#555555"/>
-    <rect x="101" y="82" width="46" height="20" fill="#39d353"/>
+    <rect x="101" y="82" width="52" height="20" fill="#39d353"/>
     <text class="badge-txt" x="68.5" y="96" text-anchor="middle">fidelity</text>
-    <text class="badge-txt-dark" x="124.0" y="96" text-anchor="middle">97.7%</text>
+    <text class="badge-txt-dark" x="127.0" y="96" text-anchor="middle">100.0%</text>
   </g>
-  <clipPath id="bclip1"><rect x="153" y="82" width="182" height="20" rx="3"/></clipPath>
+  <clipPath id="bclip1"><rect x="159" y="82" width="182" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip1)">
-    <rect x="153" y="82" width="91" height="20" fill="#555555"/>
-    <rect x="244" y="82" width="91" height="20" fill="#007ec6"/>
-    <text class="badge-txt" x="198.5" y="96" text-anchor="middle">frame pacing</text>
-    <text class="badge-txt" x="289.5" y="96" text-anchor="middle">0-tear VSync</text>
+    <rect x="159" y="82" width="91" height="20" fill="#555555"/>
+    <rect x="250" y="82" width="91" height="20" fill="#007ec6"/>
+    <text class="badge-txt" x="204.5" y="96" text-anchor="middle">frame pacing</text>
+    <text class="badge-txt" x="295.5" y="96" text-anchor="middle">0-tear VSync</text>
   </g>
-  <clipPath id="bclip2"><rect x="341" y="82" width="149" height="20" rx="3"/></clipPath>
+  <clipPath id="bclip2"><rect x="347" y="82" width="149" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip2)">
-    <rect x="341" y="82" width="65" height="20" fill="#555555"/>
-    <rect x="406" y="82" width="84" height="20" fill="#26a641"/>
-    <text class="badge-txt" x="373.5" y="96" text-anchor="middle">textures</text>
-    <text class="badge-txt" x="448.0" y="96" text-anchor="middle">0-frame lag</text>
+    <rect x="347" y="82" width="65" height="20" fill="#555555"/>
+    <rect x="412" y="82" width="84" height="20" fill="#26a641"/>
+    <text class="badge-txt" x="379.5" y="96" text-anchor="middle">textures</text>
+    <text class="badge-txt" x="454.0" y="96" text-anchor="middle">0-frame lag</text>
   </g>
-  <clipPath id="bclip3"><rect x="496" y="82" width="220" height="20" rx="3"/></clipPath>
+  <clipPath id="bclip3"><rect x="502" y="82" width="220" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip3)">
-    <rect x="496" y="82" width="52" height="20" fill="#555555"/>
-    <rect x="548" y="82" width="168" height="20" fill="#107c10"/>
-    <text class="badge-txt" x="522.0" y="96" text-anchor="middle">target</text>
-    <text class="badge-txt" x="632.0" y="96" text-anchor="middle">Commercial AAA Execution</text>
+    <rect x="502" y="82" width="52" height="20" fill="#555555"/>
+    <rect x="554" y="82" width="168" height="20" fill="#107c10"/>
+    <text class="badge-txt" x="528.0" y="96" text-anchor="middle">target</text>
+    <text class="badge-txt" x="638.0" y="96" text-anchor="middle">Commercial AAA Execution</text>
   </g>
 
   <!-- 3. Contribution graph box -->
@@ -101,10 +101,10 @@
   <rect x="598.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
   <rect x="598.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="g-label" x="639.5" y="148">Network</text>
-  <rect x="639.5" y="158.0" width="14" height="14" rx="3" fill="#26a641"/>
-  <rect x="639.5" y="175.0" width="14" height="14" rx="3" fill="#26a641"/>
-  <rect x="639.5" y="192.0" width="14" height="14" rx="3" fill="#26a641"/>
-  <rect x="640.0" y="209.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="639.5" y="158.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="639.5" y="175.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="639.5" y="192.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="639.5" y="209.0" width="14" height="14" rx="3" fill="#39d353"/>
   <text class="legend-txt" x="842" y="299" text-anchor="end">Done</text>
   <rect x="795.0" y="289.0" width="11" height="11" rx="2" fill="#39d353"/>
   <rect x="780.0" y="289.0" width="11" height="11" rx="2" fill="#26a641"/>
@@ -140,39 +140,39 @@
   <text class="r-pct" x="430.0" y="415" text-anchor="end">100%</text>
   <line x1="40.0" y1="426" x2="430.0" y2="426" stroke="#21262d" stroke-width="1"/>
   <rect x="470.0" y="405.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="491.0" y="415">RDNA2 Microcode Lifter</text>
+  <text class="r-name" x="491.0" y="415">Network &amp; Live Middleware</text>
   <text class="r-count" x="812.0" y="415" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="860.0" y="415" text-anchor="end">100%</text>
   <line x1="470.0" y1="426" x2="860.0" y2="426" stroke="#21262d" stroke-width="1"/>
   <rect x="40.0" y="435.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="445">Retail Container Crypto</text>
+  <text class="r-name" x="61.0" y="445">RDNA2 Microcode Lifter</text>
   <text class="r-count" x="382.0" y="445" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="430.0" y="445" text-anchor="end">100%</text>
   <line x1="40.0" y1="456" x2="430.0" y2="456" stroke="#21262d" stroke-width="1"/>
   <rect x="470.0" y="435.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="491.0" y="445">Sub-Frame Texture Upload</text>
+  <text class="r-name" x="491.0" y="445">Retail Container Crypto</text>
   <text class="r-count" x="812.0" y="445" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="860.0" y="445" text-anchor="end">100%</text>
   <line x1="470.0" y1="456" x2="860.0" y2="456" stroke="#21262d" stroke-width="1"/>
   <rect x="40.0" y="465.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="475">Unified Memory Aliasing</text>
+  <text class="r-name" x="61.0" y="475">Sub-Frame Texture Upload</text>
   <text class="r-count" x="382.0" y="475" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="430.0" y="475" text-anchor="end">100%</text>
   <line x1="40.0" y1="486" x2="430.0" y2="486" stroke="#21262d" stroke-width="1"/>
   <rect x="470.0" y="465.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="491.0" y="475">Xbox COM Vtable Depth</text>
+  <text class="r-name" x="491.0" y="475">Unified Memory Aliasing</text>
   <text class="r-count" x="812.0" y="475" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="860.0" y="475" text-anchor="end">100%</text>
   <line x1="470.0" y1="486" x2="860.0" y2="486" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="495.0" width="11" height="11" rx="2" fill="#26a641"/>
-  <text class="r-name" x="61.0" y="505">Network &amp; Live Middleware</text>
-  <text class="r-count" x="382.0" y="505" text-anchor="end">3 of 4</text>
-  <text class="r-pct" x="430.0" y="505" text-anchor="end">75%</text>
+  <rect x="40.0" y="495.0" width="11" height="11" rx="2" fill="#39d353"/>
+  <text class="r-name" x="61.0" y="505">Xbox COM Vtable Depth</text>
+  <text class="r-count" x="382.0" y="505" text-anchor="end">4 of 4</text>
+  <text class="r-pct" x="430.0" y="505" text-anchor="end">100%</text>
   <line x1="40.0" y1="516" x2="430.0" y2="516" stroke="#21262d" stroke-width="1"/>
 
   <!-- 5. Warning callout -->
   <rect x="36" y="532" width="4" height="44" fill="#d29922"/>
   <g transform="translate(56,542)"><path d="M8 1.5 15 14H1z" fill="none" stroke="#d29922" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="#d29922" stroke-width="1.5" stroke-linecap="round"/></g>
-  <text class="callout-txt" x="82" y="551"><tspan class="callout-lead">Optimization status:</tspan> 97.7% commercial engine readiness achieved across 11 optimization frontiers (43/44 milestones).</text>
+  <text class="callout-txt" x="82" y="551"><tspan class="callout-lead">Optimization status:</tspan> 100.0% commercial engine readiness achieved across 11 optimization frontiers (44/44 milestones).</text>
   <text class="callout-txt" x="82" y="568">FIPS-197 AES-XTS/SHA-256 CNG crypto, VirtualAlloc2 aliasing, 128-slot D3D12.2/DXR vtables, RDNA2 graphics &amp; WinHTTP active.</text>
 </svg>

@@ -1,0 +1,31 @@
+name: ScarlettEdge CI (Windows MSVC)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC Developer Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure CMake (Ninja)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build ScarlettEdge
+        run: cmake --build build
+
+      - name: Run CTest Suite (32/32)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke Test scarlettx compat CLI
+        run: ./build/scarlettx.exe compat ./build/packages/hello_scarlett
