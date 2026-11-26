@@ -193,14 +193,23 @@ Status Emulator::BootPackage(const std::string& package_dir) {
     // The guest inherits this: if it cannot load it must end with an exit
     // code instead of waiting on a system error dialog.
     const UINT previous_error_mode = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-    // Searched before System32 and inherited by the child; PATH is not.
+    std::string original_path;
+    // Searched before System32 and inherited by the child; PATH is also prepended to guarantee shim precedence.
     if (!shim_dir.empty()) {
         SetDllDirectoryA(shim_dir.c_str());
+        const char* p = std::getenv("PATH");
+        if (p) original_path = p;
+        const std::string new_path = shim_dir + ";" + original_path;
+        SetEnvironmentVariableA("PATH", new_path.c_str());
+    }
+    if (std::filesystem::exists(std::filesystem::path(work_dir) / "xgameruntime.dll")) {
+        std::cerr << "[ScarlettX][loader] Notice: Local xgameruntime.dll detected in title folder; prioritizing emulator shim directory.\n";
     }
     const BOOL created = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
                                         work_dir.c_str(), &si, &pi);
     if (!shim_dir.empty()) {
         SetDllDirectoryA(nullptr);
+        SetEnvironmentVariableA("PATH", original_path.empty() ? nullptr : original_path.c_str());
     }
     SetErrorMode(previous_error_mode);
     if (!created) {

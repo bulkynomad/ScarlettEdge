@@ -242,6 +242,8 @@ bool PreferWarpFromEnv(bool fallback) {
 // ---------------------------------------------------------------------------
 using ComVtableFn = intptr_t (SCARLETTX_GDK_CALLBACK*)(void*, uintptr_t, uintptr_t, uintptr_t);
 
+std::atomic<uint32_t> g_frame_interval_us{0};
+
 struct ProxyGuid {
     uint32_t d1;
     uint16_t d2;
@@ -1122,6 +1124,22 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
         std::cerr << "[ScarlettX][d3d12_xs] uploaded " << uploads.size()
                   << " guest texture(s) in one batch\n";
     }
+}
+
+// Lightweight non-reset check for any mid-frame guest texture writes.
+bool HasPendingGuestTextureWrites() {
+    std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
+    if (g_guest_textures.empty()) return false;
+    ULONG_PTR count = 1;
+    void* single_page = nullptr;
+    DWORD granularity = 0;
+    for (XboxD3D12ResourceProxy* tex : g_guest_textures) {
+        if (!tex || !tex->guest_memory || !tex->guest_memory->base) continue;
+        if (GetWriteWatch(0, tex->guest_memory->base, tex->guest_memory->size, &single_page, &count, &granularity) == 0 && count > 0) {
+            return true;
+        }
+    }
+    return false;
 }
 #endif
 intptr_t SCARLETTX_GDK_CALLBACK ResProxyQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
@@ -2254,11 +2272,11 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyExecuteCommandLists(
             std::cerr << "[ScarlettX][d3d12_xs] Queue::ExecuteCommandLists(q=" << self
                       << ", count=" << pc_lists.size() << ")\n";
         }
-        // Flush dirty guest textures once per presented frame, before the first
-        // submit of the frame. Every-submit flushing rescanned every texture
-        // for every command list the title queued.
+        // Flush dirty guest textures before submit: on the first submit of the frame,
+        // and on any mid-frame submit where guest textures have pending writes.
         const uint64_t epoch = g_frame_epoch.load(std::memory_order_relaxed);
-        if (epoch == 0 || g_flushed_epoch.load(std::memory_order_relaxed) != epoch) {
+        const bool first_submit = (epoch == 0 || g_flushed_epoch.load(std::memory_order_relaxed) != epoch);
+        if (first_submit || HasPendingGuestTextureWrites()) {
             LARGE_INTEGER freq{}, start{}, end{};
             QueryPerformanceFrequency(&freq);
             QueryPerformanceCounter(&start);
@@ -2268,7 +2286,9 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyExecuteCommandLists(
                                      (end.QuadPart - start.QuadPart) * 1000000ll / freq.QuadPart),
                                  std::memory_order_relaxed);
             g_flush_count.fetch_add(1, std::memory_order_relaxed);
-            g_flushed_epoch.store(epoch, std::memory_order_relaxed);
+            if (first_submit) {
+                g_flushed_epoch.store(epoch, std::memory_order_relaxed);
+            }
         }
         obj->pc_queue->ExecuteCommandLists(static_cast<UINT>(pc_lists.size()), pc_lists.data());
     }
@@ -2758,7 +2778,8 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
                 if (SUCCEEDED(obj->present_list->Close())) {
                     ID3D12CommandList* lists[] = {obj->present_list};
                     obj->pc_queue->ExecuteCommandLists(1, lists);
-                    const HRESULT present_hr = obj->swapchain->Present(0, 0);
+                    const UINT sync_interval = (std::getenv("SCARLETTX_VSYNC") || g_frame_interval_us.load(std::memory_order_relaxed) > 0) ? 1 : 0;
+                    const HRESULT present_hr = obj->swapchain->Present(sync_interval, 0);
                     if (present_hr != S_OK) {
                         // The game keeps running when the output is lost, so say so.
                         static std::atomic<uint64_t> not_ok{0};
@@ -3936,8 +3957,6 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandListX(
 }
 
 // Observed Xbox device slot 78 (+0x270) at 0x14052f501: SetFrameIntervalX(pOutput, intervalUs=0x411b, period=2, flags=0).
-std::atomic<uint32_t> g_frame_interval_us{0};
-
 intptr_t SCARLETTX_GDK_CALLBACK ProxySetFrameIntervalX(
     void* /*self*/, uintptr_t pOutput, uintptr_t intervalUs, uintptr_t period) {
     // The period is the allowed latency in intervals, not a rate divisor.
@@ -3957,6 +3976,20 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyScheduleFrameEventX(
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::ScheduleFrameEventX(type=" << eventType
                   << ", offset=" << offset << ", event=0x" << std::hex << pEvent << std::dec << ") -> S_OK\n";
     }
+#if defined(_WIN32)
+    if (pEvent) {
+        HANDLE hEvent = reinterpret_cast<HANDLE>(pEvent);
+        if (offset == 0) {
+            SetEvent(hEvent);
+        } else {
+            std::thread([hEvent, offset]() {
+                const uint32_t ms = static_cast<uint32_t>((offset + 999) / 1000);
+                Sleep(ms > 0 ? ms : 1);
+                SetEvent(hEvent);
+            }).detach();
+        }
+    }
+#endif
     return 0;
 }
 
@@ -4464,7 +4497,6 @@ int32_t D3D12XboxScheduleFrameEventX(uint64_t device_handle,
                                      uint64_t offset_us,
                                      void* event_handle) {
     (void)frame_event;
-    (void)offset_us;
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_devices.find(device_handle);
     if (it == g_devices.end()) {
@@ -4472,10 +4504,20 @@ int32_t D3D12XboxScheduleFrameEventX(uint64_t device_handle,
     }
 #if defined(_WIN32)
     if (event_handle) {
-        SetEvent(static_cast<HANDLE>(event_handle));
+        HANDLE hEvent = static_cast<HANDLE>(event_handle);
+        if (offset_us == 0) {
+            SetEvent(hEvent);
+        } else {
+            std::thread([hEvent, offset_us]() {
+                const uint32_t ms = static_cast<uint32_t>((offset_us + 999) / 1000);
+                Sleep(ms > 0 ? ms : 1);
+                SetEvent(hEvent);
+            }).detach();
+        }
     }
 #else
     (void)event_handle;
+    (void)offset_us;
 #endif
     return 0;
 }

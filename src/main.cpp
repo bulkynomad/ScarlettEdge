@@ -12,7 +12,7 @@ void PrintUsage() {
     std::cout << "ScarlettX - Xbox Series X|S (Scarlett) HLE Emulator\n"
               << "Usage:\n"
               << "  scarlettx inspect <package_dir>\n"
-              << "  scarlettx boot <package_dir> [--headless] [--in-process] [--gpu|--warp] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--rt-dump path.ppm] [--raster-dump path.ppm]\n"
+              << "  scarlettx boot <package_dir> [--headless] [--in-process|--separate-process] [--gpu|--warp] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--rt-dump path.ppm] [--raster-dump path.ppm]\n"
               << "  scarlettx diag\n";
 }
 
@@ -63,12 +63,15 @@ int main(int argc, char** argv) {
 
     if (cmd == "boot" && argc >= 3) {
         scarlettx::EmulatorConfig cfg;
+        cfg.in_process = true;  // Default to reliable in-process PE mapper with direct IAT redirection
         for (int i = 3; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--headless") {
                 cfg.headless = true;
             } else if (arg == "--in-process") {
                 cfg.in_process = true;
+            } else if (arg == "--separate-process" || arg == "--out-of-process") {
+                cfg.in_process = false;
             } else if (arg == "--gpu") {
                 cfg.prefer_warp = false;
             } else if (arg == "--warp") {
