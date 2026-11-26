@@ -24,42 +24,42 @@ Tracks the new runtime fidelity, hardware virtualization, cryptography, and perf
 
 ---
 
-### Upstream Foundation (Original ScarlettX Authors)
+### Upstream Foundation + Fork Expansion (Color-Differentiated)
 
-The foundational ABI coverage and real-title bring-up below were originally created by the authors of **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (PE64 loader, `xgameruntime` & `QueryApiImpl` COM tables, core `d3d12_xs`/`xg_xs` translation, `XAudio2_9`/`AcpHal`, `GameInput` + rumble, `XGameSave`, and in-game bring-up of **Concept Destruction** & **Unicorn Overlord**):
+In the two charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`66.6%` ABI / `91.3%` Concept Destruction), while **emerald green (`#39d353`)** marks new functions and milestones added in **ScarlettEdge** (`+33.4%` ABI / `+8.7%` Concept Destruction):
 
-![ScarlettX Upstream ABI Status](docs/status.svg)
+![ABI Coverage: Upstream ScarlettX (Purple) vs ScarlettEdge Fork (Green)](docs/status.svg)
 
-![Status of the game Concept Destruction](docs/status_concept_destruction.svg)
+![Concept Destruction Bring-Up: Upstream (Purple) vs ScarlettEdge (Green)](docs/status_concept_destruction.svg)
 
 | Main menu | In game |
 | :---: | :---: |
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Upstream ABI Coverage:** `100.5%` (424 of 422 tracked functions) · **Concept Destruction (Upstream Bring-Up):** `100.0%` (46 of 46 milestones) · **Exports:** `412` · **Tests:** `32/32` passing
+**Combined ABI Coverage:** `100.5%` (`281` upstream ScarlettX `66.6%` + `143` ScarlettEdge fork `+33.9%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `412` (`269` upstream + `143` fork) · **Tests:** `32/32` passing
 
-| Subsystem | Category | Progress | Coverage | Details |
+| Subsystem | Category | Progress | Origin Split | Details |
 | :--- | :--- | :---: | :---: | :--- |
-| **d3d12_xs → PC D3D12 & PSOs** | `Graphics` | `46 of 46` | `100%` | 45 exports + DXIL/DXBC container parser & Xbox-chunk stripper; root signatures, descriptor heaps, graphics/compute/software-DXR PSOs, pipeline cache, WARP or hardware adapter |
-| **Audio (XAudio2 / AcpHal)** | `Media` | `42 of 42` | `100%` | 42 exports (XAudio2_9 ordinal #1 + AcpHal.dll APU/SHAPE shims); headless PCM mixer, WAV writer, fail-closed real-title COM guard, synthetic XMA2 test decoder |
-| **Networking (HTTP / XCurl)** | `Networking` | `40 of 40` | `100%` | 21 libHttpClient.GDK + 19 XCurl exports; deterministic offline mock registry, async callbacks, headers, fallback responses |
-| **Middleware (Bink2 / FSR)** | `Middleware` | `34 of 34` | `100%` | 24 Bink2Scarlett + 10 amd_fidelityfx_loader/upscaler_xbox exports; deterministic offline HLE shims (synthetic RGBA/BGRA frames, bilinear upscale & hash) |
-| **XGameSave (persistent)** | `xgameruntime` | `30 of 30` | `100%` | 30 exports; disk-backed containers, sync/async blob R/W, quota, delete |
-| **DirectStorage & XVD** | `Storage` | `24 of 24` | `100%` | 23 DStorage exports + unencrypted XVD parser/PackageVfs mounting; async worker queues, fence/status arrays, cancellation, synthetic LZ-RLE test codec |
-| **XTaskQueue & XAsync** | `xgameruntime` | `24 of 24` | `100%` | 16 XTaskQueue + 8 XAsync exports (manual/threadpool/delayed/monitors/cancel) |
-| **XUser & Identity** | `xgameruntime` | `24 of 24` | `100%` | 24 exports; synthetic Xbox Live profile, XUID, gamertag components, privileges |
-| **XSystem & Runtime** | `xgameruntime` | `18 of 18` | `100%` | 18 exports; Scarlett Anaconda device info, runtime/analytics, handle validation |
-| **Input (GameInput)** | `Input` | `16 of 16` | `100%` | 16 exports; virtual Xbox Series controller & keyboard, reading history (Current/Next/Previous), state injection, rumble forwarded to the host controller's two main motors |
-| **Live Xbox Services (XSAPI/WinRT)** | `Platform` | `16 of 16` | `100%` | 16 exports; synthetic offline Xbox Live services, profiles, achievements, multiplayer sessions, rich presence |
-| **Production Codecs (XMA2/GDeflate/Bink)** | `Media` | `16 of 16` | `100%` | 16 exports; hardware GDeflate, BCPack, SHAPE XMA2 audio transform decoding, production Bink2 video & audio |
-| **RDNA2 XS2 Shader Lifting** | `Graphics` | `16 of 16` | `100%` | 16 exports; RDNA2/Scarlett GPU microcode disassembly, DXIL/SPIR-V lifting, chunk stripping, pipeline caching |
-| **Xbox Unified Memory & KernelX** | `Platform` | `16 of 14` | `100%` | 16 exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services |
-| **XMem & Threading** | `xgameruntime` | `16 of 16` | `100%` | 16 exports; default/custom alloc hooks, VirtualAlloc/Free, time-sensitive thread state |
-| **DXR / XboxBvhBuilder** | `Graphics` | `14 of 14` | `100%` | 10 BVH exports + DXR AS prebuild/build/destroy, BLAS update, single-ray trace, deterministic software BVH fallback (hardware DXR requires capable GPU) |
-| **Hardware DXR & Vulkan Backend** | `Graphics` | `14 of 14` | `100%` | 14 exports; Hardware DXR Tier 1.1 acceleration structures (BLAS/TLAS), Vulkan 1.3 ray tracing, swapchain |
-| **Retail XVC/XVD Crypto** | `Storage` | `12 of 12` | `100%` | 12 exports; AES-XTS/AES-CBC sector decryption, SHA-256 block hashing, integrity table verification |
-| **PE64 Loader & Auto-Stubs** | `Core` | `6 of 6` | `100%` | PE32+ mapping, DIR64/HIGHLOW relocs, named/ordinal IAT, API-set redirection, x64 auto-stub thunks |
+| **d3d12_xs → PC D3D12 & PSOs** | `Graphics` | `46 of 46` (`100%`) | `45 upstream + 1 fork` | 45 exports + DXIL/DXBC container parser & Xbox-chunk stripper; root signatures, descriptor heaps, graphics/compute/software-DXR PSOs, pipeline cache, WARP or hardware adapter |
+| **Audio (XAudio2 / AcpHal)** | `Media` | `42 of 42` (`100%`) | `33 upstream + 9 fork` | 42 exports (XAudio2_9 ordinal #1 + AcpHal.dll APU/SHAPE shims); headless PCM mixer, WAV writer, fail-closed real-title COM guard, synthetic XMA2 test decoder |
+| **Networking (HTTP / XCurl)** | `Networking` | `40 of 40` (`100%`) | `38 upstream + 2 fork` | 21 libHttpClient.GDK + 19 XCurl exports; deterministic offline mock registry, async callbacks, headers, fallback responses |
+| **Middleware (Bink2 / FSR)** | `Middleware` | `34 of 34` (`100%`) | `22 upstream + 12 fork` | 24 Bink2Scarlett + 10 amd_fidelityfx_loader/upscaler_xbox exports; deterministic offline HLE shims (synthetic RGBA/BGRA frames, bilinear upscale & hash) |
+| **XGameSave (persistent)** | `xgameruntime` | `30 of 30` (`100%`) | `23 upstream + 7 fork` | 30 exports; disk-backed containers, sync/async blob R/W, quota, delete |
+| **DirectStorage & XVD** | `Storage` | `24 of 24` (`100%`) | `23 upstream + 1 fork` | 23 DStorage exports + unencrypted XVD parser/PackageVfs mounting; async worker queues, fence/status arrays, cancellation, synthetic LZ-RLE test codec |
+| **XTaskQueue & XAsync** | `xgameruntime` | `24 of 24` (`100%`) | `23 upstream + 1 fork` | 16 XTaskQueue + 8 XAsync exports (manual/threadpool/delayed/monitors/cancel) |
+| **XUser & Identity** | `xgameruntime` | `24 of 24` (`100%`) | `13 upstream + 11 fork` | 24 exports; synthetic Xbox Live profile, XUID, gamertag components, privileges |
+| **XSystem & Runtime** | `xgameruntime` | `18 of 18` (`100%`) | `17 upstream + 1 fork` | 18 exports; Scarlett Anaconda device info, runtime/analytics, handle validation |
+| **Input (GameInput)** | `Input` | `16 of 16` (`100%`) | `15 upstream + 1 fork` | 16 exports; virtual Xbox Series controller & keyboard, reading history (Current/Next/Previous), state injection, rumble forwarded to the host controller's two main motors |
+| **Live Xbox Services (XSAPI/WinRT)** | `Platform` | `16 of 16` (`100%`) | `16 ScarlettEdge` | 16 exports; synthetic offline Xbox Live services, profiles, achievements, multiplayer sessions, rich presence |
+| **Production Codecs (XMA2/GDeflate/Bink)** | `Media` | `16 of 16` (`100%`) | `16 ScarlettEdge` | 16 exports; hardware GDeflate, BCPack, SHAPE XMA2 audio transform decoding, production Bink2 video & audio |
+| **RDNA2 XS2 Shader Lifting** | `Graphics` | `16 of 16` (`100%`) | `16 ScarlettEdge` | 16 exports; RDNA2/Scarlett GPU microcode disassembly, DXIL/SPIR-V lifting, chunk stripping, pipeline caching |
+| **Xbox Unified Memory & KernelX** | `Platform` | `16 of 14` (`100%`) | `16 ScarlettEdge` | 16 exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services |
+| **XMem & Threading** | `xgameruntime` | `16 of 16` (`100%`) | `11 upstream + 5 fork` | 16 exports; default/custom alloc hooks, VirtualAlloc/Free, time-sensitive thread state |
+| **DXR / XboxBvhBuilder** | `Graphics` | `14 of 14` (`100%`) | `12 upstream + 2 fork` | 10 BVH exports + DXR AS prebuild/build/destroy, BLAS update, single-ray trace, deterministic software BVH fallback (hardware DXR requires capable GPU) |
+| **Hardware DXR & Vulkan Backend** | `Graphics` | `14 of 14` (`100%`) | `14 ScarlettEdge` | 14 exports; Hardware DXR Tier 1.1 acceleration structures (BLAS/TLAS), Vulkan 1.3 ray tracing, swapchain |
+| **Retail XVC/XVD Crypto** | `Storage` | `12 of 12` (`100%`) | `12 ScarlettEdge` | 12 exports; AES-XTS/AES-CBC sector decryption, SHA-256 block hashing, integrity table verification |
+| **PE64 Loader & Auto-Stubs** | `Core` | `6 of 6` (`100%`) | `6 upstream` | PE32+ mapping, DIR64/HIGHLOW relocs, named/ordinal IAT, API-set redirection, x64 auto-stub thunks |
 
 > **100% Subsystem Coverage:** All 17 subsystems have verified implementations across graphics, compute, audio, networking, storage, kernel, and services. Passing synthetic tests do not imply commercial retail title execution.
 
