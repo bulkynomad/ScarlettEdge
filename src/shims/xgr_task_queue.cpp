@@ -260,6 +260,8 @@ void EnqueueReadyLocked(Engine& e, const std::shared_ptr<Port>& port, Item item)
     }
 }
 
+void FinishTerminationLocked(Lock& lk, const std::shared_ptr<QueueCore>& core, uint32_t own);
+
 void NotifyMonitors(Lock& lk, const std::shared_ptr<QueueCore>& core, uint32_t port_index) {
     if (core->monitors.empty() || !core->handle || core->handle->handle_refs == 0) {
         return;
@@ -267,12 +269,23 @@ void NotifyMonitors(Lock& lk, const std::shared_ptr<QueueCore>& core, uint32_t p
     const std::vector<Monitor> monitors = core->monitors;
     XTaskQueueObject* handle = core->handle;
     ++handle->handle_refs;
+    ++core->active;
     lk.unlock();
+    auto* running = GetRunningVec(true);
+    if (running) {
+        running->push_back(core.get());
+    }
     for (const auto& m : monitors) {
         m.callback(m.context, handle, static_cast<XTaskQueuePort>(port_index));
     }
+    if (running) {
+        running->pop_back();
+    }
     XTaskQueueCloseHandle(handle);
     lk.lock();
+    --core->active;
+    FinishTerminationLocked(lk, core, RunningOnThisThread(core.get()));
+    core->idle_cv.notify_all();
 }
 
 // Completes termination once nothing of the queue is queued or running.
