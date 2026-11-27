@@ -349,7 +349,7 @@ add_custom_command(TARGET ue5_slice POST_BUILD
         "$<TARGET_FILE_DIR:ue5_slice>/MicrosoftGame.Config"
 )
 
-# Synthetic Scarlett Game 6: openworld_slice (Open-World Gen9 Open-World Wave32 Vulkan + 2MB Alias vertical slice)
+# Synthetic Scarlett Game 6: openworld_slice (Open-World Gen9 Wave32 Vulkan + 2MB Alias vertical slice)
 add_executable(openworld_slice tests/synthetic_games/openworld_slice/main.cpp)
 target_link_libraries(openworld_slice PRIVATE
     xgameruntime

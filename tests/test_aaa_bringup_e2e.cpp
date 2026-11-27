@@ -186,40 +186,40 @@ int main() {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Boot Open-World Open-World Vertical Slice (In-Process + Out-of-Process Persistence)
+    // 2. Boot Open-World Vertical Slice (In-Process + Out-of-Process Persistence)
     // -----------------------------------------------------------------------
-    std::vector<uint8_t> rage_sector(4096, 0);
-    for (size_t i = 0; i < rage_sector.size(); ++i) {
-        rage_sector[i] = static_cast<uint8_t>((i * 13u + 0x21u) & 0xFFu);
+    std::vector<uint8_t> openworld_sector(4096, 0);
+    for (size_t i = 0; i < openworld_sector.size(); ++i) {
+        openworld_sector[i] = static_cast<uint8_t>((i * 13u + 0x21u) & 0xFFu);
     }
-    std::vector<uint8_t> rage_comp(8192, 0);
-    size_t rage_comp_sz = 0;
-    SX_CHECK(XboxCodecGDeflateCompress(rage_sector.data(), rage_sector.size(),
-                                       rage_comp.data(), rage_comp.size(), &rage_comp_sz) == 0);
-    const auto rage_pak_path = tmp_dir / "rage_sector0.gdeflate";
+    std::vector<uint8_t> openworld_comp(8192, 0);
+    size_t openworld_comp_sz = 0;
+    SX_CHECK(XboxCodecGDeflateCompress(openworld_sector.data(), openworld_sector.size(),
+                                       openworld_comp.data(), openworld_comp.size(), &openworld_comp_sz) == 0);
+    const auto openworld_pak_path = tmp_dir / "openworld_sector0.gdeflate";
     {
-        std::ofstream ofs(rage_pak_path, std::ios::binary);
+        std::ofstream ofs(openworld_pak_path, std::ios::binary);
         SX_CHECK(ofs.good());
-        ofs.write(reinterpret_cast<const char*>(rage_comp.data()), static_cast<std::streamsize>(rage_comp_sz));
+        ofs.write(reinterpret_cast<const char*>(openworld_comp.data()), static_cast<std::streamsize>(openworld_comp_sz));
     }
 
-    const auto rage_pkg_dir = bin_dir / "packages" / "openworld_slice";
-    const auto title_storage_root = tmp_dir / "rage_title_storage";
+    const auto openworld_pkg_dir = bin_dir / "packages" / "openworld_slice";
+    const auto title_storage_root = tmp_dir / "openworld_title_storage";
     std::error_code ec;
     std::filesystem::remove_all(title_storage_root, ec);
-    SetEnvStr("SCARLETTX_OPENWORLD_STREAM_PAK", rage_pak_path.string());
+    SetEnvStr("SCARLETTX_OPENWORLD_STREAM_PAK", openworld_pak_path.string());
     SetEnvStr("SCARLETTX_SAVE_ROOT", title_storage_root.string());
     SetEnvStr("SCARLETTX_OPENWORLD_VERIFY_PERSIST", "0");
 
     // Run 1: In-process relocated PE64 boot (uploads persistent TitleStorage checkpoint + Vulkan Wave32 + 2MB alias)
     {
-        scarlettx::EmulatorConfig rage_inproc{};
-        rage_inproc.headless = true;
-        rage_inproc.prefer_warp = true;
-        rage_inproc.in_process = true;
-        rage_inproc.force_relocate = true;
-        scarlettx::Emulator emu_rage(rage_inproc);
-        auto st = emu_rage.BootPackage(rage_pkg_dir.string());
+        scarlettx::EmulatorConfig openworld_inproc{};
+        openworld_inproc.headless = true;
+        openworld_inproc.prefer_warp = true;
+        openworld_inproc.in_process = true;
+        openworld_inproc.force_relocate = true;
+        scarlettx::Emulator emu_openworld(openworld_inproc);
+        auto st = emu_openworld.BootPackage(openworld_pkg_dir.string());
         if (!st.ok()) {
             std::cerr << "[test_aaa_bringup_e2e] Open-World in-process boot error: " << st.message << "\n";
         }
@@ -229,12 +229,12 @@ int main() {
     // Run 2: Separate child-process boot verifying persistent XblTitleStorage blob survived on disk!
     SetEnvStr("SCARLETTX_OPENWORLD_VERIFY_PERSIST", "1");
     {
-        scarlettx::EmulatorConfig rage_proc{};
-        rage_proc.headless = true;
-        rage_proc.prefer_warp = true;
-        rage_proc.in_process = false;
-        scarlettx::Emulator emu_rage_proc(rage_proc);
-        auto st = emu_rage_proc.BootPackage(rage_pkg_dir.string());
+        scarlettx::EmulatorConfig openworld_proc{};
+        openworld_proc.headless = true;
+        openworld_proc.prefer_warp = true;
+        openworld_proc.in_process = false;
+        scarlettx::Emulator emu_openworld_proc(openworld_proc);
+        auto st = emu_openworld_proc.BootPackage(openworld_pkg_dir.string());
         if (!st.ok()) {
             std::cerr << "[test_aaa_bringup_e2e] Open-World child-process boot error: " << st.message << "\n";
         }

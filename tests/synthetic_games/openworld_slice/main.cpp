@@ -69,8 +69,8 @@ extern "C" SLICE_EXPORT int ScarlettGuestMain() {
     }
 
     // Write world sector magic via base VA and read back coherently through physical alias VA!
-    static_cast<uint32_t*>(ring_base)[0] = 0x52414745u;  // 'Open-World'
-    if (static_cast<const uint32_t*>(alias_view)[0] != 0x52414745u) {
+    static_cast<uint32_t*>(ring_base)[0] = 0x4F50574Cu;  // 'OPWL'
+    if (static_cast<const uint32_t*>(alias_view)[0] != 0x4F50574Cu) {
         std::fprintf(stderr, "[openworld_slice] Physical memory alias coherency failed\n");
         return 12;
     }
@@ -93,12 +93,12 @@ extern "C" SLICE_EXPORT int ScarlettGuestMain() {
     qd_hi.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
     qd_hi.Capacity = 32;
     qd_hi.Priority = DSTORAGE_PRIORITY_HIGH;
-    qd_hi.Name = "OPENWORLD_WorldGeom";
+    qd_hi.Name = "OpenWorld_WorldGeom";
     DSTORAGE_QUEUE_DESC qd_nm{};
     qd_nm.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
     qd_nm.Capacity = 32;
     qd_nm.Priority = DSTORAGE_PRIORITY_NORMAL;
-    qd_nm.Name = "OPENWORLD_MipTex";
+    qd_nm.Name = "OpenWorld_MipTex";
     if (DStorageCreateQueue(ds_factory, &qd_hi, &q_geom) != 0 ||
         DStorageCreateQueue(ds_factory, &qd_nm, &q_tex) != 0) {
         return 22;
@@ -211,7 +211,7 @@ extern "C" SLICE_EXPORT int ScarlettGuestMain() {
     }
 
     // 4. Persistent XblTitleStorage + HCWebSocket Xbox Live RTA Session
-    if (XblInitialize("rage-openworld-scid") != 0) return 40;
+    if (XblInitialize("openworld-slice-scid") != 0) return 40;
     XblContextHandle xbl_ctx = nullptr;
     if (XblContextCreateHandle(0xCAFEBABE0001ull, &xbl_ctx) != 0 || !xbl_ctx) return 41;
 
@@ -279,20 +279,20 @@ extern "C" SLICE_EXPORT int ScarlettGuestMain() {
     for (uint32_t f = 0; f < 5; ++f) {
         uint64_t tok = 0;
         D3D12XboxWaitFrameEventX(d3d_dev, &tok);
-        D3D12XboxWriteBreadcrumb(d3d_dev, 10 + f, 0x3000 + f, "OPENWORLD_Wave32Cull");
+        D3D12XboxWriteBreadcrumb(d3d_dev, 10 + f, 0x3000 + f, "OpenWorld_Wave32Cull");
         SCARLETT_RAY_DESC ray{{0.0f, 0.0f, 0.0f}, 0.01f, {0.0f, 0.0f, 1.0f}, 100.0f};
         SCARLETT_RAY_HIT hit{};
         if (XboxBvhTraceSingleRay(tlas, &ray, &hit) != 0 || hit.Hit != 1u) return 52;
         D3D12XBOX_PRESENT_PLANE_PARAMETERS plane{256, 144, tok};
         D3D12XboxPresentX(d3d_dev, &plane);
     }
-    D3D12XboxWriteBreadcrumb(d3d_dev, 99, 0x7777, "OPENWORLD_Present60Hz");
+    D3D12XboxWriteBreadcrumb(d3d_dev, 99, 0x7777, "OpenWorld_Present60Hz");
 
     D3D12XBOX_GPU_STABILITY_REPORT stab{};
     if (D3D12XboxGetGpuStabilityReport(d3d_dev, &stab) != 0 ||
         stab.DeviceRemovedReason != 0 ||
         stab.P99FrameTimeUs == 0 ||
-        std::strcmp(stab.LastBreadcrumbTag, "OPENWORLD_Present60Hz") != 0) {
+        std::strcmp(stab.LastBreadcrumbTag, "OpenWorld_Present60Hz") != 0) {
         return 53;
     }
 

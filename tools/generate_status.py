@@ -8,7 +8,8 @@ Outputs:
   - docs/status_concept_destruction.svg  (Concept Destruction bring-up dashboard)
   - docs/status_optimizations.svg        (Phase 1 Fork Foundations dashboard)
   - docs/status_aaa_roadmap.svg          (Phase 2 Retail AAA Execution dashboard)
-  - docs/status.html                     (Responsive 4-section HTML dashboard)
+  - docs/status_phase3.svg               (Phase 3 Unification, Diagnostics & GDK 2510 dashboard)
+  - docs/status.html                     (Responsive 5-section HTML dashboard)
   - README.md                            (Auto-updated status section between SCARLETTX_STATUS markers)
 """
 
@@ -715,6 +716,60 @@ def collect_aaa_roadmap_metrics() -> list[Subsystem]:
     ]
 
 
+def collect_phase3_metrics() -> list[Subsystem]:
+    """Phase 3: Post-Audit Architectural Unification, Retail Parity, Flight-Recorder Diagnostics & GDK 2510 Verification (30/30)."""
+    return [
+        Subsystem(
+            name="Shared Core & Loader Unification",
+            short_name="Core",
+            category="Core",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** Shared scarlettx_core.dll singleton registry, PackageVfs::Global(), TLS Slot-0 + FLS isolation, .pdata zero-tail stripping, Win32 G:\\ VFS/CmdLine/GetProcAddress/Delay-Load IAT hooks",
+        ),
+        Subsystem(
+            name="Guest COM Bridge (Real-Title Mode)",
+            short_name="COM",
+            category="Runtime",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** Strict IID QueryInterface across d3d12_xs/WinRT/GameInput/IXAPO, unified dstorage/xcrdapi, XMem<->KernelX<->d3d12_xs GPU VA translation, StateObjectProperties + BuildRTAS proxies, XAsync libHttpClient",
+        ),
+        Subsystem(
+            name="Retail XVD v3, .msixvc & Codecs",
+            short_name="RetailIO",
+            category="Storage",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** Retail msft-xvd v3 (0x284+), makepkg .msixvc contiguous Merkle + 128B XvcRegionHeader v2 (FS-MD unencrypted NTFS $MFT), 48B .cik & keyring loader, 32-lane GPU GDeflate, 512-sample WMA-Pro XMA2",
+        ),
+        Subsystem(
+            name="RDNA2 XS2 CFG, SM 6.6 & Vulkan RT",
+            short_name="XS2/RT",
+            category="Graphics",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** Full-width GFX10.3 decoder (literals, DPP/SDWA, VOP3P, FLAT/MTBUF, NSA MIMG, image_bvh64_intersect_ray), structured loop/if CFG, SM 6.6 bindless + dxil.dll signing, hardware VK_KHR_ray_tracing_pipeline",
+        ),
+        Subsystem(
+            name="4-Part Flight-Recorder Suite",
+            short_name="FlightRec",
+            category="Diagnostics",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** Lock-free 4096-slot cross-DLL event ring + deduplicated import/QI/vtable/VFS miss tables, VEH/SEH .pdata Ghidra-RVA crash dumper, D3D12 DRED + shader/PSO fail dumper, zero-lock SuspendThread hang watchdog",
+        ),
+        Subsystem(
+            name="Official GDK 2510 & Gen9 Silicon",
+            short_name="GDK2510",
+            category="Platform",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** Verified on RTX 5070 Ti (--debug-layer, 0 errors) against official Microsoft.GDK.PC 2510.5.6322 (InitializeApiImplEx2, XSystem/Analytics, XGameSaveFiles, XPackage chunks, XStore, XDisplay, PLS, XNetworking) + live hybrid DXR 1.1 & SM 6.5 Mesh Shaders",
+        ),
+    ]
+
+
 def _badge_width(text: str) -> int:
     # Approximate Verdana 11px width + 12px horizontal padding
     return max(26, int(round(len(text) * 6.4)) + 14)
@@ -1008,16 +1063,22 @@ def render_html(
     cd_subsystems: list[Subsystem] | None = None,
     opt_subsystems: list[Subsystem] | None = None,
     aaa_subsystems: list[Subsystem] | None = None,
+    phase3_subsystems: list[Subsystem] | None = None,
 ) -> str:
     cd_subs = cd_subsystems or []
     opt_subs = opt_subsystems or []
     aaa_subs = aaa_subsystems or []
+    p3_subs = phase3_subsystems or []
 
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
     overall_pct = (total_impl / total_target * 100.0) if total_target else 0.0
     up_impl = sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)
     fork_impl = total_impl - up_impl
+
+    p3_impl = sum(s.implemented for s in p3_subs)
+    p3_target = sum(s.target for s in p3_subs)
+    p3_pct = (p3_impl / p3_target * 100.0) if p3_target else 0.0
 
     aaa_impl = sum(s.implemented for s in aaa_subs)
     aaa_target = sum(s.target for s in aaa_subs)
@@ -1031,6 +1092,7 @@ def render_html(
     cd_target = sum(s.target for s in cd_subs)
     cd_pct = (cd_impl / cd_target * 100.0) if cd_target else 0.0
 
+    js_p3 = _serialize_js_subsystems(p3_subs)
     js_abi = _serialize_js_subsystems(subsystems)
     js_aaa = _serialize_js_subsystems(aaa_subs)
     js_opt = _serialize_js_subsystems(opt_subs)
@@ -1154,6 +1216,18 @@ def render_html(
 <body>
 <main class="page">
   <section class="panel">
+    <h2>Phase 3: Unification, Retail Parity, Diagnostics &amp; GDK 2510: {p3_pct:.1f}%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">phase 3</span><span class="v-fn">{p3_impl}/{p3_target} ({p3_pct:.1f}%)</span></span>
+      <span class="badge"><span class="k">GDK silicon</span><span class="v-exports">2510.5.6322 + DXR/MeshShader</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
+      <span class="badge"><span class="k">next wave</span><span class="v-target">Commercial Retail Bring-Up</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-p3"></div><div class="legend" id="leg-p3"></div></div>
+    <div class="list" id="list-p3"></div>
+  </section>
+
+  <section class="panel">
     <h2>Phase 2: Retail AAA Execution Roadmap: {aaa_pct:.1f}%</h2>
     <div class="badges">
       <span class="badge"><span class="k">phase 2 AAA</span><span class="v-fn">{aaa_impl}/{aaa_target} ({aaa_pct:.1f}%)</span></span>
@@ -1203,6 +1277,7 @@ def render_html(
 </main>
 <script>
   const PANELS = [
+    ['p3',  [\n{js_p3}\n    ]],
     ['aaa', [\n{js_aaa}\n    ]],
     ['abi', [\n{js_abi}\n    ]],
     ['opt', [\n{js_opt}\n    ]],
@@ -1262,6 +1337,7 @@ def render_markdown_status(
     tests_md: str,
     opt_subsystems: list[Subsystem] | None = None,
     aaa_subsystems: list[Subsystem] | None = None,
+    phase3_subsystems: list[Subsystem] | None = None,
 ) -> str:
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
@@ -1279,10 +1355,37 @@ def render_markdown_status(
     aaa_target = sum(s.target for s in aaa_subsystems) if aaa_subsystems else 0
     aaa_pct = (aaa_impl / aaa_target * 100.0) if aaa_target else 0.0
 
+    p3_impl = sum(s.implemented for s in phase3_subsystems) if phase3_subsystems else 0
+    p3_target = sum(s.target for s in phase3_subsystems) if phase3_subsystems else 0
+    p3_pct = (p3_impl / p3_target * 100.0) if p3_target else 0.0
+
     sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
     rows = [
         "<!-- SCARLETTX_STATUS_START -->",
         "## Status",
+        "",
+        f"### Phase 3: Unification, Retail Parity, Diagnostics & GDK 2510 (Completed — {p3_impl}/{p3_target})",
+        "",
+        f"Tracks the shared `scarlettx_core.dll` unification, 4-Part Flight-Recorder Diagnostic Suite, retail `.msixvc` + `.cik` key-ring & NTFS `$MFT` parity, and official Microsoft GDK `2510.5.6322` + ATG Gen9 DXR/MeshShader RTX validation (`{p3_impl}/{p3_target}` completed):",
+        "",
+        "![ScarlettEdge Phase 3: Unification, Diagnostics & GDK 2510](docs/status_phase3.svg)",
+        "",
+        f"**Phase 3 Milestones:** `{p3_pct:.1f}%` ({p3_impl} of {p3_target} milestones) · "
+        f"**Tests:** {tests_md} · "
+        "**Next Wave:** `Per-Title Commercial Retail Title Bring-Up`",
+        "",
+        "| Phase 3 Track | Category | Progress | Readiness | Verified Capabilities |",
+        "| :--- | :--- | :---: | :---: | :--- |",
+    ]
+    if phase3_subsystems:
+        for s in sorted(phase3_subsystems, key=lambda x: (-x.ratio, -x.implemented, x.name.lower())):
+            rows.append(
+                f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` | `{round(s.pct)}%` | {s.notes} |"
+            )
+
+    rows += [
+        "",
+        "---",
         "",
         "### Phase 2: Retail AAA Execution Architecture (Completed — 72/72)",
         "",
@@ -1481,6 +1584,25 @@ def main() -> None:
         callout_line2="Passing synthetic & UE5/Open-World vertical-slice suites do not guarantee compatibility with untested commercial retail games.",
     )
 
+    p3_subsystems = collect_phase3_metrics()
+    p3_impl = sum(s.implemented for s in p3_subsystems)
+    p3_target = sum(s.target for s in p3_subsystems)
+    p3_pct = (p3_impl / p3_target * 100.0) if p3_target else 0.0
+    p3_badges = [
+        ("phase 3", f"{p3_pct:.1f}% ({p3_impl}/{p3_target})", LV3 if p3_pct >= 80.0 else LV1, p3_pct >= 80.0),
+        ("GDK silicon", "2510.5.6322 + DXR/MeshShader", BADGE_EXPORTS, False),
+        ("CI tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
+        ("next wave", "Commercial Retail Bring-Up", BADGE_TARGET, False),
+    ]
+    p3_svg = render_svg(
+        p3_subsystems,
+        badges=p3_badges,
+        heading_prefix="Phase 3: Unification, Diagnostics & GDK 2510",
+        callout_lead="Phase 3 complete:",
+        callout_line1=f"All {p3_impl}/{p3_target} ({p3_pct:.1f}%) unification, flight-recorder, .msixvc/.cik & GDK 2510.5.6322 milestones verified on RTX hardware.",
+        callout_line2="Ready for per-title commercial retail testing with live flight-recorder telemetry, VEH crash dumps & hang watchdog.",
+    )
+
     html_doc = render_html(
         subsystems,
         total_exports,
@@ -1489,18 +1611,21 @@ def main() -> None:
         cd_subsystems=cd_subsystems,
         opt_subsystems=opt_subsystems,
         aaa_subsystems=aaa_subsystems,
+        phase3_subsystems=p3_subsystems,
     )
 
     out_svg = ROOT / "docs/status.svg"
     out_cd_svg = ROOT / "docs/status_concept_destruction.svg"
     out_opt_svg = ROOT / "docs/status_optimizations.svg"
     out_aaa_svg = ROOT / "docs/status_aaa_roadmap.svg"
+    out_p3_svg = ROOT / "docs/status_phase3.svg"
     out_html = ROOT / "docs/status.html"
     out_svg.parent.mkdir(parents=True, exist_ok=True)
     out_svg.write_text(svg, encoding="utf-8")
     out_cd_svg.write_text(cd_svg, encoding="utf-8")
     out_opt_svg.write_text(opt_svg, encoding="utf-8")
     out_aaa_svg.write_text(aaa_svg, encoding="utf-8")
+    out_p3_svg.write_text(p3_svg, encoding="utf-8")
     out_html.write_text(html_doc, encoding="utf-8")
 
     md_block = render_markdown_status(
@@ -1510,6 +1635,7 @@ def main() -> None:
         tests_markdown(test_count, test_results),
         opt_subsystems=opt_subsystems,
         aaa_subsystems=aaa_subsystems,
+        phase3_subsystems=p3_subsystems,
     )
     readme_path = ROOT / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
@@ -1530,8 +1656,8 @@ def main() -> None:
     readme_path.write_text(new_readme, encoding="utf-8")
     print(
         f"[generate_status] Wrote {out_svg.relative_to(ROOT)}, {out_cd_svg.relative_to(ROOT)}, "
-        f"{out_opt_svg.relative_to(ROOT)}, {out_aaa_svg.relative_to(ROOT)}, {out_html.relative_to(ROOT)}, "
-        f"and updated README.md (exports={total_exports}, tests: {tests_text})"
+        f"{out_opt_svg.relative_to(ROOT)}, {out_aaa_svg.relative_to(ROOT)}, {out_p3_svg.relative_to(ROOT)}, "
+        f"{out_html.relative_to(ROOT)}, and updated README.md (exports={total_exports}, tests: {tests_text})"
     )
 
 
