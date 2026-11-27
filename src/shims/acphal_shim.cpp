@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <mutex>
-#include <unordered_map>
+#include <vector>
 
 #if defined(_WIN32)
 #include <malloc.h>
@@ -20,33 +22,70 @@ constexpr int32_t kS_OK = 0;
 constexpr int32_t kE_INVALIDARG = static_cast<int32_t>(0x80070057u);
 constexpr int32_t kE_OUTOFMEMORY = static_cast<int32_t>(0x8007000Eu);
 
+constexpr uint32_t kApuBasePa = 0x10000000u;
+constexpr uint32_t kMinApuAlign = 64u;
+constexpr uint32_t kDefaultHeapCapacity = 64u * 1024u * 1024u;
+constexpr uint32_t kMaxHeapCapacity = 0xE0000000u;
+
 bool TraceEnabled() {
     const char* v = std::getenv("SCARLETTX_TRACE");
     return v && v[0] != '\0' && v[0] != '0';
 }
 
+struct FreeSpan {
+    uint32_t pa = 0;
+    uint32_t size = 0;
+};
+
 struct ApuAllocation {
     void* va = nullptr;
     uint32_t pa = 0;
     uint32_t size = 0;
+    uint32_t span_size = 0;
     uint32_t alignment = 0;
     uint32_t flags = 0;
 };
 
 struct ApuState {
     std::mutex mu;
-    uint32_t next_pa = 0x10000000u;
-    uint32_t heap_capacity = 64u * 1024u * 1024u;
+    uint32_t heap_capacity = kDefaultHeapCapacity;
     bool heap_configured = false;
     uint32_t bytes_allocated = 0;
     ACP_SHAPE_CONTEXT_COUNTS shape_contexts{};
-    std::unordered_map<uintptr_t, ApuAllocation> by_va;
-    std::unordered_map<uint32_t, uintptr_t> by_pa;
+    std::vector<FreeSpan> free_blocks{{kApuBasePa, kDefaultHeapCapacity}};
+    std::map<uintptr_t, ApuAllocation> by_va;
+    std::map<uint32_t, uintptr_t> by_pa;
 };
 
 ApuState& State() {
     static ApuState s;
     return s;
+}
+
+void RebuildFreeBlocksLocked(ApuState& st) {
+    st.free_blocks.clear();
+    const uint64_t end = static_cast<uint64_t>(kApuBasePa) + static_cast<uint64_t>(st.heap_capacity);
+    uint64_t cursor = kApuBasePa;
+    uint64_t live_bytes = 0;
+    for (const auto& [pa, va_key] : st.by_pa) {
+        const auto va_it = st.by_va.find(va_key);
+        if (va_it == st.by_va.end()) continue;
+        const uint32_t span = va_it->second.span_size;
+        live_bytes += span;
+        if (pa > cursor && cursor < end) {
+            const uint64_t gap_end = std::min<uint64_t>(pa, end);
+            if (gap_end > cursor) {
+                st.free_blocks.push_back(
+                    FreeSpan{static_cast<uint32_t>(cursor), static_cast<uint32_t>(gap_end - cursor)});
+            }
+        }
+        cursor = std::max<uint64_t>(cursor, static_cast<uint64_t>(pa) + static_cast<uint64_t>(span));
+    }
+    if (cursor < end) {
+        st.free_blocks.push_back(
+            FreeSpan{static_cast<uint32_t>(cursor), static_cast<uint32_t>(end - cursor)});
+    }
+    st.bytes_allocated = static_cast<uint32_t>(std::min<uint64_t>(live_bytes, 0xFFFFFFFFull));
 }
 
 int32_t ApuAllocLocked(
@@ -56,45 +95,78 @@ int32_t ApuAllocLocked(
     uint32_t sizeInBytes,
     uint32_t alignmentInBytes,
     uint32_t flags) {
-    if (!virtualAddress || sizeInBytes == 0) return kE_INVALIDARG;
-    if (alignmentInBytes > 0x40000000u) return kE_INVALIDARG;
+    if (!virtualAddress) return kE_INVALIDARG;
+    *virtualAddress = nullptr;
+    if (physicalAddress) *physicalAddress = 0u;
+    if (sizeInBytes == 0 || alignmentInBytes > 0x40000000u) return kE_INVALIDARG;
 
     // Validate & normalize alignment to a power-of-2 >= 64 so _aligned_malloc never aborts
-    const uint32_t align = std::bit_ceil(std::max<uint32_t>(64u, alignmentInBytes));
-
-    if (st.heap_configured &&
-        static_cast<uint64_t>(st.bytes_allocated) + static_cast<uint64_t>(sizeInBytes) > st.heap_capacity) {
+    const uint32_t align = std::bit_ceil(std::max<uint32_t>(kMinApuAlign, alignmentInBytes));
+    const uint64_t span_size64 =
+        (static_cast<uint64_t>(sizeInBytes) + (kMinApuAlign - 1u)) & ~static_cast<uint64_t>(kMinApuAlign - 1u);
+    if (span_size64 == 0ull || span_size64 > st.heap_capacity) {
         return kE_OUTOFMEMORY;
     }
+    const uint32_t span_size = static_cast<uint32_t>(span_size64);
 
-    const uint64_t aligned_pa64 =
-        (static_cast<uint64_t>(st.next_pa) + static_cast<uint64_t>(align) - 1ull) &
-        ~static_cast<uint64_t>(align - 1u);
-    if (aligned_pa64 + static_cast<uint64_t>(sizeInBytes) > 0xFFFFFFFFull) {
+    size_t fit_idx = st.free_blocks.size();
+    uint32_t aligned_pa = 0u;
+    for (size_t i = 0; i < st.free_blocks.size(); ++i) {
+        const uint64_t blk_start = st.free_blocks[i].pa;
+        const uint64_t blk_end = blk_start + st.free_blocks[i].size;
+        const uint64_t cand_pa =
+            (blk_start + static_cast<uint64_t>(align) - 1ull) & ~static_cast<uint64_t>(align - 1u);
+        if (cand_pa >= blk_start && cand_pa + span_size <= blk_end && cand_pa + span_size <= 0xFFFFFFFFull) {
+            fit_idx = i;
+            aligned_pa = static_cast<uint32_t>(cand_pa);
+            break;
+        }
+    }
+    if (fit_idx >= st.free_blocks.size()) {
         return kE_OUTOFMEMORY;
     }
 
 #if defined(_WIN32)
-    void* mem = _aligned_malloc(sizeInBytes, align);
+    void* mem = _aligned_malloc(span_size, align);
 #else
     void* mem = nullptr;
-    if (posix_memalign(&mem, align, sizeInBytes) != 0) mem = nullptr;
+    if (posix_memalign(&mem, align, span_size) != 0) mem = nullptr;
 #endif
     if (!mem) return kE_OUTOFMEMORY;
-    std::memset(mem, 0, sizeInBytes);
+    std::memset(mem, 0, span_size);
 
-    const uint32_t aligned_pa = static_cast<uint32_t>(aligned_pa64);
-    st.next_pa = aligned_pa + sizeInBytes;
-    st.bytes_allocated += sizeInBytes;
+    const uint64_t blk_start = st.free_blocks[fit_idx].pa;
+    const uint64_t blk_end = blk_start + st.free_blocks[fit_idx].size;
+    const uint32_t prefix_size = static_cast<uint32_t>(aligned_pa - blk_start);
+    const uint32_t suffix_pa = aligned_pa + span_size;
+    const uint32_t suffix_size = static_cast<uint32_t>(blk_end - suffix_pa);
+
+    if (prefix_size == 0u && suffix_size == 0u) {
+        st.free_blocks.erase(st.free_blocks.begin() + static_cast<std::ptrdiff_t>(fit_idx));
+    } else if (prefix_size == 0u) {
+        st.free_blocks[fit_idx].pa = suffix_pa;
+        st.free_blocks[fit_idx].size = suffix_size;
+    } else if (suffix_size == 0u) {
+        st.free_blocks[fit_idx].size = prefix_size;
+    } else {
+        st.free_blocks[fit_idx].size = prefix_size;
+        st.free_blocks.insert(
+            st.free_blocks.begin() + static_cast<std::ptrdiff_t>(fit_idx + 1u),
+            FreeSpan{suffix_pa, suffix_size});
+    }
+
+    st.bytes_allocated += span_size;
 
     ApuAllocation rec{};
     rec.va = mem;
     rec.pa = aligned_pa;
     rec.size = sizeInBytes;
+    rec.span_size = span_size;
     rec.alignment = align;
     rec.flags = flags;
-    st.by_va[reinterpret_cast<uintptr_t>(mem)] = rec;
-    st.by_pa[aligned_pa] = reinterpret_cast<uintptr_t>(mem);
+    const uintptr_t va_key = reinterpret_cast<uintptr_t>(mem);
+    st.by_va[va_key] = rec;
+    st.by_pa[aligned_pa] = va_key;
 
     *virtualAddress = mem;
     if (physicalAddress) *physicalAddress = aligned_pa;
@@ -111,9 +183,34 @@ int32_t ApuFreeLocked(ApuState& st, void* virtualAddress) {
     if (it == st.by_va.end()) {
         return kE_INVALIDARG;
     }
-    st.bytes_allocated = st.bytes_allocated >= it->second.size ? (st.bytes_allocated - it->second.size) : 0u;
-    st.by_pa.erase(it->second.pa);
+    const uint32_t freed_pa = it->second.pa;
+    const uint32_t freed_span = it->second.span_size;
+    st.bytes_allocated = st.bytes_allocated >= freed_span ? (st.bytes_allocated - freed_span) : 0u;
+    st.by_pa.erase(freed_pa);
     st.by_va.erase(it);
+
+    // Return [freed_pa, freed_pa + freed_span) to the address-ordered free list and coalesce neighbors.
+    auto pos = std::lower_bound(
+        st.free_blocks.begin(), st.free_blocks.end(), freed_pa,
+        [](const FreeSpan& blk, uint32_t pa) { return blk.pa < pa; });
+    uint32_t merged_pa = freed_pa;
+    uint32_t merged_size = freed_span;
+    if (pos != st.free_blocks.end() &&
+        static_cast<uint64_t>(merged_pa) + static_cast<uint64_t>(merged_size) == pos->pa) {
+        merged_size += pos->size;
+        pos = st.free_blocks.erase(pos);
+    }
+    if (pos != st.free_blocks.begin()) {
+        auto prev = pos - 1;
+        if (static_cast<uint64_t>(prev->pa) + static_cast<uint64_t>(prev->size) == merged_pa) {
+            prev->size += merged_size;
+        } else {
+            st.free_blocks.insert(pos, FreeSpan{merged_pa, merged_size});
+        }
+    } else {
+        st.free_blocks.insert(pos, FreeSpan{merged_pa, merged_size});
+    }
+
 #if defined(_WIN32)
     _aligned_free(virtualAddress);
 #else
@@ -293,10 +390,26 @@ int32_t SCARLETTX_ACP_CALL AcpHalReleaseShapeContexts(void) {
 
 int32_t SCARLETTX_ACP_CALL ApuCreateHeap(uint32_t cachedSizeInBytes, uint32_t nonCachedSizeInBytes) {
     std::lock_guard<std::mutex> lk(State().mu);
+    ApuState& st = State();
     const uint64_t total = static_cast<uint64_t>(cachedSizeInBytes) + static_cast<uint64_t>(nonCachedSizeInBytes);
     if (total > 0ull) {
-        State().heap_capacity = static_cast<uint32_t>(std::min<uint64_t>(total, 0xFFFFFFFFull));
-        State().heap_configured = true;
+        const uint64_t clamped = std::min<uint64_t>(total, kMaxHeapCapacity);
+        const uint32_t aligned_cap = static_cast<uint32_t>(
+            (clamped + (kMinApuAlign - 1u)) & ~static_cast<uint64_t>(kMinApuAlign - 1u));
+        if (!st.by_pa.empty()) {
+            const auto last_it = std::prev(st.by_pa.end());
+            const auto va_it = st.by_va.find(last_it->second);
+            if (va_it != st.by_va.end()) {
+                const uint64_t highest_live_end =
+                    static_cast<uint64_t>(last_it->first) + static_cast<uint64_t>(va_it->second.span_size);
+                if (highest_live_end > static_cast<uint64_t>(kApuBasePa) + static_cast<uint64_t>(aligned_cap)) {
+                    return kE_INVALIDARG;
+                }
+            }
+        }
+        st.heap_capacity = aligned_cap;
+        st.heap_configured = true;
+        RebuildFreeBlocksLocked(st);
     }
     return kS_OK;
 }
@@ -319,12 +432,18 @@ int32_t SCARLETTX_ACP_CALL ApuFree(void* virtualAddress) {
 int32_t SCARLETTX_ACP_CALL ApuHeapGetState(APU_HEAP_STATE* apuHeapState, uint32_t /*flags*/) {
     if (!apuHeapState) return kE_INVALIDARG;
     std::lock_guard<std::mutex> lk(State().mu);
+    const ApuState& st = State();
     std::memset(apuHeapState, 0, sizeof(*apuHeapState));
-    apuHeapState->bytesAllocated = State().bytes_allocated;
-    apuHeapState->bytesFree =
-        State().heap_capacity > State().bytes_allocated ? (State().heap_capacity - State().bytes_allocated) : 0u;
-    apuHeapState->maximumBlockSizeAvailable = apuHeapState->bytesFree;
-    apuHeapState->allocationCount = static_cast<uint32_t>(State().by_va.size());
+    uint64_t free_total = 0;
+    uint32_t max_block = 0;
+    for (const FreeSpan& blk : st.free_blocks) {
+        free_total += blk.size;
+        if (blk.size > max_block) max_block = blk.size;
+    }
+    apuHeapState->bytesAllocated = st.bytes_allocated;
+    apuHeapState->bytesFree = static_cast<uint32_t>(std::min<uint64_t>(free_total, 0xFFFFFFFFull));
+    apuHeapState->maximumBlockSizeAvailable = max_block;
+    apuHeapState->allocationCount = static_cast<uint32_t>(st.by_va.size());
     return kS_OK;
 }
 
@@ -332,22 +451,29 @@ int32_t SCARLETTX_ACP_CALL ApuIsVirtualAddressValid(const void* virtualAddress, 
     if (!virtualAddress) return 0;
     const uintptr_t addr = reinterpret_cast<uintptr_t>(virtualAddress);
     std::lock_guard<std::mutex> lk(State().mu);
-    for (const auto& kv : State().by_va) {
-        const uintptr_t base = kv.first;
-        const uintptr_t alloc_sz = static_cast<uintptr_t>(kv.second.size);
-        // Overflow-safe bounds check (never computes addr + sizeInBytes!)
-        if (addr >= base && (addr - base) <= alloc_sz &&
-            static_cast<uintptr_t>(sizeInBytes) <= (alloc_sz - (addr - base))) {
-            return 1;
-        }
+    const ApuState& st = State();
+    auto it = st.by_va.upper_bound(addr);
+    if (it == st.by_va.begin()) return 0;
+    --it;
+    const uintptr_t base = it->first;
+    const uintptr_t alloc_sz = static_cast<uintptr_t>(it->second.size);
+    // Overflow-safe bounds check (never computes addr + sizeInBytes!)
+    if ((addr - base) < alloc_sz &&
+        static_cast<uintptr_t>(sizeInBytes) <= (alloc_sz - (addr - base))) {
+        return 1;
     }
     return 0;
 }
 
 void* SCARLETTX_ACP_CALL ApuMapApuAddress(uint32_t apuPhysicalAddress) {
     std::lock_guard<std::mutex> lk(State().mu);
-    for (const auto& kv : State().by_va) {
-        const auto& rec = kv.second;
+    const ApuState& st = State();
+    auto it = st.by_pa.upper_bound(apuPhysicalAddress);
+    if (it == st.by_pa.begin()) return nullptr;
+    --it;
+    const auto va_it = st.by_va.find(it->second);
+    if (va_it != st.by_va.end()) {
+        const auto& rec = va_it->second;
         if (apuPhysicalAddress >= rec.pa && (apuPhysicalAddress - rec.pa) < rec.size) {
             return static_cast<uint8_t*>(rec.va) + (apuPhysicalAddress - rec.pa);
         }
@@ -359,12 +485,14 @@ uint32_t SCARLETTX_ACP_CALL ApuMapVirtualAddress(const void* virtualAddress) {
     if (!virtualAddress) return 0;
     const uintptr_t addr = reinterpret_cast<uintptr_t>(virtualAddress);
     std::lock_guard<std::mutex> lk(State().mu);
-    for (const auto& kv : State().by_va) {
-        const uintptr_t base = kv.first;
-        const uintptr_t alloc_sz = static_cast<uintptr_t>(kv.second.size);
-        if (addr >= base && (addr - base) < alloc_sz) {
-            return kv.second.pa + static_cast<uint32_t>(addr - base);
-        }
+    const ApuState& st = State();
+    auto it = st.by_va.upper_bound(addr);
+    if (it == st.by_va.begin()) return 0;
+    --it;
+    const uintptr_t base = it->first;
+    const uintptr_t alloc_sz = static_cast<uintptr_t>(it->second.size);
+    if ((addr - base) < alloc_sz) {
+        return it->second.pa + static_cast<uint32_t>(addr - base);
     }
     return 0;
 }
