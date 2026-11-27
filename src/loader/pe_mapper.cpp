@@ -121,6 +121,8 @@ const char* ResolveSystemShimTarget(const std::string& lower_name) {
         {"gameinput.dll", "GameInput.dll"},
         {"xaudio2_9.dll", "xaudio2_9.dll"},
         {"xaudio2_9redist.dll", "xaudio2_9.dll"},
+        {"x3daudio1_7.dll", "xaudio2_9.dll"},
+        {"xapofx1_5.dll", "xaudio2_9.dll"},
         {"xcrdapi.dll", "xcrdapi.dll"},
         {"xboxbvhbuilder.dll", "XboxBvhBuilder.dll"},
         {"dstorage_xs.dll", "dstorage_xs.dll"},
@@ -273,6 +275,71 @@ HMODULE WINAPI GuestLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dw
 
 HMODULE WINAPI GuestLoadLibraryW(LPCWSTR lpLibFileName) {
     return GuestLoadLibraryExW(lpLibFileName, nullptr, 0);
+}
+
+// WinRT RoActivateInstance / RoGetActivationFactory guest IAT broker:
+// Intercepts Xbox/Game Core WinRT runtime classes via xsapi.dll's XblWinRtActivateClassByName
+// and delegates all standard desktop Windows runtime classes cleanly to host combase.dll.
+HRESULT WINAPI GuestRoActivateInstance(void* activatableClassId, void** instance) {
+    if (!instance) return E_POINTER;
+    *instance = nullptr;
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using FnGetRaw = const wchar_t*(WINAPI*)(void*, uint32_t*);
+    using FnHostActivate = HRESULT(WINAPI*)(void*, void**);
+    auto get_raw = combase ? reinterpret_cast<FnGetRaw>(reinterpret_cast<void*>(
+                                 GetProcAddress(combase, "WindowsGetStringRawBuffer")))
+                           : nullptr;
+    if (activatableClassId && get_raw) {
+        uint32_t len = 0;
+        const wchar_t* cls = get_raw(activatableClassId, &len);
+        if (cls && len > 0) {
+            HMODULE xsapi_mod = TryLoadSystemShimA("xsapi.dll");
+            if (!xsapi_mod) xsapi_mod = GetModuleHandleW(L"xsapi.dll");
+            if (xsapi_mod) {
+                using FnBroker = int32_t(__stdcall*)(const wchar_t*, const void*, int32_t, void**);
+                auto broker = reinterpret_cast<FnBroker>(reinterpret_cast<void*>(
+                    GetProcAddress(xsapi_mod, "XblWinRtActivateClassByName")));
+                if (broker && broker(cls, nullptr, 0, instance) == 0 && *instance) {
+                    return S_OK;
+                }
+            }
+        }
+    }
+    auto host_act = combase ? reinterpret_cast<FnHostActivate>(reinterpret_cast<void*>(
+                                  GetProcAddress(combase, "RoActivateInstance")))
+                            : nullptr;
+    return host_act ? host_act(activatableClassId, instance) : REGDB_E_CLASSNOTREG;
+}
+
+HRESULT WINAPI GuestRoGetActivationFactory(void* activatableClassId, const GUID* iid, void** factory) {
+    if (!factory) return E_POINTER;
+    *factory = nullptr;
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using FnGetRaw = const wchar_t*(WINAPI*)(void*, uint32_t*);
+    using FnHostGetFac = HRESULT(WINAPI*)(void*, const GUID*, void**);
+    auto get_raw = combase ? reinterpret_cast<FnGetRaw>(reinterpret_cast<void*>(
+                                 GetProcAddress(combase, "WindowsGetStringRawBuffer")))
+                           : nullptr;
+    if (activatableClassId && get_raw) {
+        uint32_t len = 0;
+        const wchar_t* cls = get_raw(activatableClassId, &len);
+        if (cls && len > 0) {
+            HMODULE xsapi_mod = TryLoadSystemShimA("xsapi.dll");
+            if (!xsapi_mod) xsapi_mod = GetModuleHandleW(L"xsapi.dll");
+            if (xsapi_mod) {
+                using FnBroker = int32_t(__stdcall*)(const wchar_t*, const void*, int32_t, void**);
+                auto broker = reinterpret_cast<FnBroker>(reinterpret_cast<void*>(
+                    GetProcAddress(xsapi_mod, "XblWinRtActivateClassByName")));
+                if (broker && broker(cls, iid, 1, factory) == 0 && *factory) {
+                    return S_OK;
+                }
+            }
+        }
+    }
+    auto host_fac = combase ? reinterpret_cast<FnHostGetFac>(reinterpret_cast<void*>(
+                                  GetProcAddress(combase, "RoGetActivationFactory")))
+                            : nullptr;
+    return host_fac ? host_fac(activatableClassId, iid, factory) : REGDB_E_CLASSNOTREG;
 }
 
 DWORD SectionCharsToPageProtect(uint32_t ch) {
@@ -685,6 +752,14 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
                                 res.kind = ImportResolutionKind::HleRegistry;
                             } else if (sym_name == "LoadLibraryW") {
                                 resolved = reinterpret_cast<void*>(&GuestLoadLibraryW);
+                                res.kind = ImportResolutionKind::HleRegistry;
+                            }
+                        } else if (target_lower == "combase.dll") {
+                            if (sym_name == "RoActivateInstance") {
+                                resolved = reinterpret_cast<void*>(&GuestRoActivateInstance);
+                                res.kind = ImportResolutionKind::HleRegistry;
+                            } else if (sym_name == "RoGetActivationFactory") {
+                                resolved = reinterpret_cast<void*>(&GuestRoGetActivationFactory);
                                 res.kind = ImportResolutionKind::HleRegistry;
                             }
                         }

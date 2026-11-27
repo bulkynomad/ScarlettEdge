@@ -53,6 +53,11 @@ constexpr Guid kApiGameEvent = {0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED
 // XPackage, and the latest of the interface ids its console object answers.
 constexpr Guid kApiPackage = {0xAF406016u, 0xE850u, 0x4AA8u, {0xA8, 0x8D, 0x2F, 0x3D, 0xCB, 0x9D, 0xAC, 0x7E}};
 constexpr Guid kIidPackageLater = {0xF92D8712u, 0x2B27u, 0x4D8Au, {0xBF, 0x01, 0x11, 0xA6, 0xF8, 0xE3, 0xEB, 0x42}};
+constexpr Guid kIidPackage2025 = {0xA8C4234Eu, 0x7F1Bu, 0x4D3Au, {0x9C, 0x81, 0x5E, 0x2B, 0x7D, 0x90, 0xA1, 0x14}};
+// GDK 2022-2026 XUser later IID & XStore API/IIDs.
+constexpr Guid kIidUser2025 = {0x8B3F21C4u, 0x5D9Eu, 0x42A1u, {0x97, 0xC8, 0x1E, 0x4F, 0xA8, 0x02, 0xB6, 0x3D}};
+constexpr Guid kApiStore = {0xCE8E7A26u, 0x2A0Eu, 0x4982u, {0xA2, 0x37, 0x71, 0xF9, 0x67, 0xB0, 0x5C, 0x3A}};
+constexpr Guid kIidStore2025 = {0xD4B92E11u, 0x5C84u, 0x49A2u, {0x8E, 0x17, 0x63, 0xF0, 0xB8, 0xC9, 0x12, 0x45}};
 
 constexpr XGameResult kNoInterface = static_cast<XGameResult>(0x80004002u);
 constexpr XGameResult kNotImplemented = static_cast<XGameResult>(0x80004001u);
@@ -327,6 +332,63 @@ XGameResult SCARLETTX_GDK_CALLBACK UserGetTokenAndSignatureResult(
     return XUserGetTokenAndSignatureResult(async, bufferSize, buffer, ptrToBuffer, bufferUsed);
 }
 
+XGameResult SCARLETTX_GDK_CALLBACK UserResolvePrivilegeWithUiAsync(
+    void* /*self*/,
+    XUserHandle user,
+    XUserPrivilegeOptions options,
+    XUserPrivilege privilege,
+    XAsyncBlock* async) {
+    return XUserResolvePrivilegeWithUiAsync(user, options, privilege, async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserResolvePrivilegeWithUiResult(void* /*self*/, XAsyncBlock* async) {
+    return XUserResolvePrivilegeWithUiResult(async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserGetTokenAndSignatureUtf16Async(
+    void* /*self*/,
+    XUserHandle user,
+    XUserGetTokenAndSignatureOptions options,
+    const wchar_t* method,
+    const wchar_t* url,
+    size_t headerCount,
+    const XUserGetTokenAndSignatureUtf16HttpHeader* headers,
+    size_t bodySize,
+    const void* bodyBuffer,
+    XAsyncBlock* async) {
+    return XUserGetTokenAndSignatureUtf16Async(
+        user, options, method, url, headerCount, headers, bodySize, bodyBuffer, async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserGetTokenAndSignatureUtf16ResultSize(
+    void* /*self*/,
+    XAsyncBlock* async,
+    size_t* bufferSize) {
+    return XUserGetTokenAndSignatureUtf16ResultSize(async, bufferSize);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserGetTokenAndSignatureUtf16Result(
+    void* /*self*/,
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XUserGetTokenAndSignatureUtf16Data** ptrToBuffer,
+    size_t* bufferUsed) {
+    return XUserGetTokenAndSignatureUtf16Result(async, bufferSize, buffer, ptrToBuffer, bufferUsed);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserResolveIssueWithUiAsync(
+    void* /*self*/,
+    XUserHandle user,
+    const char* url,
+    XAsyncBlock* async) {
+    return XUserResolveIssueWithUiAsync(user, url, async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserResolveIssueWithUiResult(void* /*self*/, XAsyncBlock* async) {
+    return XUserResolveIssueWithUiResult(async);
+}
+
 template <size_t... I>
 std::array<Slot, kUserSlots> MakeUserVtbl(std::index_sequence<I...>) {
     std::array<Slot, kUserSlots> vtbl = {reinterpret_cast<Slot>(&UserUnimplemented<static_cast<int>(I)>)...};
@@ -346,9 +408,16 @@ std::array<Slot, kUserSlots> MakeUserVtbl(std::index_sequence<I...>) {
     vtbl[15] = reinterpret_cast<Slot>(&UserGetGamertag);
     vtbl[19] = reinterpret_cast<Slot>(&UserGetAgeGroup);
     vtbl[20] = reinterpret_cast<Slot>(&UserCheckPrivilege);
+    vtbl[21] = reinterpret_cast<Slot>(&UserResolvePrivilegeWithUiAsync);
+    vtbl[22] = reinterpret_cast<Slot>(&UserResolvePrivilegeWithUiResult);
     vtbl[23] = reinterpret_cast<Slot>(&UserGetTokenAndSignatureAsync);
     vtbl[24] = reinterpret_cast<Slot>(&UserGetTokenAndSignatureResultSize);
     vtbl[25] = reinterpret_cast<Slot>(&UserGetTokenAndSignatureResult);
+    vtbl[26] = reinterpret_cast<Slot>(&UserGetTokenAndSignatureUtf16Async);
+    vtbl[27] = reinterpret_cast<Slot>(&UserGetTokenAndSignatureUtf16ResultSize);
+    vtbl[28] = reinterpret_cast<Slot>(&UserGetTokenAndSignatureUtf16Result);
+    vtbl[29] = reinterpret_cast<Slot>(&UserResolveIssueWithUiAsync);
+    vtbl[30] = reinterpret_cast<Slot>(&UserResolveIssueWithUiResult);
     vtbl[33] = reinterpret_cast<Slot>(&UserRegisterForChangeEvent);
     vtbl[34] = reinterpret_cast<Slot>(&UserUnregisterForChangeEvent);
     return vtbl;
@@ -670,15 +739,40 @@ XGameResult SCARLETTX_GDK_CALLBACK PackageGetUserLocale(void* /*self*/, size_t s
     return hr;
 }
 
-// Only the running package is installed, and it is not reported: a title
-// enumerates to find its add-on content, and there is none.
 XGameResult SCARLETTX_GDK_CALLBACK PackageEnumeratePackages(void* /*self*/, uint32_t kind, uint32_t scope,
-                                                            void* /*context*/, void* callback) {
+                                                            void* context, void* callback) {
+    if (!callback) return XGR_E_INVALIDARG;
     if (Trace()) {
-        std::fprintf(stderr, "[ScarlettX][xgameruntime] XPackageEnumeratePackages(kind=%u, scope=%u) -> no packages\n",
+        std::fprintf(stderr, "[ScarlettX][xgameruntime] XPackageEnumeratePackages(kind=%u, scope=%u)\n",
                      static_cast<unsigned>(kind), static_cast<unsigned>(scope));
     }
-    return callback ? XGR_S_OK : XGR_E_INVALIDARG;
+    return XPackageEnumeratePackages(
+        static_cast<XPackageKind>(kind),
+        static_cast<XPackageEnumerationScope>(scope),
+        context,
+        reinterpret_cast<XPackageEnumerationCallback*>(callback));
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageMountWithUiAsync(void* /*self*/, const char* pkg_id, XAsyncBlock* async) {
+    return XPackageMountWithUiAsync(pkg_id, async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageMountWithUiResult(void* /*self*/, XAsyncBlock* async,
+                                                            XPackageMountHandle* mount) {
+    return XPackageMountWithUiResult(async, mount);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageGetMountPathSize(void* /*self*/, XPackageMountHandle mount, size_t* sz) {
+    return XPackageGetMountPathSize(mount, sz);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageGetMountPath(void* /*self*/, XPackageMountHandle mount, size_t sz,
+                                                       char* path) {
+    return XPackageGetMountPath(mount, sz, path);
+}
+
+void SCARLETTX_GDK_CALLBACK PackageCloseMountHandle(void* /*self*/, XPackageMountHandle mount) {
+    XPackageCloseMountHandle(mount);
 }
 
 // Nothing is ever installed while the title runs, so the callback is never
@@ -702,9 +796,60 @@ std::array<Slot, kPackageSlots> MakePackageVtbl(std::index_sequence<I...>) {
     vtbl[11] = reinterpret_cast<Slot>(&PackageGetUserLocale);
     for (int slot : {20, 28, 35}) vtbl[slot] = reinterpret_cast<Slot>(&PackageEnumeratePackages);
     for (int slot : {21, 29, 36}) vtbl[slot] = reinterpret_cast<Slot>(&PackageRegisterPackageInstalled);
+    vtbl[22] = reinterpret_cast<Slot>(&PackageMountWithUiAsync);
+    vtbl[23] = reinterpret_cast<Slot>(&PackageMountWithUiResult);
+    vtbl[24] = reinterpret_cast<Slot>(&PackageGetMountPathSize);
+    vtbl[25] = reinterpret_cast<Slot>(&PackageGetMountPath);
+    vtbl[26] = reinterpret_cast<Slot>(&PackageCloseMountHandle);
     return vtbl;
 }
 const std::array<Slot, kPackageSlots> kPackageVtbl = MakePackageVtbl(std::make_index_sequence<kPackageSlots>{});
+
+// {CE8E7A26}: XStore (GDK 2022-2026 game license & DLC entitlement queries).
+XGameResult SCARLETTX_GDK_CALLBACK StoreCreateContext(void* /*self*/, XUserHandle user, XStoreContextHandle* out) {
+    return XStoreCreateContext(user, out);
+}
+void SCARLETTX_GDK_CALLBACK StoreCloseContextHandle(void* /*self*/, XStoreContextHandle ctx) {
+    XStoreCloseContextHandle(ctx);
+}
+XGameResult SCARLETTX_GDK_CALLBACK StoreQueryGameLicenseAsync(void* /*self*/, XStoreContextHandle ctx,
+                                                              XAsyncBlock* async) {
+    return XStoreQueryGameLicenseAsync(ctx, async);
+}
+XGameResult SCARLETTX_GDK_CALLBACK StoreQueryGameLicenseResult(void* /*self*/, XAsyncBlock* async,
+                                                               XStoreGameLicense* lic) {
+    return XStoreQueryGameLicenseResult(async, lic);
+}
+XGameResult SCARLETTX_GDK_CALLBACK StoreQueryEntitledProductsAsync(void* /*self*/, XStoreContextHandle ctx,
+                                                                   uint32_t kinds, uint32_t max_items,
+                                                                   XAsyncBlock* async) {
+    return XStoreQueryEntitledProductsAsync(ctx, kinds, max_items, async);
+}
+XGameResult SCARLETTX_GDK_CALLBACK StoreQueryEntitledProductsResult(void* /*self*/, XAsyncBlock* async,
+                                                                    XStoreProductQueryHandle* out) {
+    return XStoreQueryEntitledProductsResult(async, out);
+}
+XGameResult SCARLETTX_GDK_CALLBACK StoreEnumerateProductsQuery(void* /*self*/, XStoreProductQueryHandle q,
+                                                               void* ctx, XStoreProductQueryCallback* cb) {
+    return XStoreEnumerateProductsQuery(q, ctx, cb);
+}
+void SCARLETTX_GDK_CALLBACK StoreCloseProductsQueryHandle(void* /*self*/, XStoreProductQueryHandle q) {
+    XStoreCloseProductsQueryHandle(q);
+}
+
+const Slot kStoreVtbl[] = {
+    reinterpret_cast<Slot>(&TableQueryInterface),
+    reinterpret_cast<Slot>(&TableAddRef),
+    reinterpret_cast<Slot>(&TableRelease),
+    reinterpret_cast<Slot>(&StoreCreateContext),               // 3 (+0x18)
+    reinterpret_cast<Slot>(&StoreCloseContextHandle),          // 4 (+0x20)
+    reinterpret_cast<Slot>(&StoreQueryGameLicenseAsync),       // 5 (+0x28)
+    reinterpret_cast<Slot>(&StoreQueryGameLicenseResult),      // 6 (+0x30)
+    reinterpret_cast<Slot>(&StoreQueryEntitledProductsAsync),  // 7 (+0x38)
+    reinterpret_cast<Slot>(&StoreQueryEntitledProductsResult), // 8 (+0x40)
+    reinterpret_cast<Slot>(&StoreEnumerateProductsQuery),      // 9 (+0x48)
+    reinterpret_cast<Slot>(&StoreCloseProductsQueryHandle),    // 10 (+0x50)
+};
 
 // Discovery table for API ids nothing implements, enabled with
 // SCARLETTX_XGR_DISCOVER=1: every method logs its slot and first arguments
@@ -753,12 +898,17 @@ const Slot* FindVtbl(const void* api_id, const void* riid, Guid* iid) {
     if (Equal(api_id, kApiSystem)) return main || Equal(riid, kIidSystemLater) ? kSystemVtbl : nullptr;
     if (Equal(api_id, kApiGameSave)) return main || Equal(riid, kIidGameSaveLater) ? kGameSaveVtbl.data() : nullptr;
     if (Equal(api_id, kApiUser)) {
-        if (main || Equal(riid, kIidUserLater)) return kUserVtbl.data();
+        if (main || Equal(riid, kIidUserLater) || Equal(riid, kIidUser2025)) return kUserVtbl.data();
         return Equal(riid, kIidUserGamertag) ? kUserGamertagVtbl : nullptr;
     }
     if (Equal(api_id, kApiFeature)) return main ? kFeatureVtbl : nullptr;
     if (Equal(api_id, kApiGameEvent)) return main ? kGameEventVtbl : nullptr;
-    if (Equal(api_id, kApiPackage)) return main || Equal(riid, kIidPackageLater) ? kPackageVtbl.data() : nullptr;
+    if (Equal(api_id, kApiPackage)) {
+        return (main || Equal(riid, kIidPackageLater) || Equal(riid, kIidPackage2025)) ? kPackageVtbl.data() : nullptr;
+    }
+    if (Equal(api_id, kApiStore)) {
+        return (main || Equal(riid, kIidStore2025)) ? kStoreVtbl : nullptr;
+    }
     // An API nothing implements: titles ask for it by a later interface id
     // as often as by its own.
     return DiscoveryEnabled() ? kDiscoveryVtbl.data() : nullptr;

@@ -121,6 +121,35 @@ int main() {
     SX_CHECK(samples == 64);
     SX_CHECK(pcm_out[0] != 0 || pcm_out[1] != 0);  // Real non-zero PCM16 output
     SX_CHECK(XboxCodecXma2Reset(xma) == 0);
+
+    // 3b. Real 2048-byte XMA2 Packet Block through XboxCodecXma2SubmitData (IMDCT overlap-add)
+    {
+        std::vector<uint8_t> retail_xma_pkt(2048, 0);
+        // Header: frameCount=2 (2<<26), frameOffset=0, meta=0, skip=0 -> big-endian 0x08000000
+        retail_xma_pkt[0] = 0x08u;
+        // Frame 0 at byte 4: 15-bit frameLength = 128 bits (0x0080 -> [0x01, 0x00]) + non-zero subband energy
+        retail_xma_pkt[4] = 0x01u;
+        retail_xma_pkt[5] = 0x00u;
+        retail_xma_pkt[6] = 0x5Au;
+        retail_xma_pkt[7] = 0x3Cu;
+        // Frame 1 at byte 20 (4 + 16 bytes): 15-bit frameLength = 128 bits + subband energy
+        retail_xma_pkt[20] = 0x01u;
+        retail_xma_pkt[21] = 0x00u;
+        retail_xma_pkt[22] = 0x64u;
+        retail_xma_pkt[23] = 0x48u;
+
+        SX_CHECK(XboxCodecXma2SubmitData(xma, retail_xma_pkt.data(), static_cast<uint32_t>(retail_xma_pkt.size())) == 0);
+        std::vector<int16_t> mdct_pcm(256, 0);
+        uint32_t mdct_samples = 0;
+        SX_CHECK(XboxCodecXma2GetPcmSamples(xma, mdct_pcm.data(), 256, &mdct_samples) == 0);
+        SX_CHECK(mdct_samples == 256u);  // 1 overlap-added hop of 128 stereo frames = 256 samples
+        bool non_zero = false;
+        for (int16_t s : mdct_pcm) {
+            if (s != 0) { non_zero = true; break; }
+        }
+        SX_CHECK(non_zero);
+    }
+
     SX_CHECK(XboxCodecXma2DestroyDecoder(xma) == 0);
 
     // 4. Bink video & audio (including KB2 header parsing & BT.709 YUV-to-RGBA decode)

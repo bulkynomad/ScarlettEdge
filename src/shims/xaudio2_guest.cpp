@@ -9,9 +9,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include "scarlettx/audio/xma2_decoder.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -142,6 +146,12 @@ struct VoiceProxy {
     EngineProxy* engine = nullptr;
     bool host_effects_active = false;
     std::vector<EffectSlotState> emulated_effects;
+    bool is_xma2_voice = false;
+    uint16_t xma2_channels = 2;
+    uint32_t xma2_rate = 48000;
+    std::mutex xma2_mu;
+    std::unique_ptr<scarlettx::audio::Xma2StreamDecoder> xma2_decoder;
+    std::deque<std::vector<int16_t>> xma2_pcm_ring;
 };
 
 struct EngineProxy {
@@ -380,6 +390,51 @@ int32_t WINAPI SourceStart(VoiceProxy* v, uint32_t flags, uint32_t op_set) {
 }
 
 int32_t WINAPI SourceSubmitBuffer(VoiceProxy* v, const void* buffer, const void* buffer_wma) {
+    if (buffer && v->is_xma2_voice) {
+        #pragma pack(push, 1)
+        struct XAudio2BufRaw {
+            uint32_t flags;
+            uint32_t audio_bytes;
+            const uint8_t* audio_data;
+            uint32_t play_begin;
+            uint32_t play_length;
+            uint32_t loop_begin;
+            uint32_t loop_length;
+            uint32_t loop_count;
+            void* context;
+        };
+        #pragma pack(pop)
+        const auto* in_buf = static_cast<const XAudio2BufRaw*>(buffer);
+        if (!in_buf->audio_data || in_buf->audio_bytes == 0) return kInvalidArg;
+
+        std::vector<float> decoded_f32;
+        {
+            std::lock_guard<std::mutex> lk(v->xma2_mu);
+            if (!v->xma2_decoder) {
+                v->xma2_decoder = std::make_unique<scarlettx::audio::Xma2StreamDecoder>(
+                    v->xma2_channels, v->xma2_rate);
+            }
+            if (!v->xma2_decoder->DecodeBlock(
+                    in_buf->audio_data, in_buf->audio_bytes, decoded_f32, in_buf->play_length)) {
+                return kInvalidArg;
+            }
+            std::vector<int16_t> pcm16(decoded_f32.size());
+            for (size_t i = 0; i < decoded_f32.size(); ++i) {
+                const float clamped = std::clamp(decoded_f32[i], -1.0f, 1.0f);
+                pcm16[i] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
+            }
+            while (v->xma2_pcm_ring.size() >= 64u) {
+                v->xma2_pcm_ring.pop_front();
+            }
+            v->xma2_pcm_ring.push_back(std::move(pcm16));
+            XAudio2BufRaw host_buf{};
+            host_buf.flags = in_buf->flags;
+            host_buf.audio_bytes = static_cast<uint32_t>(v->xma2_pcm_ring.back().size() * sizeof(int16_t));
+            host_buf.audio_data = reinterpret_cast<const uint8_t*>(v->xma2_pcm_ring.back().data());
+            host_buf.context = in_buf->context;
+            return VCall<int32_t, const void*, const void*>(v->host, 21, &host_buf, nullptr);
+        }
+    }
     const int32_t hr = VCall<int32_t, const void*, const void*>(v->host, 21, buffer, buffer_wma);
     if (buffer) {
         // XAUDIO2_BUFFER: Flags, AudioBytes, ..., LoopCount at +32.
@@ -542,22 +597,6 @@ int32_t WINAPI EngineCreateSourceVoice(EngineProxy* e, void** out, const void* f
     if (has_chain && !ValidateAndCopyEffectChain(chain, &host_chain, &fx_storage, &fx_emulated)) {
         return kInvalidArg;
     }
-    CallbackBridge* bridge = guest_callback ? new CallbackBridge{kVoiceCallbackVtbl, guest_callback} : nullptr;
-    void* host_voice = nullptr;
-    bool host_fx_ok = false;
-    int32_t hr = static_cast<int32_t>(0x80004005u);
-    if (has_chain && !e->silent) {
-        hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const EffectChain*>(
-            e->host, 5, &host_voice, format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
-            &host_chain);
-        host_fx_ok = (hr >= 0 && host_voice != nullptr);
-    }
-    if (!host_fx_ok) {
-        hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const void*>(
-            e->host, 5, &host_voice, format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
-            nullptr);
-    }
-    // WAVEFORMATEX: tag, channels, samples per second, ..., bits per sample at +14.
     const auto* w = static_cast<const uint8_t*>(format);
     uint16_t tag, channels, bits;
     uint32_t rate;
@@ -565,15 +604,67 @@ int32_t WINAPI EngineCreateSourceVoice(EngineProxy* e, void** out, const void* f
     std::memcpy(&channels, w + 2, 2);
     std::memcpy(&rate, w + 4, 4);
     std::memcpy(&bits, w + 14, 2);
+
+    #pragma pack(push, 1)
+    struct HostPcmWaveFormatEx {
+        uint16_t tag;
+        uint16_t channels;
+        uint32_t rate;
+        uint32_t avg_bytes;
+        uint16_t block_align;
+        uint16_t bits;
+        uint16_t cb_size;
+    };
+    #pragma pack(pop)
+    const bool is_xma2 = (tag == 0x0166u);
+    HostPcmWaveFormatEx pcm_fmt{};
+    const void* host_format = format;
+    if (is_xma2) {
+        const uint16_t safe_ch = (channels >= 1u && channels <= 8u) ? channels : 2u;
+        const uint32_t safe_rate = rate > 0u ? rate : 48000u;
+        pcm_fmt.tag = 1u;  // WAVE_FORMAT_PCM (PC XAudio2 rejects 0x0166 XMA2 natively)
+        pcm_fmt.channels = safe_ch;
+        pcm_fmt.rate = safe_rate;
+        pcm_fmt.bits = 16u;
+        pcm_fmt.block_align = static_cast<uint16_t>(safe_ch * 2u);
+        pcm_fmt.avg_bytes = safe_rate * pcm_fmt.block_align;
+        pcm_fmt.cb_size = 0u;
+        host_format = &pcm_fmt;
+    }
+
+    CallbackBridge* bridge = guest_callback ? new CallbackBridge{kVoiceCallbackVtbl, guest_callback} : nullptr;
+    void* host_voice = nullptr;
+    bool host_fx_ok = false;
+    int32_t hr = static_cast<int32_t>(0x80004005u);
+    if (has_chain && !e->silent) {
+        hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const EffectChain*>(
+            e->host, 5, &host_voice, host_format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
+            &host_chain);
+        host_fx_ok = (hr >= 0 && host_voice != nullptr);
+    }
+    if (!host_fx_ok) {
+        hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const void*>(
+            e->host, 5, &host_voice, host_format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
+            nullptr);
+    }
     XA2_TRACE(32, "IXAudio2::CreateSourceVoice(tag=0x%x, ch=%u, rate=%u, bits=%u, flags=0x%x, ratio=%g, "
                   "callback=%p, sends=%u, fx=%u) -> 0x%08x",
               tag, channels, rate, bits, flags, static_cast<double>(max_frequency_ratio), guest_callback,
               sends ? sends->send_count : 0u, has_chain ? host_chain.effect_count : 0u, static_cast<uint32_t>(hr));
     const int32_t fin = FinishVoice(e, hr, host_voice, VoiceKind::kSource, kSourceVoiceVtbl, bridge, out);
-    if (fin >= 0 && *out && has_chain) {
+    if (fin >= 0 && *out) {
         auto* vp = static_cast<VoiceProxy*>(*out);
-        vp->host_effects_active = host_fx_ok;
-        vp->emulated_effects = std::move(fx_emulated);
+        if (has_chain) {
+            vp->host_effects_active = host_fx_ok;
+            vp->emulated_effects = std::move(fx_emulated);
+        }
+        if (is_xma2) {
+            vp->is_xma2_voice = true;
+            vp->xma2_channels = pcm_fmt.channels;
+            vp->xma2_rate = pcm_fmt.rate;
+            vp->xma2_decoder = std::make_unique<scarlettx::audio::Xma2StreamDecoder>(
+                pcm_fmt.channels, pcm_fmt.rate);
+        }
     }
     return fin;
 }

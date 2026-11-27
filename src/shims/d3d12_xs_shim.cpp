@@ -220,6 +220,90 @@ std::mutex g_mutex;
 uint64_t g_next_handle = 0x12000001ull;
 std::unordered_map<uint64_t, std::unique_ptr<D3D12XsDeviceState>> g_devices;
 std::atomic<uint32_t> g_process_debug_flags{0};
+std::atomic<uint32_t> g_live_command_lists{0};
+std::atomic<uint64_t> g_proxy_pso_cache_hits{0};
+std::atomic<uint64_t> g_proxy_pso_cache_misses{0};
+
+struct GpuStabilityProfiler {
+    static constexpr size_t kBreadcrumbCap = 64;
+    static constexpr size_t kFrameHistCap = 256;
+
+    mutable std::mutex mu;
+    std::array<D3D12XBOX_GPU_BREADCRUMB_ENTRY, kBreadcrumbCap> breadcrumbs{};
+    uint64_t total_breadcrumbs = 0;
+    std::array<uint64_t, kFrameHistCap> frame_times_us{};
+    uint64_t total_frames = 0;
+    int64_t last_qpc_tick = 0;
+
+    void WriteBreadcrumb(uint64_t cmd_list_id, uint64_t marker_value, const char* tag) {
+        std::lock_guard<std::mutex> lock(mu);
+        D3D12XBOX_GPU_BREADCRUMB_ENTRY entry{};
+        entry.CommandListId = cmd_list_id;
+        entry.MarkerValue = marker_value;
+        if (tag && *tag) {
+            std::strncpy(entry.Tag, tag, sizeof(entry.Tag) - 1);
+            entry.Tag[sizeof(entry.Tag) - 1] = '\0';
+        }
+        breadcrumbs[static_cast<size_t>(total_breadcrumbs % kBreadcrumbCap)] = entry;
+        ++total_breadcrumbs;
+    }
+
+    void RecordDurationUs(uint64_t us) {
+        if (us == 0) us = 1;
+        std::lock_guard<std::mutex> lock(mu);
+        frame_times_us[static_cast<size_t>(total_frames % kFrameHistCap)] = us;
+        ++total_frames;
+    }
+
+    void RecordQpcTick() {
+#if defined(_WIN32)
+        static const int64_t freq = []() -> int64_t {
+            LARGE_INTEGER f{};
+            QueryPerformanceFrequency(&f);
+            return f.QuadPart > 0 ? f.QuadPart : 1000000ll;
+        }();
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        std::lock_guard<std::mutex> lock(mu);
+        if (last_qpc_tick > 0 && now.QuadPart >= last_qpc_tick) {
+            const uint64_t us = std::max<uint64_t>(
+                1ull, static_cast<uint64_t>((now.QuadPart - last_qpc_tick) * 1000000ll / freq));
+            frame_times_us[static_cast<size_t>(total_frames % kFrameHistCap)] = us;
+            ++total_frames;
+        }
+        last_qpc_tick = now.QuadPart;
+#endif
+    }
+
+    void FillReport(D3D12XBOX_GPU_STABILITY_REPORT& rep) const {
+        std::lock_guard<std::mutex> lock(mu);
+        rep.BreadcrumbCount = static_cast<uint32_t>(std::min<uint64_t>(total_breadcrumbs, 0xFFFFFFFFull));
+        if (total_breadcrumbs > 0) {
+            const auto& last = breadcrumbs[static_cast<size_t>((total_breadcrumbs - 1ull) % kBreadcrumbCap)];
+            rep.LastBreadcrumbValue = last.MarkerValue;
+            std::memcpy(rep.LastBreadcrumbTag, last.Tag, sizeof(rep.LastBreadcrumbTag));
+        }
+        rep.RecordedFrameCount = total_frames;
+        if (total_frames > 0) {
+            const size_t n = static_cast<size_t>(std::min<uint64_t>(total_frames, kFrameHistCap));
+            std::vector<uint64_t> window(n);
+            for (size_t i = 0; i < n; ++i) {
+                const uint64_t idx = (total_frames > kFrameHistCap) ? (total_frames - n + i) : i;
+                window[i] = frame_times_us[static_cast<size_t>(idx % kFrameHistCap)];
+            }
+            std::sort(window.begin(), window.end());
+            rep.MinFrameTimeUs = window.front();
+            rep.MaxFrameTimeUs = window.back();
+            uint64_t sum = 0;
+            for (uint64_t v : window) sum += v;
+            rep.AvgFrameTimeUs = sum / static_cast<uint64_t>(n);
+            const size_t p99_idx = std::min<size_t>(n - 1u, (n * 99u) / 100u);
+            rep.P99FrameTimeUs = window[p99_idx];
+        }
+    }
+};
+
+GpuStabilityProfiler g_gpu_profiler;
 
 bool TraceEnabled() {
     static const bool enabled = []() {
@@ -1369,6 +1453,12 @@ struct XboxD3D12GraphicsCommandListProxy {
     uint64_t scratch_size = 0;
     std::vector<ID3D12Resource*> retired_scratch;
 #endif
+    XboxD3D12GraphicsCommandListProxy() {
+        g_live_command_lists.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~XboxD3D12GraphicsCommandListProxy() {
+        g_live_command_lists.fetch_sub(1, std::memory_order_relaxed);
+    }
 };
 intptr_t SCARLETTX_GDK_CALLBACK CmdListQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
@@ -3003,6 +3093,7 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
     static std::atomic<uint64_t> present_count{0};
     const uint64_t n = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     g_frame_epoch.fetch_add(1, std::memory_order_relaxed);
+    g_gpu_profiler.RecordQpcTick();
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12CommandQueueProxy*>(self);
     XboxD3D12ResourceProxy* src_proxy = nullptr;
@@ -4420,7 +4511,10 @@ void WaitForFrameOrigin() {
 intptr_t SCARLETTX_GDK_CALLBACK ProxyWaitFrameEventX(
     void* /*self*/, uintptr_t eventType, uintptr_t timeoutMs, uintptr_t pEvent,
     uintptr_t flags, uintptr_t pToken) {
-    if (eventType == 0) WaitForFrameOrigin();
+    if (eventType == 0) {
+        WaitForFrameOrigin();
+        g_gpu_profiler.RecordQpcTick();
+    }
     uint64_t tok = g_frame_pipeline_token.fetch_add(1, std::memory_order_relaxed);
     if (pToken) {
         *reinterpret_cast<uint64_t*>(pToken) = tok;
@@ -5312,6 +5406,7 @@ int32_t D3D12XboxPresentXParams(uint64_t device_handle, const D3D12XBOX_PRESENT_
     dev.last_present_time = now;
     dev.last_presented_token = params->Token;
     dev.presented_frame_count++;
+    g_gpu_profiler.RecordDurationUs(dev.last_frame_duration_us);
     return 0;
 }
 
@@ -6028,6 +6123,7 @@ int32_t D3D12XboxDispatchCompute(
 
     ID3D12CommandList* lists[] = {cmd};
     queue->ExecuteCommandLists(1, lists);
+    g_submit_count.fetch_add(1, std::memory_order_relaxed);
 
     hr = native_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence));
     if (FAILED(hr)) { cleanup(); return static_cast<int32_t>(hr); }
@@ -6210,6 +6306,7 @@ int32_t D3D12XboxRenderWithPipelineState(
     if (FAILED(hr)) { cleanup(); return static_cast<int32_t>(hr); }
     ID3D12CommandList* lists[] = {cmd};
     queue->ExecuteCommandLists(1, lists);
+    g_submit_count.fetch_add(1, std::memory_order_relaxed);
 
     hr = native_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void**>(&fence));
     if (FAILED(hr)) { cleanup(); return static_cast<int32_t>(hr); }
@@ -6333,6 +6430,68 @@ int32_t D3D12XboxGetPipelineCacheStats(
             ++out_stats->LiveGraphicsPsos;
         }
     }
+    return 0;
+}
+
+int32_t D3D12XboxWriteBreadcrumb(
+    uint64_t device_handle,
+    uint64_t cmd_list_id,
+    uint64_t marker_value,
+    const char* tag) {
+    (void)device_handle;
+    g_gpu_profiler.WriteBreadcrumb(cmd_list_id, marker_value, tag);
+    return 0;
+}
+
+int32_t D3D12XboxRecordFrameTimestamp(
+    uint64_t device_handle,
+    uint64_t frame_duration_us) {
+    (void)device_handle;
+    g_gpu_profiler.RecordDurationUs(frame_duration_us);
+    return 0;
+}
+
+int32_t D3D12XboxGetGpuStabilityReport(
+    uint64_t device_handle,
+    D3D12XBOX_GPU_STABILITY_REPORT* out_report) {
+    if (!out_report) {
+        return -1;
+    }
+    std::memset(out_report, 0, sizeof(*out_report));
+    out_report->LiveCommandLists = g_live_command_lists.load(std::memory_order_relaxed);
+    out_report->CompletedSubmits = g_submit_count.load(std::memory_order_relaxed);
+    out_report->PsoCacheHits = g_proxy_pso_cache_hits.load(std::memory_order_relaxed);
+    out_report->PsoCacheMisses = g_proxy_pso_cache_misses.load(std::memory_order_relaxed);
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_devices.find(device_handle);
+        if (it != g_devices.end()) {
+            out_report->PsoCacheHits += it->second->pso_cache_hits;
+            out_report->PsoCacheMisses += it->second->pso_cache_misses;
+#if defined(_WIN32)
+            if (auto* native_dev = static_cast<ID3D12Device*>(it->second->backend->NativeDevice())) {
+                out_report->DeviceRemovedReason = static_cast<int32_t>(native_dev->GetDeviceRemovedReason());
+            }
+#endif
+        } else if (device_handle > 0x10000ull) {
+#if defined(_WIN32)
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<const void*>(device_handle), &mbi, sizeof(mbi)) != 0 &&
+                mbi.State == MEM_COMMIT) {
+                const void* vtbl = *reinterpret_cast<const void* const*>(device_handle);
+                if (vtbl == kXboxDeviceProxyVtbl.data()) {
+                    const auto* proxy = reinterpret_cast<const XboxD3D12DeviceProxy*>(device_handle);
+                    if (proxy->pc_device) {
+                        out_report->DeviceRemovedReason = static_cast<int32_t>(proxy->pc_device->GetDeviceRemovedReason());
+                    }
+                }
+            }
+#endif
+        }
+    }
+
+    g_gpu_profiler.FillReport(*out_report);
     return 0;
 }
 

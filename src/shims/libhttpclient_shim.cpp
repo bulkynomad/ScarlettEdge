@@ -407,3 +407,292 @@ void HCHttpCallClearMocks(void) {
 }
 
 }  // extern "C"
+
+struct HC_WEBSOCKET {
+    std::string uri;
+    std::string subprotocol;
+    std::unordered_map<std::string, std::string> headers;
+    HCWebSocketMessageFunction* on_msg = nullptr;
+    HCWebSocketBinaryMessageFunction* on_bin = nullptr;
+    HCWebSocketCloseEventFunction* on_close = nullptr;
+    void* fn_ctx = nullptr;
+    bool connected = false;
+#if defined(_WIN32)
+    HINTERNET h_session = nullptr;
+    HINTERNET h_connect = nullptr;
+    HINTERNET h_ws = nullptr;
+#endif
+};
+
+namespace {
+
+std::unordered_map<HC_WEBSOCKET*, std::unique_ptr<HC_WEBSOCKET>> g_websockets;
+std::vector<std::pair<std::string, std::string>> g_ws_mocks;
+
+#if defined(_WIN32)
+void CloseLiveWinHttpWebSocket(HC_WEBSOCKET* ws) {
+    if (!ws) return;
+    static HMODULE wh = LoadLibraryW(L"winhttp.dll");
+    auto fnClose = wh ? reinterpret_cast<decltype(&WinHttpCloseHandle)>(
+                            reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpCloseHandle")))
+                      : nullptr;
+    if (fnClose) {
+        if (ws->h_ws) { fnClose(ws->h_ws); ws->h_ws = nullptr; }
+        if (ws->h_connect) { fnClose(ws->h_connect); ws->h_connect = nullptr; }
+        if (ws->h_session) { fnClose(ws->h_session); ws->h_session = nullptr; }
+    }
+}
+
+bool TryConnectLiveWinHttpWebSocket(HC_WEBSOCKET* ws) {
+    static HMODULE wh = LoadLibraryW(L"winhttp.dll");
+    if (!wh) return false;
+    auto fnOpen = reinterpret_cast<decltype(&WinHttpOpen)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpOpen")));
+    auto fnCrack = reinterpret_cast<decltype(&WinHttpCrackUrl)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpCrackUrl")));
+    auto fnConnect = reinterpret_cast<decltype(&WinHttpConnect)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpConnect")));
+    auto fnOpenReq = reinterpret_cast<decltype(&WinHttpOpenRequest)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpOpenRequest")));
+    auto fnSetOpt = reinterpret_cast<decltype(&WinHttpSetOption)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpSetOption")));
+    auto fnSend = reinterpret_cast<decltype(&WinHttpSendRequest)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpSendRequest")));
+    auto fnRecv = reinterpret_cast<decltype(&WinHttpReceiveResponse)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpReceiveResponse")));
+    auto fnUpgrade = reinterpret_cast<decltype(&WinHttpWebSocketCompleteUpgrade)>(
+        reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpWebSocketCompleteUpgrade")));
+    auto fnClose = reinterpret_cast<decltype(&WinHttpCloseHandle)>(reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpCloseHandle")));
+    if (!fnOpen || !fnCrack || !fnConnect || !fnOpenReq || !fnSetOpt || !fnSend || !fnRecv || !fnUpgrade || !fnClose) {
+        return false;
+    }
+
+    std::string http_url = ws->uri;
+    bool secure = false;
+    if (http_url.rfind("wss://", 0) == 0) {
+        http_url = "https://" + http_url.substr(6);
+        secure = true;
+    } else if (http_url.rfind("ws://", 0) == 0) {
+        http_url = "http://" + http_url.substr(5);
+    }
+    std::wstring wurl = Utf8ToWide(http_url);
+    URL_COMPONENTS uc{};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t host[256] = {};
+    wchar_t path[2048] = {};
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = 2048;
+    if (!fnCrack(wurl.c_str(), static_cast<DWORD>(wurl.size()), 0, &uc)) return false;
+
+    HINTERNET hSess = fnOpen(L"ScarlettEdge-HCWS/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
+    if (!hSess) return false;
+    HINTERNET hConn = fnConnect(hSess, host, uc.nPort, 0);
+    if (!hConn) { fnClose(hSess); return false; }
+    HINTERNET hReq = fnOpenReq(hConn, L"GET", path[0] ? path : L"/", nullptr, nullptr, nullptr,
+                               secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!hReq) { fnClose(hConn); fnClose(hSess); return false; }
+
+    if (!fnSetOpt(hReq, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) ||
+        !fnSend(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) ||
+        !fnRecv(hReq, nullptr)) {
+        fnClose(hReq); fnClose(hConn); fnClose(hSess);
+        return false;
+    }
+    HINTERNET hWs = fnUpgrade(hReq, 0);
+    fnClose(hReq);
+    if (!hWs) { fnClose(hConn); fnClose(hSess); return false; }
+    ws->h_session = hSess;
+    ws->h_connect = hConn;
+    ws->h_ws = hWs;
+    return true;
+}
+#endif
+
+}  // namespace
+
+extern "C" {
+
+SX_HRESULT HCWebSocketCreate(
+    HCWebSocketHandle* websocket,
+    HCWebSocketMessageFunction* message_func,
+    HCWebSocketBinaryMessageFunction* binary_message_func,
+    HCWebSocketCloseEventFunction* close_func,
+    void* function_context) {
+    if (!websocket) return SX_E_INVALIDARG;
+    *websocket = nullptr;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto obj = std::make_unique<HC_WEBSOCKET>();
+    obj->on_msg = message_func;
+    obj->on_bin = binary_message_func;
+    obj->on_close = close_func;
+    obj->fn_ctx = function_context;
+    HC_WEBSOCKET* raw = obj.get();
+    g_websockets[raw] = std::move(obj);
+    *websocket = raw;
+    return SX_S_OK;
+}
+
+SX_HRESULT HCWebSocketSetHeader(
+    HCWebSocketHandle websocket,
+    const char* header_name,
+    const char* header_value) {
+    if (!websocket || !header_name || !header_value) return SX_E_INVALIDARG;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_websockets.find(websocket) == g_websockets.end()) return SX_E_INVALIDARG;
+    websocket->headers[header_name] = header_value;
+    return SX_S_OK;
+}
+
+SX_HRESULT HCWebSocketConnectAsync(
+    const char* uri,
+    const char* subprotocol,
+    HCWebSocketHandle websocket,
+    XAsyncBlock* async_block) {
+    if (!uri || !*uri || !websocket) return SX_E_INVALIDARG;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_websockets.find(websocket) == g_websockets.end()) return SX_E_INVALIDARG;
+        websocket->uri = uri;
+        websocket->subprotocol = subprotocol ? subprotocol : "";
+#if defined(_WIN32)
+        if (LiveNetworkEnabled()) {
+            (void)TryConnectLiveWinHttpWebSocket(websocket);
+        }
+#endif
+        websocket->connected = true;
+    }
+    if (async_block) {
+        XGameResult hr = XAsyncBegin(async_block, nullptr, reinterpret_cast<const void*>(&HCWebSocketConnectAsync),
+                                     "HCWebSocketConnectAsync",
+                                     [](XAsyncOp op, const XAsyncProviderData* d) -> XGameResult {
+                                         if (op == XAsyncOp_Begin) return XAsyncSchedule(d->async, 0);
+                                         if (op == XAsyncOp_DoWork) { XAsyncComplete(d->async, SX_S_OK, 0); }
+                                         return SX_S_OK;
+                                     });
+        if (hr < 0 && async_block->callback) async_block->callback(async_block);
+    }
+    return SX_S_OK;
+}
+
+SX_HRESULT HCWebSocketSendMessageAsync(
+    HCWebSocketHandle websocket,
+    const char* message,
+    XAsyncBlock* async_block) {
+    if (!websocket || !message) return SX_E_INVALIDARG;
+    HCWebSocketMessageFunction* msg_cb = nullptr;
+    void* fn_ctx = nullptr;
+    std::string reply;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_websockets.find(websocket) == g_websockets.end() || !websocket->connected) return SX_E_INVALIDARG;
+#if defined(_WIN32)
+        if (websocket->h_ws) {
+            static HMODULE wh = LoadLibraryW(L"winhttp.dll");
+            auto fnWsSend = wh ? reinterpret_cast<decltype(&WinHttpWebSocketSend)>(
+                                     reinterpret_cast<void*>(GetProcAddress(wh, "WinHttpWebSocketSend")))
+                               : nullptr;
+            if (fnWsSend) {
+                (void)fnWsSend(websocket->h_ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                               const_cast<char*>(message), static_cast<DWORD>(std::strlen(message)));
+            }
+        }
+#endif
+        msg_cb = websocket->on_msg;
+        fn_ctx = websocket->fn_ctx;
+        for (const auto& [pre, r] : g_ws_mocks) {
+            if (websocket->uri.rfind(pre, 0) == 0) {
+                reply = r;
+                break;
+            }
+        }
+        if (reply.empty() && !websocket->h_ws) {
+            // Standard Xbox Live Real-Time Activity (RTA) `[1, seq, ...]` or PlayFab PubSub ack
+            if (message[0] == '[') {
+                reply = "[1,1,0,{\"subscriptionId\":1,\"state\":\"Subscribed\"}]";
+            } else {
+                reply = "{\"status\":\"ok\",\"bridge\":\"ScarlettEdge-PlayFab-RTA\"}";
+            }
+        }
+    }
+    if (msg_cb && !reply.empty()) {
+        msg_cb(websocket, reply.c_str(), fn_ctx);
+    }
+    if (async_block) {
+        XGameResult hr = XAsyncBegin(async_block, nullptr, reinterpret_cast<const void*>(&HCWebSocketSendMessageAsync),
+                                     "HCWebSocketSendMessageAsync",
+                                     [](XAsyncOp op, const XAsyncProviderData* d) -> XGameResult {
+                                         if (op == XAsyncOp_Begin) return XAsyncSchedule(d->async, 0);
+                                         if (op == XAsyncOp_DoWork) { XAsyncComplete(d->async, SX_S_OK, 0); }
+                                         return SX_S_OK;
+                                     });
+        if (hr < 0 && async_block->callback) async_block->callback(async_block);
+    }
+    return SX_S_OK;
+}
+
+SX_HRESULT HCWebSocketSendBinaryMessageAsync(
+    HCWebSocketHandle websocket,
+    const uint8_t* payload_bytes,
+    uint32_t payload_size,
+    XAsyncBlock* async_block) {
+    if (!websocket || (!payload_bytes && payload_size > 0)) return SX_E_INVALIDARG;
+    HCWebSocketBinaryMessageFunction* bin_cb = nullptr;
+    void* fn_ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_websockets.find(websocket) == g_websockets.end() || !websocket->connected) return SX_E_INVALIDARG;
+        bin_cb = websocket->on_bin;
+        fn_ctx = websocket->fn_ctx;
+    }
+    if (bin_cb && payload_size > 0) {
+        bin_cb(websocket, payload_bytes, payload_size, fn_ctx);
+    }
+    if (async_block) {
+        XGameResult hr = XAsyncBegin(async_block, nullptr,
+                                     reinterpret_cast<const void*>(&HCWebSocketSendBinaryMessageAsync),
+                                     "HCWebSocketSendBinaryMessageAsync",
+                                     [](XAsyncOp op, const XAsyncProviderData* d) -> XGameResult {
+                                         if (op == XAsyncOp_Begin) return XAsyncSchedule(d->async, 0);
+                                         if (op == XAsyncOp_DoWork) { XAsyncComplete(d->async, SX_S_OK, 0); }
+                                         return SX_S_OK;
+                                     });
+        if (hr < 0 && async_block->callback) async_block->callback(async_block);
+    }
+    return SX_S_OK;
+}
+
+SX_HRESULT HCWebSocketDisconnect(HCWebSocketHandle websocket) {
+    if (!websocket) return SX_E_INVALIDARG;
+    HCWebSocketCloseEventFunction* close_cb = nullptr;
+    void* fn_ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_websockets.find(websocket) == g_websockets.end()) return SX_E_INVALIDARG;
+#if defined(_WIN32)
+        CloseLiveWinHttpWebSocket(websocket);
+#endif
+        if (websocket->connected) {
+            websocket->connected = false;
+            close_cb = websocket->on_close;
+            fn_ctx = websocket->fn_ctx;
+        }
+    }
+    if (close_cb) close_cb(websocket, 1000u /* NormalClosure */, fn_ctx);
+    return SX_S_OK;
+}
+
+SX_HRESULT HCWebSocketCloseHandle(HCWebSocketHandle websocket) {
+    if (!websocket) return SX_E_INVALIDARG;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_websockets.find(websocket);
+    if (it == g_websockets.end()) return SX_E_INVALIDARG;
+#if defined(_WIN32)
+    CloseLiveWinHttpWebSocket(it->second.get());
+#endif
+    g_websockets.erase(it);
+    return SX_S_OK;
+}
+
+SX_HRESULT HCWebSocketRegisterMockReply(const char* uri_prefix, const char* reply_json) {
+    if (!uri_prefix || !reply_json) return SX_E_INVALIDARG;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_ws_mocks.emplace_back(uri_prefix, reply_json);
+    return SX_S_OK;
+}
+
+}  // extern "C"

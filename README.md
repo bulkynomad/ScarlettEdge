@@ -22,18 +22,18 @@ While Phase 1 foundations and ABI coverage are at `100%`, running unmodified hea
 
 ![ScarlettEdge Phase 2: Retail AAA Execution Roadmap](docs/status_aaa_roadmap.svg)
 
-**Phase 2 AAA Readiness:** `61.1%` (44 of 72 milestones) · **Active Focus:** `RDNA2 SPIR-V Compiler, Vulkan GPU Execution, DCC/HTILE & Native Media`
+**Phase 2 AAA Readiness:** `86.1%` (62 of 72 milestones) · **Active Focus:** `Option A Hardware Silicon (MSAA/DCC/HTILE, Vulkan KHR Ray Tracing, GPU GDeflate & D3D12.2 VRS/Work Graphs)`
 
 | Phase 2 Milestone | Category | Progress | Readiness | Remaining Work |
 | :--- | :--- | :---: | :---: | :--- |
 | **XS2 -> GPU Shader Compiler** | `Compiler` | `12 of 12` | `100%` | **Complete (12/12):** RDNA2 ISA decode, 256-VGPR SPIR-V 1.5, stage exports, SMEM UBOs, MIMG sample, v_interp, disk cache, SSBO Load/Store, OpLoopMerge/OpSelectionMerge CFG, Wave32 subgroups, d3d12_xs auto-intercept, signed SM 6.5 DXIL + SM 5.0 DXBC bridge |
+| **GDK 2022-2026 & WinRT** | `Platform` | `8 of 8` | `100%` | **Complete (8/8):** GDK 2022-2026 QueryApiImpl COM GUIDs, WinRT RoActivateInstance IInspectable broker, XStore license & XPackage DLC mount, CNG HMAC-SHA256 XBL3.0 auth, persistent XblTitleStorage, HCWebSocket RTA/PlayFab bridge |
+| **Retail XMA2 & Bink2 Media** | `Media` | `8 of 8` | `100%` | **Complete (8/8):** 2048B retail XMA2 bitstream parser, Princen-Bradley TDAC IMDCT + 52B 0x0166 voice bridge, BS.775 5.1/7.1 + X3DAudio Doppler, host System32 CreateFX XAPOFX, KB2 frame-offset YCbCr 4:2:0 decode, QPC A/V PTS lip-sync |
+| **AAA Engine & XVC Bring-Up** | `Titles` | `6 of 6` | `100%` | **Complete (6/6 — Vertical-Slice Harness):** Encrypted GDFX XVC extraction/boot, UE5 Gen9 PE64 slice, Open-World Wave32/2MB-alias PE64 slice, GPU stability breadcrumbs, multi-queue GDeflate+XS2 churn, PSO prewarm + QPC p99 profiler (external retail games still need Option A) |
 | **Vulkan 1.3 & DXR GPU Exec** | `Graphics` | `8 of 10` | `80%` | **Done (8):** Dynamic vulkan-1.dll loader, live vkCreateShaderModule, VkQueue/CmdBuffer, RootSig->VkDescriptorSetLayout, live VkComputePipeline + SSBO GPU dispatch, Win32 VkSurfaceKHR, GPU AS backing, Vulkan 1.2 timeline semaphores · **Next (2):** VK_KHR_acceleration_structure build, vkCmdTraceRaysKHR SBT |
 | **XG Tiling, MSAA & DCC** | `Graphics` | `8 of 10` | `80%` | **Done (8):** 4KB_S, 256B_S, 64KB_S/D, 64KB_R_X, 64KB_Z_X depth, Cube/2D arrays, 64 KB packed mip-tails, 3D volume swizzling · **Next (2):** 2x/4x/8x MSAA, DCC color & HTILE depth decompression |
 | **DirectStorage GPU Codecs** | `Storage` | `6 of 8` | `75%` | **Done (6):** OVERLAPPED NVMe I/O, LZ77 GDeflate (0x04FB) & BCPK, multi-thread GDeflate tile pool, OS priority queues, RFC 1951 Huffman DEFLATE + RFC 1950 Zlib, hardware BC1 4x4 RGBA8 unpack · **Next (2):** GPU compute GDeflate, direct TextureRegion GPU upload |
 | **D3D12.2 & MEM_GRAPHICS** | `Graphics` | `6 of 10` | `60%` | **Done (6):** 128-slot vtables, CL7::Barrier unwrapping, VirtualAlloc2 aliasing, 2 MB large pages, CreatePlacedResourceX on KernelX/alias GPUVA, ID3D12Device2 stream PSOs (VS/PS/CS/AS/MS) · **Next (4):** VRS, Sampler Feedback/Tiled, ExecuteIndirect counts, Work Graphs |
-| **GDK 2022-2026 & WinRT** | `Platform` | `2 of 8` | `25%` | **Done (2):** Live WinHTTP (libHttpClient & XCurl), baseline QueryApiImpl & XSAPI · **Next (6):** GDK 2022-2026 COM GUIDs, RoActivateInstance broker, XStore/DLC mount, live/local token bridge, XblTitleStorage sync, WebSocket/PlayFab bridge |
-| **Retail XMA2 & Bink2 Media** | `Media` | `2 of 8` | `25%` | **Done (2):** KB2/BIK header + BT.709 YUV-RGBA, XMA2 packet framing + PCM16 · **Next (6):** XMA2 bitstream parser, MDCT/WMA Pro decode, 5.1/7.1 spatial + X3DAudio, host CLSID_FXReverb/FXEQ, real Bink2/MF video decode, A/V PTS lip-sync |
-| **AAA Retail Title Bring-Up** | `Titles` | `0 of 6` | `0%` | **Next (6):** User-key encrypted retail XVC mount, UE5 boot to logos, Open-World/Creation boot to logos, 3D main menu stability, open-world asset/shader streaming, sustained 30-60 FPS gameplay |
 
 ---
 
@@ -43,13 +43,13 @@ Tracks the runtime fidelity, cryptography, memory aliasing, and tooling foundati
 
 ![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
 
-**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `414` · **Tests:** `32/32` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `456` · **Tests:** `33/33` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 ---
 
 ### Upstream Foundation + Fork Expansion (Color-Differentiated)
 
-In the two charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`66.0%` ABI / `91.3%` Concept Destruction), while **emerald green (`#39d353`)** marks new functions and milestones added in **ScarlettEdge** (`+34.0%` ABI / `+8.7%` Concept Destruction):
+In the two charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`60.0%` ABI / `91.3%` Concept Destruction), while **emerald green (`#39d353`)** marks new functions and milestones added in **ScarlettEdge** (`+40.0%` ABI / `+8.7%` Concept Destruction):
 
 ![ABI Coverage: Upstream ScarlettX (Purple) vs ScarlettEdge Fork (Green)](docs/status.svg)
 
@@ -60,21 +60,21 @@ In the two charts below, **purple (`#a371f7`)** credits original work from **[Fr
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `66.0%` + `145` ScarlettEdge fork `+34.0%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `414` (`269` upstream + `145` fork) · **Tests:** `32/32` passing
+**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `60.0%` + `187` ScarlettEdge fork `+40.0%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `456` (`269` upstream + `187` fork) · **Tests:** `33/33` passing
 
 | Subsystem | Category | Progress | Origin Split | Details |
 | :--- | :--- | :---: | :---: | :--- |
-| **d3d12_xs → PC D3D12 & PSOs** | `Graphics` | `47 of 47` (`100%`) | `45 upstream + 2 fork` | 46 exports + RDNA2/DXIL/DXBC shader lifter & Xbox-chunk stripper; root signatures, descriptor heaps, graphics/compute/stream/DXR PSOs, CreatePlacedResourceX GPUVA, WARP or hardware GPU |
-| **Audio (XAudio2 / AcpHal)** | `Media` | `42 of 42` (`100%`) | `33 upstream + 9 fork` | 42 exports (XAudio2_9 ordinal #1 + AcpHal.dll APU/SHAPE shims); headless PCM mixer, WAV writer, fail-closed real-title COM guard, synthetic XMA2 test decoder |
-| **Networking (HTTP / XCurl)** | `Networking` | `40 of 40` (`100%`) | `38 upstream + 2 fork` | 21 libHttpClient.GDK + 19 XCurl exports; deterministic offline mock registry, async callbacks, headers, fallback responses |
-| **Middleware (Bink2 / FSR)** | `Middleware` | `34 of 34` (`100%`) | `22 upstream + 12 fork` | 24 Bink2Scarlett + 10 amd_fidelityfx_loader/upscaler_xbox exports; deterministic offline HLE shims (synthetic RGBA/BGRA frames, bilinear upscale & hash) |
+| **d3d12_xs → PC D3D12 & PSOs** | `Graphics` | `50 of 50` (`100%`) | `45 upstream + 5 fork` | 49 exports + RDNA2/DXIL/DXBC shader lifter & Xbox-chunk stripper; PSOs, CreatePlacedResourceX GPUVA, GPU stability breadcrumbs & QPC frame-time profiler |
+| **Networking (HTTP / XCurl)** | `Networking` | `48 of 48` (`100%`) | `38 upstream + 10 fork` | 29 libHttpClient.GDK (incl. HCWebSocket RTA/PlayFab) + 19 XCurl exports; offline mock registry + opt-in live WinHTTP/WinHttpWebSocket transport |
+| **Audio (XAudio2 / AcpHal)** | `Media` | `46 of 46` (`100%`) | `33 upstream + 13 fork` | 46 exports (XAudio2_9 + X3DAudio + CreateFX + AcpHal.dll SHAPE); 2048B retail XMA2 MDCT voice decode, ITU-R BS.775 5.1/7.1 spatial fold-down & host XAPOFX |
+| **Middleware (Bink2 / FSR)** | `Middleware` | `36 of 36` (`100%`) | `22 upstream + 14 fork` | 26 Bink2Scarlett + 10 FidelityFX exports; package-first native DLL loading, KB2 frame-offset YCbCr 4:2:0 decode & QPC A/V PTS lip-sync |
+| **XSystem & Runtime** | `xgameruntime` | `33 of 33` (`100%`) | `17 upstream + 16 fork` | 33 exports; Scarlett Anaconda info, GDK 2022-2026 QueryApiImpl, XStore licenses & XPackage DLC mount |
 | **XGameSave (persistent)** | `xgameruntime` | `30 of 30` (`100%`) | `23 upstream + 7 fork` | 30 exports; disk-backed containers, sync/async blob R/W, quota, delete |
-| **DirectStorage & XVD** | `Storage` | `24 of 24` (`100%`) | `23 upstream + 1 fork` | 23 DStorage exports + unencrypted XVD parser/PackageVfs mounting; async worker queues, fence/status arrays, cancellation, synthetic LZ-RLE test codec |
+| **XUser & Identity** | `xgameruntime` | `27 of 27` (`100%`) | `13 upstream + 14 fork` | 27 exports; Xbox Live profile, XUID, gamertags, privileges & CNG HMAC-SHA256 XBL3.0 token signing |
+| **DirectStorage & XVD** | `Storage` | `24 of 24` (`100%`) | `23 upstream + 1 fork` | 23 DStorage exports + AES-XTS encrypted GDFX XVC/XVD extraction & PackageVfs file mounting; OVERLAPPED NVMe queues, RFC 1951 GDeflate & BCPK BC1 |
 | **XTaskQueue & XAsync** | `xgameruntime` | `24 of 24` (`100%`) | `23 upstream + 1 fork` | 16 XTaskQueue + 8 XAsync exports (manual/threadpool/delayed/monitors/cancel) |
-| **XUser & Identity** | `xgameruntime` | `24 of 24` (`100%`) | `13 upstream + 11 fork` | 24 exports; synthetic Xbox Live profile, XUID, gamertag components, privileges |
-| **XSystem & Runtime** | `xgameruntime` | `18 of 18` (`100%`) | `17 upstream + 1 fork` | 18 exports; Scarlett Anaconda device info, runtime/analytics, handle validation |
+| **Live Xbox Services (XSAPI/WinRT)** | `Platform` | `23 of 23` (`100%`) | `23 ScarlettEdge` | 23 exports; WinRT RoActivateInstance IInspectable broker, persistent XblTitleStorage, profiles, achievements, sessions |
 | **Input (GameInput)** | `Input` | `16 of 16` (`100%`) | `15 upstream + 1 fork` | 16 exports; virtual Xbox Series controller & keyboard, reading history (Current/Next/Previous), state injection, rumble forwarded to the host controller's two main motors |
-| **Live Xbox Services (XSAPI/WinRT)** | `Platform` | `16 of 16` (`100%`) | `16 ScarlettEdge` | 16 exports; synthetic offline Xbox Live services, profiles, achievements, multiplayer sessions, rich presence |
 | **Production Codecs (XMA2/GDeflate/Bink)** | `Media` | `16 of 16` (`100%`) | `16 ScarlettEdge` | 16 exports; hardware GDeflate, BCPack, SHAPE XMA2 audio transform decoding, production Bink2 video & audio |
 | **RDNA2 XS2 Shader Lifting** | `Graphics` | `16 of 16` (`100%`) | `16 ScarlettEdge` | 16 exports; RDNA2/Scarlett GPU microcode disassembly, DXIL/SPIR-V lifting, chunk stripping, pipeline caching |
 | **Xbox Unified Memory & KernelX** | `Platform` | `16 of 16` (`100%`) | `16 ScarlettEdge` | 16 exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services |
@@ -84,7 +84,7 @@ In the two charts below, **purple (`#a371f7`)** credits original work from **[Fr
 | **Retail XVC/XVD Crypto** | `Storage` | `12 of 12` (`100%`) | `12 ScarlettEdge` | 12 exports; AES-XTS/AES-CBC sector decryption, SHA-256 block hashing, integrity table verification |
 | **PE64 Loader & Auto-Stubs** | `Core` | `6 of 6` (`100%`) | `6 upstream` | PE32+ mapping, DIR64/HIGHLOW relocs, named/ordinal IAT, API-set redirection, x64 auto-stub thunks |
 
-> **100% ABI Surface Coverage:** All 19 subsystems (426/426 functions) have verified implementations across graphics, compute, audio, networking, storage, kernel, and services. Passing synthetic tests do not imply commercial retail title execution.
+> **100% ABI Surface Coverage:** All 19 subsystems (468/468 functions) have verified implementations across graphics, compute, audio, networking, storage, kernel, and services. Passing synthetic tests do not imply commercial retail title execution.
 
 _Regenerate with `python tools/generate_status.py --build-dir <build tree>` after adding new HLE APIs or subsystems; the test numbers are read from that tree's last `ctest` run._
 <!-- SCARLETTX_STATUS_END -->

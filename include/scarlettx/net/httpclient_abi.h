@@ -99,6 +99,66 @@ SCARLETTX_HC_API SX_HRESULT HCHttpCallRegisterMock(
     const char* content_type);
 SCARLETTX_HC_API void HCHttpCallClearMocks(void);
 
+// ---------------------------------------------------------------------------
+// HCWebSocket* (GDK 2022-2026 Xbox Live RTA & PlayFab WebSocket Transport)
+// ---------------------------------------------------------------------------
+typedef struct HC_WEBSOCKET* HCWebSocketHandle;
+
+typedef void(SCARLETTX_GDK_CALLBACK HCWebSocketMessageFunction)(
+    HCWebSocketHandle websocket,
+    const char* incoming_body_string,
+    void* function_context);
+
+typedef void(SCARLETTX_GDK_CALLBACK HCWebSocketBinaryMessageFunction)(
+    HCWebSocketHandle websocket,
+    const uint8_t* payload_bytes,
+    uint32_t payload_size,
+    void* function_context);
+
+typedef void(SCARLETTX_GDK_CALLBACK HCWebSocketCloseEventFunction)(
+    HCWebSocketHandle websocket,
+    uint32_t close_status,
+    void* function_context);
+
+SCARLETTX_HC_API SX_HRESULT HCWebSocketCreate(
+    HCWebSocketHandle* websocket,
+    HCWebSocketMessageFunction* message_func,
+    HCWebSocketBinaryMessageFunction* binary_message_func,
+    HCWebSocketCloseEventFunction* close_func,
+    void* function_context);
+
+SCARLETTX_HC_API SX_HRESULT HCWebSocketSetHeader(
+    HCWebSocketHandle websocket,
+    const char* header_name,
+    const char* header_value);
+
+SCARLETTX_HC_API SX_HRESULT HCWebSocketConnectAsync(
+    const char* uri,
+    const char* subprotocol,
+    HCWebSocketHandle websocket,
+    XAsyncBlock* async_block);
+
+SCARLETTX_HC_API SX_HRESULT HCWebSocketSendMessageAsync(
+    HCWebSocketHandle websocket,
+    const char* message,
+    XAsyncBlock* async_block);
+
+SCARLETTX_HC_API SX_HRESULT HCWebSocketSendBinaryMessageAsync(
+    HCWebSocketHandle websocket,
+    const uint8_t* payload_bytes,
+    uint32_t payload_size,
+    XAsyncBlock* async_block);
+
+SCARLETTX_HC_API SX_HRESULT HCWebSocketDisconnect(
+    HCWebSocketHandle websocket);
+
+SCARLETTX_HC_API SX_HRESULT HCWebSocketCloseHandle(
+    HCWebSocketHandle websocket);
+
+SCARLETTX_HC_API SX_HRESULT HCWebSocketRegisterMockReply(
+    const char* uri_prefix,
+    const char* reply_json);
+
 #ifdef __cplusplus
 }
 #endif

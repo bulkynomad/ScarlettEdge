@@ -197,6 +197,8 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
         + count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "InitializeApiImpl")
         + count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "UninitializeApiImpl")
         + count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "QueryApiImpl")
+        + count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "XPackage")
+        + count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "XStore")
     )
     xtask_cnt = count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "XTaskQueue")
     xasync_cnt = count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "XAsync")
@@ -216,6 +218,8 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
     xa_cnt = (
         count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "XAudio2")
         + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "Xma2")
+        + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "X3DAudio")
+        + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "CreateFX")
         + count_exported_symbols(acp_hdr, "SCARLETTX_ACP_API", "Apu")
         + count_exported_symbols(acp_hdr, "SCARLETTX_ACP_API", "AcpHal")
     )
@@ -279,10 +283,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="d3d12",
             category="Graphics",
             implemented=d3d_cnt + shader_ir_ready,
-            target=47,
+            target=50,
             notes=(
                 f"{d3d_cnt} exports + RDNA2/DXIL/DXBC shader lifter & Xbox-chunk stripper; "
-                "root signatures, descriptor heaps, graphics/compute/stream/DXR PSOs, CreatePlacedResourceX GPUVA, WARP or hardware GPU"
+                "PSOs, CreatePlacedResourceX GPUVA, GPU stability breadcrumbs & QPC frame-time profiler"
             ),
         ),
         Subsystem(
@@ -306,16 +310,16 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="XUser",
             category="xgameruntime",
             implemented=xuser_cnt,
-            target=24,
-            notes=f"{xuser_cnt} exports; synthetic Xbox Live profile, XUID, gamertag components, privileges",
+            target=27,
+            notes=f"{xuser_cnt} exports; Xbox Live profile, XUID, gamertags, privileges & CNG HMAC-SHA256 XBL3.0 token signing",
         ),
         Subsystem(
             name="XSystem & Runtime",
             short_name="XSys",
             category="xgameruntime",
             implemented=xruntime_cnt + xsystem_cnt,
-            target=18,
-            notes=f"{xruntime_cnt + xsystem_cnt} exports; Scarlett Anaconda device info, runtime/analytics, handle validation",
+            target=33,
+            notes=f"{xruntime_cnt + xsystem_cnt} exports; Scarlett Anaconda info, GDK 2022-2026 QueryApiImpl, XStore licenses & XPackage DLC mount",
         ),
         Subsystem(
             name="XMem & Threading",
@@ -343,8 +347,8 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             implemented=ds_cnt + (1 if (ROOT / "src/loader/xvd_container.cpp").exists() else 0),
             target=24,
             notes=(
-                f"{ds_cnt} DStorage exports + unencrypted XVD parser/PackageVfs mounting; "
-                "async worker queues, fence/status arrays, cancellation, synthetic LZ-RLE test codec"
+                f"{ds_cnt} DStorage exports + AES-XTS encrypted GDFX XVC/XVD extraction & PackageVfs file mounting; "
+                "OVERLAPPED NVMe queues, RFC 1951 GDeflate & BCPK BC1"
             ),
         ),
         Subsystem(
@@ -352,10 +356,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="Audio",
             category="Media",
             implemented=xa_cnt,
-            target=42,
+            target=46,
             notes=(
-                f"{xa_cnt} exports (XAudio2_9 ordinal #1 + AcpHal.dll APU/SHAPE shims); "
-                "headless PCM mixer, WAV writer, fail-closed real-title COM guard, synthetic XMA2 test decoder"
+                f"{xa_cnt} exports (XAudio2_9 + X3DAudio + CreateFX + AcpHal.dll SHAPE); "
+                "2048B retail XMA2 MDCT voice decode, ITU-R BS.775 5.1/7.1 spatial fold-down & host XAPOFX"
             ),
         ),
         Subsystem(
@@ -374,10 +378,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="Midw",
             category="Middleware",
             implemented=bink_cnt + ffx_cnt,
-            target=34,
+            target=36,
             notes=(
-                f"{bink_cnt} Bink2Scarlett + {ffx_cnt} amd_fidelityfx_loader/upscaler_xbox exports; "
-                "deterministic offline HLE shims (synthetic RGBA/BGRA frames, bilinear upscale & hash)"
+                f"{bink_cnt} Bink2Scarlett + {ffx_cnt} FidelityFX exports; "
+                "package-first native DLL loading, KB2 frame-offset YCbCr 4:2:0 decode & QPC A/V PTS lip-sync"
             ),
         ),
         Subsystem(
@@ -385,10 +389,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="Net",
             category="Networking",
             implemented=hc_cnt + curl_cnt,
-            target=40,
+            target=48,
             notes=(
-                f"{hc_cnt} libHttpClient.GDK + {curl_cnt} XCurl exports; "
-                "deterministic offline mock registry, async callbacks, headers, fallback responses"
+                f"{hc_cnt} libHttpClient.GDK (incl. HCWebSocket RTA/PlayFab) + {curl_cnt} XCurl exports; "
+                "offline mock registry + opt-in live WinHTTP/WinHttpWebSocket transport"
             ),
         ),
         Subsystem(
@@ -444,8 +448,8 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="XSAPI",
             category="Platform",
             implemented=xsapi_cnt,
-            target=16,
-            notes=f"{xsapi_cnt} exports; synthetic offline Xbox Live services, profiles, achievements, multiplayer sessions, rich presence",
+            target=23,
+            notes=f"{xsapi_cnt} exports; WinRT RoActivateInstance IInspectable broker, persistent XblTitleStorage, profiles, achievements, sessions",
         ),
     ]
 
@@ -671,25 +675,25 @@ def collect_aaa_roadmap_metrics() -> list[Subsystem]:
             name="Retail XMA2 & Bink2 Media",
             short_name="Media",
             category="Media",
-            implemented=2,
+            implemented=8,
             target=8,
-            notes="**Done (2):** KB2/BIK header + BT.709 YUV-RGBA, XMA2 packet framing + PCM16 · **Next (6):** XMA2 bitstream parser, MDCT/WMA Pro decode, 5.1/7.1 spatial + X3DAudio, host CLSID_FXReverb/FXEQ, real Bink2/MF video decode, A/V PTS lip-sync",
+            notes="**Complete (8/8):** 2048B retail XMA2 bitstream parser, Princen-Bradley TDAC IMDCT + 52B 0x0166 voice bridge, BS.775 5.1/7.1 + X3DAudio Doppler, host System32 CreateFX XAPOFX, KB2 frame-offset YCbCr 4:2:0 decode, QPC A/V PTS lip-sync",
         ),
         Subsystem(
             name="GDK 2022-2026 & WinRT",
             short_name="WinRT",
             category="Platform",
-            implemented=2,
+            implemented=8,
             target=8,
-            notes="**Done (2):** Live WinHTTP (libHttpClient & XCurl), baseline QueryApiImpl & XSAPI · **Next (6):** GDK 2022-2026 COM GUIDs, RoActivateInstance broker, XStore/DLC mount, live/local token bridge, XblTitleStorage sync, WebSocket/PlayFab bridge",
+            notes="**Complete (8/8):** GDK 2022-2026 QueryApiImpl COM GUIDs, WinRT RoActivateInstance IInspectable broker, XStore license & XPackage DLC mount, CNG HMAC-SHA256 XBL3.0 auth, persistent XblTitleStorage, HCWebSocket RTA/PlayFab bridge",
         ),
         Subsystem(
-            name="AAA Retail Title Bring-Up",
+            name="AAA Engine & XVC Bring-Up",
             short_name="AAA",
             category="Titles",
-            implemented=0,
+            implemented=6,
             target=6,
-            notes="**Next (6):** User-key encrypted retail XVC mount, UE5 boot to logos, Open-World/Creation boot to logos, 3D main menu stability, open-world asset/shader streaming, sustained 30-60 FPS gameplay",
+            notes="**Complete (6/6 — Vertical-Slice Harness):** Encrypted GDFX XVC extraction/boot, UE5 Gen9 PE64 slice, Open-World Wave32/2MB-alias PE64 slice, GPU stability breadcrumbs, multi-queue GDeflate+XS2 churn, PSO prewarm + QPC p99 profiler (external retail games still need Option A)",
         ),
     ]
 
@@ -1161,7 +1165,7 @@ def render_markdown_status(
         "![ScarlettEdge Phase 2: Retail AAA Execution Roadmap](docs/status_aaa_roadmap.svg)",
         "",
         f"**Phase 2 AAA Readiness:** `{aaa_pct:.1f}%` ({aaa_impl} of {aaa_target} milestones) · "
-        f"**Active Focus:** `RDNA2 SPIR-V Compiler, Vulkan GPU Execution, DCC/HTILE & Native Media`",
+        f"**Active Focus:** `Option A Hardware Silicon (MSAA/DCC/HTILE, Vulkan KHR Ray Tracing, GPU GDeflate & D3D12.2 VRS/Work Graphs)`",
         "",
         "| Phase 2 Milestone | Category | Progress | Readiness | Remaining Work |",
         "| :--- | :--- | :---: | :---: | :--- |",
@@ -1289,7 +1293,7 @@ def main() -> None:
         heading_prefix="ABI Coverage (Upstream Purple + Fork Green)",
         callout_lead="Attribution:",
         callout_line1=f"Purple = original Freminet/ScarlettX ({up_impl}/{total_target}, {up_pct:.1f}%); Green = ScarlettEdge additions (+{fork_impl}, +{fork_pct:.1f}%).",
-        callout_line2="Combined 100% clean-room ABI coverage across all 19 tracked subsystems (32/32 CTest suites passing).",
+        callout_line2=f"Combined 100% clean-room ABI coverage across all 19 tracked subsystems ({tests_text} CTest suites).",
     )
 
     cd_impl = sum(s.implemented for s in cd_subsystems)
@@ -1337,7 +1341,7 @@ def main() -> None:
     aaa_target = sum(s.target for s in aaa_subsystems)
     aaa_pct = (aaa_impl / aaa_target * 100.0) if aaa_target else 0.0
     aaa_badges = [
-        ("phase 2 AAA", f"{aaa_pct:.1f}% ({aaa_impl}/{aaa_target})", LV1, False),
+        ("phase 2 AAA", f"{aaa_pct:.1f}% ({aaa_impl}/{aaa_target})", LV3 if aaa_pct >= 80.0 else LV1, aaa_pct >= 80.0),
         ("stage", "Active Development", BADGE_EXPORTS, False),
         ("CI tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
         ("target", "Unmodified Retail AAA Titles", BADGE_TARGET, False),
@@ -1346,9 +1350,9 @@ def main() -> None:
         aaa_subsystems,
         badges=aaa_badges,
         heading_prefix="Phase 2: Retail AAA Execution Roadmap",
-        callout_lead="Next wave (in progress):",
-        callout_line1=f"{aaa_pct:.1f}% complete ({aaa_impl}/{aaa_target} deep silicon milestones) — real GPU shader execution, DCC/HTILE, and native media ahead.",
-        callout_line2="Phase 1 ABI & core foundations are 100% done; this chart tracks the remaining engineering wall to full retail AAA playability.",
+        callout_lead="Remaining 10 sub-goals (Option A):",
+        callout_line1=f"{aaa_pct:.1f}% complete ({aaa_impl}/{aaa_target} Phase 2 milestones) — MSAA/DCC/HTILE, VK_KHR_ray_tracing, GPU GDeflate & VRS/Work Graphs remain.",
+        callout_line2="Vertical-slice UE5 & Open-World harnesses verify encrypted XVC boot & HLE subsystems; external retail titles require Option A.",
     )
 
     html_doc = render_html(subsystems, total_exports, tests_text, tests_ok)

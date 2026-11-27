@@ -1,5 +1,6 @@
 #define SCARLETTX_BUILDING_CODECS 1
 #include "scarlettx/media/codecs_abi.h"
+#include "scarlettx/audio/xma2_decoder.h"
 #include "scarlettx/io/deflate_rfc1951.h"
 
 #include <algorithm>
@@ -105,6 +106,8 @@ bool Lz77DecompressTile(const uint8_t* src, size_t src_len, uint8_t* dst, size_t
 struct Xma2DecoderState {
     XMA2_FORMAT format{};
     std::vector<uint8_t> buffer;
+    std::vector<int16_t> decoded_pcm;
+    std::unique_ptr<scarlettx::audio::Xma2StreamDecoder> mdct_decoder;
     uint32_t sample_pos = 0;
 };
 
@@ -383,6 +386,10 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecXma2CreateDecoder(
     if (!outHandle) return kInvalidArg;
     auto* s = new Xma2DecoderState();
     if (format) s->format = *format;
+    const uint16_t ch = static_cast<uint16_t>(
+        (s->format.channelCount >= 1u && s->format.channelCount <= 8u) ? s->format.channelCount : 2u);
+    s->mdct_decoder = std::make_unique<scarlettx::audio::Xma2StreamDecoder>(
+        ch, s->format.sampleRate > 0 ? s->format.sampleRate : 48000u);
     *outHandle = s;
     return kSuccess;
 }
@@ -398,6 +405,18 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecXma2SubmitData(
     if (!handle || !xmaData || byteCount == 0) return kInvalidArg;
     auto* s = static_cast<Xma2DecoderState*>(handle);
     const auto* p = static_cast<const uint8_t*>(xmaData);
+    // Real 2048-byte XMA2 packet block -> decode through IMDCT overlap-add decoder!
+    if (byteCount >= scarlettx::audio::kXma2PacketBytes &&
+        (byteCount % scarlettx::audio::kXma2PacketBytes) == 0u && s->mdct_decoder) {
+        std::vector<float> f32;
+        if (s->mdct_decoder->DecodeBlock(p, byteCount, f32) && !f32.empty()) {
+            for (float v : f32) {
+                s->decoded_pcm.push_back(
+                    static_cast<int16_t>(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767.0f)));
+            }
+            return kSuccess;
+        }
+    }
     s->buffer.insert(s->buffer.end(), p, p + byteCount);
     return kSuccess;
 }
@@ -406,10 +425,17 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecXma2GetPcmSamples(
     XMA2_DECODER_HANDLE handle, void* outPcmBuffer, uint32_t maxSamples, uint32_t* samplesProduced) {
     if (!handle || !outPcmBuffer || maxSamples == 0) return kInvalidArg;
     auto* s = static_cast<Xma2DecoderState*>(handle);
+    auto* pcm = static_cast<int16_t*>(outPcmBuffer);
+    if (!s->decoded_pcm.empty()) {
+        const uint32_t count = std::min<uint32_t>(maxSamples, static_cast<uint32_t>(s->decoded_pcm.size()));
+        std::memcpy(pcm, s->decoded_pcm.data(), count * sizeof(int16_t));
+        s->decoded_pcm.erase(s->decoded_pcm.begin(), s->decoded_pcm.begin() + static_cast<ptrdiff_t>(count));
+        if (samplesProduced) *samplesProduced = count;
+        s->sample_pos += count;
+        return kSuccess;
+    }
     const uint32_t avail_samples = static_cast<uint32_t>(s->buffer.size() / 2);
     const uint32_t count = std::min<uint32_t>(maxSamples, avail_samples);
-    auto* pcm = static_cast<int16_t*>(outPcmBuffer);
-    // Clean-room XMA2 packet-to-PCM16 synthesis with 1st-order prediction filter
     int32_t predictor = 0;
     for (uint32_t i = 0; i < count; ++i) {
         const int16_t raw = static_cast<int16_t>(
@@ -430,6 +456,8 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecXma2Reset(XMA2_DECODER_HANDLE handle) {
     if (!handle) return kInvalidArg;
     auto* s = static_cast<Xma2DecoderState*>(handle);
     s->buffer.clear();
+    s->decoded_pcm.clear();
+    if (s->mdct_decoder) s->mdct_decoder->Reset();
     s->sample_pos = 0;
     return kSuccess;
 }

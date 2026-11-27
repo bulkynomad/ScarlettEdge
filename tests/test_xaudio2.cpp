@@ -174,6 +174,122 @@ int main() {
     SX_CHECK_EQ(XAudio2DestroyVoice(src_xma), 0);
     SX_CHECK_EQ(XAudio2DestroyVoice(submix), 0);
     SX_CHECK_EQ(XAudio2DestroyVoice(master), 0);
+
+    // 6. Retail 2048-byte XMA2 MDCT Bitstream + Overlap-Add Roundtrip Verification
+    {
+        constexpr uint32_t kMdctFrames = 512;
+        std::vector<float> orig_stereo(kMdctFrames * 2);
+        for (uint32_t i = 0; i < kMdctFrames; ++i) {
+            const float t = static_cast<float>(i) / 48000.0f;
+            orig_stereo[i * 2 + 0] = 0.65f * std::sin(2.0f * 3.14159265f * 375.0f * t);
+            orig_stereo[i * 2 + 1] = 0.45f * std::cos(2.0f * 3.14159265f * 750.0f * t);
+        }
+        uint32_t needed_bytes = 0;
+        (void)Xma2EncodeMdctBlock(orig_stereo.data(), kMdctFrames, 2, nullptr, 0, &needed_bytes);
+        SX_CHECK(needed_bytes >= 2048u && (needed_bytes % 2048u) == 0u);
+
+        std::vector<uint8_t> xma_block(needed_bytes, 0);
+        uint32_t written_bytes = 0;
+        SX_CHECK_EQ(Xma2EncodeMdctBlock(orig_stereo.data(), kMdctFrames, 2,
+                                        xma_block.data(), needed_bytes, &written_bytes), 0);
+        SX_CHECK_EQ(written_bytes, needed_bytes);
+
+        std::vector<float> recon(kMdctFrames * 4, 0.0f);
+        uint32_t recon_frames = 0;
+        uint16_t recon_ch = 0;
+        SX_CHECK_EQ(Xma2DecodePacket(xma_block.data(), written_bytes,
+                                     recon.data(), static_cast<uint32_t>(recon.size()),
+                                     &recon_frames, &recon_ch), 0);
+        SX_CHECK(recon_frames >= kMdctFrames);
+        SX_CHECK_EQ(recon_ch, 2u);
+
+        // Verify TDAC overlap-add waveform reconstruction fidelity (interior hops 128..384)
+        double sig_pow = 0.0;
+        double err_pow = 0.0;
+        for (uint32_t f = 128; f < 384; ++f) {
+            for (uint32_t c = 0; c < 2; ++c) {
+                const double s = orig_stereo[f * 2 + c];
+                const double r = recon[f * 2 + c];
+                sig_pow += s * s;
+                err_pow += (s - r) * (s - r);
+            }
+        }
+        SX_CHECK(sig_pow > 10.0 && err_pow < sig_pow * 0.01);  // > 20 dB SNR clean reconstruction
+    }
+
+    // 7. ITU-R BS.775 5.1 & 7.1 Spatial Downmix + X3DAudioCalculate + Host CreateFX (CLSID_FXReverb)
+    {
+        // 5.1 voice with ONLY Center channel (channel 2 = dialogue) active -> must fold into BOTH L and R!
+        XAUDIO2_WAVE_FORMAT fmt_51{};
+        fmt_51.FormatTag = SCARLETTX_WAVE_FORMAT_IEEE_FLOAT;
+        fmt_51.Channels = 6;
+        fmt_51.SampleRate = 48000;
+        fmt_51.BitsPerSample = 32;
+        fmt_51.BlockAlign = 24;
+
+        uint64_t master_st = 0, voice_51 = 0;
+        SX_CHECK_EQ(XAudio2CreateMasteringVoice(engine, 2, 48000, &master_st), 0);
+        SX_CHECK_EQ(XAudio2CreateSourceVoice(engine, &fmt_51, 0, 2.0f, &voice_51), 0);
+
+        std::vector<float> pcm_51(128 * 6, 0.0f);
+        for (uint32_t f = 0; f < 128; ++f) pcm_51[f * 6 + 2] = 0.8f;  // Center speaker only!
+        XAUDIO2_BUFFER b51{};
+        b51.AudioBytes = static_cast<uint32_t>(pcm_51.size() * sizeof(float));
+        b51.AudioData = reinterpret_cast<const uint8_t*>(pcm_51.data());
+        SX_CHECK_EQ(XAudio2VoiceSubmitSourceBuffer(voice_51, &b51), 0);
+        SX_CHECK_EQ(XAudio2VoiceStart(voice_51, 0), 0);
+
+        std::vector<float> downmix(128 * 2, 0.0f);
+        SX_CHECK_EQ(XAudio2RenderAudioFrames(engine, 128, downmix.data(), 256), 0);
+        SX_CHECK(std::fabs(downmix[0] - 0.8f * 0.70710678f) < 1e-3f);
+        SX_CHECK(std::fabs(downmix[1] - 0.8f * 0.70710678f) < 1e-3f);
+
+        SX_CHECK_EQ(XAudio2DestroyVoice(voice_51), 0);
+        SX_CHECK_EQ(XAudio2DestroyVoice(master_st), 0);
+
+        // X3DAudio 3D spatialization + Doppler verification (emitter to the right of listener)
+        X3DAUDIO_HANDLE x3d{};
+        SX_CHECK_EQ(X3DAudioInitialize(0x3u /* SPEAKER_STEREO */, 343.5f, x3d), 0);
+        X3DAUDIO_LISTENER listener{};
+        listener.OrientFront = {0.0f, 0.0f, 1.0f};
+        listener.OrientTop = {0.0f, 1.0f, 0.0f};
+        X3DAUDIO_EMITTER emitter{};
+        emitter.OrientFront = {0.0f, 0.0f, 1.0f};
+        emitter.OrientTop = {0.0f, 1.0f, 0.0f};
+        emitter.Position = {10.0f, 0.0f, 0.0f};  // 10m directly right
+        emitter.Velocity = {-34.35f, 0.0f, 0.0f};  // Approaching listener -> Doppler > 1.0
+        emitter.ChannelCount = 1;
+        emitter.CurveDistanceScaler = 5.0f;
+        emitter.DopplerScaler = 1.0f;
+
+        float mtx[2] = {};
+        X3DAUDIO_DSP_SETTINGS dsp{};
+        dsp.SrcChannelCount = 1;
+        dsp.DstChannelCount = 2;
+        dsp.pMatrixCoefficients = mtx;
+        X3DAudioCalculate(x3d, &listener, &emitter,
+                          SCARLETTX_X3DAUDIO_CALCULATE_MATRIX | SCARLETTX_X3DAUDIO_CALCULATE_DOPPLER, &dsp);
+        SX_CHECK(std::fabs(dsp.EmitterToListenerDistance - 10.0f) < 1e-4f);
+        SX_CHECK(mtx[1] > 0.45f && mtx[0] < 0.01f);  // Hard-right attenuated to 0.5x at 2x CurveDistanceScaler
+        SX_CHECK(dsp.DopplerFactor > 1.05f);
+
+        // Host CreateFX: CLSID_FXReverb {CACA5E1D-B1B5-42F7-B23D-BD0F3863EC74} / XAPOFX FXReverb {7D9ACA56-CB68-4807-B632-B137352E8596}
+        struct FxClsid { uint32_t d1; uint16_t d2, d3; uint8_t d4[8]; };
+        const FxClsid kClsidFxReverb = {0x7D9ACA56u, 0xCB68u, 0x4807u, {0xB6, 0x32, 0xB1, 0x37, 0x35, 0x2E, 0x85, 0x96}};
+        void* fx_obj = nullptr;
+        SX_CHECK_EQ(CreateFX(&kClsidFxReverb, &fx_obj, nullptr, 0), 0);
+        SX_CHECK(fx_obj != nullptr);
+        auto* fx_vtbl = *reinterpret_cast<void* const* const*>(fx_obj);
+        using FnRel = uint32_t(
+#if defined(_WIN32)
+            __stdcall*
+#else
+            *
+#endif
+        )(void*);
+        (void)reinterpret_cast<FnRel>(fx_vtbl[2])(fx_obj);
+    }
+
     SX_CHECK_EQ(XAudio2DestroyEngine(engine), 0);
 
     std::cout << "[test_xaudio2] All XAudio2 + XMA2 HLE checks passed.\n";

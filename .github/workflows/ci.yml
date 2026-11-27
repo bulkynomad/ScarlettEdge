@@ -24,8 +24,10 @@ jobs:
       - name: Build ScarlettEdge
         run: cmake --build build
 
-      - name: Run CTest Suite (32/32)
+      - name: Run CTest Suite (33/33)
         run: ctest --test-dir build --output-on-failure
 
-      - name: Smoke Test scarlettx compat CLI
-        run: ./build/scarlettx.exe compat ./build/packages/hello_scarlett
+      - name: Smoke Test scarlettx compat CLI (Package & Encrypted XVC)
+        run: |
+          ./build/scarlettx.exe compat ./build/packages/hello_scarlett
+          ./build/scarlettx.exe compat ./build/test_aaa_bringup_tmp/ue5_vertical_slice.xvc

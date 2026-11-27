@@ -1,6 +1,8 @@
 #include "scarlettx/audio/xaudio2_abi.h"
+#include "scarlettx/audio/xma2_decoder.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -8,6 +10,7 @@
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <vector>
 
@@ -83,13 +86,31 @@ int32_t DecodeXma2Internal(
     uint32_t packet_bytes,
     std::vector<float>& out_pcm,
     uint32_t& out_frames,
-    uint16_t& out_channels) {
+    uint16_t& out_channels,
+    uint16_t hint_channels = 0) {
     if (!packet_data || packet_bytes < sizeof(XMA2_PACKET_HEADER)) {
         return kE_INVALIDARG;
     }
     XMA2_PACKET_HEADER hdr{};
     std::memcpy(&hdr, packet_data, sizeof(hdr));
-    if (hdr.Magic != 0x32414D58u || hdr.Channels == 0 || hdr.Channels > 8 || hdr.SampleCount == 0) {
+    if (hdr.Magic != 0x32414D58u) {
+        // Retail 2048-byte XMA2 bitstream block (parsed via Xma2StreamDecoder + IMDCT overlap-add)
+        if (packet_bytes >= scarlettx::audio::kXma2PacketBytes &&
+            (packet_bytes % scarlettx::audio::kXma2PacketBytes) == 0u) {
+            const auto ph = scarlettx::audio::ParseXma2PacketHeader(packet_data);
+            const uint16_t ch = hint_channels > 0
+                                    ? hint_channels
+                                    : static_cast<uint16_t>((ph.packet_skip_count + 1u) * 2u);
+            scarlettx::audio::Xma2StreamDecoder dec(ch, 48000u);
+            if (dec.DecodeBlock(packet_data, packet_bytes, out_pcm) && !out_pcm.empty()) {
+                out_channels = ch;
+                out_frames = static_cast<uint32_t>(out_pcm.size() / ch);
+                return kS_OK;
+            }
+        }
+        return kE_INVALIDARG;
+    }
+    if (hdr.Channels == 0 || hdr.Channels > 8 || hdr.SampleCount == 0) {
         return kE_INVALIDARG;
     }
 
@@ -339,7 +360,8 @@ int32_t XAudio2VoiceSubmitSourceBuffer(uint64_t voice, const XAUDIO2_BUFFER* buf
             buffer->AudioBytes,
             qbuf.samples,
             qbuf.frame_count,
-            decoded_ch);
+            decoded_ch,
+            v.format.Channels);
         if (hr < 0) return hr;
         qbuf.channels = decoded_ch;
     } else {
@@ -557,6 +579,22 @@ int32_t XAudio2RenderAudioFrames(
                     }
                     out_interleaved_pcm[f * dst_ch + dc] += sum;
                 }
+            } else if (dst_ch == 2u && (src_ch == 6u || src_ch == 8u)) {
+                // ITU-R BS.775 5.1 (FL,FR,FC,LFE,BL,BR) & 7.1 (+SL,SR) spatial fold-down to stereo:
+                // Preserves Center dialogue (-3 dB = 0.70710678), LFE (-10 dB = 0.31622777), and Surround (-3 dB).
+                constexpr float kCenterGain = 0.70710678f;
+                constexpr float kSurrGain = 0.70710678f;
+                constexpr float kLfeGain = 0.31622777f;
+                float left = src_sample[0] + kCenterGain * src_sample[2] + kLfeGain * src_sample[3] +
+                             kSurrGain * src_sample[4];
+                float right = src_sample[1] + kCenterGain * src_sample[2] + kLfeGain * src_sample[3] +
+                              kSurrGain * src_sample[5];
+                if (src_ch == 8u) {
+                    left += kSurrGain * src_sample[6];
+                    right += kSurrGain * src_sample[7];
+                }
+                out_interleaved_pcm[f * 2u + 0u] += left;
+                out_interleaved_pcm[f * 2u + 1u] += right;
             } else {
                 for (uint32_t dc = 0; dc < dst_ch; ++dc) {
                     const uint32_t sc = (src_ch == 1) ? 0u : (dc % src_ch);
@@ -643,9 +681,291 @@ int32_t Xma2DecodePacket(
     return kS_OK;
 }
 
+int32_t Xma2EncodeMdctBlock(
+    const float* interleaved_pcm,
+    uint32_t frame_count,
+    uint16_t channels,
+    uint8_t* out_xma2_bytes,
+    uint32_t max_out_bytes,
+    uint32_t* out_bytes_written) {
+    if (!interleaved_pcm || frame_count == 0 || channels == 0 || channels > 8 || !out_bytes_written) {
+        return kE_INVALIDARG;
+    }
+    const auto encoded = scarlettx::audio::EncodeXma2MdctBlock(interleaved_pcm, frame_count, channels);
+    if (encoded.empty()) return kE_FAIL;
+    *out_bytes_written = static_cast<uint32_t>(encoded.size());
+    if (!out_xma2_bytes || max_out_bytes < encoded.size()) {
+        return static_cast<int32_t>(0x8007007Au);  // E_NOT_SUFFICIENT_BUFFER
+    }
+    std::memcpy(out_xma2_bytes, encoded.data(), encoded.size());
+    return kS_OK;
+}
+
 int32_t XAudio2Create(void** ppXAudio2, uint32_t flags, uint32_t xaudio2_processor) {
     // Always guest-facing objects, never the host COM pointer.
     return ScarlettXGuestXAudio2Create(ppXAudio2, flags, xaudio2_processor);
+}
+
+}  // extern "C"
+
+namespace {
+
+#if defined(_WIN32)
+HMODULE LoadHostSystemXAudio2Dll() {
+    static HMODULE sys_xa2 = []() -> HMODULE {
+        wchar_t full_path[MAX_PATH + 32] = {};
+        const UINT len = GetSystemDirectoryW(full_path, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) {
+            return nullptr;
+        }
+        const wchar_t kSuffix[] = L"\\xaudio2_9.dll";
+        UINT pos = len;
+        if (full_path[pos - 1] == L'\\' || full_path[pos - 1] == L'/') {
+            --pos;
+        }
+        std::memcpy(full_path + pos, kSuffix, sizeof(kSuffix));
+        HMODULE mod = LoadLibraryExW(full_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        HMODULE self_mod = nullptr;
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&LoadHostSystemXAudio2Dll),
+            &self_mod);
+        if (mod && mod == self_mod) {
+            FreeLibrary(mod);
+            return nullptr;
+        }
+        return mod;
+    }();
+    return sys_xa2;
+}
+#endif
+
+// Clean-room IXAPO / IXAPOParameters COM fallback when host CreateFX is unavailable or custom CLSID is passed
+struct FallbackXapo {
+    const void* const* vtbl;
+    std::atomic<uint32_t> refs{1};
+    std::vector<uint8_t> params;
+};
+
+int32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_QI(void* self_ptr, const void* /*riid*/, void** ppv) {
+    if (!ppv) return static_cast<int32_t>(0x80004003u);
+    if (!self_ptr) { *ppv = nullptr; return kE_INVALIDARG; }
+    auto* self = static_cast<FallbackXapo*>(self_ptr);
+    self->refs.fetch_add(1, std::memory_order_relaxed);
+    *ppv = self;
+    return kS_OK;
+}
+
+uint32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_AddRef(void* self_ptr) {
+    return self_ptr ? (static_cast<FallbackXapo*>(self_ptr)->refs.fetch_add(1, std::memory_order_relaxed) + 1u) : 0u;
+}
+
+uint32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_Release(void* self_ptr) {
+    if (!self_ptr) return 0u;
+    auto* self = static_cast<FallbackXapo*>(self_ptr);
+    const uint32_t rem = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete self;
+    return rem;
+}
+
+int32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_Ok(void*) { return kS_OK; }
+
+void
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_Void(void*) {}
+
+const void* const kFallbackXapoVtbl[16] = {
+    reinterpret_cast<const void*>(&FallbackXapo_QI),
+    reinterpret_cast<const void*>(&FallbackXapo_AddRef),
+    reinterpret_cast<const void*>(&FallbackXapo_Release),
+    reinterpret_cast<const void*>(&FallbackXapo_Ok),
+    reinterpret_cast<const void*>(&FallbackXapo_Ok),
+    reinterpret_cast<const void*>(&FallbackXapo_Ok),
+    reinterpret_cast<const void*>(&FallbackXapo_Void),
+    reinterpret_cast<const void*>(&FallbackXapo_Void),
+    reinterpret_cast<const void*>(&FallbackXapo_Void),
+    reinterpret_cast<const void*>(&FallbackXapo_Void),
+    reinterpret_cast<const void*>(&FallbackXapo_Void),
+    reinterpret_cast<const void*>(&FallbackXapo_Void),
+    reinterpret_cast<const void*>(&FallbackXapo_Ok),
+    reinterpret_cast<const void*>(&FallbackXapo_Ok),
+    reinterpret_cast<const void*>(&FallbackXapo_Void),
+    reinterpret_cast<const void*>(&FallbackXapo_Void),
+};
+
+}  // namespace
+
+extern "C" {
+
+int32_t X3DAudioInitialize(
+    uint32_t speaker_channel_mask,
+    float speed_of_sound,
+    X3DAUDIO_HANDLE instance) {
+    if (!instance || speed_of_sound <= 0.0f) return kE_INVALIDARG;
+    std::memset(instance, 0, sizeof(X3DAUDIO_HANDLE));
+    const uint32_t magic = 0x33444158u;  // 'XAD3'
+    std::memcpy(instance + 0, &magic, 4);
+    std::memcpy(instance + 4, &speaker_channel_mask, 4);
+    std::memcpy(instance + 8, &speed_of_sound, 4);
+    return kS_OK;
+}
+
+void X3DAudioCalculate(
+    const X3DAUDIO_HANDLE instance,
+    const X3DAUDIO_LISTENER* listener,
+    const X3DAUDIO_EMITTER* emitter,
+    uint32_t flags,
+    X3DAUDIO_DSP_SETTINGS* dsp) {
+    if (!instance || !listener || !emitter || !dsp) return;
+    float speed_of_sound = 343.5f;
+    std::memcpy(&speed_of_sound, instance + 8, 4);
+    if (speed_of_sound <= 1.0f) speed_of_sound = 343.5f;
+
+    const float dx = emitter->Position.x - listener->Position.x;
+    const float dy = emitter->Position.y - listener->Position.y;
+    const float dz = emitter->Position.z - listener->Position.z;
+    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    dsp->EmitterToListenerDistance = dist;
+
+    // Orthonormal listener right = Top x Front (left-handed X3DAudio coordinate system)
+    float fx = listener->OrientFront.x, fy = listener->OrientFront.y, fz = listener->OrientFront.z;
+    const float flen = std::sqrt(fx * fx + fy * fy + fz * fz);
+    if (flen > 1e-6f) { fx /= flen; fy /= flen; fz /= flen; } else { fz = 1.0f; }
+
+    float ux = listener->OrientTop.x, uy = listener->OrientTop.y, uz = listener->OrientTop.z;
+    const float ulen = std::sqrt(ux * ux + uy * uy + uz * uz);
+    if (ulen > 1e-6f) { ux /= ulen; uy /= ulen; uz /= ulen; } else { uy = 1.0f; }
+
+    const float rx = uy * fz - uz * fy;
+    const float ry = uz * fx - ux * fz;
+    const float rz = ux * fy - uy * fx;
+
+    float pan = 0.0f;  // -1 = full left, +1 = full right
+    float front_dot = 1.0f;
+    if (dist > 1e-5f) {
+        const float inv_d = 1.0f / dist;
+        pan = std::clamp((dx * rx + dy * ry + dz * rz) * inv_d, -1.0f, 1.0f);
+        front_dot = std::clamp((dx * fx + dy * fy + dz * fz) * inv_d, -1.0f, 1.0f);
+        dsp->EmitterToListenerAngle = std::acos(front_dot);
+    } else {
+        dsp->EmitterToListenerAngle = 0.0f;
+    }
+
+    const float scaler = emitter->CurveDistanceScaler > 0.0f ? emitter->CurveDistanceScaler : 1.0f;
+    const float atten = (dist <= scaler) ? 1.0f : (scaler / dist);
+
+    // Doppler pitch shift
+    dsp->DopplerFactor = 1.0f;
+    if ((flags & SCARLETTX_X3DAUDIO_CALCULATE_DOPPLER) != 0 && dist > 1e-5f) {
+        const float inv_d = 1.0f / dist;
+        const float dir_x = dx * inv_d, dir_y = dy * inv_d, dir_z = dz * inv_d;
+        const float v_listener = listener->Velocity.x * dir_x + listener->Velocity.y * dir_y + listener->Velocity.z * dir_z;
+        const float v_emitter = emitter->Velocity.x * dir_x + emitter->Velocity.y * dir_y + emitter->Velocity.z * dir_z;
+        const float d_scale = emitter->DopplerScaler > 0.0f ? emitter->DopplerScaler : 1.0f;
+        const float max_v = speed_of_sound * 0.9f;
+        const float vl = std::clamp(v_listener * d_scale, -max_v, max_v);
+        const float ve = std::clamp(v_emitter * d_scale, -max_v, max_v);
+        dsp->ListenerVelocityComponent = v_listener;
+        dsp->EmitterVelocityComponent = v_emitter;
+        dsp->DopplerFactor = std::clamp((speed_of_sound + vl) / (speed_of_sound + ve), 0.25f, 4.0f);
+    }
+
+    if ((flags & SCARLETTX_X3DAUDIO_CALCULATE_MATRIX) != 0 &&
+        dsp->pMatrixCoefficients && dsp->SrcChannelCount > 0 && dsp->DstChannelCount > 0) {
+        const uint32_t src_ch = dsp->SrcChannelCount;
+        const uint32_t dst_ch = dsp->DstChannelCount;
+        std::fill_n(dsp->pMatrixCoefficients, src_ch * dst_ch, 0.0f);
+
+        // Constant-power angle in [0, pi/2]: 0 = full left, pi/2 = full right
+        const float angle = (pan + 1.0f) * (3.14159265f * 0.25f);
+        const float gain_l = std::cos(angle) * atten;
+        const float gain_r = std::sin(angle) * atten;
+
+        for (uint32_t s = 0; s < src_ch; ++s) {
+            if (dst_ch == 1u) {
+                dsp->pMatrixCoefficients[s] = atten;
+            } else if (dst_ch == 2u) {
+                dsp->pMatrixCoefficients[0u * src_ch + s] = gain_l;
+                dsp->pMatrixCoefficients[1u * src_ch + s] = gain_r;
+            } else {
+                // 5.1 (6ch) or 7.1 (8ch) surround speaker placement: FL, FR, FC, LFE, BL, BR [, SL, SR]
+                const float front_w = std::max(0.0f, (front_dot + 1.0f) * 0.5f);
+                const float back_w = 1.0f - front_w;
+                dsp->pMatrixCoefficients[0u * src_ch + s] = gain_l * front_w;
+                dsp->pMatrixCoefficients[1u * src_ch + s] = gain_r * front_w;
+                if (dst_ch >= 3u) {
+                    dsp->pMatrixCoefficients[2u * src_ch + s] =
+                        atten * std::max(0.0f, 1.0f - std::fabs(pan)) * front_w * 0.70710678f;
+                }
+                if (dst_ch >= 4u) {
+                    dsp->pMatrixCoefficients[3u * src_ch + s] = atten * 0.25f;  // LFE
+                }
+                if (dst_ch >= 6u) {
+                    dsp->pMatrixCoefficients[4u * src_ch + s] = gain_l * back_w;
+                    dsp->pMatrixCoefficients[5u * src_ch + s] = gain_r * back_w;
+                }
+                if (dst_ch >= 8u) {
+                    const float side_w = 1.0f - std::fabs(front_dot);
+                    dsp->pMatrixCoefficients[6u * src_ch + s] = gain_l * side_w * 0.70710678f;
+                    dsp->pMatrixCoefficients[7u * src_ch + s] = gain_r * side_w * 0.70710678f;
+                }
+            }
+        }
+    }
+    dsp->LPFDirectCoefficient = std::clamp(1.0f - dist * 0.002f, 0.2f, 1.0f);
+    dsp->LPFReverbCoefficient = 0.75f;
+    dsp->ReverbLevel = atten * 0.5f;
+}
+
+int32_t CreateFX(
+    const void* clsid,
+    void** out_effect,
+    const void* init_data,
+    uint32_t init_data_bytes) {
+    if (!clsid || !out_effect) return kE_INVALIDARG;
+    *out_effect = nullptr;
+#if defined(_WIN32)
+    // Forward standard XAPOFX CLSIDs (CLSID_FXReverb, CLSID_FXEQ, CLSID_FXMasteringLimiter, CLSID_FXEcho)
+    // to Windows System32\xaudio2_9.dll CreateFX first!
+    if (HMODULE sys_xa2 = LoadHostSystemXAudio2Dll()) {
+        using FnHostCreateFX = int32_t(__cdecl*)(const void*, void**, const void*, uint32_t);
+        auto host_cfx = reinterpret_cast<FnHostCreateFX>(reinterpret_cast<void*>(
+            GetProcAddress(sys_xa2, "CreateFX")));
+        if (host_cfx && reinterpret_cast<void*>(host_cfx) != reinterpret_cast<void*>(&CreateFX)) {
+            const int32_t hr = host_cfx(clsid, out_effect, init_data, init_data_bytes);
+            if (hr >= 0 && *out_effect) {
+                return hr;
+            }
+        }
+    }
+#endif
+    auto* fx = new (std::nothrow) FallbackXapo();
+    if (!fx) return static_cast<int32_t>(0x8007000Eu);
+    fx->vtbl = kFallbackXapoVtbl;
+    if (init_data && init_data_bytes > 0) {
+        const auto* p = static_cast<const uint8_t*>(init_data);
+        fx->params.assign(p, p + init_data_bytes);
+    }
+    *out_effect = fx;
+    return kS_OK;
 }
 
 }  // extern "C"

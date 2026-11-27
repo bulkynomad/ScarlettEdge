@@ -84,6 +84,52 @@ SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblPresenceSetPresenceAsync(
 SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblPresenceSetPresenceResult(
     void* asyncBlock);
 
+// Persistent disk-backed XblTitleStorage (GDK 2022-2026 Cloud/Local Title Storage)
+enum XblTitleStorageType {
+    XblTitleStorageType_TrustedPlatformStorage = 0,
+    XblTitleStorageType_GlobalStorage = 2,
+    XblTitleStorageType_Universal = 3,
+};
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleStorageUploadBlobAsync(
+    XblContextHandle context,
+    const char* blobPath,
+    uint32_t storageType,
+    const uint8_t* blobBuffer,
+    size_t blobBufferSize,
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleStorageUploadBlobResult(
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleStorageDownloadBlobAsync(
+    XblContextHandle context,
+    const char* blobPath,
+    uint32_t storageType,
+    uint8_t* blobBuffer,
+    size_t blobBufferSize,
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleStorageDownloadBlobResult(
+    void* asyncBlock,
+    size_t* bytesDownloaded);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleStorageDeleteBlobAsync(
+    XblContextHandle context,
+    const char* blobPath,
+    uint32_t storageType,
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleStorageDeleteBlobResult(
+    void* asyncBlock);
+
+// WinRT RoActivateInstance / RoGetActivationFactory Xbox Game Core Broker
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblWinRtActivateClassByName(
+    const wchar_t* runtimeClassName,
+    const void* riid,
+    int32_t isFactory,
+    void** outInspectable);
+
 #ifdef __cplusplus
 }
 #endif

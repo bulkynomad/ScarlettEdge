@@ -65,6 +65,13 @@ int main() {
     WaitFrames(device, 1);
     SX_REQUIRE(WaitFrames(device, 3) > 40.0);
 
-    std::printf("test_d3d12_frame_pacing: OK\n");
+    D3D12XBOX_GPU_STABILITY_REPORT stab{};
+    SX_REQUIRE(D3D12XboxGetGpuStabilityReport(reinterpret_cast<uint64_t>(device), &stab) == 0);
+    SX_REQUIRE(stab.DeviceRemovedReason == 0);
+    SX_REQUIRE(stab.RecordedFrameCount >= 15ull);
+    SX_REQUIRE(stab.AvgFrameTimeUs > 0ull && stab.P99FrameTimeUs >= stab.MinFrameTimeUs);
+
+    std::printf("test_d3d12_frame_pacing: OK (p99=%llu us)\n",
+                static_cast<unsigned long long>(stab.P99FrameTimeUs));
     return 0;
 }

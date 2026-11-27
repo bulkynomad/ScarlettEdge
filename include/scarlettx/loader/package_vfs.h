@@ -23,10 +23,17 @@ public:
     bool Exists(const std::string& virtual_path) const;
 
 private:
+    struct EmbeddedFileRef {
+        std::shared_ptr<XvdContainer> container;
+        uint64_t user_data_offset = 0;
+        uint64_t size_bytes = 0;
+    };
+
     static std::string NormalizeVirtualPath(const std::string& path);
     static std::string NormalizeKey(const std::string& path);
     std::unordered_map<std::string, std::string> mounts_;
     std::unordered_map<std::string, std::shared_ptr<XvdContainer>> xvd_mounts_;
+    std::unordered_map<std::string, EmbeddedFileRef> xvd_embedded_files_;
 };
 
 }  // namespace scarlettx

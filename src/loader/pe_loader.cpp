@@ -107,6 +107,8 @@ DllRedirectionTable::DllRedirectionTable() {
     RegisterRedirect("dstoragecore.dll", "dstorage_xs.dll", true);
     RegisterRedirect("xaudio2_9.dll", "xaudio2_9.dll", true);
     RegisterRedirect("xaudio2_9redist.dll", "xaudio2_9.dll", true);
+    RegisterRedirect("x3daudio1_7.dll", "xaudio2_9.dll", true);
+    RegisterRedirect("xapofx1_5.dll", "xaudio2_9.dll", true);
     RegisterRedirect("gameinput.dll", "GameInput.dll", true);
     RegisterRedirect("xcurl.dll", "XCurl.dll", true);
     RegisterRedirect("libhttpclient.gdk.dll", "libHttpClient.GDK.dll", true);

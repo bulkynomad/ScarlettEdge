@@ -33,12 +33,27 @@ struct XvdHeaderInfo {
     std::string magic;
 };
 
+struct XvdEmbeddedFile {
+    std::string relative_path;
+    uint64_t user_data_offset = 0;
+    uint64_t size_bytes = 0;
+    bool is_directory = false;
+};
+
+struct XvdInputFile {
+    std::string relative_path;
+    std::vector<uint8_t> data;
+};
+
 class XvdContainer {
 public:
     static constexpr size_t kMagicOffset = 0x200;
     static constexpr size_t kMinHeaderSize = 0x1000;
     static constexpr size_t kSectorSize = 0x1000;
+    static constexpr size_t kGdfxSectorSize = 2048;
+    static constexpr uint64_t kGdfxDescriptorOffset = 0x10000ull;
     static constexpr const char* kMagic = "msft-xvd";
+    static constexpr const char* kGdfxMagic = "MICROSOFT*XBOX*MEDIA";
 
     // Volume flag bits (publicly documented XVD header flags).
     static constexpr uint32_t kFlagReadOnly = 1u << 0;
@@ -62,6 +77,13 @@ public:
     // 4 KiB sectors via XTS when the container is encrypted and a volume key is set).
     Status ReadUserData(uint64_t offset, uint64_t size, std::vector<uint8_t>& out_data) const;
 
+    // Embedded Xbox GDFX ("MICROSOFT*XBOX*MEDIA") filesystem inspection & extraction
+    // over decrypted XVC/XVD user-data sectors.
+    bool HasEmbeddedFilesystem() const;
+    Status ListEmbeddedFiles(std::vector<XvdEmbeddedFile>& out_files) const;
+    Status ReadEmbeddedFile(const std::string& relative_path, std::vector<uint8_t>& out_data) const;
+    Status ExtractEmbeddedFilesystem(const std::string& dest_dir) const;
+
     // Builds an unencrypted synthetic XVD image in memory for autonomous testing.
     static std::vector<uint8_t> BuildSyntheticXvd(
         const std::vector<uint8_t>& user_data,
@@ -71,6 +93,14 @@ public:
     // Builds an encrypted synthetic XVD image using 4 KiB sector XTS encryption.
     static std::vector<uint8_t> BuildEncryptedSyntheticXvd(
         const std::vector<uint8_t>& user_data,
+        const uint8_t* volume_key,
+        size_t key_len,
+        uint32_t content_type = 1);
+
+    // Builds a raw Xbox GDFX filesystem volume and an AES-XTS encrypted GDFX .xvc image.
+    static std::vector<uint8_t> BuildGdfxVolumeBytes(const std::vector<XvdInputFile>& files);
+    static std::vector<uint8_t> BuildEncryptedGdfxXvc(
+        const std::vector<XvdInputFile>& files,
         const uint8_t* volume_key,
         size_t key_len,
         uint32_t content_type = 1);

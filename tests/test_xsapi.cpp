@@ -4,8 +4,16 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <vector>
+
+#if defined(_WIN32)
+#include <objbase.h>
+#include <windows.h>
+#endif
 
 namespace {
 void SCARLETTX_GDK_CALLBACK OnXsapiComplete(XAsyncBlock* block) {
@@ -71,6 +79,80 @@ int main() {
     size_t async_used = 0;
     SX_CHECK(XblProfileGetUserProfileResult(&async, sizeof(async_profile), nullptr, &async_profile, &async_used) == 0);
     SX_CHECK(async_profile.xboxUserId == 0x0009000000000001ull);
+
+    // 6b. Persistent disk-backed XblTitleStorage (Upload -> Download -> Verify -> Delete)
+    {
+        const auto ts_root = std::filesystem::temp_directory_path() / "scarlettx_test_title_storage";
+        std::error_code ec;
+        std::filesystem::remove_all(ts_root, ec);
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_SAVE_ROOT", ts_root.string().c_str());
+#endif
+        const std::string cloud_cfg = "{\"sensitivity\":1.25,\"hdr_nits\":1000}";
+        XAsyncBlock up_ab{};
+        SX_CHECK(XblTitleStorageUploadBlobAsync(
+                     ctx, "settings/player_prefs.json", XblTitleStorageType_TrustedPlatformStorage,
+                     reinterpret_cast<const uint8_t*>(cloud_cfg.data()), cloud_cfg.size(), &up_ab) == 0);
+        SX_CHECK(XblTitleStorageUploadBlobResult(&up_ab) == 0);
+
+        std::vector<uint8_t> dl_buf(128, 0);
+        XAsyncBlock dl_ab{};
+        SX_CHECK(XblTitleStorageDownloadBlobAsync(
+                     ctx, "settings/player_prefs.json", XblTitleStorageType_TrustedPlatformStorage,
+                     dl_buf.data(), dl_buf.size(), &dl_ab) == 0);
+        size_t dl_bytes = 0;
+        SX_CHECK(XblTitleStorageDownloadBlobResult(&dl_ab, &dl_bytes) == 0);
+        SX_CHECK(dl_bytes == cloud_cfg.size());
+        SX_CHECK(std::memcmp(dl_buf.data(), cloud_cfg.data(), cloud_cfg.size()) == 0);
+
+        XAsyncBlock del_ab{};
+        SX_CHECK(XblTitleStorageDeleteBlobAsync(
+                     ctx, "settings/player_prefs.json", XblTitleStorageType_TrustedPlatformStorage, &del_ab) == 0);
+        SX_CHECK(XblTitleStorageDeleteBlobResult(&del_ab) == 0);
+        SX_CHECK(XblTitleStorageDownloadBlobAsync(
+                     ctx, "settings/player_prefs.json", XblTitleStorageType_TrustedPlatformStorage,
+                     dl_buf.data(), dl_buf.size(), nullptr) != 0);
+        std::filesystem::remove_all(ts_root, ec);
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_SAVE_ROOT", "");
+#endif
+    }
+
+    // 6c. WinRT IInspectable / IActivationFactory Xbox Game Core Broker
+    {
+        void* fac = nullptr;
+        SX_CHECK(XblWinRtActivateClassByName(
+                     L"Windows.Gaming.XboxLive.Storage.GameSaveProvider", nullptr, 1, &fac) == 0);
+        SX_CHECK(fac != nullptr);
+        auto* vtbl = *reinterpret_cast<void* const* const*>(fac);
+        using FnGetIids = int32_t(__stdcall*)(void*, uint32_t*, void**);
+        using FnGetTrust = int32_t(__stdcall*)(void*, int32_t*);
+        using FnActivate = int32_t(__stdcall*)(void*, void**);
+        using FnRelease = uint32_t(__stdcall*)(void*);
+
+        uint32_t iid_cnt = 0;
+        void* iids_mem = nullptr;
+        SX_CHECK(reinterpret_cast<FnGetIids>(vtbl[3])(fac, &iid_cnt, &iids_mem) == 0);
+        SX_CHECK(iid_cnt == 2 && iids_mem != nullptr);
+#if defined(_WIN32)
+        CoTaskMemFree(iids_mem);
+#else
+        std::free(iids_mem);
+#endif
+        int32_t trust = -1;
+        SX_CHECK(reinterpret_cast<FnGetTrust>(vtbl[5])(fac, &trust) == 0 && trust == 0);
+
+        void* inst = nullptr;
+        SX_CHECK(reinterpret_cast<FnActivate>(vtbl[6])(fac, &inst) == 0 && inst != nullptr);
+        SX_CHECK(reinterpret_cast<FnRelease>(vtbl[2])(inst) == 0u);
+        SX_CHECK(reinterpret_cast<FnRelease>(vtbl[2])(fac) == 0u);
+
+        // Non-Xbox runtime class returns REGDB_E_CLASSNOTREG so GuestRoActivateInstance delegates to combase.dll
+        void* desktop_obj = nullptr;
+        SX_CHECK(XblWinRtActivateClassByName(L"Windows.Foundation.Uri", nullptr, 1, &desktop_obj) != 0);
+        SX_CHECK(desktop_obj == nullptr);
+    }
+
     XGameRuntimeUninitialize();
 
     // 7. Cleanup

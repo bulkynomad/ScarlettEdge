@@ -672,24 +672,201 @@ XGameResult XUserResolveIssueWithUiResult(XAsyncBlock* async) {
     return hr;
 }
 
+}  // extern "C"
+
+namespace {
+
+std::string Base64EncodeBytes(const uint8_t* data, size_t len, bool url_safe = false) {
+    static constexpr char kStdTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    static constexpr char kUrlTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const char* tbl = url_safe ? kUrlTable : kStdTable;
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        const uint32_t b0 = data[i];
+        const uint32_t b1 = (i + 1 < len) ? data[i + 1] : 0u;
+        const uint32_t b2 = (i + 2 < len) ? data[i + 2] : 0u;
+        const uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push_back(tbl[(triple >> 18) & 0x3Fu]);
+        out.push_back(tbl[(triple >> 12) & 0x3Fu]);
+        if (i + 1 < len) {
+            out.push_back(tbl[(triple >> 6) & 0x3Fu]);
+        } else if (!url_safe) {
+            out.push_back('=');
+        }
+        if (i + 2 < len) {
+            out.push_back(tbl[triple & 0x3Fu]);
+        } else if (!url_safe) {
+            out.push_back('=');
+        }
+    }
+    return out;
+}
+
+void ComputeHmacSha256(const uint8_t* key, size_t key_len,
+                       const uint8_t* msg, size_t msg_len,
+                       uint8_t out_mac[32]) {
+    std::memset(out_mac, 0, 32);
+#if defined(_WIN32)
+    static HMODULE bcrypt_dll = LoadLibraryW(L"bcrypt.dll");
+    if (bcrypt_dll) {
+        using FnOpenAlg = long(WINAPI*)(void**, const wchar_t*, const wchar_t*, unsigned long);
+        using FnHash = long(WINAPI*)(void*, uint8_t*, unsigned long, uint8_t*, unsigned long, uint8_t*, unsigned long);
+        using FnCloseAlg = long(WINAPI*)(void*, unsigned long);
+        auto open_alg = reinterpret_cast<FnOpenAlg>(reinterpret_cast<void*>(
+            GetProcAddress(bcrypt_dll, "BCryptOpenAlgorithmProvider")));
+        auto do_hash = reinterpret_cast<FnHash>(reinterpret_cast<void*>(
+            GetProcAddress(bcrypt_dll, "BCryptHash")));
+        auto close_alg = reinterpret_cast<FnCloseAlg>(reinterpret_cast<void*>(
+            GetProcAddress(bcrypt_dll, "BCryptCloseAlgorithmProvider")));
+        if (open_alg && do_hash && close_alg) {
+            void* alg = nullptr;
+            if (open_alg(&alg, L"SHA256", nullptr, 0x00000008ul) == 0 && alg) {
+                const long st = do_hash(alg,
+                                        const_cast<uint8_t*>(key), static_cast<unsigned long>(key_len),
+                                        const_cast<uint8_t*>(msg), static_cast<unsigned long>(msg_len),
+                                        out_mac, 32ul);
+                close_alg(alg, 0ul);
+                if (st == 0) return;
+            }
+        }
+    }
+#endif
+    uint64_t h[4] = {0x6a09e667bb67ae85ull, 0x3c6ef372a54ff53aull,
+                     0x510e527f9b05688cull, 0x1f83d9ab5be0cd19ull};
+    for (size_t i = 0; i < key_len; ++i) {
+        h[i & 3] = (h[i & 3] ^ key[i]) * 0x100000001b3ull;
+    }
+    for (size_t i = 0; i < msg_len; ++i) {
+        h[i & 3] = (h[i & 3] ^ msg[i]) * 0x100000001b3ull + (h[(i + 1) & 3] >> 17);
+    }
+    std::memcpy(out_mac, h, 32);
+}
+
+std::string WideToUtf8Str(const wchar_t* ws) {
+    if (!ws || !*ws) return {};
+#if defined(_WIN32)
+    int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string s(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, -1, s.data(), n, nullptr, nullptr);
+    return s;
+#else
+    std::string s;
+    for (const wchar_t* p = ws; *p; ++p) s.push_back(static_cast<char>(*p & 0x7F));
+    return s;
+#endif
+}
+
+std::wstring Utf8ToWideStr(const std::string& s) {
+    if (s.empty()) return {};
+#if defined(_WIN32)
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return std::wstring(s.begin(), s.end());
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+#else
+    return std::wstring(s.begin(), s.end());
+#endif
+}
+
+void BuildTokenAndSignatureStrings(
+    uint64_t xuid,
+    const std::string& method,
+    const std::string& url,
+    const std::string& canonical_headers,
+    const void* body_buf,
+    size_t body_size,
+    std::string& out_token,
+    std::string& out_signature) {
+    char xuid_dec[32]{};
+    std::snprintf(xuid_dec, sizeof(xuid_dec), "%llu", static_cast<unsigned long long>(xuid));
+    char xuid_key[64]{};
+    std::snprintf(xuid_key, sizeof(xuid_key), "ScarlettEdge-XSTS-SessionKey-%016llX",
+                  static_cast<unsigned long long>(xuid));
+
+    if (const char* live_tok = std::getenv("SCARLETTX_XBL_TOKEN"); live_tok && *live_tok) {
+        out_token = live_tok;
+    } else {
+        const std::string jwt_hdr = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+        const std::string jwt_pay = std::string("{\"xuid\":\"") + xuid_dec +
+                                    "\",\"sbx\":\"RETAIL\",\"iss\":\"xsts.auth.xboxlive.com\"}";
+        const std::string b64_hdr = Base64EncodeBytes(
+            reinterpret_cast<const uint8_t*>(jwt_hdr.data()), jwt_hdr.size(), true);
+        const std::string b64_pay = Base64EncodeBytes(
+            reinterpret_cast<const uint8_t*>(jwt_pay.data()), jwt_pay.size(), true);
+        const std::string signing_in = b64_hdr + "." + b64_pay;
+        uint8_t jwt_mac[32]{};
+        ComputeHmacSha256(reinterpret_cast<const uint8_t*>(xuid_key), std::strlen(xuid_key),
+                          reinterpret_cast<const uint8_t*>(signing_in.data()), signing_in.size(), jwt_mac);
+        const std::string b64_mac = Base64EncodeBytes(jwt_mac, sizeof(jwt_mac), true);
+        out_token = std::string("XBL3.0 x=") + xuid_dec + ";" + signing_in + "." + b64_mac;
+    }
+
+    std::vector<uint8_t> canonical;
+    auto push_str = [&](const std::string& s) {
+        canonical.insert(canonical.end(), s.begin(), s.end());
+        canonical.push_back('\n');
+    };
+    push_str(method.empty() ? "GET" : method);
+    push_str(url);
+    push_str(canonical_headers);
+    if (body_buf && body_size > 0) {
+        const auto* bp = static_cast<const uint8_t*>(body_buf);
+        canonical.insert(canonical.end(), bp, bp + body_size);
+    }
+
+    uint8_t sig_raw[44]{};
+    sig_raw[3] = 1u;
+    sig_raw[9] = 0x01u;
+    sig_raw[10] = 0x9Au;
+    ComputeHmacSha256(reinterpret_cast<const uint8_t*>(xuid_key), std::strlen(xuid_key),
+                      canonical.data(), canonical.size(), sig_raw + 12);
+    out_signature = Base64EncodeBytes(sig_raw, sizeof(sig_raw), false);
+}
+
+}  // namespace
+
+extern "C" {
+
 XGameResult XUserGetTokenAndSignatureAsync(
     XUserHandle user,
     XUserGetTokenAndSignatureOptions /*options*/,
-    const char* /*method*/,
-    const char* /*url*/,
-    size_t /*headerCount*/,
-    const XUserGetTokenAndSignatureHttpHeader* /*headers*/,
-    size_t /*bodySize*/,
-    const void* /*bodyBuffer*/,
+    const char* method,
+    const char* url,
+    size_t headerCount,
+    const XUserGetTokenAndSignatureHttpHeader* headers,
+    size_t bodySize,
+    const void* bodyBuffer,
     XAsyncBlock* async) {
     if (!async || !user) {
         return XGR_E_INVALIDARG;
     }
 
-    char xuid_str[32]{};
-    std::snprintf(xuid_str, sizeof(xuid_str), "%016llX", static_cast<unsigned long long>(user->xuid));
-    std::string token = std::string("XBL3.0 x=") + xuid_str + ";synthetic_offline_token";
-    std::string signature = "AAAAAQAA_synthetic_offline_signature";
+    std::string hdr_joined;
+    if (headers && headerCount > 0) {
+        for (size_t i = 0; i < headerCount; ++i) {
+            if (headers[i].name) hdr_joined += headers[i].name;
+            hdr_joined += ':';
+            if (headers[i].value) hdr_joined += headers[i].value;
+            hdr_joined += ';';
+        }
+    }
+
+    std::string token;
+    std::string signature;
+    BuildTokenAndSignatureStrings(
+        user->xuid,
+        method ? method : "GET",
+        url ? url : "",
+        hdr_joined,
+        bodyBuffer,
+        bodySize,
+        token,
+        signature);
 
     const size_t token_bytes = token.size() + 1;
     const size_t sig_bytes = signature.size() + 1;
@@ -788,6 +965,116 @@ XGameResult XUserGetTokenAndSignatureResult(
         *bufferUsed = state->result_size;
     }
 
+    xgr::ReleaseHleAsyncResult(async);
+    return XGR_S_OK;
+}
+
+XGameResult XUserGetTokenAndSignatureUtf16Async(
+    XUserHandle user,
+    XUserGetTokenAndSignatureOptions /*options*/,
+    const wchar_t* method,
+    const wchar_t* url,
+    size_t headerCount,
+    const XUserGetTokenAndSignatureUtf16HttpHeader* headers,
+    size_t bodySize,
+    const void* bodyBuffer,
+    XAsyncBlock* async) {
+    if (!async || !user) {
+        return XGR_E_INVALIDARG;
+    }
+
+    std::string hdr_joined;
+    if (headers && headerCount > 0) {
+        for (size_t i = 0; i < headerCount; ++i) {
+            hdr_joined += WideToUtf8Str(headers[i].name);
+            hdr_joined += ':';
+            hdr_joined += WideToUtf8Str(headers[i].value);
+            hdr_joined += ';';
+        }
+    }
+
+    std::string tok_utf8, sig_utf8;
+    BuildTokenAndSignatureStrings(
+        user->xuid,
+        method ? WideToUtf8Str(method) : "GET",
+        WideToUtf8Str(url),
+        hdr_joined,
+        bodyBuffer,
+        bodySize,
+        tok_utf8,
+        sig_utf8);
+
+    std::wstring wtok = Utf8ToWideStr(tok_utf8);
+    std::wstring wsig = Utf8ToWideStr(sig_utf8);
+    const size_t tok_chars = wtok.size() + 1;
+    const size_t sig_chars = wsig.size() + 1;
+    const size_t required_size =
+        sizeof(XUserGetTokenAndSignatureUtf16Data) + (tok_chars + sig_chars) * sizeof(wchar_t);
+
+    return BeginAsyncOperation(async, [wtok = std::move(wtok), wsig = std::move(wsig), required_size](XAsyncState* st) {
+        std::vector<uint8_t> payload;
+        auto append = [&](const void* d, size_t n) {
+            const auto* p = static_cast<const uint8_t*>(d);
+            payload.insert(payload.end(), p, p + n);
+        };
+        const uint32_t tc = static_cast<uint32_t>(wtok.size() + 1);
+        const uint32_t sc = static_cast<uint32_t>(wsig.size() + 1);
+        append(&tc, sizeof(tc));
+        append(wtok.c_str(), tc * sizeof(wchar_t));
+        append(&sc, sizeof(sc));
+        append(wsig.c_str(), sc * sizeof(wchar_t));
+        st->result_payload = std::move(payload);
+        CompleteAsyncState(st, XGR_S_OK, required_size);
+    });
+}
+
+XGameResult XUserGetTokenAndSignatureUtf16ResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize) {
+    return XUserGetTokenAndSignatureResultSize(async, bufferSize);
+}
+
+XGameResult XUserGetTokenAndSignatureUtf16Result(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XUserGetTokenAndSignatureUtf16Data** ptrToBuffer,
+    size_t* bufferUsed) {
+    if (!async || !buffer || !ptrToBuffer) return XGR_E_INVALIDARG;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr != XGR_S_OK) return hr;
+    auto state = GetAsyncState(async);
+    if (!state) return XGR_E_INVALIDARG;
+    if (bufferSize < state->result_size) return XGR_E_NOT_SUFFICIENT_BUFFER;
+
+    const auto& payload = state->result_payload;
+    if (payload.size() < sizeof(uint32_t) * 2) return XGR_E_FAIL;
+
+    size_t off = 0;
+    uint32_t tc = 0;
+    std::memcpy(&tc, payload.data() + off, sizeof(tc));
+    off += sizeof(tc);
+    const auto* wtok_src = reinterpret_cast<const wchar_t*>(payload.data() + off);
+    off += static_cast<size_t>(tc) * sizeof(wchar_t);
+
+    uint32_t sc = 0;
+    std::memcpy(&sc, payload.data() + off, sizeof(sc));
+    off += sizeof(sc);
+    const auto* wsig_src = reinterpret_cast<const wchar_t*>(payload.data() + off);
+
+    auto* data = reinterpret_cast<XUserGetTokenAndSignatureUtf16Data*>(buffer);
+    auto* wstr_ptr = reinterpret_cast<wchar_t*>(data + 1);
+
+    data->tokenCount = tc;
+    data->signatureCount = sc;
+    std::memcpy(wstr_ptr, wtok_src, static_cast<size_t>(tc) * sizeof(wchar_t));
+    data->token = wstr_ptr;
+    wstr_ptr += tc;
+    std::memcpy(wstr_ptr, wsig_src, static_cast<size_t>(sc) * sizeof(wchar_t));
+    data->signature = wstr_ptr;
+
+    *ptrToBuffer = data;
+    if (bufferUsed) *bufferUsed = state->result_size;
     xgr::ReleaseHleAsyncResult(async);
     return XGR_S_OK;
 }
@@ -1524,8 +1811,77 @@ XGameResult XGameSaveFilesGetRemainingQuotaResult(
 }
 
 // ===========================================================================
-// XPackage.h
+// XPackage.h & XStore.h (DLC Discovery, VFS Mounting & Retail Licensing)
 // ===========================================================================
+}  // extern "C"
+
+struct XPackageMountObject {
+    std::string package_id;
+    std::string host_path;
+};
+
+struct XStoreContextObject {
+    XUserHandle user = nullptr;
+};
+
+struct XStoreProductQueryObject {
+    struct Entry {
+        std::string store_id;
+        std::string title;
+        std::string description;
+        uint32_t kind = 1;
+    };
+    std::vector<Entry> items;
+};
+
+namespace {
+
+struct DiscoveredDlcEntry {
+    std::string package_id;
+    std::string store_id;
+    std::string display_name;
+    std::string host_path;
+};
+
+std::vector<DiscoveredDlcEntry> DiscoverInstalledDlcPackages() {
+    std::vector<DiscoveredDlcEntry> out;
+    std::vector<fs::path> search_roots;
+    if (const char* dlc_env = std::getenv("SCARLETTX_DLC_ROOT"); dlc_env && *dlc_env) {
+        search_roots.emplace_back(dlc_env);
+    }
+    if (const char* pkg_env = std::getenv("SCARLETTX_PACKAGE_ROOT"); pkg_env && *pkg_env) {
+        search_roots.push_back(fs::path(pkg_env) / "dlc");
+    }
+
+    std::error_code ec;
+    for (const auto& root : search_roots) {
+        if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) continue;
+        for (const auto& entry : fs::directory_iterator(root, ec)) {
+            const std::string stem = entry.path().stem().string();
+            if (stem.empty()) continue;
+            bool is_dlc = entry.is_directory(ec);
+            if (!is_dlc && entry.is_regular_file(ec)) {
+                std::string ext = entry.path().extension().string();
+                for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                is_dlc = (ext == ".xvc" || ext == ".xvd");
+            }
+            if (!is_dlc) continue;
+
+            DiscoveredDlcEntry dlc;
+            dlc.package_id = "SCARLETTEDGE.DLC." + SanitizeSaveName(stem);
+            dlc.store_id = ("9N" + SanitizeSaveName(stem) + "000000000000").substr(0, 12);
+            dlc.display_name = stem;
+            dlc.host_path = fs::absolute(entry.path(), ec).make_preferred().string();
+            out.push_back(std::move(dlc));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+extern "C" {
+
 XGameResult XPackageGetUserLocale(size_t localeSize, char* locale) {
     if (!locale) {
         return XGR_E_POINTER;
@@ -1537,6 +1893,234 @@ XGameResult XPackageGetUserLocale(size_t localeSize, char* locale) {
         name = MatchPackageLanguage(HostLocaleName(), PackageLanguages());
     }
     return CopyStringToBuffer(name, localeSize, locale, nullptr);
+}
+
+XGameResult XPackageEnumeratePackages(
+    XPackageKind kind,
+    XPackageEnumerationScope /*scope*/,
+    void* context,
+    XPackageEnumerationCallback* callback) {
+    if (!callback) {
+        return XGR_E_INVALIDARG;
+    }
+    const auto dlcs = DiscoverInstalledDlcPackages();
+    for (const auto& dlc : dlcs) {
+        if (kind != XPackageKind_Content && kind != XPackageKind_Game) {
+            continue;
+        }
+        XPackageDetails det{};
+        det.packageIdentifier = dlc.package_id.c_str();
+        det.version.major = 1;
+        det.kind = XPackageKind_Content;
+        det.displayName = dlc.display_name.c_str();
+        det.description = "ScarlettEdge Add-On Content Package";
+        det.publisher = "ScarlettEdge";
+        det.storeId = dlc.store_id.c_str();
+        det.installing = false;
+        if (!callback(context, &det)) {
+            break;
+        }
+    }
+    return XGR_S_OK;
+}
+
+XGameResult XPackageMountWithUiAsync(
+    const char* packageIdentifier,
+    XAsyncBlock* async) {
+    if (!packageIdentifier || !*packageIdentifier || !async) {
+        return XGR_E_INVALIDARG;
+    }
+    std::string pkg_id = packageIdentifier;
+    return BeginAsyncOperation(async, [pkg_id = std::move(pkg_id)](XAsyncState* st) {
+        std::string resolved_path;
+        const auto dlcs = DiscoverInstalledDlcPackages();
+        for (const auto& dlc : dlcs) {
+            if (dlc.package_id == pkg_id || dlc.display_name == pkg_id || dlc.store_id == pkg_id) {
+                resolved_path = dlc.host_path;
+                break;
+            }
+        }
+        if (resolved_path.empty()) {
+            std::error_code ec;
+            if (fs::exists(pkg_id, ec)) {
+                resolved_path = fs::absolute(pkg_id, ec).make_preferred().string();
+            } else if (const char* root = std::getenv("SCARLETTX_PACKAGE_ROOT"); root && *root) {
+                resolved_path = fs::absolute(fs::path(root), ec).make_preferred().string();
+            } else {
+                resolved_path = fs::current_path(ec).make_preferred().string();
+            }
+        }
+        while (resolved_path.size() > 3 && (resolved_path.back() == '\\' || resolved_path.back() == '/')) {
+            resolved_path.pop_back();
+        }
+        auto* mh = new (std::nothrow) XPackageMountObject();
+        if (!mh) {
+            CompleteAsyncState(st, XGR_E_OUTOFMEMORY, 0);
+            return;
+        }
+        mh->package_id = pkg_id;
+        mh->host_path = std::move(resolved_path);
+        RegisterValidHandle(mh);
+        st->result_handle = mh;
+        CompleteAsyncState(st, XGR_S_OK, sizeof(XPackageMountHandle));
+    });
+}
+
+XGameResult XPackageMountWithUiResult(
+    XAsyncBlock* async,
+    XPackageMountHandle* mountHandle) {
+    if (!async || !mountHandle) return XGR_E_INVALIDARG;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr != XGR_S_OK) {
+        *mountHandle = nullptr;
+        return hr;
+    }
+    auto state = GetAsyncState(async);
+    if (!state || !state->result_handle) {
+        *mountHandle = nullptr;
+        return XGR_E_FAIL;
+    }
+    *mountHandle = static_cast<XPackageMountHandle>(state->result_handle);
+    xgr::ReleaseHleAsyncResult(async);
+    return XGR_S_OK;
+}
+
+XGameResult XPackageGetMountPathSize(
+    XPackageMountHandle mountHandle,
+    size_t* pathSize) {
+    if (!mountHandle || !pathSize) return XGR_E_INVALIDARG;
+    *pathSize = mountHandle->host_path.size() + 1;
+    return XGR_S_OK;
+}
+
+XGameResult XPackageGetMountPath(
+    XPackageMountHandle mountHandle,
+    size_t pathSize,
+    char* path) {
+    if (!mountHandle || !path) return XGR_E_INVALIDARG;
+    return CopyStringToBuffer(mountHandle->host_path, pathSize, path, nullptr);
+}
+
+void XPackageCloseMountHandle(XPackageMountHandle mountHandle) {
+    if (!mountHandle) return;
+    UnregisterValidHandle(mountHandle);
+    delete mountHandle;
+}
+
+XGameResult XStoreCreateContext(
+    XUserHandle user,
+    XStoreContextHandle* storeContextHandle) {
+    if (!storeContextHandle) return XGR_E_INVALIDARG;
+    auto* ctx = new (std::nothrow) XStoreContextObject();
+    if (!ctx) return XGR_E_OUTOFMEMORY;
+    ctx->user = user;
+    RegisterValidHandle(ctx);
+    *storeContextHandle = ctx;
+    return XGR_S_OK;
+}
+
+void XStoreCloseContextHandle(XStoreContextHandle storeContextHandle) {
+    if (!storeContextHandle) return;
+    UnregisterValidHandle(storeContextHandle);
+    delete storeContextHandle;
+}
+
+XGameResult XStoreQueryGameLicenseAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) return XGR_E_INVALIDARG;
+    return BeginAsyncOperation(async, [](XAsyncState* st) {
+        XStoreGameLicense lic{};
+        std::strncpy(lic.skuStoreId, "9N5CA00001RETAIL", sizeof(lic.skuStoreId) - 1);
+        lic.isActive = true;
+        lic.isTrialOwnedByThisUser = false;
+        lic.isDiscLicense = false;
+        lic.isTrial = false;
+        lic.trialTimeRemainingInSeconds = 0;
+        lic.expirationDate = 0;
+        st->result_payload.resize(sizeof(lic));
+        std::memcpy(st->result_payload.data(), &lic, sizeof(lic));
+        CompleteAsyncState(st, XGR_S_OK, sizeof(lic));
+    });
+}
+
+XGameResult XStoreQueryGameLicenseResult(
+    XAsyncBlock* async,
+    XStoreGameLicense* license) {
+    if (!async || !license) return XGR_E_INVALIDARG;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr != XGR_S_OK) return hr;
+    auto state = GetAsyncState(async);
+    if (!state || state->result_payload.size() < sizeof(XStoreGameLicense)) return XGR_E_FAIL;
+    std::memcpy(license, state->result_payload.data(), sizeof(XStoreGameLicense));
+    xgr::ReleaseHleAsyncResult(async);
+    return XGR_S_OK;
+}
+
+XGameResult XStoreQueryEntitledProductsAsync(
+    XStoreContextHandle storeContextHandle,
+    uint32_t /*productKinds*/,
+    uint32_t maxItemsToRetrieveCount,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) return XGR_E_INVALIDARG;
+    return BeginAsyncOperation(async, [maxItemsToRetrieveCount](XAsyncState* st) {
+        auto* q = new (std::nothrow) XStoreProductQueryObject();
+        if (!q) {
+            CompleteAsyncState(st, XGR_E_OUTOFMEMORY, 0);
+            return;
+        }
+        const auto dlcs = DiscoverInstalledDlcPackages();
+        for (const auto& dlc : dlcs) {
+            if (maxItemsToRetrieveCount > 0 && q->items.size() >= maxItemsToRetrieveCount) break;
+            q->items.push_back({dlc.store_id, dlc.display_name, "Entitled Add-On Content", 1u});
+        }
+        RegisterValidHandle(q);
+        st->result_handle = q;
+        CompleteAsyncState(st, XGR_S_OK, sizeof(XStoreProductQueryHandle));
+    });
+}
+
+XGameResult XStoreQueryEntitledProductsResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle) {
+    if (!async || !productQueryHandle) return XGR_E_INVALIDARG;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr != XGR_S_OK) {
+        *productQueryHandle = nullptr;
+        return hr;
+    }
+    auto state = GetAsyncState(async);
+    if (!state || !state->result_handle) {
+        *productQueryHandle = nullptr;
+        return XGR_E_FAIL;
+    }
+    *productQueryHandle = static_cast<XStoreProductQueryHandle>(state->result_handle);
+    xgr::ReleaseHleAsyncResult(async);
+    return XGR_S_OK;
+}
+
+XGameResult XStoreEnumerateProductsQuery(
+    XStoreProductQueryHandle productQueryHandle,
+    void* context,
+    XStoreProductQueryCallback* callback) {
+    if (!productQueryHandle || !callback) return XGR_E_INVALIDARG;
+    for (const auto& item : productQueryHandle->items) {
+        XStoreProduct prod{};
+        prod.storeId = item.store_id.c_str();
+        prod.title = item.title.c_str();
+        prod.description = item.description.c_str();
+        prod.language = "en-US";
+        prod.productKind = item.kind;
+        prod.isInUserCollection = true;
+        if (!callback(&prod, context)) break;
+    }
+    return XGR_S_OK;
+}
+
+void XStoreCloseProductsQueryHandle(XStoreProductQueryHandle productQueryHandle) {
+    if (!productQueryHandle) return;
+    UnregisterValidHandle(productQueryHandle);
+    delete productQueryHandle;
 }
 
 // ===========================================================================
@@ -2192,6 +2776,46 @@ bool SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Slot17(
     return true;
 }
 
+XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Slot08(
+    void* /*self_ptr*/,
+    uint16_t* out_port) {
+    if (!out_port) return XGR_E_POINTER;
+    *out_port = 3074u;
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Slot09(
+    void* /*self_ptr*/,
+    XAsyncBlock* async) {
+    if (!async) return XGR_E_INVALIDARG;
+    return BeginAsyncOperation(async, [](XAsyncState* st) {
+        uint16_t port = 3074u;
+        st->result_payload.resize(sizeof(port));
+        std::memcpy(st->result_payload.data(), &port, sizeof(port));
+        CompleteAsyncState(st, XGR_S_OK, sizeof(port));
+    });
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Slot10(
+    void* /*self_ptr*/,
+    XAsyncBlock* async,
+    uint16_t* out_port) {
+    if (!async || !out_port) return XGR_E_INVALIDARG;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr != XGR_S_OK) return hr;
+    *out_port = 3074u;
+    xgr::ReleaseHleAsyncResult(async);
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Slot14(
+    void* /*self_ptr*/,
+    const char* /*url*/,
+    size_t* out_size) {
+    if (out_size) *out_size = 16u;
+    return XGR_S_OK;
+}
+
 template <uint32_t SlotIndex>
 XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_UnimplementedSlot(void* /*self_ptr*/) {
     std::fprintf(stderr,
@@ -2211,13 +2835,13 @@ const XgrApiImpl37E56907Vtable kApiImpl37E56907Vtable = {{
     reinterpret_cast<void*>(&ApiImpl37E56907_Slot05),                // 5  (+0x28)
     reinterpret_cast<void*>(&ApiImpl37E56907_Slot06),                // 6  (+0x30)
     reinterpret_cast<void*>(&ApiImpl37E56907_Slot07),                // 7  (+0x38)
-    reinterpret_cast<void*>(&ApiImpl37E56907_UnimplementedSlot<8>),  // 8  (+0x40)
-    reinterpret_cast<void*>(&ApiImpl37E56907_UnimplementedSlot<9>),  // 9  (+0x48)
-    reinterpret_cast<void*>(&ApiImpl37E56907_UnimplementedSlot<10>), // 10 (+0x50)
+    reinterpret_cast<void*>(&ApiImpl37E56907_Slot08),                // 8  (+0x40)
+    reinterpret_cast<void*>(&ApiImpl37E56907_Slot09),                // 9  (+0x48)
+    reinterpret_cast<void*>(&ApiImpl37E56907_Slot10),                // 10 (+0x50)
     reinterpret_cast<void*>(&ApiImpl37E56907_UnimplementedSlot<11>), // 11 (+0x58)
     reinterpret_cast<void*>(&ApiImpl37E56907_UnimplementedSlot<12>), // 12 (+0x60)
     reinterpret_cast<void*>(&ApiImpl37E56907_UnimplementedSlot<13>), // 13 (+0x68)
-    reinterpret_cast<void*>(&ApiImpl37E56907_UnimplementedSlot<14>), // 14 (+0x70)
+    reinterpret_cast<void*>(&ApiImpl37E56907_Slot14),                // 14 (+0x70)
     reinterpret_cast<void*>(&ApiImpl37E56907_Slot15),                // 15 (+0x78)
     reinterpret_cast<void*>(&ApiImpl37E56907_Slot16),                // 16 (+0x80)
     reinterpret_cast<void*>(&ApiImpl37E56907_Slot17),                // 17 (+0x88)

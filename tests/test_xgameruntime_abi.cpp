@@ -308,6 +308,67 @@ int main() {
     CHECK(token_data->token != nullptr && std::strlen(token_data->token) > 0);
     CHECK(token_data->signature != nullptr && std::strlen(token_data->signature) > 0);
     CHECK(token_buf_used == token_buf_size);
+    const std::string sig_url_a = token_data->signature;
+    CHECK(std::strncmp(token_data->token, "XBL3.0 x=", 9) == 0);
+
+    // Verify real HMAC-SHA256 request signing produces distinct signatures for different URLs/bodies
+    // and matches UTF-16 XUserGetTokenAndSignatureUtf16Async!
+    XAsyncBlock token_async_b{};
+    token_async_b.queue = tp_q;
+    const char post_body[] = "{\"matchmaking\":\"scarlett\"}";
+    CHECK(XUserGetTokenAndSignatureAsync(user, XUserGetTokenAndSignatureOptions_None, "POST",
+                                         "https://sessiondirectory.xboxlive.com/sessions",
+                                         0, nullptr, sizeof(post_body) - 1, post_body, &token_async_b) == XGR_S_OK);
+    size_t tsz_b = 0;
+    CHECK(XUserGetTokenAndSignatureResultSize(&token_async_b, &tsz_b) == XGR_S_OK);
+    std::vector<uint8_t> tbuf_b(tsz_b);
+    XUserGetTokenAndSignatureData* tdata_b = nullptr;
+    CHECK(XUserGetTokenAndSignatureResult(&token_async_b, tsz_b, tbuf_b.data(), &tdata_b, nullptr) == XGR_S_OK);
+    CHECK(sig_url_a != std::string(tdata_b->signature));
+
+    XAsyncBlock utf16_async{};
+    utf16_async.queue = tp_q;
+    CHECK(XUserGetTokenAndSignatureUtf16Async(user, XUserGetTokenAndSignatureOptions_None, L"POST",
+                                              L"https://sessiondirectory.xboxlive.com/sessions",
+                                              0, nullptr, sizeof(post_body) - 1, post_body, &utf16_async) == XGR_S_OK);
+    size_t utf16_sz = 0;
+    CHECK(XUserGetTokenAndSignatureUtf16ResultSize(&utf16_async, &utf16_sz) == XGR_S_OK);
+    std::vector<uint8_t> utf16_buf(utf16_sz);
+    XUserGetTokenAndSignatureUtf16Data* utf16_data = nullptr;
+    CHECK(XUserGetTokenAndSignatureUtf16Result(&utf16_async, utf16_sz, utf16_buf.data(), &utf16_data, nullptr) == XGR_S_OK);
+    CHECK(utf16_data != nullptr && utf16_data->token != nullptr && utf16_data->signature != nullptr);
+    CHECK(std::wcsncmp(utf16_data->token, L"XBL3.0 x=", 9) == 0);
+    std::string utf16_sig_narrow;
+    for (const wchar_t* p = utf16_data->signature; *p; ++p) utf16_sig_narrow.push_back(static_cast<char>(*p));
+    CHECK(utf16_sig_narrow == std::string(tdata_b->signature));
+
+    // Verify XStore entitled DLC products + XPackage DLC VFS mount
+    {
+        fs::path dlc_root = sandbox / "dlc_store" / "season_pass_pack";
+        fs::create_directories(dlc_root);
+        std::ofstream(dlc_root / "pack.dat", std::ios::binary) << "SEASON_PASS";
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_DLC_ROOT", (sandbox / "dlc_store").string().c_str());
+#endif
+        XStoreContextHandle sctx = nullptr;
+        CHECK(XStoreCreateContext(user, &sctx) == XGR_S_OK && sctx != nullptr);
+        XAsyncBlock ent_ab{};
+        ent_ab.queue = tp_q;
+        CHECK(XStoreQueryEntitledProductsAsync(sctx, 0xFFu, 16u, &ent_ab) == XGR_S_OK);
+        XStoreProductQueryHandle pq = nullptr;
+        CHECK(XStoreQueryEntitledProductsResult(&ent_ab, &pq) == XGR_S_OK && pq != nullptr);
+        int prod_cnt = 0;
+        CHECK(XStoreEnumerateProductsQuery(pq, &prod_cnt, [](const XStoreProduct* prod, void* c) -> bool {
+            if (prod && prod->isInUserCollection) ++*static_cast<int*>(c);
+            return true;
+        }) == XGR_S_OK);
+        CHECK(prod_cnt == 1);
+        XStoreCloseProductsQueryHandle(pq);
+        XStoreCloseContextHandle(sctx);
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_DLC_ROOT", "");
+#endif
+    }
 
     // 6. XGameSave (async init, write, sync + async read, enumerate, delete)
     XAsyncBlock save_init_async{};

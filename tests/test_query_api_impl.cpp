@@ -719,6 +719,72 @@ int main() {
         // A slot nothing identifies is in the table and fails.
         CHECK(LoadVtableSlot<FnOther>(package, 0x18)(package, 0, 0, 0) == kENotImpl);
         CHECK(LoadVtableSlot<FnRelease>(package, 0x10)(package) == 0u);
+
+        // GDK 2022-2026 XPackage ({A8C4234E}) + XStore ({CE8E7A26} / {D4B92E11}) + XNetworking ({BF2346B2})
+        const TestGuid kGuidPkg2025 = {0xA8C4234Eu, 0x7F1Bu, 0x4D3Au, {0x9C, 0x81, 0x5E, 0x2B, 0x7D, 0x90, 0xA1, 0x14}};
+        const TestGuid kGuidStore = {0xCE8E7A26u, 0x2A0Eu, 0x4982u, {0xA2, 0x37, 0x71, 0xF9, 0x67, 0xB0, 0x5C, 0x3A}};
+        const TestGuid kGuidStore2025 = {0xD4B92E11u, 0x5C84u, 0x49A2u, {0x8E, 0x17, 0x63, 0xF0, 0xB8, 0xC9, 0x12, 0x45}};
+        const TestGuid kGuidNetLater = {0xBF2346B2u, 0x39AFu, 0x4658u, {0xB5, 0xEA, 0x44, 0x71, 0x3C, 0x7E, 0x83, 0xB3}};
+
+        // Create a real DLC folder under package_root/dlc/expansion_pack_01
+        const std::filesystem::path dlc_dir = package_root / "dlc" / "expansion_pack_01";
+        std::filesystem::create_directories(dlc_dir);
+        std::ofstream(dlc_dir / "dlc_manifest.bin", std::ios::binary) << "DLC_OK";
+        set_env("SCARLETTX_PACKAGE_ROOT", package_root.string());
+
+        void* pkg25 = nullptr;
+        CHECK(QueryApiImpl(&kGuidAF406016, &kGuidPkg2025, &pkg25) == XGR_S_OK && pkg25 != nullptr);
+        std::string found_pkg_id;
+        XPackageEnumerationCallback* on_pkg = [](void* ctx, const XPackageDetails* det) -> bool {
+            if (det && det->packageIdentifier) {
+                *static_cast<std::string*>(ctx) = det->packageIdentifier;
+            }
+            return true;
+        };
+        CHECK(LoadVtableSlot<FnEnumerate>(pkg25, 0x118)(pkg25, 1u, 1u, &found_pkg_id, reinterpret_cast<void*>(on_pkg)) == XGR_S_OK);
+        CHECK(!found_pkg_id.empty());
+
+        using FnMountAsync = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, const char*, XAsyncBlock*);
+        using FnMountResult = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, XAsyncBlock*, XPackageMountHandle*);
+        using FnMountSize = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, XPackageMountHandle, size_t*);
+        using FnMountPath = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, XPackageMountHandle, size_t, char*);
+        using FnMountClose = void (SCARLETTX_GDK_CALLBACK*)(void*, XPackageMountHandle);
+        XAsyncBlock m_ab{};
+        CHECK(LoadVtableSlot<FnMountAsync>(pkg25, 0xB0)(pkg25, found_pkg_id.c_str(), &m_ab) == XGR_S_OK);
+        XPackageMountHandle mh = nullptr;
+        CHECK(LoadVtableSlot<FnMountResult>(pkg25, 0xB8)(pkg25, &m_ab, &mh) == XGR_S_OK && mh != nullptr);
+        size_t mpath_sz = 0;
+        CHECK(LoadVtableSlot<FnMountSize>(pkg25, 0xC0)(pkg25, mh, &mpath_sz) == XGR_S_OK && mpath_sz > 4);
+        std::string mpath(mpath_sz, '\0');
+        CHECK(LoadVtableSlot<FnMountPath>(pkg25, 0xC8)(pkg25, mh, mpath.size(), mpath.data()) == XGR_S_OK);
+        CHECK(std::filesystem::exists(std::filesystem::path(mpath.c_str()) / "dlc_manifest.bin"));
+        LoadVtableSlot<FnMountClose>(pkg25, 0xD0)(pkg25, mh);
+        CHECK(LoadVtableSlot<FnRelease>(pkg25, 0x10)(pkg25) == 0u);
+
+        void* store = nullptr;
+        CHECK(QueryApiImpl(&kGuidStore, &kGuidStore2025, &store) == XGR_S_OK && store != nullptr);
+        using FnStoreCreate = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, XUserHandle, XStoreContextHandle*);
+        using FnStoreClose = void (SCARLETTX_GDK_CALLBACK*)(void*, XStoreContextHandle);
+        using FnLicAsync = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, XStoreContextHandle, XAsyncBlock*);
+        using FnLicResult = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, XAsyncBlock*, XStoreGameLicense*);
+        XStoreContextHandle sctx = nullptr;
+        CHECK(LoadVtableSlot<FnStoreCreate>(store, 0x18)(store, nullptr, &sctx) == XGR_S_OK && sctx != nullptr);
+        XAsyncBlock lic_ab{};
+        CHECK(LoadVtableSlot<FnLicAsync>(store, 0x28)(store, sctx, &lic_ab) == XGR_S_OK);
+        XStoreGameLicense lic{};
+        CHECK(LoadVtableSlot<FnLicResult>(store, 0x30)(store, &lic_ab, &lic) == XGR_S_OK);
+        CHECK(lic.isActive && !lic.isTrial && std::strlen(lic.skuStoreId) > 0);
+        LoadVtableSlot<FnStoreClose>(store, 0x20)(store, sctx);
+        CHECK(LoadVtableSlot<FnRelease>(store, 0x10)(store) == 0u);
+
+        void* net25 = nullptr;
+        CHECK(QueryApiImpl(&kGuid37E56907, &kGuidNetLater, &net25) == XGR_S_OK && net25 != nullptr);
+        using FnUdpPort = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, uint16_t*);
+        uint16_t udp_port = 0;
+        CHECK(LoadVtableSlot<FnUdpPort>(net25, 0x40)(net25, &udp_port) == XGR_S_OK && udp_port == 3074u);
+        CHECK(LoadVtableSlot<FnRelease>(net25, 0x10)(net25) == 0u);
+
+        set_env("SCARLETTX_PACKAGE_ROOT", "");
     }
 
     UninitializeApiImpl();

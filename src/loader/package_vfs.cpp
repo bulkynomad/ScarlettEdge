@@ -60,7 +60,20 @@ Status PackageVfs::MountXvd(
             StatusCode::UnsupportedFormat,
             "Encrypted XVD containers cannot be mounted without a volume key");
     }
-    xvd_mounts_[NormalizeKey(virtual_path)] = std::move(container);
+    const std::string mount_key = NormalizeKey(virtual_path);
+    std::vector<XvdEmbeddedFile> embedded;
+    if (container->ListEmbeddedFiles(embedded).ok()) {
+        for (const auto& entry : embedded) {
+            if (entry.is_directory) continue;
+            const std::string file_key = NormalizeKey(mount_key + "\\" + entry.relative_path);
+            xvd_embedded_files_[file_key] = EmbeddedFileRef{
+                container,
+                entry.user_data_offset,
+                entry.size_bytes,
+            };
+        }
+    }
+    xvd_mounts_[mount_key] = std::move(container);
     return Status::Ok();
 }
 
@@ -94,6 +107,10 @@ Status PackageVfs::ResolvePath(const std::string& virtual_path, std::string& out
 Status PackageVfs::ReadFileBytes(const std::string& virtual_path,
                                  std::vector<uint8_t>& out_data) const {
     const std::string key = NormalizeKey(virtual_path);
+    auto eit = xvd_embedded_files_.find(key);
+    if (eit != xvd_embedded_files_.end()) {
+        return eit->second.container->ReadUserData(eit->second.user_data_offset, eit->second.size_bytes, out_data);
+    }
     auto xit = xvd_mounts_.find(key);
     if (xit != xvd_mounts_.end()) {
         const auto& hdr = xit->second->Header();
@@ -113,7 +130,11 @@ Status PackageVfs::ReadFileBytes(const std::string& virtual_path,
 }
 
 bool PackageVfs::Exists(const std::string& virtual_path) const {
-    if (xvd_mounts_.find(NormalizeKey(virtual_path)) != xvd_mounts_.end()) {
+    const std::string key = NormalizeKey(virtual_path);
+    if (xvd_embedded_files_.find(key) != xvd_embedded_files_.end()) {
+        return true;
+    }
+    if (xvd_mounts_.find(key) != xvd_mounts_.end()) {
         return true;
     }
     std::string host_path;

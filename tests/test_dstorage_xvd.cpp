@@ -226,6 +226,59 @@ int main() {
         SX_CHECK(enc_vfs.ReadFileBytes("G:\\enc_assets", vfs_plain).ok());
         SX_CHECK_EQ(vfs_plain.size(), large_payload.size());
         SX_CHECK(std::memcmp(vfs_plain.data(), large_payload.data(), large_payload.size()) == 0);
+
+        // 1b. Encrypted GDFX ("MICROSOFT*XBOX*MEDIA") .xvc hierarchy + PackageVfs file-level mounting + extraction
+        const std::string cfg_xml = "<Game configVersion=\"1\"><Identity Name=\"GdfxTest\" /></Game>";
+        std::vector<uint8_t> pak_payload(6144);
+        for (size_t i = 0; i < pak_payload.size(); ++i) {
+            pak_payload[i] = static_cast<uint8_t>((i * 29 + 7) & 0xFFu);
+        }
+        std::vector<scarlettx::XvdInputFile> gdfx_inputs = {
+            {"MicrosoftGame.Config", std::vector<uint8_t>(cfg_xml.begin(), cfg_xml.end())},
+            {"Content/Paks/pakchunk0-xsx.pak", pak_payload},
+            {"DLC/Season1/manifest.bin", {0xDE, 0xAD, 0xBE, 0xEF}},
+        };
+        auto gdfx_xvc_bytes = scarlettx::XvdContainer::BuildEncryptedGdfxXvc(
+            gdfx_inputs, vol_key.data(), vol_key.size(), 1);
+        const auto gdfx_xvc_path = (tmp_dir / "title_gdfx.xvc").string();
+        {
+            std::ofstream ofs(gdfx_xvc_path, std::ios::binary);
+            SX_CHECK(ofs.good());
+            ofs.write(reinterpret_cast<const char*>(gdfx_xvc_bytes.data()),
+                      static_cast<std::streamsize>(gdfx_xvc_bytes.size()));
+        }
+
+        scarlettx::XvdContainer gdfx_xvd;
+        SX_CHECK(gdfx_xvd.OpenFile(gdfx_xvc_path).ok());
+        SX_CHECK(gdfx_xvd.Header().is_encrypted);
+        SX_CHECK(!gdfx_xvd.HasEmbeddedFilesystem());  // Must reject without volume key
+        SX_CHECK(gdfx_xvd.SetVolumeKeyHex(hex_key).ok());
+        SX_CHECK(gdfx_xvd.HasEmbeddedFilesystem());
+
+        std::vector<scarlettx::XvdEmbeddedFile> gdfx_list;
+        SX_CHECK(gdfx_xvd.ListEmbeddedFiles(gdfx_list).ok());
+        SX_CHECK(gdfx_list.size() >= 3u);
+
+        std::vector<uint8_t> read_pak;
+        SX_CHECK(gdfx_xvd.ReadEmbeddedFile("content\\paks\\pakchunk0-xsx.pak", read_pak).ok());
+        SX_CHECK_EQ(read_pak.size(), pak_payload.size());
+        SX_CHECK(std::memcmp(read_pak.data(), pak_payload.data(), pak_payload.size()) == 0);
+
+        scarlettx::PackageVfs gdfx_vfs;
+        SX_CHECK(gdfx_vfs.MountXvd("G:", gdfx_xvc_path, hex_key).ok());
+        SX_CHECK(gdfx_vfs.Exists("G:\\MicrosoftGame.Config"));
+        SX_CHECK(gdfx_vfs.Exists("G:\\Content\\Paks\\pakchunk0-xsx.pak"));
+        SX_CHECK(gdfx_vfs.Exists("G:/DLC/Season1/manifest.bin"));
+        std::vector<uint8_t> vfs_cfg;
+        SX_CHECK(gdfx_vfs.ReadFileBytes("G:\\MicrosoftGame.Config", vfs_cfg).ok());
+        SX_CHECK_EQ(std::string(vfs_cfg.begin(), vfs_cfg.end()), cfg_xml);
+
+        const auto extract_dir = tmp_dir / "gdfx_extracted";
+        SX_CHECK(gdfx_xvd.ExtractEmbeddedFilesystem(extract_dir.string()).ok());
+        SX_CHECK(std::filesystem::exists(extract_dir / "MicrosoftGame.Config"));
+        SX_CHECK(std::filesystem::exists(extract_dir / "Content" / "Paks" / "pakchunk0-xsx.pak"));
+        SX_CHECK_EQ(std::filesystem::file_size(extract_dir / "Content" / "Paks" / "pakchunk0-xsx.pak"),
+                    pak_payload.size());
     }
 
     // 2. DirectStorage configuration, factory, queue, status array

@@ -1,11 +1,14 @@
 #include "scarlettx/runtime/emulator.h"
 
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 
 #include "scarlettx/loader/package_vfs.h"
 #include "scarlettx/loader/pe_mapper.h"
+#include "scarlettx/loader/xvd_container.h"
 #include "scarlettx/runtime/virtual_drive.h"
 
 #if defined(_WIN32)
@@ -15,6 +18,62 @@
 namespace scarlettx {
 
 namespace {
+
+bool IsXvdContainerFile(const std::string& path_str) {
+    std::error_code ec;
+    const std::filesystem::path p(path_str);
+    if (!std::filesystem::is_regular_file(p, ec)) return false;
+    std::string ext = p.extension().string();
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".xvc" || ext == ".xvd";
+}
+
+Status StageXvdPackageIfNeeded(
+    const std::string& package_or_xvc,
+    const std::string& volume_key,
+    std::string& out_resolved_dir) {
+    if (!IsXvdContainerFile(package_or_xvc)) {
+        out_resolved_dir = package_or_xvc;
+        return Status::Ok();
+    }
+
+    XvdContainer xvd;
+    Status st = xvd.OpenFile(package_or_xvc);
+    if (!st.ok()) return st;
+
+    std::string effective_key = volume_key;
+    if (effective_key.empty()) {
+        if (const char* env_key = std::getenv("SCARLETTX_VOLUME_KEY"); env_key && *env_key) {
+            effective_key = env_key;
+        }
+    }
+    if (!effective_key.empty()) {
+        st = std::filesystem::exists(effective_key)
+                 ? xvd.LoadVolumeKeyFile(effective_key)
+                 : xvd.SetVolumeKeyHex(effective_key);
+        if (!st.ok()) return st;
+    }
+    if (xvd.Header().is_encrypted && !xvd.HasVolumeKey()) {
+        return Status::Error(
+            StatusCode::NotImplemented,
+            "Encrypted XVC/XVD container requires --volume-key <hex|file>: " + package_or_xvc);
+    }
+
+    char cid_hex[33] = {};
+    for (size_t i = 0; i < 16; ++i) {
+        std::snprintf(cid_hex + i * 2, 3, "%02x", xvd.Header().content_id[i]);
+    }
+    const std::filesystem::path stage_dir =
+        std::filesystem::temp_directory_path() /
+        ("scarlettx_xvc_" + std::filesystem::path(package_or_xvc).stem().string() + "_" + cid_hex);
+
+    st = xvd.ExtractEmbeddedFilesystem(stage_dir.string());
+    if (!st.ok()) {
+        return st;
+    }
+    out_resolved_dir = stage_dir.string();
+    return Status::Ok();
+}
 
 std::string FindGameConfigInDir(const std::string& package_dir) {
     const std::filesystem::path dir(package_dir);
@@ -34,10 +93,15 @@ Emulator::Emulator(EmulatorConfig config) : config_(std::move(config)) {}
 Status Emulator::InspectPackage(const std::string& package_dir,
                                 PackageInspectionReport& out_report) const {
     out_report = PackageInspectionReport{};
-    const std::string cfg_path = FindGameConfigInDir(package_dir);
+    std::string resolved_dir;
+    Status stage_st = StageXvdPackageIfNeeded(package_dir, config_.volume_key, resolved_dir);
+    if (!stage_st.ok()) {
+        return stage_st;
+    }
+    const std::string cfg_path = FindGameConfigInDir(resolved_dir);
     if (cfg_path.empty()) {
         return Status::Error(StatusCode::NotFound,
-                             "MicrosoftGame.Config not found in package directory: " + package_dir);
+                             "MicrosoftGame.Config not found in package directory: " + resolved_dir);
     }
 
     Status st = LoadGameConfigFile(cfg_path, out_report.config);
@@ -50,7 +114,7 @@ Status Emulator::InspectPackage(const std::string& package_dir,
         return Status::Error(StatusCode::ParseError, "No primary executable in MicrosoftGame.Config");
     }
 
-    const std::filesystem::path exe_path = std::filesystem::path(package_dir) / exe->name;
+    const std::filesystem::path exe_path = std::filesystem::path(resolved_dir) / exe->name;
     if (!std::filesystem::exists(exe_path)) {
         return Status::Error(StatusCode::NotFound, "Package executable missing: " + exe_path.string());
     }
@@ -59,7 +123,12 @@ Status Emulator::InspectPackage(const std::string& package_dir,
     return InspectPeFile(out_report.executable_path, redirects_, out_report.main_pe);
 }
 
-Status Emulator::BootPackage(const std::string& package_dir) {
+Status Emulator::BootPackage(const std::string& package_input) {
+    std::string package_dir;
+    Status stage_st = StageXvdPackageIfNeeded(package_input, config_.volume_key, package_dir);
+    if (!stage_st.ok()) {
+        return stage_st;
+    }
     PackageInspectionReport report;
     Status st = InspectPackage(package_dir, report);
     if (!st.ok()) {

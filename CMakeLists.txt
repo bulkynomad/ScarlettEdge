@@ -317,6 +317,51 @@ add_custom_command(TARGET scarlett_arena POST_BUILD
         "$<TARGET_FILE_DIR:scarlett_arena>"
 )
 
+# Synthetic Scarlett Game 5: ue5_slice (Encrypted GDFX .xvc Gen9 UE5 vertical slice)
+add_executable(ue5_slice tests/synthetic_games/ue5_slice/main.cpp)
+target_link_libraries(ue5_slice PRIVATE
+    xgameruntime
+    d3d12_xs
+    dstorage
+    xbox_codecs
+    xaudio2_9
+    Bink2Scarlett
+    xsapi
+    $<$<BOOL:${WIN32}>:ole32>
+)
+target_include_directories(ue5_slice PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(ue5_slice PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/ue5_slice"
+)
+add_custom_command(TARGET ue5_slice POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/ue5_slice/MicrosoftGame.Config"
+        "$<TARGET_FILE_DIR:ue5_slice>/MicrosoftGame.Config"
+)
+
+# Synthetic Scarlett Game 6: openworld_slice (Open-World Gen9 Open-World Wave32 Vulkan + 2MB Alias vertical slice)
+add_executable(openworld_slice tests/synthetic_games/openworld_slice/main.cpp)
+target_link_libraries(openworld_slice PRIVATE
+    xgameruntime
+    d3d12_xs
+    XboxBvhBuilder
+    dstorage
+    kernelx
+    xs2_lifting
+    vulkan_backend
+    xsapi
+    libHttpClient_GDK
+)
+target_include_directories(openworld_slice PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(openworld_slice PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/openworld_slice"
+)
+add_custom_command(TARGET openworld_slice POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/openworld_slice/MicrosoftGame.Config"
+        "$<TARGET_FILE_DIR:openworld_slice>/MicrosoftGame.Config"
+)
+
 # ---------------------------------------------------------------------------
 # Autonomous Test Suite
 # ---------------------------------------------------------------------------
@@ -430,4 +475,24 @@ add_test(
 add_test(
     NAME test_boot_rt_showcase
     COMMAND $<TARGET_FILE:scarlettx> boot "${CMAKE_BINARY_DIR}/packages/rt_showcase" --headless --warp --frames 2 --rt-dump "${CMAKE_BINARY_DIR}/rt_showcase_frame.ppm"
+)
+
+scarlettx_add_test(test_aaa_bringup_e2e tests/test_aaa_bringup_e2e.cpp)
+target_link_libraries(test_aaa_bringup_e2e PRIVATE dstorage xbox_codecs xaudio2_9)
+add_dependencies(test_aaa_bringup_e2e
+    ue5_slice
+    openworld_slice
+    scarlettx
+    xgameruntime
+    d3d12_xs
+    XboxBvhBuilder
+    dstorage
+    xbox_codecs
+    xaudio2_9
+    Bink2Scarlett
+    kernelx
+    xs2_lifting
+    vulkan_backend
+    xsapi
+    libHttpClient_GDK
 )

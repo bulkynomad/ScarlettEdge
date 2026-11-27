@@ -352,6 +352,18 @@ struct XUserGetTokenAndSignatureData {
     const char* signature;
 };
 
+struct XUserGetTokenAndSignatureUtf16HttpHeader {
+    const wchar_t* name;
+    const wchar_t* value;
+};
+
+struct XUserGetTokenAndSignatureUtf16Data {
+    size_t tokenCount;
+    size_t signatureCount;
+    const wchar_t* token;
+    const wchar_t* signature;
+};
+
 SCARLETTX_XGR_API XGameResult XUserAddAsync(
     XUserAddOptions options,
     XAsyncBlock* async);
@@ -398,6 +410,25 @@ SCARLETTX_XGR_API XGameResult XUserGetTokenAndSignatureResult(
     size_t bufferSize,
     void* buffer,
     XUserGetTokenAndSignatureData** ptrToBuffer,
+    size_t* bufferUsed);
+SCARLETTX_XGR_API XGameResult XUserGetTokenAndSignatureUtf16Async(
+    XUserHandle user,
+    XUserGetTokenAndSignatureOptions options,
+    const wchar_t* method,
+    const wchar_t* url,
+    size_t headerCount,
+    const XUserGetTokenAndSignatureUtf16HttpHeader* headers,
+    size_t bodySize,
+    const void* bodyBuffer,
+    XAsyncBlock* async);
+SCARLETTX_XGR_API XGameResult XUserGetTokenAndSignatureUtf16ResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize);
+SCARLETTX_XGR_API XGameResult XUserGetTokenAndSignatureUtf16Result(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XUserGetTokenAndSignatureUtf16Data** ptrToBuffer,
     size_t* bufferUsed);
 // Legacy convenience helper retained for early synthetic tests.
 SCARLETTX_XGR_API XGameResult XUserGetDefaultXuid(uint64_t* out_xuid);
@@ -572,11 +603,109 @@ SCARLETTX_XGR_API XGameResult XGameSaveFilesGetRemainingQuotaResult(
     int64_t* remainingQuota);
 
 // ---------------------------------------------------------------------------
-// XPackage.h
+// XPackage.h & XStore.h (GDK 2022-2026 DLC Enumeration, Mounting & Licensing)
 // ---------------------------------------------------------------------------
+enum XPackageKind : uint32_t {
+    XPackageKind_Game = 0,
+    XPackageKind_Content = 1,
+};
+
+enum XPackageEnumerationScope : uint32_t {
+    XPackageEnumerationScope_ThisOnly = 0,
+    XPackageEnumerationScope_ThisAndRelated = 1,
+};
+
+struct XPackageDetails {
+    const char* packageIdentifier;
+    XVersion version;
+    XPackageKind kind;
+    const char* displayName;
+    const char* description;
+    const char* publisher;
+    const char* storeId;
+    bool installing;
+};
+
+typedef struct XPackageMountObject* XPackageMountHandle;
+typedef bool(SCARLETTX_GDK_CALLBACK XPackageEnumerationCallback)(
+    void* context,
+    const XPackageDetails* details);
+
 // The host user's locale name ("en-US"), matched against the languages the
 // package declares when there are any. SCARLETTX_LOCALE overrides it.
 SCARLETTX_XGR_API XGameResult XPackageGetUserLocale(size_t localeSize, char* locale);
+SCARLETTX_XGR_API XGameResult XPackageEnumeratePackages(
+    XPackageKind kind,
+    XPackageEnumerationScope scope,
+    void* context,
+    XPackageEnumerationCallback* callback);
+SCARLETTX_XGR_API XGameResult XPackageMountWithUiAsync(
+    const char* packageIdentifier,
+    XAsyncBlock* async);
+SCARLETTX_XGR_API XGameResult XPackageMountWithUiResult(
+    XAsyncBlock* async,
+    XPackageMountHandle* mountHandle);
+SCARLETTX_XGR_API XGameResult XPackageGetMountPathSize(
+    XPackageMountHandle mountHandle,
+    size_t* pathSize);
+SCARLETTX_XGR_API XGameResult XPackageGetMountPath(
+    XPackageMountHandle mountHandle,
+    size_t pathSize,
+    char* path);
+SCARLETTX_XGR_API void XPackageCloseMountHandle(XPackageMountHandle mountHandle);
+
+typedef struct XStoreContextObject* XStoreContextHandle;
+typedef struct XStoreProductQueryObject* XStoreProductQueryHandle;
+
+struct XStoreGameLicense {
+    char skuStoreId[18];
+    bool isActive;
+    bool isTrialOwnedByThisUser;
+    bool isDiscLicense;
+    bool isTrial;
+    uint32_t trialTimeRemainingInSeconds;
+    char trialUniqueId[64];
+    int64_t expirationDate;
+};
+
+struct XStoreProduct {
+    const char* storeId;
+    const char* title;
+    const char* description;
+    const char* language;
+    uint32_t productKind;
+    bool isInUserCollection;
+};
+
+typedef bool(SCARLETTX_GDK_CALLBACK XStoreProductQueryCallback)(
+    const XStoreProduct* product,
+    void* context);
+
+SCARLETTX_XGR_API XGameResult XStoreCreateContext(
+    XUserHandle user,
+    XStoreContextHandle* storeContextHandle);
+SCARLETTX_XGR_API void XStoreCloseContextHandle(
+    XStoreContextHandle storeContextHandle);
+SCARLETTX_XGR_API XGameResult XStoreQueryGameLicenseAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async);
+SCARLETTX_XGR_API XGameResult XStoreQueryGameLicenseResult(
+    XAsyncBlock* async,
+    XStoreGameLicense* license);
+SCARLETTX_XGR_API XGameResult XStoreQueryEntitledProductsAsync(
+    XStoreContextHandle storeContextHandle,
+    uint32_t productKinds,
+    uint32_t maxItemsToRetrieveCount,
+    XAsyncBlock* async);
+SCARLETTX_XGR_API XGameResult XStoreQueryEntitledProductsResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle);
+SCARLETTX_XGR_API XGameResult XStoreEnumerateProductsQuery(
+    XStoreProductQueryHandle productQueryHandle,
+    void* context,
+    XStoreProductQueryCallback* callback);
+SCARLETTX_XGR_API void XStoreCloseProductsQueryHandle(
+    XStoreProductQueryHandle productQueryHandle);
 
 // ---------------------------------------------------------------------------
 // XMem.h (GDK Memory & Unified Virtual Memory Hooks)

@@ -160,7 +160,7 @@ SCARLETTX_XAUDIO2_API int32_t XAudio2WriteWavFile(
     const float* interleaved_pcm,
     uint32_t frame_count);
 
-// XMA2 packet encode/decode bridge
+// XMA2 packet encode/decode bridge (supports both 2048-byte retail XMA2 MDCT blocks and XMA2 test packets)
 SCARLETTX_XAUDIO2_API int32_t Xma2DecodePacket(
     const uint8_t* packet_data,
     uint32_t packet_bytes,
@@ -168,5 +168,88 @@ SCARLETTX_XAUDIO2_API int32_t Xma2DecodePacket(
     uint32_t out_sample_capacity,
     uint32_t* out_frames_decoded,
     uint16_t* out_channels);
+
+SCARLETTX_XAUDIO2_API int32_t Xma2EncodeMdctBlock(
+    const float* interleaved_pcm,
+    uint32_t frame_count,
+    uint16_t channels,
+    uint8_t* out_xma2_bytes,
+    uint32_t max_out_bytes,
+    uint32_t* out_bytes_written);
+
+// ---------------------------------------------------------------------------
+// X3DAudio & XAPOFX (CreateFX: CLSID_FXReverb, CLSID_FXEQ, CLSID_FXMasteringLimiter)
+// ---------------------------------------------------------------------------
+typedef uint8_t X3DAUDIO_HANDLE[20];
+
+struct X3DAUDIO_VECTOR {
+    float x;
+    float y;
+    float z;
+};
+
+struct X3DAUDIO_LISTENER {
+    X3DAUDIO_VECTOR OrientFront;
+    X3DAUDIO_VECTOR OrientTop;
+    X3DAUDIO_VECTOR Position;
+    X3DAUDIO_VECTOR Velocity;
+    void* pCone;
+};
+
+struct X3DAUDIO_EMITTER {
+    void* pCone;
+    X3DAUDIO_VECTOR OrientFront;
+    X3DAUDIO_VECTOR OrientTop;
+    X3DAUDIO_VECTOR Position;
+    X3DAUDIO_VECTOR Velocity;
+    float InnerRadius;
+    float InnerRadiusAngle;
+    uint32_t ChannelCount;
+    float ChannelRadius;
+    float* pChannelAzimuths;
+    void* pVolumeCurve;
+    void* pLFECurve;
+    void* pLPFDirectCurve;
+    void* pLPFReverbCurve;
+    void* pReverbCurve;
+    float CurveDistanceScaler;
+    float DopplerScaler;
+};
+
+struct X3DAUDIO_DSP_SETTINGS {
+    float* pMatrixCoefficients;
+    float* pDelayTimes;
+    uint32_t SrcChannelCount;
+    uint32_t DstChannelCount;
+    float LPFDirectCoefficient;
+    float LPFReverbCoefficient;
+    float ReverbLevel;
+    float DopplerFactor;
+    float EmitterToListenerAngle;
+    float EmitterToListenerDistance;
+    float EmitterVelocityComponent;
+    float ListenerVelocityComponent;
+};
+
+static constexpr uint32_t SCARLETTX_X3DAUDIO_CALCULATE_MATRIX = 0x00000001u;
+static constexpr uint32_t SCARLETTX_X3DAUDIO_CALCULATE_DOPPLER = 0x00000020u;
+
+SCARLETTX_XAUDIO2_API int32_t X3DAudioInitialize(
+    uint32_t speaker_channel_mask,
+    float speed_of_sound,
+    X3DAUDIO_HANDLE instance);
+
+SCARLETTX_XAUDIO2_API void X3DAudioCalculate(
+    const X3DAUDIO_HANDLE instance,
+    const X3DAUDIO_LISTENER* listener,
+    const X3DAUDIO_EMITTER* emitter,
+    uint32_t flags,
+    X3DAUDIO_DSP_SETTINGS* dsp_settings);
+
+SCARLETTX_XAUDIO2_API int32_t CreateFX(
+    const void* clsid,
+    void** out_effect,
+    const void* init_data,
+    uint32_t init_data_bytes);
 
 }  // extern "C"

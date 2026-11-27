@@ -254,6 +254,64 @@ int RunEngine(bool force_silent) {
     SX_CHECK(engine_cb.pass_start == engine_passes);
 
     VCall<void>(submix, 18);
+
+    // Retail 52-byte XMA2WAVEFORMATEX (tag = 0x0166) guest voice -> automatic IMDCT-to-PCM16 bridge!
+    {
+        #pragma pack(push, 1)
+        struct GuestXma2Fmt {
+            uint16_t tag;
+            uint16_t channels;
+            uint32_t rate;
+            uint32_t avg_bytes;
+            uint16_t block_align;
+            uint16_t bits;
+            uint16_t cb_size;
+            uint16_t num_streams;
+            uint32_t channel_mask;
+            uint32_t samples_encoded;
+            uint32_t bytes_per_block;
+            uint32_t play_begin, play_length, loop_begin, loop_length;
+            uint8_t loop_count, encoder_ver;
+            uint16_t block_count;
+        };
+        #pragma pack(pop)
+        static_assert(sizeof(GuestXma2Fmt) == 52, "XMA2WAVEFORMATEX size");
+
+        GuestXma2Fmt xfmt{};
+        xfmt.tag = 0x0166u;
+        xfmt.channels = 2;
+        xfmt.rate = 48000;
+        xfmt.bits = 16;
+        xfmt.cb_size = 34;
+        xfmt.num_streams = 1;
+        xfmt.bytes_per_block = 2048;
+        xfmt.encoder_ver = 4;
+        xfmt.block_count = 1;
+
+        VoiceCallback xma_cb{kVoiceCallbackVtbl};
+        void* xma_voice = nullptr;
+        SX_CHECK(VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const void*>(
+                     engine, 5, &xma_voice, &xfmt, 0u, 2.0f, &xma_cb, nullptr, nullptr) == 0);
+        SX_CHECK(xma_voice != nullptr);
+
+        std::vector<float> test_pcm(256 * 2, 0.25f);
+        uint32_t xma_bytes = 0;
+        (void)Xma2EncodeMdctBlock(test_pcm.data(), 256, 2, nullptr, 0, &xma_bytes);
+        std::vector<uint8_t> xma_pkt(xma_bytes, 0);
+        SX_CHECK(Xma2EncodeMdctBlock(test_pcm.data(), 256, 2, xma_pkt.data(), xma_bytes, &xma_bytes) == 0);
+
+        Buffer xbuf{};
+        xbuf.flags = 0x40;  // END_OF_STREAM
+        xbuf.audio_bytes = xma_bytes;
+        xbuf.audio_data = xma_pkt.data();
+        xbuf.context = reinterpret_cast<void*>(uintptr_t{0x5CA2});
+        SX_CHECK(VCall<int32_t, const Buffer*, const void*>(xma_voice, 21, &xbuf, nullptr) == 0);
+        SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(xma_voice, 19, 0u, 0u) == 0);
+        SX_CHECK(WaitFor([&] { return xma_cb.buffer_end == 1; }));
+        SX_CHECK(xma_cb.last_context.load() == xbuf.context);
+        VCall<void>(xma_voice, 18);
+    }
+
     VCall<void>(mastering, 18);
     SX_CHECK(VCall<uint32_t>(engine, 2) == 0);
     return 0;

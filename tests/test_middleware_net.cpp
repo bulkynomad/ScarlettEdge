@@ -13,6 +13,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -73,6 +75,46 @@ int main() {
         SX_CHECK(BinkOpenMiles(reinterpret_cast<void*>(0x1234)) == reinterpret_cast<void*>(0x1234));
 
         BinkClose(bnk);
+
+        // 1b. Real KB2 container with frame-offset table + YCbCr decode + A/V PTS lip-sync frame catch-up
+        const auto kb2_path = std::filesystem::temp_directory_path() / "scarlett_pts_test.bk2";
+        {
+            std::vector<uint8_t> kb2(256, 0);
+            kb2[0] = 'K'; kb2[1] = 'B'; kb2[2] = '2'; kb2[3] = 'i';
+            auto wr32 = [&](size_t off, uint32_t v) { std::memcpy(kb2.data() + off, &v, 4); };
+            wr32(8, 10u);    // 10 frames
+            wr32(20, 64u);   // 64x64
+            wr32(24, 64u);
+            wr32(28, 30u);   // 30 FPS (33,333 us/frame)
+            wr32(32, 1u);
+            // Frame offset table at +44 (11 entries)
+            for (uint32_t fi = 0; fi <= 10u; ++fi) {
+                wr32(44u + fi * 4u, (100u + fi * 12u) | (fi == 0 ? 1u : 0u));
+            }
+            for (size_t k = 100u; k < kb2.size(); ++k) {
+                kb2[k] = static_cast<uint8_t>((k * 37u) & 0xFFu);
+            }
+            std::ofstream(kb2_path, std::ios::binary).write(
+                reinterpret_cast<const char*>(kb2.data()), static_cast<std::streamsize>(kb2.size()));
+        }
+        BINK* pts_bnk = BinkOpen(kb2_path.string().c_str(), BINKOPEN_PTS_SYNC);
+        SX_CHECK(pts_bnk != nullptr && pts_bnk->Width == 64 && pts_bnk->Frames == 10);
+        // Advance audio clock to 110,000 us (~3.3 frames @ 30 FPS) -> BinkDoFrame must skip lagging frames to lip-sync!
+        BinkSetAudioPts(pts_bnk, 110000ull);
+        SX_CHECK(BinkDoFrame(pts_bnk) == 1);  // 1 = skipped lagging frames to catch up with audio PTS
+        uint64_t v_pts = 0, a_pts = 0;
+        int64_t drift = 0;
+        SX_CHECK(BinkGetPtsState(pts_bnk, &v_pts, &a_pts, &drift) == 0);
+        SX_CHECK(a_pts == 110000ull && std::llabs(drift) <= 50000ll);
+        BINKSUMMARY pts_sum{};
+        BinkGetSummary(pts_bnk, &pts_sum);
+        SX_CHECK(pts_sum.SkippedFrames >= 2u);
+        BINKREALTIME rt{};
+        BinkGetRealtime(pts_bnk, &rt, 0);
+        SX_CHECK(rt.FrameRate == 30u && rt.ReadBufferSize > 0u);
+        BinkClose(pts_bnk);
+        std::error_code rm_ec;
+        std::filesystem::remove(kb2_path, rm_ec);
     }
 
     // 2. amd_fidelityfx_loader_xbox.dll -> amd_fidelityfx_upscaler_xbox.dll
@@ -203,6 +245,39 @@ int main() {
         SX_CHECK(HCHttpCallResponseGetHeader(call, "Content-Type", &ct) == SX_S_OK);
         SX_CHECK(ct && std::string(ct) == "application/json");
         SX_CHECK(HCHttpCallCloseHandle(call) == SX_S_OK);
+
+        // 3b. HCWebSocket* (Xbox Live RTA & PlayFab WebSocket transport)
+        struct WsCtx {
+            std::string last_msg;
+            std::vector<uint8_t> last_bin;
+            uint32_t close_code = 0;
+        } ws_ctx;
+        HCWebSocketHandle ws = nullptr;
+        SX_CHECK(HCWebSocketCreate(
+                     &ws,
+                     [](HCWebSocketHandle, const char* msg, void* c) {
+                         static_cast<WsCtx*>(c)->last_msg = msg ? msg : "";
+                     },
+                     [](HCWebSocketHandle, const uint8_t* b, uint32_t n, void* c) {
+                         static_cast<WsCtx*>(c)->last_bin.assign(b, b + n);
+                     },
+                     [](HCWebSocketHandle, uint32_t code, void* c) {
+                         static_cast<WsCtx*>(c)->close_code = code;
+                     },
+                     &ws_ctx) == SX_S_OK);
+        SX_CHECK(ws != nullptr);
+        SX_CHECK(HCWebSocketSetHeader(ws, "Authorization", "XBL3.0 x=1;jwt") == SX_S_OK);
+        SX_CHECK(HCWebSocketConnectAsync("wss://rta.xboxlive.com/connect", "xboxlive-rta", ws, nullptr) == SX_S_OK);
+        SX_CHECK(HCWebSocketSendMessageAsync(ws, "[1,1,\"https://sessiondirectory.xboxlive.com\"]", nullptr) == SX_S_OK);
+        SX_CHECK(ws_ctx.last_msg.find("Subscribed") != std::string::npos);
+
+        const uint8_t bin_ping[4] = {0x50, 0x46, 0x01, 0x02};
+        SX_CHECK(HCWebSocketSendBinaryMessageAsync(ws, bin_ping, sizeof(bin_ping), nullptr) == SX_S_OK);
+        SX_CHECK(ws_ctx.last_bin.size() == 4 && ws_ctx.last_bin[0] == 0x50);
+        SX_CHECK(HCWebSocketDisconnect(ws) == SX_S_OK);
+        SX_CHECK(ws_ctx.close_code == 1000u);
+        SX_CHECK(HCWebSocketCloseHandle(ws) == SX_S_OK);
+
         HCCleanup();
     }
 

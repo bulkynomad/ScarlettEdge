@@ -457,6 +457,45 @@ SCARLETTX_D3D12_API int32_t D3D12XboxGetPipelineCacheStats(
     uint64_t device_handle,
     D3D12XBOX_PIPELINE_CACHE_STATS* out_stats);
 
+// ---------------------------------------------------------------------------
+// GPU Stability Breadcrumb Diagnostics & QPC Frame-Time Histogram Profiler
+// ---------------------------------------------------------------------------
+typedef struct D3D12XBOX_GPU_BREADCRUMB_ENTRY {
+    uint64_t CommandListId;
+    uint64_t MarkerValue;
+    char Tag[32];
+} D3D12XBOX_GPU_BREADCRUMB_ENTRY;
+
+typedef struct D3D12XBOX_GPU_STABILITY_REPORT {
+    uint32_t LiveCommandLists;
+    uint64_t CompletedSubmits;
+    uint32_t BreadcrumbCount;
+    uint64_t LastBreadcrumbValue;
+    char LastBreadcrumbTag[32];
+    int32_t DeviceRemovedReason;
+    uint64_t PsoCacheHits;
+    uint64_t PsoCacheMisses;
+    uint64_t RecordedFrameCount;
+    uint64_t MinFrameTimeUs;
+    uint64_t AvgFrameTimeUs;
+    uint64_t P99FrameTimeUs;
+    uint64_t MaxFrameTimeUs;
+} D3D12XBOX_GPU_STABILITY_REPORT;
+
+SCARLETTX_D3D12_API int32_t D3D12XboxWriteBreadcrumb(
+    uint64_t device_handle,
+    uint64_t cmd_list_id,
+    uint64_t marker_value,
+    const char* tag);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxRecordFrameTimestamp(
+    uint64_t device_handle,
+    uint64_t frame_duration_us);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxGetGpuStabilityReport(
+    uint64_t device_handle,
+    D3D12XBOX_GPU_STABILITY_REPORT* out_report);
+
 // xgameruntime.dll exports are declared in scarlettx/gdk/xgameruntime_abi.h.
 
 // ---------------------------------------------------------------------------

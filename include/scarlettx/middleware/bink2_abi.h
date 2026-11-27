@@ -46,13 +46,27 @@ typedef struct BINKSUMMARY {
     uint32_t SkippedFrames;
 } BINKSUMMARY;
 
-// Surface pixel format flags matching Bink2 conventions
+// Surface pixel format & PTS lip-sync flags matching Bink2 conventions
 enum {
     BINKSURFACE32RGBA = 6,
     BINKSURFACE32BGRA = 3,
     BINKSURFACE24 = 1,
+    BINKOPEN_PTS_SYNC = 0x00010000u,
     BINKCOPYALL = 0x80000000u
 };
+
+typedef struct BINKREALTIME {
+    uint32_t FrameNum;
+    uint32_t FrameRate;
+    uint32_t FrameRateDiv;
+    uint32_t Frames;
+    uint32_t FramesTime;
+    uint32_t FramesVideoDecompTime;
+    uint32_t FramesAudioDecompTime;
+    uint32_t ReadBufferSize;
+    uint32_t ReadBufferUsed;
+    uint32_t FramesDataRate;
+} BINKREALTIME;
 
 SCARLETTX_BINK2_API BINK* BinkOpen(const char* name, uint32_t flags);
 SCARLETTX_BINK2_API void BinkClose(BINK* bnk);
@@ -85,6 +99,12 @@ SCARLETTX_BINK2_API void BinkSetMixBins(BINK* bnk, uint32_t track_id, const uint
 SCARLETTX_BINK2_API void BinkSetMixBinVolumes(BINK* bnk, uint32_t track_id, const float* volumes, uint32_t count);
 SCARLETTX_BINK2_API void BinkSetMemory(void* alloc_func, void* free_func);
 SCARLETTX_BINK2_API void* BinkOpenMiles(void* miles_driver);
+SCARLETTX_BINK2_API void BinkSetAudioPts(BINK* bnk, uint64_t audio_pts_us);
+SCARLETTX_BINK2_API int32_t BinkGetPtsState(
+    BINK* bnk,
+    uint64_t* out_video_pts_us,
+    uint64_t* out_audio_pts_us,
+    int64_t* out_av_drift_us);
 
 #ifdef __cplusplus
 }

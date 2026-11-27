@@ -201,6 +201,24 @@ int main() {
     SX_CHECK_EQ(D3D12XboxResumeX(dev), 0);
     SX_CHECK_EQ(D3D12XboxPresentXParams(dev, &present_params), 0);
 
+    // GPU stability breadcrumbs + QPC frame-time percentile profiler
+    SX_CHECK_EQ(D3D12XboxWriteBreadcrumb(dev, 0x1001ull, 0xCAFE0001ull, "MenuPassBegin"), 0);
+    SX_CHECK_EQ(D3D12XboxWriteBreadcrumb(dev, 0x1001ull, 0xCAFE0002ull, "SceneOpaquePass"), 0);
+    SX_CHECK_EQ(D3D12XboxRecordFrameTimestamp(dev, 16500ull), 0);
+    SX_CHECK_EQ(D3D12XboxRecordFrameTimestamp(dev, 16667ull), 0);
+    SX_CHECK_EQ(D3D12XboxRecordFrameTimestamp(dev, 17100ull), 0);
+
+    D3D12XBOX_GPU_STABILITY_REPORT stab{};
+    SX_CHECK_EQ(D3D12XboxGetGpuStabilityReport(dev, &stab), 0);
+    SX_CHECK_EQ(stab.DeviceRemovedReason, 0);
+    SX_CHECK(stab.BreadcrumbCount >= 2u);
+    SX_CHECK_EQ(stab.LastBreadcrumbValue, 0xCAFE0002ull);
+    SX_CHECK_EQ(std::string(stab.LastBreadcrumbTag), std::string("SceneOpaquePass"));
+    SX_CHECK(stab.RecordedFrameCount >= 3ull);
+    SX_CHECK(stab.MinFrameTimeUs > 0ull);
+    SX_CHECK(stab.P99FrameTimeUs >= stab.AvgFrameTimeUs);
+    SX_CHECK(stab.MaxFrameTimeUs >= stab.P99FrameTimeUs);
+
 #if defined(_WIN32)
     queue->Release();
     native_dev->Release();

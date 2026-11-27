@@ -44,7 +44,11 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "inspect" && argc >= 3) {
-        scarlettx::Emulator emu;
+        scarlettx::EmulatorConfig cfg;
+        for (int i = 3; i + 1 < argc; ++i) {
+            if (std::string(argv[i]) == "--volume-key") cfg.volume_key = argv[++i];
+        }
+        scarlettx::Emulator emu(cfg);
         scarlettx::PackageInspectionReport rep;
         auto st = emu.InspectPackage(argv[2], rep);
         if (!st.ok()) {
@@ -65,7 +69,24 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "compat" && argc >= 3) {
-        scarlettx::Emulator emu;
+        scarlettx::EmulatorConfig cfg;
+        for (int i = 3; i + 1 < argc; ++i) {
+            if (std::string(argv[i]) == "--volume-key") cfg.volume_key = argv[++i];
+        }
+        const std::filesystem::path target_p(argv[2]);
+        std::error_code file_ec;
+        if (std::filesystem::is_regular_file(target_p, file_ec)) {
+            scarlettx::XvdContainer xvd;
+            if (xvd.OpenFile(argv[2]).ok() && xvd.Header().is_encrypted && cfg.volume_key.empty()) {
+                std::cout << "=== ScarlettEdge Compatibility Report ===\n"
+                          << "Container:       " << target_p.filename().string() << "\n"
+                          << "Drive Size:      " << xvd.Header().drive_size << " bytes\n"
+                          << "XVD Containers:  1 found (1 encrypted)\n"
+                          << "Readiness:       ENCRYPTED_CONTAINER (supply --volume-key <hex|file>)\n";
+                return 0;
+            }
+        }
+        scarlettx::Emulator emu(cfg);
         scarlettx::PackageInspectionReport rep;
         auto st = emu.InspectPackage(argv[2], rep);
         if (!st.ok()) {
@@ -78,20 +99,30 @@ int main(int argc, char** argv) {
             if (mod.is_scarlett_hle) ++hle_mods;
             else ++os_mods;
         }
-        size_t xvd_total = 0, xvd_encrypted = 0;
+        size_t xvd_total = 0, xvd_encrypted = 0, xvd_decrypted = 0;
         std::error_code ec;
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(argv[2], ec)) {
-            if (!entry.is_regular_file()) continue;
-            auto ext = entry.path().extension().string();
+        auto inspect_xvd_file = [&](const std::filesystem::path& p) {
+            auto ext = p.extension().string();
             for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             if (ext == ".xvd" || ext == ".xvc") {
                 scarlettx::XvdContainer xvd;
-                if (xvd.OpenFile(entry.path().string()).ok()) {
+                if (xvd.OpenFile(p.string()).ok()) {
                     ++xvd_total;
-                    if (xvd.Header().is_encrypted) ++xvd_encrypted;
+                    if (xvd.Header().is_encrypted) {
+                        ++xvd_encrypted;
+                        if (!cfg.volume_key.empty()) ++xvd_decrypted;
+                    }
                 }
             }
+        };
+        if (std::filesystem::is_regular_file(target_p, ec)) {
+            inspect_xvd_file(target_p);
+        } else {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(argv[2], ec)) {
+                if (entry.is_regular_file()) inspect_xvd_file(entry.path());
+            }
         }
+        const bool locked = (xvd_encrypted > xvd_decrypted);
         std::cout << "=== ScarlettEdge Compatibility Report ===\n"
                   << "Title:           " << rep.config.display_name << " (" << rep.config.title_id << ")\n"
                   << "Gen9 Native:     " << (rep.config.IsNativeScarlett() ? "YES (XboxGen9)" : "NO") << "\n"
@@ -100,7 +131,7 @@ int main(int argc, char** argv) {
                   << hle_mods << " Scarlett HLE, " << os_mods << " OS/local, " << total_syms << " symbols)\n"
                   << "XVD Containers:  " << xvd_total << " found (" << xvd_encrypted << " encrypted)\n"
                   << "Readiness:       "
-                  << (xvd_encrypted > 0
+                  << (locked
                           ? "ENCRYPTED_CONTAINER (supply --volume-key <hex|file>)"
                           : (rep.main_pe.is_pe64 ? "READY_TO_BOOT" : "UNSUPPORTED_ARCH"))
                   << "\n";
