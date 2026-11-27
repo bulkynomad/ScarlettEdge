@@ -53,6 +53,10 @@ struct ShaderTranslationResult {
 
 uint64_t HashShaderBytes(const uint8_t* data, size_t size);
 
+// Computes and writes the retail 16-byte DXBC modified-MD5 checksum at bytes 4..19
+// of a DXBC/DXIL container (hashing bytes 20..size). Returns false if size < 32.
+bool UpdateDxbcContainerChecksum(uint8_t* dxbc_data, size_t total_size);
+
 Status InspectShaderContainer(const std::vector<uint8_t>& bytecode, ShaderModuleInfo& out_info);
 
 // Translates a Scarlett/Xbox DXBC or DXIL container into a PC-compatible DXBC/DXIL

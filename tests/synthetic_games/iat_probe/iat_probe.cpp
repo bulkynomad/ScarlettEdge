@@ -44,12 +44,13 @@ void ProbeThrowHelper(int value) {
 }
 
 __declspec(dllexport) int ProbeThrowCatch(int value) {
+    int result = -1;
     try {
         ProbeThrowHelper(value);
     } catch (int caught) {
-        return caught + 1;
+        result = caught + 1;
     }
-    return -1;
+    return result;
 }
 
 // Per-thread storage of the guest image (implicit TLS on MSVC guests).

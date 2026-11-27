@@ -2,10 +2,15 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "scarlettx/core/status.h"
+
+namespace scarlettx::crypto {
+struct AesXtsPreparedKey;
+}
 
 namespace scarlettx {
 
@@ -43,7 +48,7 @@ public:
     Status OpenFile(const std::string& path);
     Status OpenBytes(std::vector<uint8_t> data);
 
-    // Loads a 16-byte (AES-128) or 32-byte (AES-256) volume key for encrypted XVD streaming.
+    // Loads a 16-byte, 32-byte (AES-128-XTS), or 64-byte (AES-256-XTS) volume key for encrypted XVD streaming.
     Status SetVolumeKey(const uint8_t* key, size_t key_len);
     Status SetVolumeKeyHex(const std::string& hex_key);
     Status LoadVolumeKeyFile(const std::string& key_file_path);
@@ -77,9 +82,10 @@ private:
     std::vector<uint8_t> backing_bytes_;
     bool memory_backed_ = false;
     XvdHeaderInfo header_{};
-    std::array<uint8_t, 32> volume_key_{};
+    std::array<uint8_t, 64> volume_key_{};
     uint32_t volume_key_len_ = 0;
     bool has_volume_key_ = false;
+    std::shared_ptr<crypto::AesXtsPreparedKey> prepared_key_;
 };
 
 }  // namespace scarlettx

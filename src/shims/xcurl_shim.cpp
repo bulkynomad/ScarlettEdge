@@ -25,7 +25,10 @@ struct XCurlEasyHandle {
     std::string url;
     std::string method = "GET";
     std::string user_agent;
+    const char* raw_post_ptr = nullptr;
+    int64_t explicit_post_size = -1;
     std::vector<uint8_t> post_data;
+    std::vector<std::string> headers;
     curl_write_callback write_cb = nullptr;
     void* write_data = nullptr;
     int64_t timeout_sec = 30;
@@ -63,9 +66,19 @@ bool XCurlLiveNetworkEnabled() {
 }
 
 #if defined(_WIN32)
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    int needed = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (needed <= 0) return std::wstring(s.begin(), s.end());
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), needed);
+    return out;
+}
+
 bool XCurlPerformWinHttp(
     const std::string& method,
     const std::string& url,
+    const std::vector<std::string>& headers,
     const std::vector<uint8_t>& post_data,
     int64_t timeout_sec,
     int64_t& out_code,
@@ -87,8 +100,14 @@ bool XCurlPerformWinHttp(
         return false;
     }
 
-    std::wstring wurl(url.begin(), url.end());
-    std::wstring wmethod(method.begin(), method.end());
+    std::wstring wurl = Utf8ToWide(url);
+    std::wstring wmethod = Utf8ToWide(method);
+    std::string hdr_joined;
+    for (const auto& hdr : headers) {
+        hdr_joined += hdr;
+        hdr_joined += "\r\n";
+    }
+    std::wstring wheaders = Utf8ToWide(hdr_joined);
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
     wchar_t host[256] = {};
@@ -112,7 +131,9 @@ bool XCurlPerformWinHttp(
     HINTERNET hReq = fnOpenReq(hConnect, wmethod.c_str(), path[0] ? path : L"/", nullptr, nullptr, nullptr, flags);
     if (!hReq) { fnClose(hConnect); fnClose(hSession); return false; }
 
-    BOOL ok = fnSend(hReq, nullptr, 0,
+    BOOL ok = fnSend(hReq,
+                     wheaders.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : wheaders.c_str(),
+                     static_cast<DWORD>(wheaders.size()),
                      post_data.empty() ? nullptr : const_cast<uint8_t*>(post_data.data()),
                      static_cast<DWORD>(post_data.size()),
                      static_cast<DWORD>(post_data.size()), 0);
@@ -228,15 +249,34 @@ CURLcode curl_easy_setopt(CURL* curl, CURLoption option, ...) {
         }
         case CURLOPT_POSTFIELDS: {
             const char* p = va_arg(args, const char*);
+            h.raw_post_ptr = p;
             if (p) {
-                const size_t len = std::strlen(p);
+                const size_t len = (h.explicit_post_size >= 0)
+                                       ? static_cast<size_t>(h.explicit_post_size)
+                                       : std::strlen(p);
                 h.post_data.assign(reinterpret_cast<const uint8_t*>(p),
                                    reinterpret_cast<const uint8_t*>(p) + len);
+            } else {
+                h.post_data.clear();
             }
             break;
         }
         case CURLOPT_POSTFIELDSIZE: {
-            (void)va_arg(args, long);
+            const long sz = va_arg(args, long);
+            h.explicit_post_size = sz;
+            if (h.raw_post_ptr && sz >= 0) {
+                h.post_data.assign(reinterpret_cast<const uint8_t*>(h.raw_post_ptr),
+                                   reinterpret_cast<const uint8_t*>(h.raw_post_ptr) + static_cast<size_t>(sz));
+            }
+            break;
+        }
+        case 30120: /* CURLOPT_POSTFIELDSIZE_LARGE */ {
+            const int64_t sz = va_arg(args, int64_t);
+            h.explicit_post_size = sz;
+            if (h.raw_post_ptr && sz >= 0) {
+                h.post_data.assign(reinterpret_cast<const uint8_t*>(h.raw_post_ptr),
+                                   reinterpret_cast<const uint8_t*>(h.raw_post_ptr) + static_cast<size_t>(sz));
+            }
             break;
         }
         case CURLOPT_WRITEFUNCTION: {
@@ -248,7 +288,11 @@ CURLcode curl_easy_setopt(CURL* curl, CURLoption option, ...) {
             break;
         }
         case CURLOPT_HTTPHEADER: {
-            (void)va_arg(args, curl_slist*);
+            const curl_slist* list = va_arg(args, const curl_slist*);
+            h.headers.clear();
+            for (const curl_slist* cur = list; cur != nullptr; cur = cur->next) {
+                if (cur->data) h.headers.emplace_back(cur->data);
+            }
             break;
         }
         case CURLOPT_TIMEOUT: {
@@ -294,7 +338,7 @@ CURLcode curl_easy_perform(CURL* curl) {
             int64_t live_code = 0;
             std::vector<uint8_t> live_body;
             if (XCurlLiveNetworkEnabled() &&
-                XCurlPerformWinHttp(h.method, h.url, h.post_data, h.timeout_sec, live_code, live_body)) {
+                XCurlPerformWinHttp(h.method, h.url, h.headers, h.post_data, h.timeout_sec, live_code, live_body)) {
                 h.response_code = live_code;
                 h.content_type = "application/octet-stream";
                 body = std::move(live_body);

@@ -48,7 +48,9 @@ Status PackageVfs::MountXvd(
         return st;
     }
     if (!volume_key_hex.empty()) {
-        st = container->SetVolumeKeyHex(volume_key_hex);
+        st = std::filesystem::exists(volume_key_hex)
+                 ? container->LoadVolumeKeyFile(volume_key_hex)
+                 : container->SetVolumeKeyHex(volume_key_hex);
         if (!st.ok()) {
             return st;
         }

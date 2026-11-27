@@ -8,6 +8,8 @@
 // Structure layouts follow the public GDK reference for dstorage_xs.h and
 // match what a title builds. A vtable slot has a name here only if a title's
 // call confirmed it; the others report themselves when called.
+#include "scarlettx/media/codecs_abi.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -16,8 +18,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <new>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -45,7 +49,7 @@ constexpr uint64_t kOptDestinationPhysical = 1ull << 21;
 constexpr uint64_t kOptSourceMemory = 1ull << 22;
 constexpr uint64_t kOptSourcePhysical = 1ull << 23;
 constexpr uint64_t kOptUnsupported =
-    kOptZlib | kOptBcpack | kOptSwizzle | kOptDestinationPhysical | kOptSourcePhysical;
+    kOptSwizzle | kOptDestinationPhysical | kOptSourcePhysical;
 
 bool TraceEnabled() {
     static const bool on = [] {
@@ -269,21 +273,66 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
     const bool from_memory = (r.options & kOptSourceMemory) != 0;
     if (from_memory != (queue->source_type == 1)) return kInvalidArg;
     if (r.source_size == 0) return kOk;
-    if (!r.destination || !r.source || r.destination_size < r.source_size) return kInvalidArg;
+    const bool is_zlib = (r.options & kOptZlib) != 0;
+    const uint32_t bcpack_fmt = static_cast<uint32_t>((r.options & kOptBcpack) >> 1);
+    const bool compressed = is_zlib || (bcpack_fmt != 0);
+    if (!r.destination || !r.source || (!compressed && r.destination_size < r.source_size)) {
+        return kInvalidArg;
+    }
+
+    uint8_t* dst_ptr = static_cast<uint8_t*>(r.destination) + r.destination_page_offset;
+    std::vector<uint8_t> raw_buf;
+    uint8_t* io_target = compressed ? nullptr : dst_ptr;
+    if (compressed) {
+        raw_buf.resize(r.source_size);
+        io_target = raw_buf.data();
+    }
+
     if (from_memory) {
-        std::memcpy(r.destination, r.source, r.source_size);
-        return kOk;
+        std::memcpy(io_target, r.source, r.source_size);
+    } else {
+        HANDLE file_handle = INVALID_HANDLE_VALUE;
+        {
+            std::lock_guard<std::mutex> lock(entry.file->mu);
+            file_handle = entry.file->handle;
+        }
+        if (file_handle == INVALID_HANDLE_VALUE) return HresultFromWin32(ERROR_INVALID_HANDLE);
+        OVERLAPPED at{};
+        at.Offset = static_cast<DWORD>(r.file_offset);
+        at.OffsetHigh = static_cast<DWORD>(r.file_offset >> 32);
+        at.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        DWORD read = 0;
+        BOOL ok = ReadFile(file_handle, io_target, r.source_size, &read, &at);
+        if (!ok) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                ok = GetOverlappedResult(file_handle, &at, &read, TRUE);
+            }
+        }
+        const DWORD final_err = ok ? 0 : GetLastError();
+        if (at.hEvent) CloseHandle(at.hEvent);
+        if (!ok) return HresultFromWin32(final_err);
+        if (read != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
     }
-    std::lock_guard<std::mutex> lock(entry.file->mu);
-    if (entry.file->handle == INVALID_HANDLE_VALUE) return HresultFromWin32(ERROR_INVALID_HANDLE);
-    OVERLAPPED at{};
-    at.Offset = static_cast<DWORD>(r.file_offset);
-    at.OffsetHigh = static_cast<DWORD>(r.file_offset >> 32);
-    DWORD read = 0;
-    if (!ReadFile(entry.file->handle, r.destination, r.source_size, &read, &at)) {
-        return HresultFromWin32(GetLastError());
+
+    if (is_zlib) {
+        // Dispatch tile-framed GDeflate streams (0x04 0xFB); return E_NOTIMPL for raw RFC 1951 Zlib
+        // or unrecognized payloads without overwriting destination memory.
+        if (raw_buf.size() >= 8 && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu) {
+            size_t written = 0;
+            return XboxCodecGDeflateDecompress(
+                raw_buf.data(), raw_buf.size(), dst_ptr, r.destination_size, &written);
+        }
+        return kNotImpl;
     }
-    return read == r.source_size ? kOk : HresultFromWin32(ERROR_HANDLE_EOF);
+    if (bcpack_fmt != 0) {
+        if (raw_buf.size() >= 8 && std::memcmp(raw_buf.data(), "BCPK", 4) == 0) {
+            return XboxCodecBcPackDecompress(
+                raw_buf.data(), raw_buf.size(), dst_ptr, r.destination_size, bcpack_fmt);
+        }
+        return kNotImpl;
+    }
+    return kOk;
 }
 
 void QueueRun(Queue* queue) {
@@ -457,8 +506,32 @@ int32_t WINAPI FactoryOpenFile(Object* /*self*/, const wchar_t* path, const void
     if (!out) return kPointer;
     *out = nullptr;
     if (!path) return kInvalidArg;
-    const HANDLE handle =
-        CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    std::wstring resolved_path(path);
+    HANDLE handle = CreateFileW(
+        resolved_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+    if (handle == INVALID_HANDLE_VALUE && resolved_path.size() >= 2 && resolved_path[1] == L':') {
+        const wchar_t drv = resolved_path[0];
+        if ((drv == L'G' || drv == L'g' || drv == L'D' || drv == L'd') &&
+            std::getenv("SCARLETTX_PACKAGE_ROOT")) {
+            const char* pkg = std::getenv("SCARLETTX_PACKAGE_ROOT");
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, pkg, -1, nullptr, 0);
+            if (wlen > 1) {
+                std::wstring wpkg(static_cast<size_t>(wlen - 1), L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, pkg, -1, wpkg.data(), wlen);
+                size_t rel_pos = 2;
+                while (rel_pos < resolved_path.size() &&
+                       (resolved_path[rel_pos] == L'\\' || resolved_path[rel_pos] == L'/')) {
+                    ++rel_pos;
+                }
+                const auto candidate = std::filesystem::path(wpkg) / resolved_path.substr(rel_pos);
+                handle = CreateFileW(
+                    candidate.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+            }
+        }
+    }
     if (handle == INVALID_HANDLE_VALUE) {
         const int32_t hr = HresultFromWin32(GetLastError());
         DS_LOG("OpenFile failed: %ls hr=0x%08X", path, static_cast<unsigned>(hr));

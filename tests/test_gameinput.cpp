@@ -206,16 +206,16 @@ int main() {
         Call(device, 2);
 
         // The three things the test title reads from the device information.
-        const auto* info = reinterpret_cast<const uint8_t*>(Call(device, kDevGetDeviceInfo));
-        SX_CHECK(info != nullptr);
+        const auto* raw_info = reinterpret_cast<const uint8_t*>(Call(device, kDevGetDeviceInfo));
+        SX_CHECK(raw_info != nullptr);
         uint32_t supported = 0;
-        std::memcpy(&supported, info + 0x68, sizeof(supported));
+        std::memcpy(&supported, raw_info + 0x68, sizeof(supported));
         SX_CHECK((supported & kKindGamepad) != 0);
         bool id_set = false;
-        for (int i = 0; i < 32; ++i) id_set = id_set || info[0x20 + i] != 0;
+        for (int i = 0; i < 32; ++i) id_set = id_set || raw_info[0x20 + i] != 0;
         SX_CHECK(id_set);
         const uint8_t* name = nullptr;
-        std::memcpy(&name, info + 0x130, sizeof(name));
+        std::memcpy(&name, raw_info + 0x130, sizeof(name));
         SX_CHECK(name != nullptr);
         const char* name_text = nullptr;
         std::memcpy(&name_text, name + 8, sizeof(name_text));

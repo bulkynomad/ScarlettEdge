@@ -43,19 +43,6 @@ constexpr size_t kOffEmbeddedXvdLen = 0x244;
 constexpr size_t kOffUserDataOffset = 0x250;
 constexpr size_t kOffUserDataLength = 0x258;
 
-void TransformSectorXts(
-    bool do_encrypt,
-    uint64_t sector_index,
-    const uint8_t* in_buf,
-    uint8_t* out_buf,
-    size_t len,
-    const std::array<uint8_t, 32>& volume_key,
-    uint32_t key_len) {
-    const size_t effective_len = key_len >= 16 ? key_len : 32;
-    scarlettx::crypto::AesXtsTransformSector(
-        do_encrypt, volume_key.data(), effective_len, sector_index, in_buf, out_buf, len);
-}
-
 int HexNibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
@@ -73,13 +60,18 @@ Status XvdContainer::SetVolumeKey(const uint8_t* key, size_t key_len) {
     const size_t copy_len = std::min<size_t>(key_len, volume_key_.size());
     std::memcpy(volume_key_.data(), key, copy_len);
     volume_key_len_ = static_cast<uint32_t>(copy_len);
+    auto prep = std::make_shared<crypto::AesXtsPreparedKey>();
+    if (!prep->Init(volume_key_.data(), copy_len)) {
+        return Status::Error(StatusCode::InvalidArgument, "Failed to initialize XVD AES-XTS key");
+    }
+    prepared_key_ = std::move(prep);
     has_volume_key_ = true;
     return Status::Ok();
 }
 
 Status XvdContainer::SetVolumeKeyHex(const std::string& hex_key) {
     std::vector<uint8_t> bytes;
-    bytes.reserve(32);
+    bytes.reserve(64);
     size_t i = 0;
     if (hex_key.size() >= 2 && hex_key[0] == '0' && (hex_key[1] == 'x' || hex_key[1] == 'X')) {
         i = 2;
@@ -101,8 +93,8 @@ Status XvdContainer::SetVolumeKeyHex(const std::string& hex_key) {
             high = -1;
         }
     }
-    if (high >= 0 || bytes.size() < 16) {
-        return Status::Error(StatusCode::InvalidArgument, "XVD hex volume key must decode to 16..32 bytes");
+    if (high >= 0 || bytes.size() < 16 || bytes.size() > 64) {
+        return Status::Error(StatusCode::InvalidArgument, "XVD hex volume key must decode to 16..64 bytes");
     }
     return SetVolumeKey(bytes.data(), bytes.size());
 }
@@ -113,10 +105,10 @@ Status XvdContainer::LoadVolumeKeyFile(const std::string& key_file_path) {
         return Status::Error(StatusCode::NotFound, "Failed to open XVD volume key file: " + key_file_path);
     }
     std::vector<uint8_t> raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    if (raw.size() == 16 || raw.size() == 32) {
+    if (raw.size() == 16 || raw.size() == 32 || raw.size() == 64) {
         return SetVolumeKey(raw.data(), raw.size());
     }
-    // Fall back to parsing hex text inside the file (e.g. 32 or 64 hex chars + optional newline).
+    // Fall back to parsing hex text inside the file (e.g. 32, 64, or 128 hex chars + optional newline).
     std::string text(reinterpret_cast<const char*>(raw.data()), raw.size());
     return SetVolumeKeyHex(text);
 }
@@ -248,7 +240,13 @@ Status XvdContainer::ReadUserData(
         if (!st.ok()) {
             return st;
         }
-        TransformSectorXts(false, sector, cipher_sector.data(), plain_sector.data(), sector_avail, volume_key_, volume_key_len_);
+        if (prepared_key_) {
+            prepared_key_->TransformSector(false, sector, cipher_sector.data(), plain_sector.data(), sector_avail);
+        } else {
+            crypto::AesXtsTransformSector(
+                false, volume_key_.data(), volume_key_len_ >= 16 ? volume_key_len_ : 32,
+                sector, cipher_sector.data(), plain_sector.data(), sector_avail);
+        }
 
         const uint64_t copy_start = std::max<uint64_t>(offset, sector_start);
         const uint64_t copy_end = std::min<uint64_t>(offset + size, sector_start + sector_avail);
@@ -294,17 +292,19 @@ std::vector<uint8_t> XvdContainer::BuildEncryptedSyntheticXvd(
     const uint8_t* volume_key,
     size_t key_len,
     uint32_t content_type) {
-    std::array<uint8_t, 32> key{};
+    std::array<uint8_t, 64> key{};
+    const size_t effective_len = (volume_key && key_len >= 16) ? std::min<size_t>(key_len, key.size()) : 32;
     if (volume_key && key_len > 0) {
         std::memcpy(key.data(), volume_key, std::min<size_t>(key_len, key.size()));
     }
+    crypto::AesXtsPreparedKey prep;
+    prep.Init(key.data(), effective_len);
     std::vector<uint8_t> encrypted(user_data.size());
     const uint64_t num_sectors = (user_data.size() + kSectorSize - 1) / kSectorSize;
     for (uint64_t s = 0; s < num_sectors; ++s) {
         const size_t start = static_cast<size_t>(s * kSectorSize);
         const size_t len = std::min<size_t>(kSectorSize, user_data.size() - start);
-        TransformSectorXts(true, s, user_data.data() + start, encrypted.data() + start, len, key,
-                           static_cast<uint32_t>(std::min<size_t>(key_len, key.size())));
+        prep.TransformSector(true, s, user_data.data() + start, encrypted.data() + start, len);
     }
     return BuildSyntheticXvd(encrypted, content_type, true);
 }

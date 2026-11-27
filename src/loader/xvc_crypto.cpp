@@ -30,6 +30,10 @@ int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoInitializeContext(XVC_CRYPTO_CONTEXT*
 
 int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoReleaseContext(XVC_CRYPTO_CONTEXT* context) {
     if (!context) return kInvalidArg;
+    if (context->internalState) {
+        delete static_cast<scarlettx::crypto::AesXtsPreparedKey*>(context->internalState);
+        context->internalState = nullptr;
+    }
     std::memset(context, 0, sizeof(*context));
     return kSuccess;
 }
@@ -37,21 +41,60 @@ int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoReleaseContext(XVC_CRYPTO_CONTEXT* co
 int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoSetVolumeKey(
     XVC_CRYPTO_CONTEXT* context, const uint8_t* key, uint32_t keyLen) {
     if (!context || !key || keyLen < 16) return kInvalidArg;
-    const uint32_t copy_len = std::min<uint32_t>(keyLen, 32);
-    std::memcpy(context->volumeKey, key, copy_len);
-    if (keyLen >= 32) {
-        std::memcpy(context->tweakKey, key + 16, std::min<uint32_t>(keyLen - 16, 32));
+    if (context->internalState) {
+        delete static_cast<scarlettx::crypto::AesXtsPreparedKey*>(context->internalState);
+        context->internalState = nullptr;
     }
-    context->keyLength = copy_len;
+    std::memset(context->volumeKey, 0, sizeof(context->volumeKey));
+    std::memset(context->tweakKey, 0, sizeof(context->tweakKey));
+    const uint32_t capped = std::min<uint32_t>(keyLen, 64u);
+    if (capped >= 64u) {
+        std::memcpy(context->volumeKey, key, 32);
+        std::memcpy(context->tweakKey, key + 32, 32);
+    } else if (capped >= 32u) {
+        std::memcpy(context->volumeKey, key, 32);
+        std::memcpy(context->tweakKey, key + 16, 16);
+    } else {
+        std::memcpy(context->volumeKey, key, capped);
+        std::memcpy(context->tweakKey, key, capped);
+    }
+    context->keyLength = capped;
+    auto* prep = new scarlettx::crypto::AesXtsPreparedKey();
+    if (!prep->Init(key, capped)) {
+        delete prep;
+        return kFail;
+    }
+    context->internalState = prep;
     return kSuccess;
+}
+
+static const scarlettx::crypto::AesXtsPreparedKey* EnsurePreparedKey(XVC_CRYPTO_CONTEXT* context) {
+    if (!context) return nullptr;
+    if (context->internalState) {
+        return static_cast<const scarlettx::crypto::AesXtsPreparedKey*>(context->internalState);
+    }
+    uint8_t combined[64]{};
+    const size_t key_len = context->keyLength >= 16 ? std::min<uint32_t>(context->keyLength, 64u) : 32u;
+    if (key_len >= 64u) {
+        std::memcpy(combined, context->volumeKey, 32);
+        std::memcpy(combined + 32, context->tweakKey, 32);
+    } else {
+        std::memcpy(combined, context->volumeKey, 32);
+    }
+    auto* prep = new scarlettx::crypto::AesXtsPreparedKey();
+    if (!prep->Init(combined, key_len)) {
+        delete prep;
+        return nullptr;
+    }
+    context->internalState = prep;
+    return prep;
 }
 
 int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoDecryptSectorXts(
     XVC_CRYPTO_CONTEXT* context, uint64_t sectorIndex, const uint8_t* inCipher, uint8_t* outPlain, uint32_t sectorSize) {
     if (!context || !inCipher || !outPlain || sectorSize == 0) return kInvalidArg;
-    const size_t key_len = context->keyLength >= 16 ? context->keyLength : 32;
-    if (!scarlettx::crypto::AesXtsTransformSector(
-            false, context->volumeKey, key_len, sectorIndex, inCipher, outPlain, sectorSize)) {
+    const auto* prep = EnsurePreparedKey(context);
+    if (!prep || !prep->TransformSector(false, sectorIndex, inCipher, outPlain, sectorSize)) {
         return kFail;
     }
     context->sectorsProcessed++;
@@ -61,9 +104,8 @@ int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoDecryptSectorXts(
 int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoEncryptSectorXts(
     XVC_CRYPTO_CONTEXT* context, uint64_t sectorIndex, const uint8_t* inPlain, uint8_t* outCipher, uint32_t sectorSize) {
     if (!context || !inPlain || !outCipher || sectorSize == 0) return kInvalidArg;
-    const size_t key_len = context->keyLength >= 16 ? context->keyLength : 32;
-    if (!scarlettx::crypto::AesXtsTransformSector(
-            true, context->volumeKey, key_len, sectorIndex, inPlain, outCipher, sectorSize)) {
+    const auto* prep = EnsurePreparedKey(context);
+    if (!prep || !prep->TransformSector(true, sectorIndex, inPlain, outCipher, sectorSize)) {
         return kFail;
     }
     context->sectorsProcessed++;
@@ -105,8 +147,9 @@ int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoParseManifestSignature(
 int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoDecryptPackageStream(
     XVC_CRYPTO_CONTEXT* context, const uint8_t* inData, uint8_t* outData, uint64_t length) {
     if (!context || !inData || !outData || length == 0) return kInvalidArg;
-    for (uint64_t i = 0; i < length; ++i) {
-        outData[i] = inData[i] ^ context->volumeKey[i % 32];
+    const auto* prep = EnsurePreparedKey(context);
+    if (!prep || !prep->TransformStreamCtr(0, inData, outData, static_cast<size_t>(length))) {
+        return kFail;
     }
     return kSuccess;
 }
@@ -114,9 +157,10 @@ int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoDecryptPackageStream(
 int32_t SCARLETTX_XVC_CRYPTO_CALL XvcCryptoDeriveContentKey(
     const uint8_t* packageKey, const uint8_t* contentId, uint8_t* outKey) {
     if (!packageKey || !contentId || !outKey) return kInvalidArg;
-    for (uint32_t i = 0; i < 32; ++i) {
-        outKey[i] = packageKey[i] ^ contentId[i % 16] ^ static_cast<uint8_t>(i * 3 + 1);
-    }
+    uint8_t material[48]{};
+    std::memcpy(material, packageKey, 32);
+    std::memcpy(material + 32, contentId, 16);
+    ComputeDigest256(material, sizeof(material), outKey);
     return kSuccess;
 }
 

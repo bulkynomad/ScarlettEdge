@@ -37,7 +37,21 @@ struct MemBlock {
 struct AliasBlock {
     void* va = nullptr;
     HANDLE section = nullptr;
+    uintptr_t parent_va = 0;
+    uint64_t offset = 0;
+    uint64_t gpu_va = 0;
     uint64_t size = 0;
+};
+
+struct Win32AddressRequirements {
+    PVOID LowestStartingAddress;
+    PVOID HighestEndingAddress;
+    SIZE_T Alignment;
+};
+
+struct alignas(8) Win32MemExtendedParam {
+    ULONG64 Type; // MemExtendedParameterAddressRequirements = 1
+    PVOID Pointer;
 };
 
 using VirtualAlloc2Fn = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
@@ -63,14 +77,19 @@ const Win32MemApi& MemApi() {
     return api;
 }
 
-void* MapSectionWithPlaceholder(HANDLE section, uint64_t offset, uint64_t size) {
+void* MapSectionWithPlaceholder(HANDLE section, uint64_t offset, uint64_t size, uint32_t alignment = 0) {
     const auto& api = MemApi();
     if (api.virtual_alloc2 && api.map_view3) {
         constexpr ULONG kMemReservePlaceholder = 0x00040000u;
         constexpr ULONG kMemReplacePlaceholder = 0x00004000u;
+        Win32AddressRequirements req{nullptr, nullptr, static_cast<SIZE_T>(alignment)};
+        Win32MemExtendedParam ext{1ull, &req};
+        void* ext_ptr = (alignment > 0x10000u) ? static_cast<void*>(&ext) : nullptr;
+        ULONG ext_cnt = (alignment > 0x10000u) ? 1u : 0u;
+
         void* placeholder = api.virtual_alloc2(
             GetCurrentProcess(), nullptr, static_cast<SIZE_T>(size),
-            MEM_RESERVE | kMemReservePlaceholder, PAGE_NOACCESS, nullptr, 0);
+            MEM_RESERVE | kMemReservePlaceholder, PAGE_NOACCESS, ext_ptr, ext_cnt);
         if (placeholder) {
             void* mapped = api.map_view3(
                 section, GetCurrentProcess(), placeholder, offset, static_cast<SIZE_T>(size),
@@ -134,7 +153,7 @@ int32_t SCARLETTX_KERNELX_CALL KernelXAllocateMemory(
         static_cast<DWORD>(aligned_size & 0xFFFFFFFFu), nullptr);
     bool mapped_view = false;
     if (section) {
-        mem = MapSectionWithPlaceholder(section, 0, aligned_size);
+        mem = MapSectionWithPlaceholder(section, 0, aligned_size, align);
         if (mem) {
             mapped_view = true;
         } else {
@@ -213,6 +232,15 @@ int32_t SCARLETTX_KERNELX_CALL KernelXMapVirtualToGpu(const void* virtualAddress
             return kSuccess;
         }
     }
+#if defined(_WIN32)
+    for (const auto& kv : State().aliases) {
+        const uintptr_t base = kv.first;
+        if (va >= base && va < base + kv.second.size) {
+            *outGpuAddress = kv.second.gpu_va + (va - base);
+            return kSuccess;
+        }
+    }
+#endif
     return kInvalidArg;
 }
 
@@ -235,24 +263,30 @@ int32_t SCARLETTX_KERNELX_CALL KernelXCreateMemoryAlias(
     *outAliasVirtualAddress = nullptr;
 #if defined(_WIN32)
     HANDLE dup_section = nullptr;
+    uint64_t alias_gpu_va = 0;
+    uint32_t page_align = 0;
+    const uintptr_t parent_va = reinterpret_cast<uintptr_t>(existingVirtualAddress);
     {
         std::lock_guard<std::mutex> lk(State().mu);
-        auto it = State().by_va.find(reinterpret_cast<uintptr_t>(existingVirtualAddress));
+        auto it = State().by_va.find(parent_va);
         if (it == State().by_va.end() || !it->second.section) return kInvalidArg;
         if (offset > it->second.size || size > it->second.size - offset) return kInvalidArg;
+        alias_gpu_va = it->second.gpu_va + offset;
+        page_align = it->second.page_size;
         if (!DuplicateHandle(GetCurrentProcess(), it->second.section, GetCurrentProcess(),
                              &dup_section, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
             return kOutOfMemory;
         }
     }
-    void* alias_va = MapSectionWithPlaceholder(dup_section, offset, size);
+    void* alias_va = MapSectionWithPlaceholder(dup_section, offset, size, page_align);
     if (!alias_va) {
         CloseHandle(dup_section);
         return kOutOfMemory;
     }
     {
         std::lock_guard<std::mutex> lk(State().mu);
-        State().aliases[reinterpret_cast<uintptr_t>(alias_va)] = AliasBlock{alias_va, dup_section, size};
+        State().aliases[reinterpret_cast<uintptr_t>(alias_va)] =
+            AliasBlock{alias_va, dup_section, parent_va, offset, alias_gpu_va, size};
     }
     *outAliasVirtualAddress = alias_va;
     return kSuccess;

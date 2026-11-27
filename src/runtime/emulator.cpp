@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <iostream>
 
+#include "scarlettx/loader/package_vfs.h"
 #include "scarlettx/loader/pe_mapper.h"
 #include "scarlettx/runtime/virtual_drive.h"
 
@@ -107,6 +108,28 @@ Status Emulator::BootPackage(const std::string& package_dir) {
     const std::string abs_pkg_dir = std::filesystem::absolute(package_dir).string();
     set_env("SCARLETTX_PACKAGE_ROOT", abs_pkg_dir.c_str());
 
+    if (!config_.volume_key.empty()) {
+        set_env("SCARLETTX_VOLUME_KEY", config_.volume_key.c_str());
+    }
+
+    // Mount package directory and any embedded .xvd / .xvc containers into VFS.
+    PackageVfs pkg_vfs;
+    (void)pkg_vfs.MountDirectory("G:", abs_pkg_dir);
+    std::error_code dir_ec;
+    for (const auto& entry : std::filesystem::directory_iterator(abs_pkg_dir, dir_ec)) {
+        if (!entry.is_regular_file(dir_ec)) continue;
+        std::string ext = entry.path().extension().string();
+        for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (ext == ".xvd" || ext == ".xvc") {
+            const std::string vpath = "G:\\" + entry.path().filename().string();
+            Status xvd_st = pkg_vfs.MountXvd(vpath, entry.path().string(), config_.volume_key);
+            if (!xvd_st.ok()) {
+                return xvd_st;
+            }
+            std::cout << "[ScarlettX][vfs] Mounted container " << entry.path().filename().string() << "\n";
+        }
+    }
+
     // Real Xbox Series X|S titles (e.g. Unity Game Core nativePlugins.txt) reference G:/.
     // The mapping is skipped when G: is already assigned on the host.
     struct VirtualDriveGuard {
@@ -203,7 +226,7 @@ Status Emulator::BootPackage(const std::string& package_dir) {
         SetEnvironmentVariableA("PATH", new_path.c_str());
     }
     if (std::filesystem::exists(std::filesystem::path(work_dir) / "xgameruntime.dll")) {
-        std::cerr << "[ScarlettX][loader] Notice: Local xgameruntime.dll detected in title folder; prioritizing emulator shim directory.\n";
+        std::cerr << "[ScarlettX][loader] Warning: Local xgameruntime.dll in title folder overrides SetDllDirectory/PATH in --separate-process mode; use default --in-process mode to force HLE shims.\n";
     }
     const BOOL created = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
                                         work_dir.c_str(), &si, &pi);
@@ -217,7 +240,14 @@ Status Emulator::BootPackage(const std::string& package_dir) {
                              "CreateProcessA failed for guest executable: " + report.executable_path);
     }
 
-    const bool timed_out = WaitForSingleObject(pi.hProcess, 60000) == WAIT_TIMEOUT;
+    DWORD timeout_ms = INFINITE;
+    if (const char* env_to = std::getenv("SCARLETTX_PROCESS_TIMEOUT_MS"); env_to && *env_to) {
+        const unsigned long parsed = std::strtoul(env_to, nullptr, 10);
+        if (parsed > 0) timeout_ms = static_cast<DWORD>(parsed);
+    } else if (config_.max_frames > 0) {
+        timeout_ms = 60000;
+    }
+    const bool timed_out = WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_TIMEOUT;
     if (timed_out) {
         TerminateProcess(pi.hProcess, 1);
         WaitForSingleObject(pi.hProcess, 5000);
@@ -228,7 +258,7 @@ Status Emulator::BootPackage(const std::string& package_dir) {
     CloseHandle(pi.hProcess);
 
     if (timed_out) {
-        return Status::Error(StatusCode::DeviceError, "Guest process did not exit within 60 seconds and was stopped");
+        return Status::Error(StatusCode::DeviceError, "Guest process timed out and was stopped");
     }
 
     if (exit_code != 0) {

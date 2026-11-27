@@ -1190,7 +1190,9 @@ XGameResult XGameSaveSubmitUpdateResult(XAsyncBlock* async) {
     if (!async) {
         return XGR_E_INVALIDARG;
     }
-    return XAsyncGetStatus(async, true);
+    XGameResult hr = XAsyncGetStatus(async, true);
+    xgr::ReleaseHleAsyncResult(async);
+    return hr;
 }
 
 XGameResult XGameSaveReadBlobData(
@@ -1723,8 +1725,30 @@ XGameResult XThreadGetTimeSensitive(bool* isTimeSensitive) {
     return XGR_S_OK;
 }
 
-XGameResult XThreadSetTimeSensitiveThread(uint32_t /*threadId*/, bool isTimeSensitive) {
+XGameResult XThreadSetTimeSensitiveThread(uint32_t threadId, bool isTimeSensitive) {
+    static std::mutex ts_mu;
+    static std::unordered_map<uint32_t, bool> ts_by_tid;
+    {
+        std::lock_guard<std::mutex> lock(ts_mu);
+        ts_by_tid[threadId] = isTimeSensitive;
+    }
+#if defined(_WIN32)
+    bool other_live_thread = false;
+    if (threadId != 0 && threadId != GetCurrentThreadId()) {
+        if (HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, threadId)) {
+            DWORD pid = GetProcessIdOfThread(h);
+            CloseHandle(h);
+            if (pid == GetCurrentProcessId()) {
+                other_live_thread = true;
+            }
+        }
+    }
+    if (!other_live_thread) {
+        g_thread_time_sensitive = isTimeSensitive;
+    }
+#else
     g_thread_time_sensitive = isTimeSensitive;
+#endif
     return XGR_S_OK;
 }
 

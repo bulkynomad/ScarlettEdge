@@ -97,6 +97,39 @@ int main() {
         SX_CHECK(XvcCryptoReleaseContext(&vctx) == 0);
     }
 
+    // 9. Full 64-byte AES-256-XTS + IEEE 1619 CTS non-aligned tail (37 bytes) + AES-CTR stream roundtrip
+    {
+        XVC_CRYPTO_CONTEXT ctx256{};
+        SX_CHECK(XvcCryptoInitializeContext(&ctx256) == 0);
+        uint8_t key64_a[64]{};
+        uint8_t key64_b[64]{};
+        for (int i = 0; i < 64; ++i) {
+            key64_a[i] = static_cast<uint8_t>(i + 1);
+            key64_b[i] = static_cast<uint8_t>(i + 1);
+        }
+        key64_b[48] ^= 0xFFu; // Differs only in second 32B half (tweak key K2), proving 64B key is not truncated!
+
+        uint8_t cts_plain[37]{};
+        for (int i = 0; i < 37; ++i) cts_plain[i] = static_cast<uint8_t>(0x30 + i);
+        uint8_t cts_cipher_a[37]{}, cts_cipher_b[37]{}, cts_dec[37]{};
+
+        SX_CHECK(XvcCryptoSetVolumeKey(&ctx256, key64_a, 64) == 0);
+        SX_CHECK(XvcCryptoEncryptSectorXts(&ctx256, 7, cts_plain, cts_cipher_a, 37) == 0);
+        SX_CHECK(XvcCryptoDecryptSectorXts(&ctx256, 7, cts_cipher_a, cts_dec, 37) == 0);
+        SX_CHECK(std::memcmp(cts_plain, cts_dec, 37) == 0);
+
+        SX_CHECK(XvcCryptoSetVolumeKey(&ctx256, key64_b, 64) == 0);
+        SX_CHECK(XvcCryptoEncryptSectorXts(&ctx256, 7, cts_plain, cts_cipher_b, 37) == 0);
+        SX_CHECK(std::memcmp(cts_cipher_a, cts_cipher_b, 37) != 0);
+
+        uint8_t stream_cipher[37]{}, stream_dec[37]{};
+        SX_CHECK(XvcCryptoDecryptPackageStream(&ctx256, cts_plain, stream_cipher, 37) == 0);
+        SX_CHECK(std::memcmp(cts_plain, stream_cipher, 37) != 0);
+        SX_CHECK(XvcCryptoDecryptPackageStream(&ctx256, stream_cipher, stream_dec, 37) == 0);
+        SX_CHECK(std::memcmp(cts_plain, stream_dec, 37) == 0);
+        SX_CHECK(XvcCryptoReleaseContext(&ctx256) == 0);
+    }
+
     std::cout << "[test_xvc_crypto] All 12 XvcCrypto APIs + NIST SHA-256 & IEEE 1619 AES-XTS vectors verified!\n";
     return 0;
 }

@@ -181,6 +181,14 @@ int main() {
     SX_CHECK(CompileHlslToDxbc(ps_src, "main", "ps_5_0", ps_dxbc).ok());
     SX_CHECK(CompileHlslToDxbc(cs_src, "main", "cs_5_0", cs_dxbc).ok());
 
+    // Verify retail DXBC modified-MD5 checksum matches Microsoft d3dcompiler byte-for-byte
+    for (const auto* orig_blob : {&vs_dxbc, &ps_dxbc, &cs_dxbc}) {
+        std::vector<uint8_t> copy_blob = *orig_blob;
+        std::memset(copy_blob.data() + 4, 0, 16);
+        SX_CHECK(UpdateDxbcContainerChecksum(copy_blob.data(), copy_blob.size()));
+        SX_CHECK(std::memcmp(copy_blob.data() + 4, orig_blob->data() + 4, 16) == 0);
+    }
+
     // Inspect compiled shaders through the d3d12_xs C ABI
     D3D12XBOX_SHADER_BYTECODE cs_bc{cs_dxbc.data(), cs_dxbc.size()};
     D3D12XBOX_SHADER_INSPECTION cs_insp{};

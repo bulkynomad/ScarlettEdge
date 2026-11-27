@@ -129,37 +129,72 @@ inline bool ComputeSha256(const uint8_t* data, size_t len, uint8_t out_digest[32
     return true;
 }
 
-// IEEE 1619 / NIST SP 800-38E AES-XTS sector transform (encrypt or decrypt).
-// Supports 32-byte keys (AES-128-XTS: 16B K1 + 16B K2), 16-byte keys (K1=K2), and 64-byte keys (AES-256-XTS).
-inline bool AesXtsTransformSector(
-    bool do_encrypt,
-    const uint8_t* key,
-    size_t key_len,
-    uint64_t sector_index,
-    const uint8_t* in_buf,
-    uint8_t* out_buf,
-    size_t len) {
-    if (!key || key_len < 16 || !in_buf || !out_buf || len == 0) return false;
+// Cached CNG AES-XTS key pair (eliminates per-sector BCryptGenerateSymmetricKey overhead).
+// Supports 16B (K1=K2 AES-128), 32B (AES-128-XTS: 16B K1 + 16B K2), and 64B (AES-256-XTS: 32B K1 + 32B K2).
+struct AesXtsPreparedKey {
+    std::array<uint8_t, 64> raw_key{};
+    size_t raw_key_len = 0;
+#if defined(_WIN32)
+    BCRYPT_KEY_HANDLE hk1 = nullptr;
+    BCRYPT_KEY_HANDLE hk2 = nullptr;
+    bool cng_ready = false;
+#endif
 
-    const uint8_t* k1 = key;
-    const uint8_t* k2 = key;
-    ULONG aes_key_bytes = 16;
-    if (key_len >= 64) {
-        aes_key_bytes = 32;
-        k2 = key + 32;
-    } else if (key_len >= 32) {
-        aes_key_bytes = 16;
-        k2 = key + 16;
+    AesXtsPreparedKey() = default;
+    AesXtsPreparedKey(const AesXtsPreparedKey&) = delete;
+    AesXtsPreparedKey& operator=(const AesXtsPreparedKey&) = delete;
+
+    ~AesXtsPreparedKey() { Reset(); }
+
+    void Reset() {
+#if defined(_WIN32)
+        const auto& api = Cng();
+        if (api.destroy_key) {
+            if (hk2) { api.destroy_key(hk2); hk2 = nullptr; }
+            if (hk1) { api.destroy_key(hk1); hk1 = nullptr; }
+        }
+        cng_ready = false;
+#endif
+        raw_key.fill(0);
+        raw_key_len = 0;
     }
 
+    bool Init(const uint8_t* key, size_t key_len) {
+        Reset();
+        if (!key || key_len < 16) return false;
+        raw_key_len = std::min<size_t>(key_len, 64);
+        std::memcpy(raw_key.data(), key, raw_key_len);
+
 #if defined(_WIN32)
-    const auto& api = Cng();
-    if (api.aes_ecb_alg && api.gen_key && api.destroy_key && api.encrypt && api.decrypt) {
-        BCRYPT_KEY_HANDLE hk1 = nullptr;
-        BCRYPT_KEY_HANDLE hk2 = nullptr;
-        if (api.gen_key(api.aes_ecb_alg, &hk1, nullptr, 0, const_cast<PUCHAR>(k1), aes_key_bytes, 0) >= 0 &&
-            api.gen_key(api.aes_ecb_alg, &hk2, nullptr, 0, const_cast<PUCHAR>(k2), aes_key_bytes, 0) >= 0) {
-            // Compute initial tweak T = AES_ECB_Encrypt(K2, LE128(sector_index))
+        const uint8_t* k1 = raw_key.data();
+        const uint8_t* k2 = raw_key.data();
+        ULONG aes_key_bytes = 16;
+        if (raw_key_len >= 64) {
+            aes_key_bytes = 32;
+            k2 = raw_key.data() + 32;
+        } else if (raw_key_len >= 32) {
+            aes_key_bytes = 16;
+            k2 = raw_key.data() + 16;
+        }
+        const auto& api = Cng();
+        if (api.aes_ecb_alg && api.gen_key && api.destroy_key && api.encrypt && api.decrypt) {
+            if (api.gen_key(api.aes_ecb_alg, &hk1, nullptr, 0, const_cast<PUCHAR>(k1), aes_key_bytes, 0) >= 0 &&
+                api.gen_key(api.aes_ecb_alg, &hk2, nullptr, 0, const_cast<PUCHAR>(k2), aes_key_bytes, 0) >= 0) {
+                cng_ready = true;
+            } else {
+                if (hk1) { api.destroy_key(hk1); hk1 = nullptr; }
+                if (hk2) { api.destroy_key(hk2); hk2 = nullptr; }
+            }
+        }
+#endif
+        return true;
+    }
+
+    bool TransformSector(bool do_encrypt, uint64_t sector_index, const uint8_t* in_buf, uint8_t* out_buf, size_t len) const {
+        if (raw_key_len < 16 || !in_buf || !out_buf || len == 0) return false;
+#if defined(_WIN32)
+        if (cng_ready) {
+            const auto& api = Cng();
             uint8_t tweak[16]{};
             for (int i = 0; i < 8; ++i) {
                 tweak[i] = static_cast<uint8_t>((sector_index >> (i * 8)) & 0xFFu);
@@ -171,7 +206,9 @@ inline bool AesXtsTransformSector(
             const size_t rem = len % 16;
             uint8_t block[16]{};
 
-            for (size_t b = 0; ok && b < full_blocks; ++b) {
+            // NIST SP 800-38E / IEEE 1619 ciphertext stealing (CTS) when len >= 16 and rem > 0
+            const size_t main_blocks = (rem > 0 && full_blocks >= 1) ? (full_blocks - 1) : full_blocks;
+            for (size_t b = 0; ok && b < main_blocks; ++b) {
                 const uint8_t* src = in_buf + b * 16;
                 uint8_t* dst = out_buf + b * 16;
                 for (int i = 0; i < 16; ++i) block[i] = static_cast<uint8_t>(src[i] ^ tweak[i]);
@@ -183,34 +220,107 @@ inline bool AesXtsTransformSector(
                 Gf128MulAlpha(tweak);
             }
 
-            // Handle non-block-aligned tail (synthetic partial final sector) deterministically
             if (ok && rem > 0) {
-                uint8_t mask[16]{};
-                ok = api.encrypt(hk1, tweak, 16, nullptr, nullptr, 0, mask, 16, &cb_out, 0) >= 0;
-                if (ok) {
-                    const size_t base = full_blocks * 16;
-                    for (size_t i = 0; i < rem; ++i) {
-                        out_buf[base + i] = static_cast<uint8_t>(in_buf[base + i] ^ mask[i]);
+                if (full_blocks >= 1) {
+                    // IEEE 1619 / NIST SP 800-38E XTS Ciphertext Stealing on penultimate + partial block
+                    uint8_t t_penult[16]{};
+                    uint8_t t_last[16]{};
+                    std::memcpy(t_penult, tweak, 16);
+                    std::memcpy(t_last, tweak, 16);
+                    Gf128MulAlpha(t_last);
+
+                    const uint8_t* t1 = do_encrypt ? t_penult : t_last;
+                    const uint8_t* t2 = do_encrypt ? t_last : t_penult;
+                    const size_t penult_off = (full_blocks - 1) * 16;
+                    const size_t last_off = full_blocks * 16;
+
+                    uint8_t cc[16]{};
+                    for (int i = 0; i < 16; ++i) block[i] = static_cast<uint8_t>(in_buf[penult_off + i] ^ t1[i]);
+                    NTSTATUS st1 = do_encrypt
+                        ? api.encrypt(hk1, block, 16, nullptr, nullptr, 0, block, 16, &cb_out, 0)
+                        : api.decrypt(hk1, block, 16, nullptr, nullptr, 0, block, 16, &cb_out, 0);
+                    if (st1 < 0) ok = false;
+                    for (int i = 0; i < 16; ++i) cc[i] = static_cast<uint8_t>(block[i] ^ t1[i]);
+
+                    if (ok) {
+                        uint8_t pp[16]{};
+                        std::memcpy(pp, in_buf + last_off, rem);
+                        std::memcpy(pp + rem, cc + rem, 16 - rem);
+                        std::memcpy(out_buf + last_off, cc, rem);
+
+                        for (int i = 0; i < 16; ++i) block[i] = static_cast<uint8_t>(pp[i] ^ t2[i]);
+                        NTSTATUS st2 = do_encrypt
+                            ? api.encrypt(hk1, block, 16, nullptr, nullptr, 0, block, 16, &cb_out, 0)
+                            : api.decrypt(hk1, block, 16, nullptr, nullptr, 0, block, 16, &cb_out, 0);
+                        if (st2 < 0) ok = false;
+                        for (int i = 0; i < 16; ++i) out_buf[penult_off + i] = static_cast<uint8_t>(block[i] ^ t2[i]);
+                    }
+                } else {
+                    // Sub-16-byte synthetic buffer fallback via AES-ECB keystream mask
+                    uint8_t mask[16]{};
+                    ok = api.encrypt(hk1, tweak, 16, nullptr, nullptr, 0, mask, 16, &cb_out, 0) >= 0;
+                    if (ok) {
+                        for (size_t i = 0; i < rem; ++i) {
+                            out_buf[i] = static_cast<uint8_t>(in_buf[i] ^ mask[i]);
+                        }
                     }
                 }
             }
-
-            api.destroy_key(hk2);
-            api.destroy_key(hk1);
             if (ok) return true;
-        } else {
-            if (hk1) api.destroy_key(hk1);
-            if (hk2) api.destroy_key(hk2);
         }
-    }
 #endif
-
-    // Portable fallback if CNG is unavailable
-    for (size_t i = 0; i < len; ++i) {
-        const uint8_t tw = static_cast<uint8_t>((sector_index >> ((i % 8) * 8)) & 0xFFu);
-        out_buf[i] = static_cast<uint8_t>(in_buf[i] ^ key[i % key_len] ^ tw);
+        for (size_t i = 0; i < len; ++i) {
+            const uint8_t tw = static_cast<uint8_t>((sector_index >> ((i % 8) * 8)) & 0xFFu);
+            out_buf[i] = static_cast<uint8_t>(in_buf[i] ^ raw_key[i % raw_key_len] ^ tw);
+        }
+        return true;
     }
-    return true;
+
+    // Symmetric AES-CTR stream transform using cached hk1 (for package stream decryption).
+    bool TransformStreamCtr(uint64_t initial_counter, const uint8_t* in_buf, uint8_t* out_buf, size_t len) const {
+        if (raw_key_len < 16 || !in_buf || !out_buf || len == 0) return false;
+#if defined(_WIN32)
+        if (cng_ready) {
+            const auto& api = Cng();
+            uint8_t ctr[16]{};
+            uint8_t ks[16]{};
+            ULONG cb_out = 0;
+            uint64_t block_idx = initial_counter;
+            size_t pos = 0;
+            while (pos < len) {
+                for (int i = 0; i < 8; ++i) {
+                    ctr[i] = static_cast<uint8_t>((block_idx >> (i * 8)) & 0xFFu);
+                }
+                if (api.encrypt(hk1, ctr, 16, nullptr, nullptr, 0, ks, 16, &cb_out, 0) < 0) break;
+                const size_t chunk = std::min<size_t>(16, len - pos);
+                for (size_t i = 0; i < chunk; ++i) {
+                    out_buf[pos + i] = static_cast<uint8_t>(in_buf[pos + i] ^ ks[i]);
+                }
+                pos += chunk;
+                ++block_idx;
+            }
+            if (pos == len) return true;
+        }
+#endif
+        for (size_t i = 0; i < len; ++i) {
+            out_buf[i] = static_cast<uint8_t>(in_buf[i] ^ raw_key[i % raw_key_len]);
+        }
+        return true;
+    }
+};
+
+// IEEE 1619 / NIST SP 800-38E AES-XTS sector transform (one-shot convenience wrapper).
+inline bool AesXtsTransformSector(
+    bool do_encrypt,
+    const uint8_t* key,
+    size_t key_len,
+    uint64_t sector_index,
+    const uint8_t* in_buf,
+    uint8_t* out_buf,
+    size_t len) {
+    AesXtsPreparedKey prep;
+    if (!prep.Init(key, key_len)) return false;
+    return prep.TransformSector(do_encrypt, sector_index, in_buf, out_buf, len);
 }
 
 }  // namespace scarlettx::crypto

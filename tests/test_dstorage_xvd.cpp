@@ -337,7 +337,7 @@ int main() {
     SX_CHECK_EQ(DStorageEnqueueRequest(queue, &cancel_req), 0);
     SX_CHECK_EQ(DStorageCancelRequestsWithTag(queue, cancel_mask, cancel_value), 0);
     // Requests added after the cancellation still run, even with the same tag.
-    std::fill(dst.begin(), dst.end(), 0);
+    std::fill(dst.begin(), dst.end(), uint8_t{0});
     DSTORAGE_REQUEST later_req = cancel_req;
     later_req.DestinationMemory = dst.data();
     later_req.Name = "ReadAfterCancellation";

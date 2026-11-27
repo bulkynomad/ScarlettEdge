@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "scarlettx/gpu/xg_layout.h"
 #include <sstream>
 #include <unordered_map>
@@ -23,6 +25,12 @@
 #include "scarlettx/gpu/shader_ir.h"
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -2181,9 +2189,41 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListBarrier(
     if (obj && obj->pc_list && numBarrierGroups > 0 && pBarrierGroups) {
         ID3D12GraphicsCommandList7* cl7 = nullptr;
         if (SUCCEEDED(obj->pc_list->QueryInterface(IID_PPV_ARGS(&cl7))) && cl7) {
-            cl7->Barrier(
-                static_cast<UINT32>(numBarrierGroups),
-                reinterpret_cast<const D3D12_BARRIER_GROUP*>(pBarrierGroups));
+            const auto* in_groups = reinterpret_cast<const D3D12_BARRIER_GROUP*>(pBarrierGroups);
+            std::vector<D3D12_BARRIER_GROUP> groups(in_groups, in_groups + numBarrierGroups);
+            std::vector<std::vector<D3D12_TEXTURE_BARRIER>> tex_storage;
+            std::vector<std::vector<D3D12_BUFFER_BARRIER>> buf_storage;
+            tex_storage.reserve(static_cast<size_t>(numBarrierGroups));
+            buf_storage.reserve(static_cast<size_t>(numBarrierGroups));
+
+            for (size_t g = 0; g < groups.size(); ++g) {
+                if (groups[g].Type == D3D12_BARRIER_TYPE_TEXTURE && groups[g].NumBarriers > 0 &&
+                    groups[g].pTextureBarriers) {
+                    tex_storage.emplace_back(
+                        groups[g].pTextureBarriers,
+                        groups[g].pTextureBarriers + groups[g].NumBarriers);
+                    for (auto& tb : tex_storage.back()) {
+                        if (tb.pResource) {
+                            auto* rp = reinterpret_cast<XboxD3D12ResourceProxy*>(tb.pResource);
+                            tb.pResource = rp->pc_res;
+                        }
+                    }
+                    groups[g].pTextureBarriers = tex_storage.back().data();
+                } else if (groups[g].Type == D3D12_BARRIER_TYPE_BUFFER && groups[g].NumBarriers > 0 &&
+                           groups[g].pBufferBarriers) {
+                    buf_storage.emplace_back(
+                        groups[g].pBufferBarriers,
+                        groups[g].pBufferBarriers + groups[g].NumBarriers);
+                    for (auto& bb : buf_storage.back()) {
+                        if (bb.pResource) {
+                            auto* rp = reinterpret_cast<XboxD3D12ResourceProxy*>(bb.pResource);
+                            bb.pResource = rp->pc_res;
+                        }
+                    }
+                    groups[g].pBufferBarriers = buf_storage.back().data();
+                }
+            }
+            cl7->Barrier(static_cast<UINT32>(groups.size()), groups.data());
             cl7->Release();
         }
     }
@@ -3019,13 +3059,22 @@ const auto kXboxCommandQueueProxyVtbl = BuildQueueProxyVtable();
 
 // Titles built against a later SDK (D3D12XboxCreateDevice version 0x20004,
 // against 0x20001 for the table above) find two more methods ahead of
-// Signal. Only the slots a title was seen calling have a name here.
+// Signal, shifting slots >= 14 by +2.
 std::array<ComVtableFn, 64> BuildQueueProxyVtableV4() {
     auto vtbl = MakeQueueProxyVtable(std::make_index_sequence<61>{});
     vtbl[6] = &QueueProxySetName;
     vtbl[10] = &QueueProxyExecuteCommandLists;
-    vtbl[16] = &QueueProxySignal;    // +0x80, observed at 0x1404f6166
-    vtbl[32] = &QueueProxyPresentX;  // +0x100, observed at 0x1404f60d3
+    vtbl[11] = &QueueProxyNoop;
+    vtbl[12] = &QueueProxyNoop;
+    vtbl[13] = &QueueProxyNoop;
+    vtbl[14] = &QueueProxyNoop;
+    vtbl[15] = &QueueProxyNoop;
+    vtbl[16] = &QueueProxySignal;                // +0x80, observed at 0x1404f6166
+    vtbl[17] = &QueueProxyWait;                  // +0x88
+    vtbl[18] = &QueueProxyGetTimestampFrequency; // +0x90
+    vtbl[19] = &QueueProxyGetClockCalibration;   // +0x98
+    vtbl[20] = &QueueProxyGetDesc;               // +0xa0
+    vtbl[32] = &QueueProxyPresentX;              // +0x100, observed at 0x1404f60d3
     return vtbl;
 }
 
@@ -3411,6 +3460,22 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandAllocator(
 #endif
 }
 
+#if defined(_WIN32)
+void TranslateGuestShaderStageIfNeeded(
+    D3D12_SHADER_BYTECODE& stage,
+    std::vector<uint8_t>& out_owned) {
+    if (!stage.pShaderBytecode || stage.BytecodeLength < 32) return;
+    const auto* bytes = static_cast<const uint8_t*>(stage.pShaderBytecode);
+    std::vector<uint8_t> src(bytes, bytes + stage.BytecodeLength);
+    scarlettx::ShaderTranslationResult tr{};
+    if (scarlettx::TranslateXboxShaderToPc(src, tr).ok() && tr.stripped_xbox_chunks > 0) {
+        out_owned = std::move(tr.pc_bytecode);
+        stage.pShaderBytecode = out_owned.data();
+        stage.BytecodeLength = out_owned.size();
+    }
+}
+#endif
+
 intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
     void* self, uintptr_t pDesc, uintptr_t /*riid*/, uintptr_t ppPso) {
 #if defined(_WIN32)
@@ -3423,6 +3488,12 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
         desc.pRootSignature = reinterpret_cast<ID3D12RootSignature*>(
             reinterpret_cast<XboxD3D12SimpleObjectProxy*>(desc.pRootSignature)->pc_obj);
     }
+    std::vector<uint8_t> vs_owned, ps_owned, ds_owned, hs_owned, gs_owned;
+    TranslateGuestShaderStageIfNeeded(desc.VS, vs_owned);
+    TranslateGuestShaderStageIfNeeded(desc.PS, ps_owned);
+    TranslateGuestShaderStageIfNeeded(desc.DS, ds_owned);
+    TranslateGuestShaderStageIfNeeded(desc.HS, hs_owned);
+    TranslateGuestShaderStageIfNeeded(desc.GS, gs_owned);
     ID3D12PipelineState* pc_pso = nullptr;
     const HRESULT hr = obj->pc_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pc_pso));
     if (TraceEnabled()) {
@@ -3460,6 +3531,8 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateComputePipelineState(
         desc.pRootSignature = reinterpret_cast<ID3D12RootSignature*>(
             reinterpret_cast<XboxD3D12SimpleObjectProxy*>(desc.pRootSignature)->pc_obj);
     }
+    std::vector<uint8_t> cs_owned;
+    TranslateGuestShaderStageIfNeeded(desc.CS, cs_owned);
     ID3D12PipelineState* pc_pso = nullptr;
     const HRESULT hr = obj->pc_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pc_pso));
     if (TraceEnabled()) {
@@ -4138,6 +4211,57 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxySetFrameIntervalX(
     return 0;
 }
 
+#if defined(_WIN32)
+void EnqueueDelayedEventSignal(HANDLE hEvent, uint64_t offset_us) {
+    if (!hEvent) return;
+    if (offset_us == 0) {
+        SetEvent(hEvent);
+        return;
+    }
+    struct DelayedSignalScheduler {
+        using Clock = std::chrono::steady_clock;
+        struct Item {
+            Clock::time_point due;
+            HANDLE ev;
+            bool operator>(const Item& o) const { return due > o.due; }
+        };
+        std::mutex mu;
+        std::condition_variable cv;
+        std::vector<Item> heap;
+        DelayedSignalScheduler() {
+            std::thread([this]() {
+                std::unique_lock<std::mutex> lk(mu);
+                for (;;) {
+                    if (heap.empty()) {
+                        cv.wait(lk);
+                        continue;
+                    }
+                    const auto now = Clock::now();
+                    if (heap.front().due > now) {
+                        cv.wait_until(lk, heap.front().due);
+                        continue;
+                    }
+                    std::pop_heap(heap.begin(), heap.end(), std::greater<Item>{});
+                    HANDLE target = heap.back().ev;
+                    heap.pop_back();
+                    lk.unlock();
+                    SetEvent(target);
+                    lk.lock();
+                }
+            }).detach();
+        }
+        void Schedule(HANDLE ev, uint64_t us) {
+            std::lock_guard<std::mutex> lk(mu);
+            heap.push_back(Item{Clock::now() + std::chrono::microseconds(us), ev});
+            std::push_heap(heap.begin(), heap.end(), std::greater<Item>{});
+            cv.notify_one();
+        }
+    };
+    static DelayedSignalScheduler* sched = new DelayedSignalScheduler();
+    sched->Schedule(hEvent, offset_us);
+}
+#endif
+
 // Observed Xbox device slot 79 (+0x278) at 0x14052f51e: ScheduleFrameEventX(eventType, offset, pEvent, flags).
 intptr_t SCARLETTX_GDK_CALLBACK ProxyScheduleFrameEventX(
     void* /*self*/, uintptr_t eventType, uintptr_t offset, uintptr_t pEvent) {
@@ -4147,16 +4271,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyScheduleFrameEventX(
     }
 #if defined(_WIN32)
     if (pEvent) {
-        HANDLE hEvent = reinterpret_cast<HANDLE>(pEvent);
-        if (offset == 0) {
-            SetEvent(hEvent);
-        } else {
-            std::thread([hEvent, offset]() {
-                const uint32_t ms = static_cast<uint32_t>((offset + 999) / 1000);
-                Sleep(ms > 0 ? ms : 1);
-                SetEvent(hEvent);
-            }).detach();
-        }
+        EnqueueDelayedEventSignal(reinterpret_cast<HANDLE>(pEvent), static_cast<uint64_t>(offset));
     }
 #endif
     return 0;
@@ -4235,15 +4350,34 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxySetStablePowerState(void* self, uintptr_t e
     return 0;
 }
 
-intptr_t SCARLETTX_GDK_CALLBACK ProxyGetAdapterLuid(void* self, uintptr_t pOutLuid, uintptr_t, uintptr_t) {
+intptr_t SCARLETTX_GDK_CALLBACK ProxyGetAdapterLuid(void* arg0, uintptr_t arg1, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
-    auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
-    if (obj && obj->pc_device && pOutLuid) {
-        *reinterpret_cast<LUID*>(pOutLuid) = obj->pc_device->GetAdapterLuid();
-        return static_cast<intptr_t>(pOutLuid);
+    XboxD3D12DeviceProxy* obj = nullptr;
+    uintptr_t sret_ptr = 0;
+    if (arg0 && *reinterpret_cast<const void* const*>(arg0) == kXboxDeviceProxyVtbl.data()) {
+        obj = static_cast<XboxD3D12DeviceProxy*>(arg0);
+        sret_ptr = arg1;
+    } else if (arg1 > 0x10000u &&
+               *reinterpret_cast<const void* const*>(arg1) == kXboxDeviceProxyVtbl.data()) {
+        obj = reinterpret_cast<XboxD3D12DeviceProxy*>(arg1);
+        sret_ptr = reinterpret_cast<uintptr_t>(arg0);
+    }
+    if (obj && obj->pc_device) {
+        const LUID luid = obj->pc_device->GetAdapterLuid();
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (sret_ptr > 0x10000u &&
+            VirtualQuery(reinterpret_cast<const void*>(sret_ptr), &mbi, sizeof(mbi)) != 0 &&
+            mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0) {
+            *reinterpret_cast<LUID*>(sret_ptr) = luid;
+            return static_cast<intptr_t>(sret_ptr);
+        }
+        uint64_t packed = 0;
+        std::memcpy(&packed, &luid, sizeof(packed));
+        return static_cast<intptr_t>(packed);
     }
 #endif
-    return static_cast<intptr_t>(pOutLuid);
+    return static_cast<intptr_t>(arg1);
 }
 
 intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateStateObject(
@@ -4257,9 +4391,59 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateStateObject(
     if (FAILED(obj->pc_device->QueryInterface(IID_PPV_ARGS(&dev5))) || !dev5) {
         return static_cast<intptr_t>(E_NOINTERFACE);
     }
+
+    const auto* in_desc = reinterpret_cast<const D3D12_STATE_OBJECT_DESC*>(pDesc);
+    D3D12_STATE_OBJECT_DESC desc = *in_desc;
+    std::vector<D3D12_STATE_SUBOBJECT> subobjs;
+    std::vector<D3D12_GLOBAL_ROOT_SIGNATURE> global_rs;
+    std::vector<D3D12_LOCAL_ROOT_SIGNATURE> local_rs;
+    if (in_desc->NumSubobjects > 0 && in_desc->pSubobjects) {
+        subobjs.assign(in_desc->pSubobjects, in_desc->pSubobjects + in_desc->NumSubobjects);
+        global_rs.reserve(subobjs.size());
+        local_rs.reserve(subobjs.size());
+        for (size_t i = 0; i < subobjs.size(); ++i) {
+            if (subobjs[i].Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE && subobjs[i].pDesc) {
+                auto grs = *static_cast<const D3D12_GLOBAL_ROOT_SIGNATURE*>(subobjs[i].pDesc);
+                if (grs.pGlobalRootSignature) {
+                    auto* rp = reinterpret_cast<XboxD3D12SimpleObjectProxy*>(grs.pGlobalRootSignature);
+                    grs.pGlobalRootSignature = reinterpret_cast<ID3D12RootSignature*>(rp->pc_obj);
+                }
+                global_rs.push_back(grs);
+                subobjs[i].pDesc = &global_rs.back();
+            } else if (subobjs[i].Type == D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE && subobjs[i].pDesc) {
+                auto lrs = *static_cast<const D3D12_LOCAL_ROOT_SIGNATURE*>(subobjs[i].pDesc);
+                if (lrs.pLocalRootSignature) {
+                    auto* rp = reinterpret_cast<XboxD3D12SimpleObjectProxy*>(lrs.pLocalRootSignature);
+                    lrs.pLocalRootSignature = reinterpret_cast<ID3D12RootSignature*>(rp->pc_obj);
+                }
+                local_rs.push_back(lrs);
+                subobjs[i].pDesc = &local_rs.back();
+            } else if (subobjs[i].Type == D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION &&
+                       subobjs[i].pDesc) {
+                // Keep pointer to translated subobject slot if pointing into original array
+                const auto* assoc = static_cast<const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(subobjs[i].pDesc);
+                if (assoc->pSubobjectToAssociate >= in_desc->pSubobjects &&
+                    assoc->pSubobjectToAssociate < in_desc->pSubobjects + in_desc->NumSubobjects) {
+                    const size_t idx = static_cast<size_t>(assoc->pSubobjectToAssociate - in_desc->pSubobjects);
+                    auto* copy_assoc = new D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION(*assoc);
+                    copy_assoc->pSubobjectToAssociate = &subobjs[idx];
+                    subobjs[i].pDesc = copy_assoc;
+                }
+            }
+        }
+        desc.pSubobjects = subobjs.data();
+    }
+
     ID3D12StateObject* so = nullptr;
-    const HRESULT hr = dev5->CreateStateObject(
-        reinterpret_cast<const D3D12_STATE_OBJECT_DESC*>(pDesc), IID_PPV_ARGS(&so));
+    const HRESULT hr = dev5->CreateStateObject(&desc, IID_PPV_ARGS(&so));
+    if (in_desc->NumSubobjects > 0 && in_desc->pSubobjects) {
+        for (size_t i = 0; i < subobjs.size(); ++i) {
+            if (subobjs[i].Type == D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION &&
+                subobjs[i].pDesc != in_desc->pSubobjects[i].pDesc) {
+                delete static_cast<const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(subobjs[i].pDesc);
+            }
+        }
+    }
     dev5->Release();
     if (FAILED(hr) || !so) return static_cast<intptr_t>(hr);
     auto* proxy = new XboxD3D12SimpleObjectProxy();
@@ -4743,16 +4927,7 @@ int32_t D3D12XboxScheduleFrameEventX(uint64_t device_handle,
     }
 #if defined(_WIN32)
     if (event_handle) {
-        HANDLE hEvent = static_cast<HANDLE>(event_handle);
-        if (offset_us == 0) {
-            SetEvent(hEvent);
-        } else {
-            std::thread([hEvent, offset_us]() {
-                const uint32_t ms = static_cast<uint32_t>((offset_us + 999) / 1000);
-                Sleep(ms > 0 ? ms : 1);
-                SetEvent(hEvent);
-            }).detach();
-        }
+        EnqueueDelayedEventSignal(static_cast<HANDLE>(event_handle), offset_us);
     }
 #else
     (void)event_handle;

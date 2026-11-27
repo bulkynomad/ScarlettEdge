@@ -51,9 +51,19 @@ bool LiveNetworkEnabled() {
 }
 
 #if defined(_WIN32)
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    int needed = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (needed <= 0) return std::wstring(s.begin(), s.end());
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), needed);
+    return out;
+}
+
 bool PerformWinHttpRequest(
     const std::string& method,
     const std::string& url,
+    const std::unordered_map<std::string, std::string>& req_headers,
     const std::vector<uint8_t>& req_body,
     uint32_t timeout_sec,
     uint32_t& out_status,
@@ -75,8 +85,13 @@ bool PerformWinHttpRequest(
         return false;
     }
 
-    std::wstring wurl(url.begin(), url.end());
-    std::wstring wmethod(method.begin(), method.end());
+    std::wstring wurl = Utf8ToWide(url);
+    std::wstring wmethod = Utf8ToWide(method);
+    std::string hdr_joined;
+    for (const auto& kv : req_headers) {
+        hdr_joined += kv.first + ": " + kv.second + "\r\n";
+    }
+    std::wstring wheaders = Utf8ToWide(hdr_joined);
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
     wchar_t host[256] = {};
@@ -87,7 +102,7 @@ bool PerformWinHttpRequest(
     uc.dwUrlPathLength = 2048;
     if (!fnCrack(wurl.c_str(), static_cast<DWORD>(wurl.size()), 0, &uc)) return false;
 
-    HINTERNET hSession = fnOpen(L"ScarlettX/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
+    HINTERNET hSession = fnOpen(L"ScarlettEdge-HC/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
     if (!hSession) return false;
     if (fnSetTimeouts) {
         const int ms = static_cast<int>(timeout_sec ? timeout_sec * 1000 : 15000);
@@ -100,7 +115,9 @@ bool PerformWinHttpRequest(
     HINTERNET hReq = fnOpenReq(hConnect, wmethod.c_str(), path[0] ? path : L"/", nullptr, nullptr, nullptr, flags);
     if (!hReq) { fnClose(hConnect); fnClose(hSession); return false; }
 
-    BOOL ok = fnSend(hReq, nullptr, 0,
+    BOOL ok = fnSend(hReq,
+                     wheaders.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : wheaders.c_str(),
+                     static_cast<DWORD>(wheaders.size()),
                      req_body.empty() ? nullptr : const_cast<uint8_t*>(req_body.data()),
                      static_cast<DWORD>(req_body.size()),
                      static_cast<DWORD>(req_body.size()), 0);
@@ -262,7 +279,7 @@ SX_HRESULT HCHttpCallPerformAsync(HCCallHandle call, XAsyncBlock* async_block) {
             uint32_t live_status = 0;
             std::vector<uint8_t> live_body;
             if (LiveNetworkEnabled() &&
-                PerformWinHttpRequest(call->method, call->url, call->req_body, call->timeout_seconds, live_status, live_body)) {
+                PerformWinHttpRequest(call->method, call->url, call->req_headers, call->req_body, call->timeout_seconds, live_status, live_body)) {
                 call->status_code = live_status;
                 call->network_error = SX_S_OK;
                 call->platform_error = 0;

@@ -100,25 +100,65 @@ std::string& GuestShimDirectory() {
     return dir;
 }
 
-bool IsHleShimFilename(const std::string& lower_name) {
-    static const char* const kShims[] = {
-        "xgameruntime.dll",
-        "d3d12_xs.dll",
-        "xg_xs.dll",
-        "acphal.dll",
-        "gameinput.dll",
-        "xaudio2_9.dll",
-        "dstorage_xs.dll",
-        "bink2scarlett.dll",
-        "amd_fidelityfx_loader_xbox.dll",
-        "amd_fidelityfx_upscaler_xbox.dll",
-        "libhttpclient.gdk.dll",
-        "xcurl.dll",
+std::string& GuestPackageDirectory() {
+    static std::string dir;
+    return dir;
+}
+
+// OS / hardware system DLLs: always prioritize ScarlettEdge HLE shims over
+// anything in the title directory or Windows System32.
+const char* ResolveSystemShimTarget(const std::string& lower_name) {
+    struct Mapping {
+        const char* guest;
+        const char* target;
     };
-    for (const char* s : kShims) {
-        if (lower_name == s) return true;
+    static constexpr Mapping kSystemShims[] = {
+        {"xgameruntime.dll", "xgameruntime.dll"},
+        {"xmem.dll", "xgameruntime.dll"},
+        {"d3d12_xs.dll", "d3d12_xs.dll"},
+        {"xg_xs.dll", "xg_xs.dll"},
+        {"acphal.dll", "AcpHal.dll"},
+        {"gameinput.dll", "GameInput.dll"},
+        {"xaudio2_9.dll", "xaudio2_9.dll"},
+        {"xaudio2_9redist.dll", "xaudio2_9.dll"},
+        {"xcrdapi.dll", "xcrdapi.dll"},
+        {"xboxbvhbuilder.dll", "XboxBvhBuilder.dll"},
+        {"dstorage_xs.dll", "dstorage_xs.dll"},
+        {"dstorage.dll", "dstorage_xs.dll"},
+        {"dstoragecore.dll", "dstorage_xs.dll"},
+        {"kernelx.dll", "kernelx.dll"},
+        {"xvc_crypto.dll", "xvc_crypto.dll"},
+        {"xbox_codecs.dll", "xbox_codecs.dll"},
+        {"xsapi.dll", "xsapi.dll"},
+        {"xs2_lifting.dll", "xs2_lifting.dll"},
+        {"vulkan_backend.dll", "vulkan_backend.dll"},
+        {"pixevt.dll", "pixevt_stub.dll"},
+        {"pixevt_stub.dll", "pixevt_stub.dll"},
+    };
+    for (const auto& m : kSystemShims) {
+        if (lower_name == m.guest) return m.target;
     }
-    return false;
+    return nullptr;
+}
+
+// Title-shipped middleware DLLs: prioritize the real DLL inside the game package
+// directory when present, falling back to ScarlettEdge HLE shims only when absent.
+const char* ResolveFallbackMiddlewareTarget(const std::string& lower_name) {
+    struct Mapping {
+        const char* guest;
+        const char* target;
+    };
+    static constexpr Mapping kMiddlewareShims[] = {
+        {"bink2scarlett.dll", "Bink2Scarlett.dll"},
+        {"amd_fidelityfx_loader_xbox.dll", "amd_fidelityfx_loader_xbox.dll"},
+        {"amd_fidelityfx_upscaler_xbox.dll", "amd_fidelityfx_upscaler_xbox.dll"},
+        {"libhttpclient.gdk.dll", "libHttpClient.GDK.dll"},
+        {"xcurl.dll", "XCurl.dll"},
+    };
+    for (const auto& m : kMiddlewareShims) {
+        if (lower_name == m.guest) return m.target;
+    }
+    return nullptr;
 }
 
 std::string ExtractBasenameLower(const std::string& path_str) {
@@ -127,13 +167,14 @@ std::string ExtractBasenameLower(const std::string& path_str) {
     return ToLowerAscii(base);
 }
 
-HMODULE TryLoadGuestShimA(const char* name) {
+HMODULE TryLoadSystemShimA(const char* name) {
     if (!name || !*name) return nullptr;
     const std::string& shim_dir = GuestShimDirectory();
     if (shim_dir.empty()) return nullptr;
     const std::string base = ExtractBasenameLower(name);
-    if (!IsHleShimFilename(base)) return nullptr;
-    const auto candidate = std::filesystem::path(shim_dir) / base;
+    const char* target = ResolveSystemShimTarget(base);
+    if (!target) return nullptr;
+    const auto candidate = std::filesystem::path(shim_dir) / target;
     if (std::filesystem::exists(candidate)) {
         HMODULE mod = LoadLibraryA(candidate.string().c_str());
         const DWORD error = mod ? 0 : GetLastError();
@@ -150,6 +191,37 @@ HMODULE TryLoadGuestShimA(const char* name) {
     return nullptr;
 }
 
+HMODULE TryLoadPackageOrFallbackMiddlewareA(const char* name) {
+    if (!name || !*name) return nullptr;
+    const std::string base = ExtractBasenameLower(name);
+    const char* mw_target = ResolveFallbackMiddlewareTarget(base);
+    if (!mw_target) return nullptr;
+
+    // 1. Prefer the game's own shipped middleware DLL in the package directory.
+    const std::string& pkg_dir = GuestPackageDirectory();
+    if (!pkg_dir.empty()) {
+        for (const std::string& fname : {std::string(mw_target), base}) {
+            const auto pkg_candidate = std::filesystem::path(pkg_dir) / fname;
+            if (std::filesystem::exists(pkg_candidate)) {
+                if (HMODULE mod = LoadLibraryA(pkg_candidate.string().c_str())) {
+                    guest::PatchHostModuleForGuests(mod);
+                    return mod;
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to ScarlettEdge HLE middleware shim when package does not ship it.
+    const std::string& shim_dir = GuestShimDirectory();
+    if (!shim_dir.empty()) {
+        const auto shim_candidate = std::filesystem::path(shim_dir) / mw_target;
+        if (std::filesystem::exists(shim_candidate)) {
+            return LoadLibraryA(shim_candidate.string().c_str());
+        }
+    }
+    return nullptr;
+}
+
 // A title DLL loaded by the host loader still has to see the guest image when
 // it asks which module it runs in.
 HMODULE AdoptHostModule(HMODULE mod) {
@@ -162,14 +234,20 @@ HMODULE AdoptHostModule(HMODULE mod) {
 }
 
 HMODULE WINAPI GuestLoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
-    if (HMODULE mod = TryLoadGuestShimA(lpLibFileName)) {
+    if (HMODULE mod = TryLoadSystemShimA(lpLibFileName)) {
+        return mod;
+    }
+    if (HMODULE mod = TryLoadPackageOrFallbackMiddlewareA(lpLibFileName)) {
         return mod;
     }
     return AdoptHostModule(LoadLibraryExA(lpLibFileName, hFile, dwFlags));
 }
 
 HMODULE WINAPI GuestLoadLibraryA(LPCSTR lpLibFileName) {
-    if (HMODULE mod = TryLoadGuestShimA(lpLibFileName)) {
+    if (HMODULE mod = TryLoadSystemShimA(lpLibFileName)) {
+        return mod;
+    }
+    if (HMODULE mod = TryLoadPackageOrFallbackMiddlewareA(lpLibFileName)) {
         return mod;
     }
     return AdoptHostModule(LoadLibraryA(lpLibFileName));
@@ -177,11 +255,16 @@ HMODULE WINAPI GuestLoadLibraryA(LPCSTR lpLibFileName) {
 
 HMODULE WINAPI GuestLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
     if (lpLibFileName && *lpLibFileName) {
+        int needed = WideCharToMultiByte(CP_UTF8, 0, lpLibFileName, -1, nullptr, 0, nullptr, nullptr);
         std::string narrow;
-        for (const wchar_t* p = lpLibFileName; *p; ++p) {
-            narrow.push_back(*p < 128 ? static_cast<char>(*p) : '?');
+        if (needed > 1) {
+            narrow.resize(static_cast<size_t>(needed - 1));
+            WideCharToMultiByte(CP_UTF8, 0, lpLibFileName, -1, narrow.data(), needed, nullptr, nullptr);
         }
-        if (HMODULE mod = TryLoadGuestShimA(narrow.c_str())) {
+        if (HMODULE mod = TryLoadSystemShimA(narrow.c_str())) {
+            return mod;
+        }
+        if (HMODULE mod = TryLoadPackageOrFallbackMiddlewareA(narrow.c_str())) {
             return mod;
         }
     }
@@ -481,21 +564,38 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
     }
 
     // 4. Resolve Import Address Table (IAT):
-    //    Order: HleSymbolRegistry -> redirected/API-set host DLL -> x86-64 StubThunkTable.
+    //    Order: HleSymbolRegistry -> package middleware (if middleware) / HLE shim -> host DLL -> StubThunkTable.
+    const std::filesystem::path pkg_dir = std::filesystem::absolute(pe_path).parent_path();
+    GuestPackageDirectory() = pkg_dir.string();
     if (!options.shim_directory.empty()) {
         GuestShimDirectory() = options.shim_directory;
     }
     stubs_.SetVerboseLogging(options.verbose_stub_logging);
     std::unordered_map<std::string, HMODULE> module_cache;
 
-    auto load_target_module = [&](const std::string& target_dll, bool is_hle) -> HMODULE {
+    auto load_target_module = [&](const std::string& guest_dll,
+                                  const std::string& target_dll,
+                                  bool is_hle) -> HMODULE {
         const std::string key = ToLowerAscii(target_dll);
         auto it = module_cache.find(key);
         if (it != module_cache.end()) {
             return it->second;
         }
         HMODULE mod = nullptr;
-        if (is_hle && !options.shim_directory.empty()) {
+        const bool is_fallback_mw =
+            ResolveFallbackMiddlewareTarget(ToLowerAscii(guest_dll)) != nullptr ||
+            ResolveFallbackMiddlewareTarget(key) != nullptr;
+        if (is_fallback_mw) {
+            // Prioritize game-shipped middleware DLL inside the package directory.
+            for (const std::string& fname : {guest_dll, target_dll}) {
+                const auto pkg_candidate = pkg_dir / fname;
+                if (std::filesystem::exists(pkg_candidate)) {
+                    mod = LoadLibraryA(pkg_candidate.string().c_str());
+                    if (mod) break;
+                }
+            }
+        }
+        if (!mod && is_hle && !options.shim_directory.empty()) {
             const auto candidate = std::filesystem::path(options.shim_directory) / target_dll;
             if (std::filesystem::exists(candidate)) {
                 mod = LoadLibraryA(candidate.string().c_str());
@@ -601,7 +701,7 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
 
                     // (b) Check host / HLE shim DLL via LoadLibrary + GetProcAddress.
                     if (!resolved) {
-                        HMODULE mod = load_target_module(target_dll, is_hle);
+                        HMODULE mod = load_target_module(guest_dll, target_dll, is_hle);
                         if (mod) {
                             FARPROC proc = by_ordinal
                                                ? GetProcAddress(mod, MAKEINTRESOURCEA(ordinal))

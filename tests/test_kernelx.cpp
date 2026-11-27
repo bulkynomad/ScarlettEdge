@@ -30,7 +30,18 @@ int main() {
     // Writing through alias_va is instantaneously visible in va1
     static_cast<uint8_t*>(alias_va)[1234] = 0x5E;
     SX_CHECK(static_cast<uint8_t*>(va1)[1234] == 0x5E);
+    uint64_t alias_gpu = 0;
+    SX_CHECK(KernelXMapVirtualToGpu(alias_va, &alias_gpu) == 0);
+    SX_CHECK(alias_gpu == gpu_va1);
     SX_CHECK(KernelXFreeMemoryAlias(alias_va) == 0);
+
+    // 1c. Verify guaranteed 2 MB virtual address alignment on KERNELX_PAGE_2MB
+    void* va_2mb = nullptr;
+    uint64_t gpu_2mb = 0;
+    SX_CHECK(KernelXAllocateMemory(0x200000, KERNELX_PAGE_2MB, KERNELX_MEM_GPU_VISIBLE, &va_2mb, &gpu_2mb) == 0);
+    SX_CHECK(va_2mb != nullptr);
+    SX_CHECK((reinterpret_cast<uintptr_t>(va_2mb) & (0x200000ull - 1ull)) == 0);
+    SX_CHECK(KernelXFreeMemory(va_2mb) == 0);
 
     // 2. Dual VA <-> GPU VA mapping lookup
     uint64_t mapped_gpu = 0;

@@ -7,6 +7,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 enable_testing()
 
+if(MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    add_compile_options(/W4 /wd4100 /wd4201 /wd4324)
+else()
+    add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+endif()
+
 # Core emulator static library
 add_library(scarlettx_core STATIC
     src/core/status.cpp
@@ -157,7 +164,7 @@ target_compile_definitions(xbox_codecs PRIVATE SCARLETTX_BUILDING_CODECS=1)
 
 add_library(xsapi SHARED src/shims/xsapi_shim.cpp)
 set_target_properties(xsapi PROPERTIES PREFIX "" OUTPUT_NAME "xsapi")
-target_link_libraries(xsapi PRIVATE scarlettx_core)
+target_link_libraries(xsapi PRIVATE scarlettx_core xgameruntime)
 target_compile_definitions(xsapi PRIVATE SCARLETTX_BUILDING_XSAPI=1)
 
 add_library(xs2_lifting SHARED src/gpu/xs2_lifting_shim.cpp)
@@ -169,6 +176,9 @@ add_library(vulkan_backend SHARED src/gpu/vulkan_backend_shim.cpp)
 set_target_properties(vulkan_backend PROPERTIES PREFIX "" OUTPUT_NAME "vulkan_backend")
 target_link_libraries(vulkan_backend PRIVATE scarlettx_core)
 target_compile_definitions(vulkan_backend PRIVATE SCARLETTX_BUILDING_VULKAN=1)
+
+add_library(pixevt_stub SHARED src/shims/pixevt_stub.cpp)
+set_target_properties(pixevt_stub PROPERTIES PREFIX "" OUTPUT_NAME "pixevt_stub")
 
 # ---------------------------------------------------------------------------
 # ScarlettX CLI Emulator Runner
@@ -197,6 +207,7 @@ add_dependencies(scarlettx
     xsapi
     xs2_lifting
     vulkan_backend
+    pixevt_stub
 )
 
 # ---------------------------------------------------------------------------
@@ -392,7 +403,7 @@ scarlettx_add_test(test_codecs tests/test_codecs.cpp)
 target_link_libraries(test_codecs PRIVATE xbox_codecs)
 
 scarlettx_add_test(test_xsapi tests/test_xsapi.cpp)
-target_link_libraries(test_xsapi PRIVATE xsapi)
+target_link_libraries(test_xsapi PRIVATE xsapi xgameruntime)
 
 scarlettx_add_test(test_xs2_lifting tests/test_xs2_lifting.cpp)
 target_link_libraries(test_xs2_lifting PRIVATE xs2_lifting)

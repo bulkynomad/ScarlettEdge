@@ -404,7 +404,7 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="Kern",
             category="Platform",
             implemented=kernelx_cnt,
-            target=14,
+            target=16,
             notes=f"{kernelx_cnt} exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services",
         ),
         Subsystem(
@@ -639,9 +639,9 @@ def collect_aaa_roadmap_metrics() -> list[Subsystem]:
             name="D3D12.2 & MEM_GRAPHICS",
             short_name="D3D12.2",
             category="Graphics",
-            implemented=3,
+            implemented=4,
             target=10,
-            notes="**Done (3):** 128-slot vtables, CL7::Barrier, VirtualAlloc2 aliasing · **Next (7):** CreatePlacedResourceX on guest GPUVA, 2 MB large pages, Mesh PSOs, VRS, Sampler Feedback/Tiled, ExecuteIndirect counts, Work Graphs",
+            notes="**Done (4):** 128-slot vtables, CL7::Barrier resource unwrapping, VirtualAlloc2 aliasing, 2 MB aligned large pages · **Next (6):** CreatePlacedResourceX on guest GPUVA, Mesh PSOs, VRS, Sampler Feedback/Tiled, ExecuteIndirect counts, Work Graphs",
         ),
         Subsystem(
             name="XS2 -> GPU Shader Compiler",
@@ -965,7 +965,7 @@ def render_html(subsystems: list[Subsystem], total_exports: int, tests_text: str
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ScarlettX — Status</title>
+<title>ScarlettEdge — Status</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@400;500;600;700&display=swap">
 <style>
@@ -1087,7 +1087,7 @@ def render_html(subsystems: list[Subsystem], total_exports: int, tests_text: str
   <div class="list" id="list"></div>
   <div class="callout">
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 15 14H1z" fill="none" stroke="{LV3}" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="{LV3}" stroke-width="1.5" stroke-linecap="round"/></svg>
-    <span><strong>100% Milestone:</strong> Full clean-room parity achieved across all 17 subsystems on Xbox Series X|S (Gen9).</span>
+    <span><strong>Phase 1 ABI Parity (100%):</strong> Full clean-room ABI surface across all {len(subsystems)} subsystems ({total_impl}/{total_target} functions; {sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)} upstream ScarlettX + {total_impl - sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)} ScarlettEdge). See README for Phase 2 AAA Silicon Roadmap.</span>
   </div>
 </main>
 <script>
@@ -1171,6 +1171,15 @@ def render_markdown_status(
             rows.append(
                 f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` | `{round(s.pct)}%` | {s.notes} |"
             )
+    up_total = sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)
+    fork_total = total_impl - up_total
+    up_pct = (up_total / total_target * 100.0) if total_target else 0.0
+    fork_pct = (fork_total / total_target * 100.0) if total_target else 0.0
+    cd_up = sum(min(s.implemented, s.upstream_implemented or 0) for s in cd_subsystems)
+    cd_fork = cd_impl - cd_up
+    cd_up_pct = (cd_up / cd_target * 100.0) if cd_target else 0.0
+    cd_fork_pct = (cd_fork / cd_target * 100.0) if cd_target else 0.0
+
     rows += [
         "",
         "---",
@@ -1190,7 +1199,7 @@ def render_markdown_status(
         "",
         "### Upstream Foundation + Fork Expansion (Color-Differentiated)",
         "",
-        "In the two charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`66.6%` ABI / `91.3%` Concept Destruction), while **emerald green (`#39d353`)** marks new functions and milestones added in **ScarlettEdge** (`+33.4%` ABI / `+8.7%` Concept Destruction):",
+        f"In the two charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`{up_pct:.1f}%` ABI / `{cd_up_pct:.1f}%` Concept Destruction), while **emerald green (`#39d353`)** marks new functions and milestones added in **ScarlettEdge** (`+{fork_pct:.1f}%` ABI / `+{cd_fork_pct:.1f}%` Concept Destruction):",
         "",
         "![ABI Coverage: Upstream ScarlettX (Purple) vs ScarlettEdge Fork (Green)](docs/status.svg)",
         "",
@@ -1208,12 +1217,6 @@ def render_markdown_status(
             rows.append("| " + " | ".join(caption for _, _, _, caption in shots) + " |")
         rows.append("")
 
-    up_total = sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)
-    fork_total = total_impl - up_total
-    up_pct = (up_total / total_target * 100.0) if total_target else 0.0
-    fork_pct = (fork_total / total_target * 100.0) if total_target else 0.0
-    cd_up = sum(min(s.implemented, s.upstream_implemented or 0) for s in cd_subsystems)
-    cd_fork = cd_impl - cd_up
     rows += [
         f"**Combined ABI Coverage:** `{overall_pct:.1f}%` (`{up_total}` upstream ScarlettX `{up_pct:.1f}%` + `{fork_total}` ScarlettEdge fork `+{fork_pct:.1f}%`) · "
         f"**Concept Destruction:** `{cd_pct:.1f}%` (`{cd_up}` upstream + `{cd_fork}` fork) · "
@@ -1237,7 +1240,7 @@ def render_markdown_status(
         )
     rows.append("")
     rows.append(
-        "> **100% Subsystem Coverage:** All 17 subsystems have verified implementations across graphics, compute, "
+        f"> **100% ABI Surface Coverage:** All {len(subsystems)} subsystems ({total_impl}/{total_target} functions) have verified implementations across graphics, compute, "
         "audio, networking, storage, kernel, and services. Passing synthetic tests do not imply commercial retail title execution."
     )
     rows.append("")
@@ -1389,7 +1392,8 @@ def main() -> None:
     readme_path.write_text(new_readme, encoding="utf-8")
     print(
         f"[generate_status] Wrote {out_svg.relative_to(ROOT)}, {out_cd_svg.relative_to(ROOT)}, "
-        f"{out_opt_svg.relative_to(ROOT)}, {out_html.relative_to(ROOT)}, and updated README.md (exports={total_exports}, tests: {tests_text})"
+        f"{out_opt_svg.relative_to(ROOT)}, {out_aaa_svg.relative_to(ROOT)}, {out_html.relative_to(ROOT)}, "
+        f"and updated README.md (exports={total_exports}, tests: {tests_text})"
     )
 
 

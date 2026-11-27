@@ -52,6 +52,22 @@ int main() {
     SX_REQUIRE(found_xgr);
     SX_REQUIRE(found_bvh);
 
+    // Verify full Scarlett redirection table coverage (including PIX and Phase 2+ shims).
+    const auto check_redirect = [&](const char* guest, const char* expected_host) {
+        std::string host;
+        bool is_hle = false;
+        SX_REQUIRE(redirects.Resolve(guest, host, is_hle));
+        SX_REQUIRE(is_hle);
+        SX_REQUIRE(host == expected_host);
+    };
+    check_redirect("pixevt.dll", "pixevt_stub.dll");
+    check_redirect("kernelx.dll", "kernelx.dll");
+    check_redirect("xvc_crypto.dll", "xvc_crypto.dll");
+    check_redirect("xbox_codecs.dll", "xbox_codecs.dll");
+    check_redirect("xsapi.dll", "xsapi.dll");
+    check_redirect("xs2_lifting.dll", "xs2_lifting.dll");
+    check_redirect("vulkan_backend.dll", "vulkan_backend.dll");
+
     std::cout << "[test_pe_loader] PASSED (imports=" << info.imports.size() << ")\n";
     return 0;
 }

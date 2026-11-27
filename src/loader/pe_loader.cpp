@@ -42,10 +42,12 @@ bool ReadCString(const std::vector<uint8_t>& buf, size_t offset, std::string& ou
 
 bool RvaToFileOffset(uint32_t rva, const std::vector<PeSectionInfo>& sections, size_t& out_offset) {
     for (const auto& sec : sections) {
-        const uint32_t span = std::max(sec.virtual_size, sec.raw_data_size);
-        if (rva >= sec.virtual_address && rva < sec.virtual_address + span) {
-            out_offset = static_cast<size_t>(sec.raw_data_offset) + (rva - sec.virtual_address);
-            return true;
+        if (rva >= sec.virtual_address) {
+            const uint32_t offset_in_sec = rva - sec.virtual_address;
+            if (offset_in_sec < sec.raw_data_size) {
+                out_offset = static_cast<size_t>(sec.raw_data_offset) + offset_in_sec;
+                return true;
+            }
         }
     }
     return false;
@@ -111,6 +113,12 @@ DllRedirectionTable::DllRedirectionTable() {
     RegisterRedirect("bink2scarlett.dll", "Bink2Scarlett.dll", true);
     RegisterRedirect("amd_fidelityfx_loader_xbox.dll", "amd_fidelityfx_loader_xbox.dll", true);
     RegisterRedirect("amd_fidelityfx_upscaler_xbox.dll", "amd_fidelityfx_upscaler_xbox.dll", true);
+    RegisterRedirect("kernelx.dll", "kernelx.dll", true);
+    RegisterRedirect("xvc_crypto.dll", "xvc_crypto.dll", true);
+    RegisterRedirect("xbox_codecs.dll", "xbox_codecs.dll", true);
+    RegisterRedirect("xsapi.dll", "xsapi.dll", true);
+    RegisterRedirect("xs2_lifting.dll", "xs2_lifting.dll", true);
+    RegisterRedirect("vulkan_backend.dll", "vulkan_backend.dll", true);
     RegisterRedirect("pixevt.dll", "pixevt_stub.dll", true);
 }
 

@@ -2,6 +2,7 @@
 #include "sx_check.h"
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -296,6 +297,71 @@ int main() {
         SX_REQUIRE(!fixed.MapFile(fixed_dll.string(), redirects, hle_reg, opts).ok());
         SX_REQUIRE(!fixed.IsMapped());
         std::filesystem::remove(fixed_dll);
+    }
+
+    // 9. Middleware-first vs. System-shim-first loading policy:
+    //    - Game-shipped middleware (e.g. Bink2Scarlett.dll in package dir) takes precedence
+    //      over ScarlettEdge fallback middleware shims.
+    //    - Xbox OS/hardware system DLLs (e.g. xgameruntime.dll) strictly resolve from shim_dir
+    //      first even if a decoy/Xbox copy sits in the package dir.
+    {
+        const std::filesystem::path mw_dir =
+            std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_mw_precedence_pkg";
+        std::filesystem::create_directories(mw_dir);
+        const std::filesystem::path mw_probe = mw_dir / "mw_probe.dll";
+        const std::filesystem::path mw_bink = mw_dir / "Bink2Scarlett.dll";
+        const std::filesystem::path decoy_xgr = mw_dir / "xgameruntime.dll";
+
+        std::ifstream in(probe_dll, std::ios::binary);
+        std::vector<char> patched((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+        const auto replace_ascii = [&](const char* from, const char* to) {
+            const size_t from_len = std::strlen(from);
+            const size_t to_len = std::strlen(to);
+            SX_REQUIRE(to_len <= from_len);
+            auto it = std::search(patched.begin(), patched.end(), from, from + from_len);
+            SX_REQUIRE(it != patched.end());
+            std::fill(it, it + static_cast<std::ptrdiff_t>(from_len), '\0');
+            std::copy(to, to + to_len, it);
+        };
+        replace_ascii("xgameoverlay_missing.dll", "Bink2Scarlett.dll");
+        replace_ascii("XOverlayShowNotice", "XvcCryptoGetStatus");
+        {
+            std::ofstream out(mw_probe, std::ios::binary);
+            out.write(patched.data(), static_cast<std::streamsize>(patched.size()));
+            SX_REQUIRE(out.good());
+        }
+
+        // Place a game-shipped middleware DLL exporting XvcCryptoGetStatus in the package dir,
+        // and place a decoy xgameruntime.dll (lacking XGameRuntimeInitialize) beside it.
+        std::filesystem::copy_file(std::filesystem::path(SCARLETTX_BINARY_DIR) / "xvc_crypto.dll",
+                                   mw_bink, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::copy_file(std::filesystem::path(SCARLETTX_BINARY_DIR) / "pixevt_stub.dll",
+                                   decoy_xgr, std::filesystem::copy_options::overwrite_existing);
+
+        scarlettx::MappedPeImage mw_mapped;
+        SX_REQUIRE(mw_mapped.MapFile(mw_probe.string(), redirects, hle_reg, opts).ok());
+        bool saw_pkg_middleware = false;
+        bool saw_shim_xgr = false;
+        for (const auto& r : mw_mapped.Resolutions()) {
+            const std::string dll = ToLower(r.dll_name);
+            if (dll == "bink2scarlett.dll" && r.symbol_name == "XvcCryptoGetStatus") {
+                SX_REQUIRE(r.kind == scarlettx::ImportResolutionKind::HostDll);
+                saw_pkg_middleware = true;
+            } else if (dll == "xgameruntime.dll" && r.symbol_name == "XGameRuntimeInitialize") {
+                SX_REQUIRE(r.kind == scarlettx::ImportResolutionKind::HostDll);
+                saw_shim_xgr = true;
+            }
+        }
+        SX_REQUIRE(saw_pkg_middleware);
+        SX_REQUIRE(saw_shim_xgr);
+        mw_mapped.Unmap();
+
+        if (HMODULE h = GetModuleHandleA(mw_bink.string().c_str())) {
+            FreeLibrary(h);
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(mw_dir, ec);
     }
 
     std::cout << "[test_inproc_loader] PASSED (relocs=" << mapped.RelocationsApplied()
