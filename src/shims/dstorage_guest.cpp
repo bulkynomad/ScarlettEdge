@@ -9,6 +9,7 @@
 // match what a title builds. A vtable slot has a name here only if a title's
 // call confirmed it; the others report themselves when called.
 #include "scarlettx/media/codecs_abi.h"
+#include "scarlettx/io/deflate_rfc1951.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -316,12 +317,21 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
     }
 
     if (is_zlib) {
-        // Dispatch tile-framed GDeflate streams (0x04 0xFB); return E_NOTIMPL for raw RFC 1951 Zlib
-        // or unrecognized payloads without overwriting destination memory.
+        // Dispatch tile-framed GDeflate streams (0x04 0xFB) and spec-compliant RFC 1950 Zlib streams;
+        // return E_NOTIMPL for unrecognized/unframed payloads without overwriting destination memory.
         if (raw_buf.size() >= 8 && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu) {
             size_t written = 0;
             return XboxCodecGDeflateDecompress(
                 raw_buf.data(), raw_buf.size(), dst_ptr, r.destination_size, &written);
+        }
+        if (scarlettx::io::LooksLikeRfc1950ZlibHeader(raw_buf.data(), raw_buf.size())) {
+            std::vector<uint8_t> staged(r.destination_size, 0u);
+            size_t written = 0;
+            if (scarlettx::io::InflateZlibRfc1950(
+                    raw_buf.data(), raw_buf.size(), staged.data(), staged.size(), written)) {
+                std::memcpy(dst_ptr, staged.data(), std::min<size_t>(written, r.destination_size));
+                return kOk;
+            }
         }
         return kNotImpl;
     }

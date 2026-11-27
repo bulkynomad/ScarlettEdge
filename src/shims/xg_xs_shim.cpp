@@ -207,4 +207,17 @@ int32_t SCARLETTX_XG_CALL XGCreateTexture2DComputer(
     return 0;  // S_OK
 }
 
+int32_t SCARLETTX_XG_CALL XGCreateTexture3DComputer(
+    const XG_TEXTURE3D_DESC* desc,
+    void** computer) {
+    if (!desc || !computer) {
+        return static_cast<int32_t>(0x80070057u);  // E_INVALIDARG
+    }
+    auto* obj = new XGTexture2DComputerImpl();
+    obj->lpVtbl = &kVtbl;
+    scarlettx::gpu::xg::ComputeTexture3DLayout(*desc, &obj->layout);
+    *computer = obj;
+    return 0;  // S_OK
+}
+
 }  // extern "C"

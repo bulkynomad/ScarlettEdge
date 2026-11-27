@@ -1,5 +1,6 @@
 #define SCARLETTX_BUILDING_CODECS 1
 #include "scarlettx/media/codecs_abi.h"
+#include "scarlettx/io/deflate_rfc1951.h"
 
 #include <algorithm>
 #include <atomic>
@@ -157,9 +158,17 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateDecompress(
             if (valid_table) {
                 std::atomic<bool> all_ok{true};
                 std::atomic<size_t> total_written{0};
+                auto decompress_one_tile = [](const uint8_t* tsrc, size_t tlen, uint8_t* tdst,
+                                              size_t tcap, size_t& tw) -> bool {
+                    if (scarlettx::io::LooksLikeRfc1950ZlibHeader(tsrc, tlen) &&
+                        scarlettx::io::InflateZlibRfc1950(tsrc, tlen, tdst, tcap, tw)) {
+                        return true;
+                    }
+                    return Lz77DecompressTile(tsrc, tlen, tdst, tcap, tw);
+                };
                 if (num_tiles == 1) {
                     size_t tw = 0;
-                    if (Lz77DecompressTile(in + tile_in_off[0], tile_comp_sz[0], out, tile_out_cap[0], tw)) {
+                    if (decompress_one_tile(in + tile_in_off[0], tile_comp_sz[0], out, tile_out_cap[0], tw)) {
                         total_written.store(tw, std::memory_order_relaxed);
                     } else {
                         all_ok.store(false, std::memory_order_relaxed);
@@ -176,8 +185,8 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateDecompress(
                                 const uint16_t t = next_tile.fetch_add(1, std::memory_order_relaxed);
                                 if (t >= num_tiles) break;
                                 size_t tw = 0;
-                                if (Lz77DecompressTile(in + tile_in_off[t], tile_comp_sz[t],
-                                                       out + tile_out_off[t], tile_out_cap[t], tw)) {
+                                if (decompress_one_tile(in + tile_in_off[t], tile_comp_sz[t],
+                                                        out + tile_out_off[t], tile_out_cap[t], tw)) {
                                     total_written.fetch_add(tw, std::memory_order_relaxed);
                                 } else {
                                     all_ok.store(false, std::memory_order_relaxed);
@@ -193,6 +202,23 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateDecompress(
                     return kSuccess;
                 }
             }
+        }
+    }
+
+    // Spec-compliant RFC 1950 Zlib (with Adler-32 verification) & raw RFC 1951 Huffman DEFLATE
+    {
+        size_t inf_written = 0;
+        if (scarlettx::io::LooksLikeRfc1950ZlibHeader(in, compressedSize) &&
+            scarlettx::io::InflateZlibRfc1950(in, compressedSize, out, decompressedSize, inf_written)) {
+            if (bytesWritten) *bytesWritten = inf_written;
+            return kSuccess;
+        }
+        size_t consumed = 0;
+        if (compressedSize >= 2 &&
+            scarlettx::io::InflateRfc1951(in, compressedSize, out, decompressedSize, inf_written, &consumed) &&
+            inf_written > 0 && consumed == compressedSize) {
+            if (bytesWritten) *bytesWritten = inf_written;
+            return kSuccess;
         }
     }
 
@@ -257,11 +283,65 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress(
 }
 
 int32_t SCARLETTX_CODEC_CALL XboxCodecBcPackDecompress(
-    const void* srcCompressed, size_t compressedSize, void* dstBlocks, size_t decompressedSize, uint32_t /*format*/) {
+    const void* srcCompressed, size_t compressedSize, void* dstBlocks, size_t decompressedSize, uint32_t format) {
     if (!srcCompressed || compressedSize == 0 || !dstBlocks || decompressedSize == 0) return kInvalidArg;
     const auto* in = static_cast<const uint8_t*>(srcCompressed);
+
+    // Hardware BC1 (0x101) / BC4 (0x104) 4x4 block-to-texel unpack mode
+    if (format == 0x101u && (compressedSize % 8u) == 0u && decompressedSize >= (compressedSize / 8u) * 64u) {
+        auto* out_rgba = static_cast<uint8_t*>(dstBlocks);
+        const size_t num_blocks = compressedSize / 8u;
+        for (size_t b = 0; b < num_blocks; ++b) {
+            const uint8_t* blk = in + b * 8u;
+            const uint16_t c0 = static_cast<uint16_t>(blk[0] | (static_cast<uint16_t>(blk[1]) << 8));
+            const uint16_t c1 = static_cast<uint16_t>(blk[2] | (static_cast<uint16_t>(blk[3]) << 8));
+            uint32_t bits = static_cast<uint32_t>(blk[4]) |
+                            (static_cast<uint32_t>(blk[5]) << 8) |
+                            (static_cast<uint32_t>(blk[6]) << 16) |
+                            (static_cast<uint32_t>(blk[7]) << 24);
+            auto exp565 = [](uint16_t c, uint8_t rgba[4]) {
+                const uint8_t r5 = static_cast<uint8_t>((c >> 11) & 0x1Fu);
+                const uint8_t g6 = static_cast<uint8_t>((c >> 5) & 0x3Fu);
+                const uint8_t b5 = static_cast<uint8_t>(c & 0x1Fu);
+                rgba[0] = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
+                rgba[1] = static_cast<uint8_t>((g6 << 2) | (g6 >> 4));
+                rgba[2] = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
+                rgba[3] = 255u;
+            };
+            uint8_t pal[4][4]{};
+            exp565(c0, pal[0]);
+            exp565(c1, pal[1]);
+            if (c0 > c1) {
+                for (int ch = 0; ch < 3; ++ch) {
+                    pal[2][ch] = static_cast<uint8_t>((2u * pal[0][ch] + pal[1][ch] + 1u) / 3u);
+                    pal[3][ch] = static_cast<uint8_t>((pal[0][ch] + 2u * pal[1][ch] + 1u) / 3u);
+                }
+                pal[2][3] = 255u;
+                pal[3][3] = 255u;
+            } else {
+                for (int ch = 0; ch < 3; ++ch) {
+                    pal[2][ch] = static_cast<uint8_t>((pal[0][ch] + pal[1][ch]) / 2u);
+                    pal[3][ch] = 0u;
+                }
+                pal[2][3] = 255u;
+                pal[3][3] = 0u;
+            }
+            for (size_t px = 0; px < 16u; ++px) {
+                const uint32_t idx = bits & 0x3u;
+                bits >>= 2u;
+                std::memcpy(out_rgba + b * 64u + px * 4u, pal[idx], 4u);
+            }
+        }
+        return kSuccess;
+    }
+
     if (compressedSize >= 8 && std::memcmp(in, "BCPK", 4) == 0) {
         size_t written = 0;
+        if (scarlettx::io::LooksLikeRfc1950ZlibHeader(in + 8, compressedSize - 8) &&
+            scarlettx::io::InflateZlibRfc1950(in + 8, compressedSize - 8, static_cast<uint8_t*>(dstBlocks),
+                                              decompressedSize, written)) {
+            return kSuccess;
+        }
         if (Lz77DecompressTile(in + 8, compressedSize - 8, static_cast<uint8_t*>(dstBlocks), decompressedSize, written)) {
             return kSuccess;
         }

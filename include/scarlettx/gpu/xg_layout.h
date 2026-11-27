@@ -19,6 +19,7 @@ bool IsBlockCompressed(uint32_t dxgi_format);
 // layout (block padding, mip tail, smallest mip first). Other modes get a
 // block-padded layout without texel addressing.
 void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* out);
+void ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT* out);
 
 // True when texel addressing is available for this layout.
 bool IsAddressable(const XG_RESOURCE_LAYOUT& layout);

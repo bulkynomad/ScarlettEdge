@@ -279,10 +279,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="d3d12",
             category="Graphics",
             implemented=d3d_cnt + shader_ir_ready,
-            target=46,
+            target=47,
             notes=(
-                f"{d3d_cnt} exports + DXIL/DXBC container parser & Xbox-chunk stripper; "
-                "root signatures, descriptor heaps, graphics/compute/software-DXR PSOs, pipeline cache, WARP or hardware adapter"
+                f"{d3d_cnt} exports + RDNA2/DXIL/DXBC shader lifter & Xbox-chunk stripper; "
+                "root signatures, descriptor heaps, graphics/compute/stream/DXR PSOs, CreatePlacedResourceX GPUVA, WARP or hardware GPU"
             ),
         ),
         Subsystem(
@@ -436,8 +436,8 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="Vulk",
             category="Graphics",
             implemented=vulkan_cnt,
-            target=14,
-            notes=f"{vulkan_cnt} exports; Hardware DXR Tier 1.1 acceleration structures (BLAS/TLAS), Vulkan 1.3 ray tracing, swapchain",
+            target=15,
+            notes=f"{vulkan_cnt} exports; live Vulkan 1.3 VkComputePipeline + UBO/SSBO dispatch, timeline semaphores, Win32 VkSurfaceKHR, GPU AS backing",
         ),
         Subsystem(
             name="Live Xbox Services (XSAPI/WinRT)",
@@ -628,36 +628,44 @@ def collect_aaa_roadmap_metrics() -> list[Subsystem]:
     """Phase 2: Granular next-wave deep silicon & commercial AAA retail execution sub-goals (72 total)."""
     return [
         Subsystem(
-            name="XG Tiling, MSAA & DCC",
-            short_name="XG/DCC",
-            category="Graphics",
-            implemented=6,
-            target=10,
-            notes="**Done (6):** 4KB_S, 256B_S, 64KB_S/D, 64KB_R_X, 64KB_Z_X depth, Cube/2D arrays · **Next (4):** 3D volumes, 2x/4x/8x MSAA, DCC color & HTILE depth decompression",
-        ),
-        Subsystem(
-            name="D3D12.2 & MEM_GRAPHICS",
-            short_name="D3D12.2",
-            category="Graphics",
-            implemented=4,
-            target=10,
-            notes="**Done (4):** 128-slot vtables, CL7::Barrier resource unwrapping, VirtualAlloc2 aliasing, 2 MB aligned large pages · **Next (6):** CreatePlacedResourceX on guest GPUVA, Mesh PSOs, VRS, Sampler Feedback/Tiled, ExecuteIndirect counts, Work Graphs",
-        ),
-        Subsystem(
             name="XS2 -> GPU Shader Compiler",
             short_name="XS2-IR",
             category="Compiler",
-            implemented=7,
+            implemented=12,
             target=12,
-            notes="**Done (7):** RDNA2 ISA decode, 256-VGPR SPIR-V 1.5 SSA, stage Output exports, SMEM UBOs, MIMG OpImageSampleImplicitLod, v_interp Fragment inputs, disk shader cache · **Next (5):** SSBO Load/Store, CFG reconvergence, Wave32 subgroups, d3d12_xs auto-intercept, SPIR-V->DXIL bridge",
+            notes="**Complete (12/12):** RDNA2 ISA decode, 256-VGPR SPIR-V 1.5, stage exports, SMEM UBOs, MIMG sample, v_interp, disk cache, SSBO Load/Store, OpLoopMerge/OpSelectionMerge CFG, Wave32 subgroups, d3d12_xs auto-intercept, signed SM 6.5 DXIL + SM 5.0 DXBC bridge",
+        ),
+        Subsystem(
+            name="XG Tiling, MSAA & DCC",
+            short_name="XG/DCC",
+            category="Graphics",
+            implemented=8,
+            target=10,
+            notes="**Done (8):** 4KB_S, 256B_S, 64KB_S/D, 64KB_R_X, 64KB_Z_X depth, Cube/2D arrays, 64 KB packed mip-tails, 3D volume swizzling · **Next (2):** 2x/4x/8x MSAA, DCC color & HTILE depth decompression",
+        ),
+        Subsystem(
+            name="Vulkan 1.3 & DXR GPU Exec",
+            short_name="VkExec",
+            category="Graphics",
+            implemented=8,
+            target=10,
+            notes="**Done (8):** Dynamic vulkan-1.dll loader, live vkCreateShaderModule, VkQueue/CmdBuffer, RootSig->VkDescriptorSetLayout, live VkComputePipeline + SSBO GPU dispatch, Win32 VkSurfaceKHR, GPU AS backing, Vulkan 1.2 timeline semaphores · **Next (2):** VK_KHR_acceleration_structure build, vkCmdTraceRaysKHR SBT",
         ),
         Subsystem(
             name="DirectStorage GPU Codecs",
             short_name="DS-GPU",
             category="Storage",
-            implemented=4,
+            implemented=6,
             target=8,
-            notes="**Done (4):** OVERLAPPED NVMe I/O, LZ77 GDeflate (0x04FB) & BCPK, multi-thread GDeflate tile pool, OS priority-preemptive queues · **Next (4):** RFC 1951 Huffman DEFLATE, GPU compute GDeflate, hardware BC1-BC7 unpack, direct TextureRegion GPU upload",
+            notes="**Done (6):** OVERLAPPED NVMe I/O, LZ77 GDeflate (0x04FB) & BCPK, multi-thread GDeflate tile pool, OS priority queues, RFC 1951 Huffman DEFLATE + RFC 1950 Zlib, hardware BC1 4x4 RGBA8 unpack · **Next (2):** GPU compute GDeflate, direct TextureRegion GPU upload",
+        ),
+        Subsystem(
+            name="D3D12.2 & MEM_GRAPHICS",
+            short_name="D3D12.2",
+            category="Graphics",
+            implemented=6,
+            target=10,
+            notes="**Done (6):** 128-slot vtables, CL7::Barrier unwrapping, VirtualAlloc2 aliasing, 2 MB large pages, CreatePlacedResourceX on KernelX/alias GPUVA, ID3D12Device2 stream PSOs (VS/PS/CS/AS/MS) · **Next (4):** VRS, Sampler Feedback/Tiled, ExecuteIndirect counts, Work Graphs",
         ),
         Subsystem(
             name="Retail XMA2 & Bink2 Media",
@@ -674,14 +682,6 @@ def collect_aaa_roadmap_metrics() -> list[Subsystem]:
             implemented=2,
             target=8,
             notes="**Done (2):** Live WinHTTP (libHttpClient & XCurl), baseline QueryApiImpl & XSAPI · **Next (6):** GDK 2022-2026 COM GUIDs, RoActivateInstance broker, XStore/DLC mount, live/local token bridge, XblTitleStorage sync, WebSocket/PlayFab bridge",
-        ),
-        Subsystem(
-            name="Vulkan 1.3 & DXR GPU Exec",
-            short_name="VkExec",
-            category="Graphics",
-            implemented=4,
-            target=10,
-            notes="**Done (4):** Dynamic vulkan-1.dll loader, live vkCreateShaderModule, VkQueue/VkCommandPool/VkCommandBuffer, VkDescriptorSetLayout · **Next (6):** Graphics/Compute VkPipeline, Win32 swapchain, GPU BLAS build, GPU TLAS update, vkCmdTraceRaysKHR SBT, timeline semaphores",
         ),
         Subsystem(
             name="AAA Retail Title Bring-Up",

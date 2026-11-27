@@ -5,6 +5,7 @@
 // the Xbox-facing COM proxies, as a guest would call them.
 #include "scarlettx/gpu/d3d12_xs_abi.h"
 #include "scarlettx/gpu/xg_layout.h"
+#include "scarlettx/kernel/kernelx_abi.h"
 #include "sx_check.h"
 
 #include <windows.h>
@@ -331,6 +332,139 @@ int main() {
         SX_REQUIRE(Call(heap, 2) == 0);
         SX_REQUIRE(Call(placed, kResGetGPUVirtualAddress) != 0);
         SX_REQUIRE(Call(placed, 2) == 0);
+    }
+
+    // 4. CreatePlacedResourceX (slot 74) on KernelX MEM_GRAPHICS GPUVA + MapViewOfFile3 virtual alias:
+    //    Write console-swizzled texels through the KernelX alias VA and verify automatic GPU upload!
+    {
+        constexpr int kDevCreateRootSignature = 16;
+        constexpr int kDevCreatePipelineStateStream = 50;
+        constexpr int kDevCreatePlacedResourceX = 74;
+
+        void* kx_va = nullptr;
+        uint64_t kx_gpu_va = 0;
+        SX_REQUIRE(KernelXAllocateMemory(0x10000, KERNELX_PAGE_64KB, KERNELX_MEM_GPU_VISIBLE,
+                                         &kx_va, &kx_gpu_va) == 0);
+        SX_REQUIRE(kx_va != nullptr && kx_gpu_va != 0);
+
+        void* kx_alias = nullptr;
+        SX_REQUIRE(KernelXCreateMemoryAlias(kx_va, 0, 0x10000, &kx_alias) == 0);
+        SX_REQUIRE(kx_alias != nullptr && kx_alias != kx_va);
+
+        D3D12_RESOURCE_DESC px_desc = td;
+        px_desc.Width = 32;
+        px_desc.Height = 32;
+        px_desc.MipLevels = 1;
+
+        void* placed_x = nullptr;
+        SX_REQUIRE(Call(c.device, kDevCreatePlacedResourceX, static_cast<uintptr_t>(kx_gpu_va), &px_desc,
+                        static_cast<uintptr_t>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                        static_cast<void*>(nullptr), static_cast<void*>(nullptr), &placed_x) == 0);
+        SX_REQUIRE(placed_x != nullptr);
+        SX_REQUIRE(static_cast<uint64_t>(Call(placed_x, kResGetGPUVirtualAddress)) == kx_gpu_va);
+
+        // Cook linear 32x32 RGBA8 pattern into console 4KB_S swizzled layout via the KernelX ALIAS view!
+        XG_TEXTURE2D_DESC px_xd{};
+        px_xd.Width = 32;
+        px_xd.Height = 32;
+        px_xd.MipLevels = 1;
+        px_xd.ArraySize = 1;
+        px_xd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        px_xd.SampleDesc.Count = 1;
+        px_xd.SwizzleMode = XG_SWIZZLE_MODE_4KB_S;
+        XG_RESOURCE_LAYOUT xlay{};
+        xg::ComputeTexture2DLayout(px_xd, &xlay);
+
+        std::vector<uint8_t> linear_src(32 * 32 * 4);
+        for (size_t i = 0; i < linear_src.size(); ++i) {
+            linear_src[i] = static_cast<uint8_t>((i * 37u + 0x5Au) & 0xFFu);
+        }
+        SX_REQUIRE(xg::CopyIntoSubresource(xlay, kx_alias, 0, 0, linear_src.data(), 32 * 4));
+
+        // Copy from placed_x on the GPU command list to c.readback and verify every byte matches!
+        SX_REQUIRE(Call(c.list, kListReset, c.allocator, static_cast<void*>(nullptr)) == 0);
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = static_cast<ID3D12Resource*>(placed_x);
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        Call(c.list, kListResourceBarrier, uintptr_t{1}, &b);
+
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = static_cast<ID3D12Resource*>(c.readback);
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = 0;
+        dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        dst.PlacedFootprint.Footprint.Width = 32;
+        dst.PlacedFootprint.Footprint.Height = 32;
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = 256;
+
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = static_cast<ID3D12Resource*>(placed_x);
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        Call(c.list, kListCopyTextureRegion, &dst, uintptr_t{0}, uintptr_t{0}, uintptr_t{0}, &src,
+             static_cast<void*>(nullptr));
+        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+        Call(c.list, kListResourceBarrier, uintptr_t{1}, &b);
+        SX_REQUIRE(Call(c.list, kListClose) == 0);
+
+        void* lists[] = {c.list};
+        Call(c.queue, kQueueExecuteCommandLists, uintptr_t{1}, static_cast<void**>(lists));
+        const uint64_t fval = ++c.fence_value;
+        SX_REQUIRE(Call(c.queue, kQueueSignal, c.fence, static_cast<uintptr_t>(fval)) == 0);
+        while (static_cast<uint64_t>(Call(c.fence, kFenceGetCompletedValue)) < fval) Sleep(1);
+
+        void* rb_ptr = nullptr;
+        SX_REQUIRE(Call(c.readback, kResMap, uintptr_t{0}, static_cast<void*>(nullptr), &rb_ptr) == 0);
+        for (uint32_t row = 0; row < 32; ++row) {
+            SX_REQUIRE(std::memcmp(static_cast<const uint8_t*>(rb_ptr) + row * 256,
+                                   linear_src.data() + row * 128, 128) == 0);
+        }
+        Call(c.readback, kResUnmap, uintptr_t{0}, static_cast<void*>(nullptr));
+
+        SX_REQUIRE(Call(placed_x, 2) == 0);
+        SX_REQUIRE(KernelXFreeMemoryAlias(kx_alias) == 0);
+        SX_REQUIRE(KernelXFreeMemory(kx_va) == 0);
+
+        // 5. ID3D12Device2::CreatePipelineState (slot 50) stream PSO with Xbox RS proxy + XS2\0 shader!
+        D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+        ID3DBlob* rs_blob = nullptr;
+        SX_REQUIRE(D3D12XsSerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                 reinterpret_cast<void**>(&rs_blob), nullptr) >= 0);
+        void* rs_proxy = nullptr;
+        const IID rs_iid = __uuidof(ID3D12RootSignature);
+        SX_REQUIRE(Call(c.device, kDevCreateRootSignature, uintptr_t{0}, rs_blob->GetBufferPointer(),
+                        rs_blob->GetBufferSize(), &rs_iid, &rs_proxy) == 0 && rs_proxy != nullptr);
+        rs_blob->Release();
+
+        // Minimal XS2\0 compute shader (v_add_f32 v2, v0, v0; s_endpgm — no UAV/CBV needed for empty RS)
+        const uint8_t xs2_stream_cs[] = {
+            'X', 'S', '2', '\0',
+            1, 0, 0, 0,
+            3, 0, 0, 0,  // Compute stage
+            8, 0, 0, 0,  // 8 bytes of RDNA2 ISA
+            0x00, 0x00, 0x04, 0x06,  // v_add_f32 v2, v0, v0
+            0x00, 0x00, 0x80, 0xBF   // s_endpgm
+        };
+        struct alignas(void*) TokRs { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; ID3D12RootSignature* rs; };
+        struct alignas(void*) TokCs { D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type; D3D12_SHADER_BYTECODE cs; };
+        struct StreamLayout {
+            TokRs rs;
+            TokCs cs;
+        } stream_data{
+            {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, static_cast<ID3D12RootSignature*>(rs_proxy)},
+            {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, {xs2_stream_cs, sizeof(xs2_stream_cs)}},
+        };
+        D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(stream_data), &stream_data};
+        void* stream_pso = nullptr;
+        const IID pso_iid = __uuidof(ID3D12PipelineState);
+        SX_REQUIRE(Call(c.device, kDevCreatePipelineStateStream, &stream_desc, &pso_iid, &stream_pso) == 0);
+        SX_REQUIRE(stream_pso != nullptr);
+        SX_REQUIRE(Call(stream_pso, 2) == 0);
+        SX_REQUIRE(Call(rs_proxy, 2) == 0);
     }
 
     std::printf("test_d3d12_guest_texture: OK\n");

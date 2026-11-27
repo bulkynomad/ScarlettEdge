@@ -70,6 +70,19 @@ typedef struct XG_TEXTURE2D_DESC {
     uint32_t Pitch;
 } XG_TEXTURE2D_DESC;
 
+typedef struct XG_TEXTURE3D_DESC {
+    uint32_t Width;
+    uint32_t Height;
+    uint32_t Depth;
+    uint32_t MipLevels;
+    uint32_t Format;
+    uint32_t Usage;
+    uint32_t BindFlags;
+    uint32_t CPUAccessFlags;
+    uint32_t MiscFlags;
+    uint32_t SwizzleMode;
+} XG_TEXTURE3D_DESC;
+
 typedef struct XG_MIPLEVEL_LAYOUT {
     uint64_t SizeBytes;               // +0x00
     uint64_t OffsetBytes;             // +0x08
@@ -136,6 +149,10 @@ SCARLETTX_XG_API uint32_t SCARLETTX_XG_CALL XGComputeOptimalSwizzleMode(
 
 SCARLETTX_XG_API int32_t SCARLETTX_XG_CALL XGCreateTexture2DComputer(
     const XG_TEXTURE2D_DESC* desc,
+    void** computer);
+
+SCARLETTX_XG_API int32_t SCARLETTX_XG_CALL XGCreateTexture3DComputer(
+    const XG_TEXTURE3D_DESC* desc,
     void** computer);
 
 #ifdef __cplusplus

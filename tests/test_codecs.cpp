@@ -41,12 +41,67 @@ int main() {
         SX_CHECK(std::memcmp(asset.data(), restored.data(), asset.size()) == 0);
     }
 
-    // 2. BCPack compress & decompress
+    // 2. BCPack compress & decompress + Hardware BC1 4x4 RGBA8 block unpack (format=0x101)
     std::vector<uint8_t> bc_comp(128, 0);
     size_t bc_comp_len = 0;
     SX_CHECK(XboxCodecBcPackCompress(raw_data, 64, bc_comp.data(), bc_comp.size(), &bc_comp_len) == 0);
     std::vector<uint8_t> bc_decomp(64, 0);
     SX_CHECK(XboxCodecBcPackDecompress(bc_comp.data(), bc_comp_len, bc_decomp.data(), bc_decomp.size(), 1) == 0);
+
+    {
+        // BC1 4x4 block: c0=0xF800 (pure red), c1=0x001F (pure blue), all 16 indices=0 -> 16 opaque red pixels
+        const uint8_t bc1_blk[8] = {0x00u, 0xF8u, 0x1Fu, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u};
+        uint8_t unpacked_rgba[64]{};
+        SX_CHECK(XboxCodecBcPackDecompress(bc1_blk, sizeof(bc1_blk), unpacked_rgba, sizeof(unpacked_rgba), 0x101u) == 0);
+        for (size_t px = 0; px < 16u; ++px) {
+            SX_CHECK(unpacked_rgba[px * 4u + 0] == 255u);
+            SX_CHECK(unpacked_rgba[px * 4u + 1] == 0u);
+            SX_CHECK(unpacked_rgba[px * 4u + 2] == 0u);
+            SX_CHECK(unpacked_rgba[px * 4u + 3] == 255u);
+        }
+    }
+
+    // 2b. Spec-compliant RFC 1950 Zlib & RFC 1951 Canonical Huffman DEFLATE (verified against Python zlib!)
+    {
+        const uint8_t zlib_fixed[] = {
+            0x78u, 0x01u, 0x0Bu, 0x4Eu, 0x4Eu, 0x2Cu, 0xCAu, 0x49u, 0x2Du, 0x29u, 0x71u, 0x4Du, 0x49u,
+            0x4Fu, 0x55u, 0x08u, 0x72u, 0x73u, 0x36u, 0xB4u, 0x34u, 0x35u, 0x54u, 0x70u, 0xCBu, 0xACu,
+            0x48u, 0x4Du, 0x51u, 0xF0u, 0x28u, 0x4Du, 0x4Bu, 0xCBu, 0x4Du, 0xCCu, 0x53u, 0x08u, 0x49u,
+            0x2Du, 0x2Eu, 0x51u, 0x54u, 0x08u, 0xA6u, 0xBAu, 0x42u, 0x00u, 0xE2u, 0x05u, 0x28u, 0x69u
+        };
+        const std::string expected_str =
+            "ScarlettEdge RFC1951 Fixed Huffman Test! "
+            "ScarlettEdge RFC1951 Fixed Huffman Test! "
+            "ScarlettEdge RFC1951 Fixed Huffman Test! ";
+        std::vector<uint8_t> z_out(expected_str.size(), 0);
+        size_t z_written = 0;
+        SX_CHECK(XboxCodecGDeflateDecompress(zlib_fixed, sizeof(zlib_fixed), z_out.data(), z_out.size(), &z_written) == 0);
+        SX_CHECK(z_written == expected_str.size());
+        SX_CHECK(std::memcmp(z_out.data(), expected_str.data(), expected_str.size()) == 0);
+
+        // Dynamic Huffman (BTYPE=2, Python zlib level=9) golden vector: 125B -> 464B
+        const uint8_t zlib_dyn[] = {
+            0x78u, 0xDAu, 0xEDu, 0xCDu, 0x4Bu, 0x0Au, 0xC2u, 0x30u, 0x14u, 0x05u, 0xD0u, 0x2Du, 0xB5u,
+            0xE9u, 0x7Fu, 0xD8u, 0x12u, 0xD1u, 0x82u, 0x88u, 0x34u, 0x20u, 0x99u, 0x5Du, 0x9Eu, 0xF1u,
+            0xB5u, 0x06u, 0x93u, 0x46u, 0x62u, 0x04u, 0xDDu, 0xBDu, 0x6Eu, 0xC2u, 0x99u, 0x1Bu, 0x38u,
+            0x47u, 0x9Fu, 0xC3u, 0x4Bu, 0x71u, 0xB4u, 0xFCu, 0xD0u, 0x50u, 0x86u, 0xA2u, 0xE3u, 0x94u,
+            0x36u, 0x97u, 0x85u, 0x21u, 0xDFu, 0x2Bu, 0x79u, 0x6Bu, 0x76u, 0xCFu, 0x79u, 0xF6u, 0xB4u,
+            0x62u, 0x70u, 0xC1u, 0xDCu, 0xD0u, 0xBBu, 0xFBu, 0x95u, 0x90u, 0xE5u, 0xA2u, 0x28u, 0xABu,
+            0xBAu, 0x69u, 0x3Bu, 0x0Cu, 0x9Cu, 0x08u, 0x5Du, 0xDBu, 0xD4u, 0x55u, 0x59u, 0x88u, 0x3Cu,
+            0xC3u, 0x96u, 0xBCu, 0x27u, 0x48u, 0x1Bu, 0xD9u, 0x24u, 0x95u, 0x42u, 0xA4u, 0xAFu, 0x34u,
+            0xC9u, 0x43u, 0x2Fu, 0xA0u, 0x8Eu, 0xE3u, 0x74u, 0x82u, 0xD4u, 0xE3u, 0x1Eu, 0xFAu, 0x7Fu,
+            0xFEu, 0xECu, 0xFCu, 0x00u, 0x12u, 0x61u, 0xA0u, 0x39u
+        };
+        const std::string dyn_unit =
+            "XboxSeriesX_ScarlettEdge_DynamicHuffman_Block_Alpha_0123456789_"
+            "Beta_9876543210_Gamma_DirectStorage_RDNA2_SPIRV_DXIL_";
+        const std::string expected_dyn = dyn_unit + dyn_unit + dyn_unit + dyn_unit;
+        std::vector<uint8_t> dyn_out(expected_dyn.size(), 0);
+        size_t dyn_written = 0;
+        SX_CHECK(XboxCodecGDeflateDecompress(zlib_dyn, sizeof(zlib_dyn), dyn_out.data(), dyn_out.size(), &dyn_written) == 0);
+        SX_CHECK(dyn_written == expected_dyn.size());
+        SX_CHECK(std::memcmp(dyn_out.data(), expected_dyn.data(), expected_dyn.size()) == 0);
+    }
 
     // 3. XMA2 decoder lifecycle
     XMA2_FORMAT fmt{};

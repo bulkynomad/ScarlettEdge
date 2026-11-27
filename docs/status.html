@@ -111,8 +111,8 @@
 <main class="status">
   <h2>Status: 100.0%</h2>
   <div class="badges">
-    <span class="badge"><span class="k">functions</span><span class="v-fn">424/424</span></span>
-    <span class="badge"><span class="k">exports</span><span class="v-exports">412</span></span>
+    <span class="badge"><span class="k">functions</span><span class="v-fn">426/426</span></span>
+    <span class="badge"><span class="k">exports</span><span class="v-exports">414</span></span>
     <span class="badge"><span class="k">tests</span><span class="v-tests">32/32 passing</span></span>
     <span class="badge"><span class="k">target</span><span class="v-target">Xbox Series X|S (Gen9)</span></span>
   </div>
@@ -125,12 +125,12 @@
   <div class="list" id="list"></div>
   <div class="callout">
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 15 14H1z" fill="none" stroke="#39d353" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="#39d353" stroke-width="1.5" stroke-linecap="round"/></svg>
-    <span><strong>Phase 1 ABI Parity (100%):</strong> Full clean-room ABI surface across all 19 subsystems (424/424 functions; 281 upstream ScarlettX + 143 ScarlettEdge). See README for Phase 2 AAA Silicon Roadmap.</span>
+    <span><strong>Phase 1 ABI Parity (100%):</strong> Full clean-room ABI surface across all 19 subsystems (426/426 functions; 281 upstream ScarlettX + 145 ScarlettEdge). See README for Phase 2 AAA Silicon Roadmap.</span>
   </div>
 </main>
 <script>
   const SUBSYSTEMS = [
-    ['d3d12', 'd3d12_xs → PC D3D12 & PSOs', 46, 46],
+    ['d3d12', 'd3d12_xs → PC D3D12 & PSOs', 47, 47],
     ['XTask', 'XTaskQueue & XAsync', 24, 24],
     ['Save', 'XGameSave (persistent)', 30, 30],
     ['XUser', 'XUser & Identity', 24, 24],
@@ -147,7 +147,7 @@
     ['XS2', 'RDNA2 XS2 Shader Lifting', 16, 16],
     ['Crypt', 'Retail XVC/XVD Crypto', 12, 12],
     ['Codec', 'Production Codecs (XMA2/GDeflate/Bink)', 16, 16],
-    ['Vulk', 'Hardware DXR & Vulkan Backend', 14, 14],
+    ['Vulk', 'Hardware DXR & Vulkan Backend', 15, 15],
     ['XSAPI', 'Live Xbox Services (XSAPI/WinRT)', 16, 16],
   ];
   const level = p => p >= 0.8 ? 'lv3' : p >= 0.6 ? 'lv2' : p >= 0.4 ? 'lv1' : 'lv0';

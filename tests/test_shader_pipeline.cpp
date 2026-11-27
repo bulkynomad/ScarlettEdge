@@ -96,14 +96,15 @@ int main() {
         SX_CHECK(pc_info.has_embedded_root_signature);
     }
 
-    // 2. Scarlett precompiled RDNA2 ISA container detection
+    // 2. Scarlett precompiled RDNA2 ISA container detection & real GPU execution
     {
-        std::vector<uint8_t> rdna2 = {'X', 'S', '2', '\0', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        // Header-only 16-byte stub (no RDNA2 microcode payload) returns UnsupportedFormat
+        std::vector<uint8_t> rdna2_empty = {'X', 'S', '2', '\0', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         ShaderModuleInfo info{};
-        SX_CHECK(InspectShaderContainer(rdna2, info).ok());
+        SX_CHECK(InspectShaderContainer(rdna2_empty, info).ok());
         SX_CHECK(info.kind == ShaderContainerKind::ScarlettRdna2);
-        ShaderTranslationResult tr{};
-        Status st = TranslateXboxShaderToPc(rdna2, tr);
+        ShaderTranslationResult tr_empty{};
+        Status st = TranslateXboxShaderToPc(rdna2_empty, tr_empty);
         SX_CHECK(!st.ok());
         SX_CHECK(st.code == StatusCode::UnsupportedFormat);
     }
@@ -262,6 +263,51 @@ int main() {
     SX_CHECK(stats.LiveGraphicsPsos == 2);
     SX_CHECK(stats.LiveComputePsos == 1);
     SX_CHECK(stats.LiveRaytracingPsos == 1);
+
+    // 5. End-to-End Scarlett RDNA2 (XS2\0) -> PC DXIL/DXBC Auto-Intercept & Live D3D12 Dispatch!
+    {
+        // RDNA2 Compute Kernel:
+        //   v0 starts at (float)tid.x (0..15)
+        //   v_add_f32 v2, v0, v0        -> v2 = 2 * tid.x   (w0 = (0x03<<25) | (2<<17) | (0<<9) | 0 = 0x06040000)
+        //   v_mul_f32 v3, v2, v2        -> v3 = 4 * tid.x^2 (w0 = (0x08<<25) | (3<<17) | (2<<9) | 2 = 0x10060402)
+        //   buffer_store_dword v3, v0   -> u0[tid.x] = asuint(v3)
+        //   s_endpgm
+        const uint32_t xs2_cs_words[] = {
+            0x06040000u,
+            0x10060402u,
+            0xE2000000u, 0x00000300u,
+            0xBF800000u,
+        };
+        std::vector<uint8_t> xs2_cs_blob = {'X', 'S', '2', '\0'};
+        AppendLe32(xs2_cs_blob, 1u);  // version 1
+        AppendLe32(xs2_cs_blob, 3u);  // stage = Compute
+        AppendLe32(xs2_cs_blob, static_cast<uint32_t>(sizeof(xs2_cs_words)));
+        const auto* cs_raw = reinterpret_cast<const uint8_t*>(xs2_cs_words);
+        xs2_cs_blob.insert(xs2_cs_blob.end(), cs_raw, cs_raw + sizeof(xs2_cs_words));
+
+        D3D12XBOX_ROOT_SIGNATURE_DESC xs2_rs_desc{};
+        xs2_rs_desc.NumUavs = 1;
+        uint64_t xs2_rs = 0;
+        SX_CHECK(D3D12XboxCreateRootSignature(dev, &xs2_rs_desc, &xs2_rs) == 0);
+
+        D3D12XBOX_COMPUTE_PSO_DESC xs2_pso_desc{};
+        xs2_pso_desc.RootSignatureHandle = xs2_rs;
+        xs2_pso_desc.CS = {xs2_cs_blob.data(), xs2_cs_blob.size()};
+        uint64_t xs2_pso = 0;
+        SX_CHECK(D3D12XboxCreateComputePipelineState(dev, &xs2_pso_desc, &xs2_pso) == 0);
+        SX_CHECK(xs2_pso != 0);
+
+        float xs2_uav_out[16] = {};
+        SX_CHECK(D3D12XboxDispatchCompute(
+                     dev, xs2_pso, 1, 1, 1, nullptr, 0, xs2_uav_out, sizeof(xs2_uav_out)) == 0);
+        for (uint32_t i = 0; i < 16; ++i) {
+            const float expected = 4.0f * static_cast<float>(i * i);
+            SX_CHECK(xs2_uav_out[i] == expected);
+        }
+
+        SX_CHECK(D3D12XboxDestroyPipelineState(dev, xs2_pso) == 0);
+        SX_CHECK(D3D12XboxDestroyRootSignature(dev, xs2_rs) == 0);
+    }
 
     SX_CHECK(D3D12XboxDestroyPipelineState(dev, gfx_pso1) == 0);
     SX_CHECK(D3D12XboxDestroyPipelineState(dev, gfx_pso2) == 0);

@@ -193,6 +193,68 @@ void TestRoundTrip() {
     auto cube = Desc(128, 128, 1, kRgba8, 6);  // 6-face CubeMap array
     cube.SwizzleMode = 9;
     RoundTrip(cube);
+
+    // 64KB_S & 64KB_R_X (mode 27) full mip-chains with RDNA2 64 KB packed mip-tails!
+    auto d64s_mipped = Desc(512, 512, 10, kRgba8);
+    d64s_mipped.SwizzleMode = 9;
+    RoundTrip(d64s_mipped);
+    {
+        XG_RESOURCE_LAYOUT ml64{};
+        xg::ComputeTexture2DLayout(d64s_mipped, &ml64);
+        // Mips 5..9 (16x16 down to 1x1) fit inside half a 32x32 micro-tile and share one 64 KB tail block!
+        SX_REQUIRE(ml64.Plane[0].Reserved2C == 5 && ml64.Plane[0].Reserved30 == 5);
+        SX_REQUIRE(ml64.Plane[0].MipLayout[5].Reserved64 == 1);
+    }
+    auto d64rx_mipped = Desc(256, 256, 9, kRgba8);
+    d64rx_mipped.SwizzleMode = 27;  // XG_SWIZZLE_MODE_64KB_R_X
+    RoundTrip(d64rx_mipped);
+
+    // 3D Volume Texture (64x64x8, 4 mips, 4KB_S & 64KB_S) zero-overlap round-trip via XGCreateTexture3DComputer
+    {
+        XG_TEXTURE3D_DESC d3{};
+        d3.Width = 64;
+        d3.Height = 64;
+        d3.Depth = 8;
+        d3.MipLevels = 4;
+        d3.Format = kRgba8;
+        d3.BindFlags = 0x8;
+        d3.SwizzleMode = XG_SWIZZLE_MODE_4KB_S;
+        void* comp3d = nullptr;
+        SX_REQUIRE(XGCreateTexture3DComputer(&d3, &comp3d) == 0 && comp3d != nullptr);
+        XG_RESOURCE_LAYOUT l3{};
+        using LayoutFn3 = int32_t (SCARLETTX_XG_CALL*)(void*, XG_RESOURCE_LAYOUT*);
+        using RefFn3 = uint32_t (SCARLETTX_XG_CALL*)(void*);
+        SX_REQUIRE((*reinterpret_cast<void***>(comp3d))[2] != nullptr);
+        SX_REQUIRE(reinterpret_cast<LayoutFn3>((*reinterpret_cast<void***>(comp3d))[2])(comp3d, &l3) == 0);
+        SX_REQUIRE(l3.Dimension == 4u && l3.MipLevels == 4u);
+        SX_REQUIRE(l3.Plane[0].MipLayout[0].DepthOrArraySize == 8u);
+        SX_REQUIRE(l3.Plane[0].MipLayout[1].DepthOrArraySize == 4u);
+        SX_REQUIRE(l3.Plane[0].MipLayout[2].DepthOrArraySize == 2u);
+        SX_REQUIRE(l3.Plane[0].MipLayout[3].DepthOrArraySize == 1u);
+
+        std::vector<uint8_t> vol_mem(static_cast<size_t>(l3.SizeBytes), 0);
+        std::vector<uint8_t> slice_in(64 * 64 * 4), slice_out(64 * 64 * 4);
+        for (uint32_t mip = 0; mip < 4u; ++mip) {
+            const uint32_t w = 64u >> mip, h = 64u >> mip, dep = 8u >> mip;
+            for (uint32_t z = 0; z < dep; ++z) {
+                for (size_t i = 0; i < w * h * 4u; ++i) {
+                    slice_in[i] = static_cast<uint8_t>((i * 11u + z * 53u + mip * 97u) & 0xFFu);
+                }
+                SX_REQUIRE(xg::CopyIntoSubresource(l3, vol_mem.data(), mip, z, slice_in.data(), w * 4u));
+            }
+        }
+        for (uint32_t mip = 0; mip < 4u; ++mip) {
+            const uint32_t w = 64u >> mip, h = 64u >> mip, dep = 8u >> mip;
+            for (uint32_t z = 0; z < dep; ++z) {
+                SX_REQUIRE(xg::CopyFromSubresource(l3, vol_mem.data(), mip, z, slice_out.data(), w * 4u));
+                for (size_t i = 0; i < w * h * 4u; ++i) {
+                    const uint8_t exp = static_cast<uint8_t>((i * 11u + z * 53u + mip * 97u) & 0xFFu);
+                    SX_REQUIRE(slice_out[i] == exp);
+                }
+            }
+        }
+        SX_REQUIRE(reinterpret_cast<RefFn3>((*reinterpret_cast<void***>(comp3d))[1])(comp3d) == 0);
+    }
 }
 
 // The texture computer as a title uses it: through its vtable.

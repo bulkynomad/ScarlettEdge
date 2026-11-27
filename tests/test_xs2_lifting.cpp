@@ -6,6 +6,100 @@
 #include <iostream>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+
+namespace {
+
+// Live GPU driver verification: creates a real VkInstance + VkDevice on host vulkan-1.dll
+// and validates that vkCreateShaderModule accepts our lifted SPIR-V 1.5 binary with VK_SUCCESS (0).
+bool VerifySpirvWithHostVulkanDriver(const void* spirv_bytes, size_t spirv_size, bool* out_driver_present) {
+    if (out_driver_present) *out_driver_present = false;
+    HMODULE vk_dll = LoadLibraryW(L"vulkan-1.dll");
+    if (!vk_dll) return true;
+
+    struct VkAppInfo { uint32_t sType; const void* pNext; const char* app; uint32_t appVer; const char* eng; uint32_t engVer; uint32_t apiVer; };
+    struct VkInstInfo { uint32_t sType; const void* pNext; uint32_t flags; const VkAppInfo* app; uint32_t lc; const char* const* l; uint32_t ec; const char* const* e; };
+    struct VkQueueInfo { uint32_t sType; const void* pNext; uint32_t flags; uint32_t qfi; uint32_t qc; const float* prio; };
+    struct VkDevInfo { uint32_t sType; const void* pNext; uint32_t flags; uint32_t qic; const VkQueueInfo* qi; uint32_t lc; const char* const* l; uint32_t ec; const char* const* e; const void* feat; };
+    struct VkShaderModInfo { uint32_t sType; const void* pNext; uint32_t flags; size_t codeSize; const uint32_t* pCode; };
+
+    using FnCreateInst = int32_t (WINAPI*)(const VkInstInfo*, const void*, void**);
+    using FnDestroyInst = void (WINAPI*)(void*, const void*);
+    using FnEnumPhys = int32_t (WINAPI*)(void*, uint32_t*, void**);
+    using FnCreateDev = int32_t (WINAPI*)(void*, const VkDevInfo*, const void*, void**);
+    using FnDestroyDev = void (WINAPI*)(void*, const void*);
+    using FnCreateMod = int32_t (WINAPI*)(void*, const VkShaderModInfo*, const void*, uint64_t*);
+    using FnDestroyMod = void (WINAPI*)(void*, uint64_t, const void*);
+
+    auto create_inst = reinterpret_cast<FnCreateInst>(reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkCreateInstance")));
+    auto destroy_inst = reinterpret_cast<FnDestroyInst>(reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkDestroyInstance")));
+    auto enum_phys = reinterpret_cast<FnEnumPhys>(reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkEnumeratePhysicalDevices")));
+    auto create_dev = reinterpret_cast<FnCreateDev>(reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkCreateDevice")));
+    auto destroy_dev = reinterpret_cast<FnDestroyDev>(reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkDestroyDevice")));
+    auto create_mod = reinterpret_cast<FnCreateMod>(reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkCreateShaderModule")));
+    auto destroy_mod = reinterpret_cast<FnDestroyMod>(reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkDestroyShaderModule")));
+    if (!create_inst || !destroy_inst || !enum_phys || !create_dev || !destroy_dev || !create_mod || !destroy_mod) {
+        FreeLibrary(vk_dll);
+        return true;
+    }
+
+    VkAppInfo app{0, nullptr, "SXTest", 1, "SXTest", 1, (1u << 22) | (2u << 12)};
+    VkInstInfo ici{1, nullptr, 0, &app, 0, nullptr, 0, nullptr};
+    void* inst = nullptr;
+    if (create_inst(&ici, nullptr, &inst) != 0 || !inst) {
+        FreeLibrary(vk_dll);
+        return true;
+    }
+    uint32_t count = 0;
+    std::vector<void*> phys;
+    if (enum_phys(inst, &count, nullptr) == 0 && count > 0) {
+        phys.resize(count);
+        enum_phys(inst, &count, phys.data());
+    }
+    if (phys.empty() || !phys[0]) {
+        destroy_inst(inst, nullptr);
+        FreeLibrary(vk_dll);
+        return true;
+    }
+    struct VkPhysProps { uint32_t apiVersion; uint32_t driverVersion; uint32_t vendorID; uint32_t deviceID; uint32_t deviceType; char deviceName[256]; uint8_t pad[1024]; };
+    using FnGetPhysProps = void (WINAPI*)(void*, VkPhysProps*);
+    auto get_phys_props = reinterpret_cast<FnGetPhysProps>(reinterpret_cast<void*>(GetProcAddress(vk_dll, "vkGetPhysicalDeviceProperties")));
+    if (get_phys_props) {
+        VkPhysProps props{};
+        get_phys_props(phys[0], &props);
+        if (props.apiVersion < ((1u << 22) | (2u << 12))) {
+            destroy_inst(inst, nullptr);
+            FreeLibrary(vk_dll);
+            return true;  // SPIR-V 1.5 requires Vulkan 1.2+; skip gracefully on legacy 1.0/1.1 CI stubs
+        }
+    }
+    const float prio = 1.0f;
+    VkQueueInfo qci{2, nullptr, 0, 0, 1, &prio};
+    VkDevInfo dci{3, nullptr, 0, 1, &qci, 0, nullptr, 0, nullptr, nullptr};
+    void* dev = nullptr;
+    if (create_dev(phys[0], &dci, nullptr, &dev) != 0 || !dev) {
+        destroy_inst(inst, nullptr);
+        FreeLibrary(vk_dll);
+        return true;
+    }
+    if (out_driver_present) *out_driver_present = true;
+
+    VkShaderModInfo smi{16, nullptr, 0, spirv_size, static_cast<const uint32_t*>(spirv_bytes)};
+    uint64_t mod = 0;
+    const int32_t res = create_mod(dev, &smi, nullptr, &mod);
+    if (res == 0 && mod != 0) {
+        destroy_mod(dev, mod, nullptr);
+    }
+    destroy_dev(dev, nullptr);
+    destroy_inst(inst, nullptr);
+    FreeLibrary(vk_dll);
+    return (res == 0 && mod != 0);
+}
+
+}  // namespace
+#endif
+
 int main() {
     std::cout << "[test_xs2_lifting] Testing RDNA2 XS2 Shader Lifting...\n";
 
@@ -232,6 +326,87 @@ int main() {
         };
         SX_CHECK(check_spv_export(ps_kernel, sizeof(ps_kernel), true));
         SX_CHECK(check_spv_export(vs_kernel, sizeof(vs_kernel), false));
+#if defined(_WIN32)
+        {
+            void* spv_ps = nullptr; size_t sz_ps = 0;
+            void* spv_vs = nullptr; size_t sz_vs = 0;
+            SX_CHECK(Xs2ShaderLiftToSpirv(ps_kernel, sizeof(ps_kernel), &opts, &spv_ps, &sz_ps) == 0);
+            SX_CHECK(Xs2ShaderLiftToSpirv(vs_kernel, sizeof(vs_kernel), &opts, &spv_vs, &sz_vs) == 0);
+            bool drv = false;
+            SX_CHECK(VerifySpirvWithHostVulkanDriver(spv_ps, sz_ps, &drv));
+            SX_CHECK(VerifySpirvWithHostVulkanDriver(spv_vs, sz_vs, nullptr));
+            Xs2ShaderFreeBytecode(spv_ps);
+            Xs2ShaderFreeBytecode(spv_vs);
+        }
+#endif
+    }
+
+    // 9. Wave32 Subgroup + Structured CFG Loop/Branch + SSBO StorageBuffer + LDS Shared Barrier Kernel
+    {
+        XS2_TRANSLATION_OPTIONS wave_opts{};
+        wave_opts.targetShaderModel = 0x00060005u;
+        wave_opts.enableWave32 = 1;
+        wave_opts.enableSubgroupOps = 1;
+
+        const uint32_t wave32_cfg_ssbo_kernel[] = {
+            0xE0000000u, 0x00000200u, // MUBUF: buffer_load_dword v2, v0 (SSBO Binding 2)
+            0x7E045D02u,              // VOP1:  v_rsq_f32 v2, v2 (GLSL.std.450 InverseSqrt, op=0x2E -> 0x2E<<9=0x5C00 | 0x102)
+            0x7E060402u,              // VOP1:  v_readfirstlane_b32 s3, v2 (Wave32 BroadcastFirst, op=0x02)
+            0x7C020602u,              // VOPC:  v_cmp_lt_f32 vcc_lo, v2, v3 (op=0x01)
+            0xD6FF0004u, 0x00000000u, // VOP3:  v_mbcnt_lo_u32_b32 v4, v0, v1, v2 (Wave32 Ballot, op=0x2FF)
+            0xBF87FFFCu,              // SOPP:  s_cbranch_vccnz -4 (backward structured loop -> OpLoopMerge)
+            0xDA000000u, 0x00000200u, // LDS:   ds_write_b32 v0, v2 (Workgroup shared array)
+            0xBF8A0000u,              // SOPP:  s_barrier (OpControlBarrier Workgroup)
+            0xD8000000u, 0x05000000u, // LDS:   ds_read_b32 v5, v0
+            0xBF850001u,              // SOPP:  s_cbranch_scc1 +1 (forward conditional -> OpSelectionMerge)
+            0xE2000000u, 0x00000500u, // MUBUF: buffer_store_dword v5, v0 (SSBO Binding 2)
+            0xBF800000u               // SOPP:  s_endpgm
+        };
+
+        char cfg_disasm[2048]{};
+        SX_CHECK(Xs2ShaderDisassembleRdna2(wave32_cfg_ssbo_kernel, sizeof(wave32_cfg_ssbo_kernel),
+                                           cfg_disasm, sizeof(cfg_disasm), nullptr) == 0);
+        SX_CHECK(std::strstr(cfg_disasm, "v_readfirstlane_b32") != nullptr);
+        SX_CHECK(std::strstr(cfg_disasm, "v_cmp_lt_f32") != nullptr);
+        SX_CHECK(std::strstr(cfg_disasm, "v_mbcnt_lo_u32_b32") != nullptr);
+        SX_CHECK(std::strstr(cfg_disasm, "s_cbranch_vccnz") != nullptr);
+        SX_CHECK(std::strstr(cfg_disasm, "s_barrier") != nullptr);
+        SX_CHECK(std::strstr(cfg_disasm, "s_cbranch_scc1") != nullptr);
+
+        void* cfg_spv = nullptr;
+        size_t cfg_spv_sz = 0;
+        SX_CHECK(Xs2ShaderLiftToSpirv(wave32_cfg_ssbo_kernel, sizeof(wave32_cfg_ssbo_kernel),
+                                      &wave_opts, &cfg_spv, &cfg_spv_sz) == 0);
+        SX_CHECK(cfg_spv != nullptr && cfg_spv_sz >= 80 && (cfg_spv_sz % 4) == 0);
+
+        const auto* w = static_cast<const uint32_t*>(cfg_spv);
+        const size_t n = cfg_spv_sz / 4;
+        bool has_ssbo_rt_arr = false, has_lds_arr = false, has_loop_merge = false;
+        bool has_sel_merge = false, has_barrier_op = false, has_bcast_first = false, has_ballot = false;
+        for (size_t i = 5; i < n; ) {
+            const uint32_t wc = w[i] >> 16;
+            const uint32_t op = w[i] & 0xFFFFu;
+            SX_CHECK(wc >= 1 && i + wc <= n);
+            if (op == 29u) has_ssbo_rt_arr = true;   // OpTypeRuntimeArray (SSBO)
+            if (op == 28u) has_lds_arr = true;       // OpTypeArray (LDS Workgroup)
+            if (op == 246u) has_loop_merge = true;   // OpLoopMerge
+            if (op == 247u) has_sel_merge = true;    // OpSelectionMerge
+            if (op == 224u) has_barrier_op = true;   // OpControlBarrier
+            if (op == 338u) has_bcast_first = true;  // OpGroupNonUniformBroadcastFirst
+            if (op == 339u) has_ballot = true;       // OpGroupNonUniformBallot
+            i += wc;
+        }
+        SX_CHECK(has_ssbo_rt_arr && has_lds_arr && has_loop_merge && has_sel_merge &&
+                 has_barrier_op && has_bcast_first && has_ballot);
+
+#if defined(_WIN32)
+        bool vk_present = false;
+        const bool vk_ok = VerifySpirvWithHostVulkanDriver(cfg_spv, cfg_spv_sz, &vk_present);
+        std::cout << "[test_xs2_lifting] Host Vulkan SPIR-V 1.5 driver validation (present="
+                  << (vk_present ? "yes" : "no") << "): " << (vk_ok ? "PASSED" : "FAILED") << "\n";
+        SX_CHECK(vk_ok);
+#endif
+        Xs2ShaderFreeBytecode(cfg_spv);
     }
 
     std::cout << "[test_xs2_lifting] All 16 Xs2Shader APIs verified successfully!\n";

@@ -1,9 +1,15 @@
 #include "scarlettx/gpu/vulkan_backend_abi.h"
+#include "scarlettx/gpu/xs2_abi.h"
 #include "sx_check.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 int main() {
     std::cout << "[test_vulkan_backend] Testing Hardware DXR & Vulkan Backend...\n";
@@ -92,13 +98,76 @@ int main() {
     SX_CHECK(stats.framesPresented == 1);
     SX_CHECK(stats.raysTraced == 1920ull * 1080ull);
 
-    // 8. Cleanup
+    // 8. End-to-End Scarlett RDNA2 (XS2) -> SPIR-V 1.5 -> Live Vulkan 1.3 GPU Compute + Timeline Semaphore!
+    {
+        // RDNA2 Compute Kernel:
+        //   v0 starts at float(GlobalInvocationId.x)
+        //   s_load_dwordx4 s[4:7], s[0:1], 0x0 -> v4..v7 = uboVec4.xyzw (sdata = 4 -> 4<<6 = 0x100)
+        //   v_fma_f32 v2, v0, v4, v5           -> v2 = tid.x * ubo.x + ubo.y (w1 = (5<<18)|(4<<9)|0 = 0x00140800)
+        //   buffer_store_dword v2, v0          -> ssbo[tid.x] = v2
+        //   s_endpgm
+        const uint32_t rdna2_vk_kernel[] = {
+            0xF4000100u, 0x00000000u,
+            0xD4000002u, 0x00140800u,
+            0xE2000000u, 0x00000200u,
+            0xBF800000u,
+        };
+        XS2_TRANSLATION_OPTIONS spv_opts{};
+        spv_opts.targetShaderModel = 0x00060005u;
+        spv_opts.enableWave32 = 1;
+        void* spv_code = nullptr;
+        size_t spv_size = 0;
+        SX_CHECK(Xs2ShaderLiftToSpirv(rdna2_vk_kernel, sizeof(rdna2_vk_kernel), &spv_opts, &spv_code, &spv_size) == 0);
+        SX_CHECK(spv_code != nullptr && spv_size >= 40);
+
+        const float ubo_params[4] = {3.5f, 12.0f, 0.0f, 0.0f};
+        float ssbo_data[16] = {};
+        uint64_t timeline_val = 0;
+
+        VULKAN_XS_COMPUTE_DISPATCH_DESC disp{};
+        disp.spirvBytecode = spv_code;
+        disp.spirvSize = spv_size;
+        disp.groupCountX = 2;  // 2 * LocalSize(8) = 16 invocations
+        disp.groupCountY = 1;
+        disp.groupCountZ = 1;
+        disp.uboVec4 = ubo_params;
+        disp.inoutSsboData = ssbo_data;
+        disp.ssboByteSize = sizeof(ssbo_data);
+        disp.outTimelineValue = &timeline_val;
+
+        SX_CHECK(VulkanXsDispatchComputeSpirv(backend, &disp) == 0);
+        if (std::strstr(caps.deviceName, "ScarlettEdge Vulkan (") != nullptr) {
+            SX_CHECK(timeline_val >= 1ull);
+            for (uint32_t i = 0; i < 16; ++i) {
+                const float expected = static_cast<float>(i) * 3.5f + 12.0f;
+                SX_CHECK(std::fabs(ssbo_data[i] - expected) < 1e-4f);
+            }
+            std::cout << "[test_vulkan_backend] Verified live GPU execution on " << caps.deviceName
+                      << " (timeline=" << timeline_val << ", ssbo[15]=" << ssbo_data[15] << ")\n";
+        }
+        Xs2ShaderFreeBytecode(spv_code);
+
+#if defined(_WIN32)
+        // Verify real Win32 HWND VkSurfaceKHR creation path
+        HWND hwnd = CreateWindowExW(0, L"STATIC", L"SXVkSurf", WS_POPUP, 0, 0, 64, 64,
+                                    nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (hwnd) {
+            VULKAN_XS_SWAPCHAIN_HANDLE w32_sw = nullptr;
+            SX_CHECK(VulkanXsCreateSwapchain(backend, hwnd, 64, 64, &w32_sw) == 0);
+            SX_CHECK(w32_sw != nullptr);
+            SX_CHECK(VulkanXsDestroySwapchain(backend, w32_sw) == 0);
+            DestroyWindow(hwnd);
+        }
+#endif
+    }
+
+    // 9. Cleanup
     SX_CHECK(VulkanXsDestroySwapchain(backend, swapchain) == 0);
     SX_CHECK(VulkanXsDestroyAccelerationStructure(backend, tlas) == 0);
     SX_CHECK(VulkanXsDestroyAccelerationStructure(backend, blas) == 0);
     SX_CHECK(VulkanXsDestroyRaytracingPipeline(backend, rt_pipe) == 0);
     SX_CHECK(VulkanXsDestroyBackend(backend) == 0);
 
-    std::cout << "[test_vulkan_backend] All 14 VulkanXs APIs verified successfully!\n";
+    std::cout << "[test_vulkan_backend] All 15 VulkanXs APIs verified successfully!\n";
     return 0;
 }

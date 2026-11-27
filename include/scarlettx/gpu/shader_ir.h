@@ -49,6 +49,7 @@ struct ShaderTranslationResult {
     std::vector<uint8_t> pc_bytecode;
     uint64_t translated_hash = 0;
     uint32_t stripped_xbox_chunks = 0;
+    bool lifted_from_rdna2 = false;
 };
 
 uint64_t HashShaderBytes(const uint8_t* data, size_t size);
@@ -58,6 +59,18 @@ uint64_t HashShaderBytes(const uint8_t* data, size_t size);
 bool UpdateDxbcContainerChecksum(uint8_t* dxbc_data, size_t total_size);
 
 Status InspectShaderContainer(const std::vector<uint8_t>& bytecode, ShaderModuleInfo& out_info);
+
+// Lifts raw Scarlett RDNA2 ISA microcode bytes into a genuine retail-signed PC DXIL (SM 6.x
+// via dxcompiler.dll + dxil.dll when available) or DXBC (SM 5.0 via D3DCompile fallback)
+// container accepted natively by Windows ID3D12Device::Create*PipelineState.
+Status LiftRdna2MicrocodeToPcShader(
+    const uint8_t* microcode,
+    size_t byte_size,
+    ShaderStage stage_override,
+    uint32_t target_shader_model,
+    bool enable_wave32,
+    std::vector<uint8_t>& out_pc_dxbc,
+    ShaderStage* out_detected_stage = nullptr);
 
 // Translates a Scarlett/Xbox DXBC or DXIL container into a PC-compatible DXBC/DXIL
 // container by stripping Xbox-private chunks (XBOX, XS2M, XDBG) and rebuilding the

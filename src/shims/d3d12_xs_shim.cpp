@@ -809,12 +809,28 @@ struct XboxD3D12ResourceProxy {
 struct GuestTextureMemory {
     void* base = nullptr;
     size_t size = 0;
+    bool owns_memory = true;
+    uint64_t external_gpu_va = 0;
+    std::vector<uint64_t> subresource_hashes;
     XG_RESOURCE_LAYOUT layout{};
 };
 std::mutex g_guest_textures_mutex;
 std::vector<XboxD3D12ResourceProxy*> g_guest_textures;
 std::atomic<uint64_t> g_upload_textures{0};
 std::atomic<uint64_t> g_upload_bytes{0};
+
+uint64_t HashMemoryRegionFast(const uint8_t* ptr, size_t len) {
+    uint64_t h = 14695981039346656037ull;
+    const size_t n8 = len / 8u;
+    const auto* w = reinterpret_cast<const uint64_t*>(ptr);
+    for (size_t i = 0; i < n8; ++i) {
+        h = (h ^ w[i]) * 1099511628211ull;
+    }
+    for (size_t i = n8 * 8u; i < len; ++i) {
+        h = (h ^ ptr[i]) * 1099511628211ull;
+    }
+    return h ? h : 1ull;
+}
 
 // True when the guest layout describes the same rows as the host texture's
 // subresources. Rules out planar formats and element sizes the layout code
@@ -880,12 +896,48 @@ void* EnsureGuestTextureMemory(XboxD3D12ResourceProxy* obj) {
     return obj->guest_memory->base;
 }
 
+bool BindExternalGuestTextureMemory(XboxD3D12ResourceProxy* obj, void* guest_cpu_va, uint64_t guest_gpu_va) {
+    if (!obj || !obj->pc_res || !guest_cpu_va) return false;
+    std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
+    if (obj->guest_memory) return true;
+    const D3D12_RESOURCE_DESC d = obj->pc_res->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 ||
+        (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
+        return false;
+    }
+    XG_TEXTURE2D_DESC xd{};
+    xd.Width = static_cast<uint32_t>(d.Width);
+    xd.Height = d.Height;
+    xd.MipLevels = d.MipLevels;
+    xd.ArraySize = d.DepthOrArraySize;
+    xd.Format = static_cast<uint32_t>(obj->guest_format != DXGI_FORMAT_UNKNOWN ? obj->guest_format : d.Format);
+    xd.SampleDesc.Count = 1;
+    xd.BindFlags = 0x8;
+    xd.SwizzleMode = XG_SWIZZLE_MODE_4KB_S;
+    auto mem = std::make_unique<GuestTextureMemory>();
+    scarlettx::gpu::xg::ComputeTexture2DLayout(xd, &mem->layout);
+    if (!scarlettx::gpu::xg::IsAddressable(mem->layout) || mem->layout.SizeBytes == 0 ||
+        !GuestLayoutMatchesHost(obj->pc_res, d, mem->layout)) {
+        return false;
+    }
+    mem->base = guest_cpu_va;
+    mem->size = static_cast<size_t>(mem->layout.SizeBytes);
+    mem->owns_memory = false;
+    mem->external_gpu_va = guest_gpu_va ? guest_gpu_va : reinterpret_cast<uint64_t>(guest_cpu_va);
+    mem->subresource_hashes.assign(static_cast<size_t>(d.MipLevels) * d.DepthOrArraySize, 0ull);
+    obj->guest_memory = mem.release();
+    g_guest_textures.push_back(obj);
+    return true;
+}
+
 void ReleaseGuestTextureMemory(XboxD3D12ResourceProxy* obj) {
     std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
     if (!obj->guest_memory) return;
     g_guest_textures.erase(std::remove(g_guest_textures.begin(), g_guest_textures.end(), obj),
                            g_guest_textures.end());
-    VirtualFree(obj->guest_memory->base, 0, MEM_RELEASE);
+    if (obj->guest_memory->owns_memory && obj->guest_memory->base) {
+        VirtualFree(obj->guest_memory->base, 0, MEM_RELEASE);
+    }
     delete obj->guest_memory;
     obj->guest_memory = nullptr;
 }
@@ -1096,30 +1148,52 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
     std::vector<UINT> dirty;
     for (XboxD3D12ResourceProxy* tex : g_guest_textures) {
         GuestTextureMemory& mem = *tex->guest_memory;
-        pages.resize(mem.size / 4096 + 1);
-        ULONG_PTR count = pages.size();
-        DWORD granularity = 0;
-        // Reading resets the watch: a write that lands during the copy is picked up next time.
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, mem.base, mem.size, pages.data(), &count, &granularity) != 0 ||
-            count == 0) {
-            continue;
-        }
-        pages.resize(count);
-        // Only the subresources the title wrote to: the others may hold data
-        // that arrived through command-list copies.
         const D3D12_RESOURCE_DESC d = tex->pc_res->GetDesc();
+        const UINT subres_count = static_cast<UINT>(d.MipLevels) * d.DepthOrArraySize;
         dirty.clear();
-        for (UINT s = 0; s < static_cast<UINT>(d.MipLevels) * d.DepthOrArraySize; ++s) {
-            uint64_t offset = 0, size = 0;
-            if (!scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size)) {
+        if (!mem.owns_memory) {
+            // External KernelX / MapViewOfFile3 / guest GPUVA allocation (where MEM_WRITE_WATCH
+            // is unavailable on section views): detect dirty subresources via fast 64-bit hash.
+            if (mem.subresource_hashes.size() < subres_count) {
+                mem.subresource_hashes.resize(subres_count, 0ull);
+            }
+            for (UINT s = 0; s < subres_count; ++s) {
+                uint64_t offset = 0, size = 0;
+                if (!scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size) ||
+                    offset + size > mem.size) {
+                    continue;
+                }
+                const uint64_t cur_hash =
+                    HashMemoryRegionFast(static_cast<const uint8_t*>(mem.base) + offset, static_cast<size_t>(size));
+                if (cur_hash != mem.subresource_hashes[s]) {
+                    mem.subresource_hashes[s] = cur_hash;
+                    dirty.push_back(s);
+                }
+            }
+        } else {
+            pages.resize(mem.size / 4096 + 1);
+            ULONG_PTR count = pages.size();
+            DWORD granularity = 0;
+            // Reading resets the watch: a write that lands during the copy is picked up next time.
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, mem.base, mem.size, pages.data(), &count, &granularity) != 0 ||
+                count == 0) {
                 continue;
             }
-            const auto* first = static_cast<const uint8_t*>(mem.base) + offset;
-            const bool written = std::any_of(pages.begin(), pages.end(), [&](void* page) {
-                const auto* p = static_cast<const uint8_t*>(page);
-                return p + granularity > first && p < first + size;
-            });
-            if (written) dirty.push_back(s);
+            pages.resize(count);
+            // Only the subresources the title wrote to: the others may hold data
+            // that arrived through command-list copies.
+            for (UINT s = 0; s < subres_count; ++s) {
+                uint64_t offset = 0, size = 0;
+                if (!scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size)) {
+                    continue;
+                }
+                const auto* first = static_cast<const uint8_t*>(mem.base) + offset;
+                const bool written = std::any_of(pages.begin(), pages.end(), [&](void* page) {
+                    const auto* p = static_cast<const uint8_t*>(page);
+                    return p + granularity > first && p < first + size;
+                });
+                if (written) dirty.push_back(s);
+            }
         }
         if (dirty.empty()) continue;
         GuestTextureUpload u;
@@ -1143,6 +1217,22 @@ bool HasPendingGuestTextureWrites() {
     DWORD granularity = 0;
     for (XboxD3D12ResourceProxy* tex : g_guest_textures) {
         if (!tex || !tex->guest_memory || !tex->guest_memory->base) continue;
+        if (!tex->guest_memory->owns_memory) {
+            const GuestTextureMemory& mem = *tex->guest_memory;
+            const D3D12_RESOURCE_DESC d = tex->pc_res->GetDesc();
+            const UINT subres_count = static_cast<UINT>(d.MipLevels) * d.DepthOrArraySize;
+            for (UINT s = 0; s < subres_count && s < mem.subresource_hashes.size(); ++s) {
+                uint64_t offset = 0, size = 0;
+                if (scarlettx::gpu::xg::SubresourceRange(mem.layout, s % d.MipLevels, s / d.MipLevels, &offset, &size) &&
+                    offset + size <= mem.size) {
+                    const uint64_t h =
+                        HashMemoryRegionFast(static_cast<const uint8_t*>(mem.base) + offset, static_cast<size_t>(size));
+                    if (h != mem.subresource_hashes[s]) return true;
+                }
+            }
+            continue;
+        }
+        count = 1;
         if (GetWriteWatch(0, tex->guest_memory->base, tex->guest_memory->size, &single_page, &count, &granularity) == 0 && count > 0) {
             return true;
         }
@@ -1226,6 +1316,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ResProxyGetDesc(void* self, uintptr_t sret_ptr, 
 intptr_t SCARLETTX_GDK_CALLBACK ResProxyGetGPUVirtualAddress(void* self, uintptr_t, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12ResourceProxy*>(self);
+    if (obj->guest_memory && obj->guest_memory->external_gpu_va != 0) {
+        return static_cast<intptr_t>(obj->guest_memory->external_gpu_va);
+    }
     if (obj->pc_res) {
         const auto va = obj->pc_res->GetGPUVirtualAddress();
         if (va != 0) return static_cast<intptr_t>(va);
@@ -3464,11 +3557,12 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandAllocator(
 void TranslateGuestShaderStageIfNeeded(
     D3D12_SHADER_BYTECODE& stage,
     std::vector<uint8_t>& out_owned) {
-    if (!stage.pShaderBytecode || stage.BytecodeLength < 32) return;
+    if (!stage.pShaderBytecode || stage.BytecodeLength < 20) return;
     const auto* bytes = static_cast<const uint8_t*>(stage.pShaderBytecode);
     std::vector<uint8_t> src(bytes, bytes + stage.BytecodeLength);
     scarlettx::ShaderTranslationResult tr{};
-    if (scarlettx::TranslateXboxShaderToPc(src, tr).ok() && tr.stripped_xbox_chunks > 0) {
+    if (scarlettx::TranslateXboxShaderToPc(src, tr).ok() &&
+        (tr.stripped_xbox_chunks > 0 || tr.lifted_from_rdna2)) {
         out_owned = std::move(tr.pc_bytecode);
         stage.pShaderBytecode = out_owned.data();
         stage.BytecodeLength = out_owned.size();
@@ -4474,6 +4568,180 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyGetRaytracingPrebuildInfo(
     return 0;
 }
 
+#if defined(_WIN32)
+template <typename Inner>
+struct alignas(void*) PsoStreamToken {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    Inner inner;
+};
+
+size_t PsoStreamSubobjectByteSize(uint32_t raw_type) {
+    switch (raw_type) {
+        case 0:  return sizeof(PsoStreamToken<ID3D12RootSignature*>);               // ROOT_SIGNATURE
+        case 1:                                                                     // VS
+        case 2:                                                                     // PS
+        case 3:                                                                     // DS
+        case 4:                                                                     // HS
+        case 5:                                                                     // GS
+        case 6:                                                                     // CS
+        case 24:                                                                    // AS (Amplification)
+        case 25: return sizeof(PsoStreamToken<D3D12_SHADER_BYTECODE>);              // MS (Mesh)
+        case 7:  return sizeof(PsoStreamToken<D3D12_STREAM_OUTPUT_DESC>);           // STREAM_OUTPUT
+        case 8:  return sizeof(PsoStreamToken<D3D12_BLEND_DESC>);                   // BLEND
+        case 9:  return sizeof(PsoStreamToken<UINT>);                               // SAMPLE_MASK
+        case 10: return sizeof(PsoStreamToken<D3D12_RASTERIZER_DESC>);              // RASTERIZER
+        case 11: return sizeof(PsoStreamToken<D3D12_DEPTH_STENCIL_DESC>);           // DEPTH_STENCIL
+        case 12: return sizeof(PsoStreamToken<D3D12_INPUT_LAYOUT_DESC>);            // INPUT_LAYOUT
+        case 13: return sizeof(PsoStreamToken<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>); // IB_STRIP_CUT_VALUE
+        case 14: return sizeof(PsoStreamToken<D3D12_PRIMITIVE_TOPOLOGY_TYPE>);      // PRIMITIVE_TOPOLOGY
+        case 15: return sizeof(PsoStreamToken<D3D12_RT_FORMAT_ARRAY>);              // RENDER_TARGET_FORMATS
+        case 16: return sizeof(PsoStreamToken<DXGI_FORMAT>);                        // DEPTH_STENCIL_FORMAT
+        case 17: return sizeof(PsoStreamToken<DXGI_SAMPLE_DESC>);                   // SAMPLE_DESC
+        case 18: return sizeof(PsoStreamToken<UINT>);                               // NODE_MASK
+        case 19: return sizeof(PsoStreamToken<D3D12_CACHED_PIPELINE_STATE>);        // CACHED_PSO
+        case 20: return sizeof(PsoStreamToken<D3D12_PIPELINE_STATE_FLAGS>);         // FLAGS
+        case 21: return sizeof(PsoStreamToken<D3D12_DEPTH_STENCIL_DESC1>);          // DEPTH_STENCIL1
+        case 22: return sizeof(PsoStreamToken<D3D12_VIEW_INSTANCING_DESC>);         // VIEW_INSTANCING
+        default: return 0;
+    }
+}
+#endif
+
+// ID3D12Device2::CreatePipelineState (stream-based PSOs for Mesh Shaders, VRS, modern D3D12.2):
+// Unwraps XboxD3D12SimpleObjectProxy* root signatures and translates Xbox/XS2 shader stages in-stream.
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePipelineState(
+    void* self, uintptr_t pDesc, uintptr_t /*riid*/, uintptr_t ppPso) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
+    auto** out = reinterpret_cast<void**>(ppPso);
+    if (!obj || !obj->pc_device || !pDesc || !out) return static_cast<intptr_t>(E_INVALIDARG);
+    *out = nullptr;
+
+    ID3D12Device2* dev2 = nullptr;
+    if (FAILED(obj->pc_device->QueryInterface(IID_PPV_ARGS(&dev2))) || !dev2) {
+        return static_cast<intptr_t>(E_NOINTERFACE);
+    }
+
+    const auto* in_stream = reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(pDesc);
+    if (!in_stream->pPipelineStateSubobjectStream || in_stream->SizeInBytes == 0) {
+        dev2->Release();
+        return static_cast<intptr_t>(E_INVALIDARG);
+    }
+
+    const auto* src_bytes = static_cast<const uint8_t*>(in_stream->pPipelineStateSubobjectStream);
+    std::vector<uint8_t> stream_copy(src_bytes, src_bytes + in_stream->SizeInBytes);
+    std::vector<std::vector<uint8_t>> translated_stages;
+    translated_stages.reserve(6);
+
+    size_t pos = 0;
+    while (pos + sizeof(uint32_t) <= stream_copy.size()) {
+        uint32_t raw_type = 0;
+        std::memcpy(&raw_type, stream_copy.data() + pos, sizeof(uint32_t));
+        const size_t tok_sz = PsoStreamSubobjectByteSize(raw_type);
+        if (tok_sz == 0 || pos + tok_sz > stream_copy.size()) {
+            break;  // Unknown vendor extension tail; pass stream prefix/remainder untouched
+        }
+        if (raw_type == 0) {
+            auto* tok = reinterpret_cast<PsoStreamToken<ID3D12RootSignature*>*>(stream_copy.data() + pos);
+            if (tok->inner) {
+                auto* rs_proxy = reinterpret_cast<XboxD3D12SimpleObjectProxy*>(tok->inner);
+                tok->inner = reinterpret_cast<ID3D12RootSignature*>(rs_proxy->pc_obj);
+            }
+        } else if ((raw_type >= 1 && raw_type <= 6) || raw_type == 24 || raw_type == 25) {
+            auto* tok = reinterpret_cast<PsoStreamToken<D3D12_SHADER_BYTECODE>*>(stream_copy.data() + pos);
+            std::vector<uint8_t> stage_blob;
+            TranslateGuestShaderStageIfNeeded(tok->inner, stage_blob);
+            if (!stage_blob.empty()) {
+                translated_stages.push_back(std::move(stage_blob));
+                tok->inner.pShaderBytecode = translated_stages.back().data();
+                tok->inner.BytecodeLength = translated_stages.back().size();
+            }
+        }
+        pos += tok_sz;
+    }
+
+    D3D12_PIPELINE_STATE_STREAM_DESC mod_desc{};
+    mod_desc.SizeInBytes = stream_copy.size();
+    mod_desc.pPipelineStateSubobjectStream = stream_copy.data();
+
+    ID3D12PipelineState* pc_pso = nullptr;
+    const HRESULT hr = dev2->CreatePipelineState(&mod_desc, IID_PPV_ARGS(&pc_pso));
+    dev2->Release();
+    if (FAILED(hr) || !pc_pso) return static_cast<intptr_t>(hr);
+
+    auto* proxy = new XboxD3D12SimpleObjectProxy();
+    proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
+    proxy->pc_obj = pc_pso;
+    proxy->kind = "PipelineState";
+    *out = proxy;
+    return 0;
+#else
+    return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
+#endif
+}
+
+// Xbox ID3D12Device::CreatePlacedResourceX (slot 74, +0x250):
+// Places a D3D12 resource directly onto a guest Unified Memory / KernelX GPU Virtual Address,
+// syncing console-swizzled writes (even through MapViewOfFile3 memory aliases) to the host GPU!
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePlacedResourceX(
+    void* self, uintptr_t baseAddress, uintptr_t pDesc, uintptr_t initialState,
+    uintptr_t pClearVal, uintptr_t riid, uintptr_t ppvRes) {
+#if defined(_WIN32)
+    auto** out = reinterpret_cast<void**>(ppvRes);
+    if (out) *out = nullptr;
+    if (!self || baseAddress == 0 || !pDesc || !out) {
+        return static_cast<intptr_t>(E_INVALIDARG);
+    }
+
+    void* guest_cpu_va = nullptr;
+    if (HMODULE kx = GetModuleHandleA("kernelx.dll")) {
+        using MapGpuToVaFn = int32_t (__stdcall*)(uint64_t, void**);
+        auto fn = reinterpret_cast<MapGpuToVaFn>(
+            reinterpret_cast<void*>(GetProcAddress(kx, "KernelXMapGpuToVirtual")));
+        if (fn) {
+            (void)fn(static_cast<uint64_t>(baseAddress), &guest_cpu_va);
+        }
+    }
+    if (!guest_cpu_va) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(baseAddress), &mbi, sizeof(mbi)) != 0 &&
+            mbi.State == MEM_COMMIT) {
+            guest_cpu_va = reinterpret_cast<void*>(baseAddress);
+        }
+    }
+    if (!guest_cpu_va) {
+        return static_cast<intptr_t>(E_INVALIDARG);
+    }
+
+    const auto& src_desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(pDesc);
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = (src_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+               (src_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0)
+                  ? D3D12_HEAP_TYPE_UPLOAD
+                  : D3D12_HEAP_TYPE_DEFAULT;
+    const intptr_t hr = ProxyCreateCommittedResource(
+        self, reinterpret_cast<uintptr_t>(&hp), 0u, pDesc, initialState, pClearVal, riid, ppvRes);
+    if (hr != 0 || !*out) {
+        return hr;
+    }
+
+    auto* res_proxy = static_cast<XboxD3D12ResourceProxy*>(*out);
+    if (src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        (void)BindExternalGuestTextureMemory(res_proxy, guest_cpu_va, static_cast<uint64_t>(baseAddress));
+    } else if (src_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && hp.Type == D3D12_HEAP_TYPE_UPLOAD &&
+               res_proxy->pc_res) {
+        void* mapped = nullptr;
+        if (SUCCEEDED(res_proxy->pc_res->Map(0, nullptr, &mapped)) && mapped) {
+            std::memcpy(mapped, guest_cpu_va, static_cast<size_t>(src_desc.Width));
+            res_proxy->pc_res->Unmap(0, nullptr);
+        }
+    }
+    return 0;
+#else
+    return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
+#endif
+}
+
 std::array<ComVtableFn, 128> BuildXboxDeviceProxyVtable() {
     auto vtbl = MakeProxyVtable(std::make_index_sequence<125>{});
     vtbl[6] = &ProxySetName;                                                           // +0x30
@@ -4508,11 +4776,13 @@ std::array<ComVtableFn, 128> BuildXboxDeviceProxyVtable() {
     vtbl[41] = reinterpret_cast<ComVtableFn>(&ProxyCreateCommandSignature);            // +0x148
     vtbl[44] = &ProxyGetAdapterLuid;                                                   // +0x160
     vtbl[48] = &ProxyCreateCommandQueueX;                                              // +0x180
+    vtbl[50] = &ProxyCreatePipelineState;                                              // +0x190 (ID3D12Device2 stream PSO)
     vtbl[55] = &ProxyCreateStateObject;                                                // +0x1b8
     vtbl[57] = &ProxyGetRaytracingPrebuildInfo;                                        // +0x1c8
     vtbl[68] = &ProxySlot68XboxInfo;                                                   // +0x220
     vtbl[69] = &ProxySlot69XboxSetting;                                                // +0x228
     vtbl[73] = reinterpret_cast<ComVtableFn>(&ProxyCreateCommandListX);                // +0x248
+    vtbl[74] = reinterpret_cast<ComVtableFn>(&ProxyCreatePlacedResourceX);             // +0x250 (CreatePlacedResourceX)
     vtbl[78] = &ProxySetFrameIntervalX;                                                // +0x270
     vtbl[79] = &ProxyScheduleFrameEventX;                                              // +0x278
     vtbl[80] = reinterpret_cast<ComVtableFn>(&ProxyWaitFrameEventX);                   // +0x280

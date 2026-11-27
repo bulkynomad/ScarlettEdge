@@ -13,13 +13,16 @@ constexpr uint32_t kMode256BS = 1;
 constexpr uint32_t kMode64KbS = 9;
 constexpr uint32_t kMode64KbD = 10;
 constexpr uint32_t kMode64KbZX = 24;
-constexpr uint32_t kMode64KbRX = 25;
+constexpr uint32_t kMode64KbSX = 25;
+constexpr uint32_t kMode64KbDX = 26;
+constexpr uint32_t kMode64KbRX = 27;
 constexpr uint32_t kBlockBytes = 4096;
 constexpr uint32_t kBlockBytes64K = 65536;
 constexpr uint32_t kMaxMips = 15;
 
 bool Is64KbAddressableMode(uint32_t mode) {
-    return mode == kMode64KbS || mode == kMode64KbD || mode == kMode64KbZX || mode == kMode64KbRX;
+    return mode == kMode64KbS || mode == kMode64KbD ||
+           mode == kMode64KbZX || mode == kMode64KbSX || mode == kMode64KbDX || mode == kMode64KbRX;
 }
 
 // Source of each offset bit inside a 4 KB block: 'x'/'y' and the coordinate bit.
@@ -124,7 +127,9 @@ bool ViewMip(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, Mip
     view->block_bytes = view->is_64k ? kBlockBytes64K : kBlockBytes;
     view->block_w = view->is_64k ? (view->micro_w * 4u) : view->micro_w;
     view->block_h = view->is_64k ? (view->micro_h * 4u) : view->micro_h;
-    view->base = static_cast<uint64_t>(slice) * plane.Reserved10;
+    const bool is_3d = (layout.Dimension == 4u);
+    view->base = is_3d ? (static_cast<uint64_t>(slice) * ml.Slice2DSizeBytes)
+                       : (static_cast<uint64_t>(slice) * plane.Reserved10);
     if (ml.Reserved64) {
         const uint32_t in_block = static_cast<uint32_t>(ml.OffsetBytes) & (kBlockBytes - 1);
         view->origin_x = AxisOrigin(*eq, 'x', in_block);
@@ -241,13 +246,16 @@ bool SubresourceRange(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t s
     const XG_PLANE_LAYOUT& plane = layout.Plane[0];
     const XG_MIPLEVEL_LAYOUT& ml = plane.MipLayout[mip];
     if (slice >= std::max<uint32_t>(1, ml.DepthOrArraySize)) return false;
-    const uint64_t base = static_cast<uint64_t>(slice) * plane.Reserved10;
+    const bool is_3d = (layout.Dimension == 4u);
+    const uint64_t base = is_3d ? (static_cast<uint64_t>(slice) * ml.Slice2DSizeBytes)
+                                : (static_cast<uint64_t>(slice) * plane.Reserved10);
     if (ml.Reserved64) {
-        *offset = base + (ml.OffsetBytes & ~static_cast<uint64_t>(kBlockBytes - 1));
-        *size = kBlockBytes;
+        const uint64_t tail_blk = (plane.BaseAlignmentBytes >= kBlockBytes64K) ? kBlockBytes64K : kBlockBytes;
+        *offset = base + (ml.OffsetBytes & ~(tail_blk - 1));
+        *size = tail_blk;
     } else {
         *offset = base + ml.OffsetBytes;
-        *size = ml.SizeBytes;
+        *size = is_3d ? ml.Slice2DSizeBytes : ml.SizeBytes;
     }
     return true;
 }
@@ -329,11 +337,13 @@ void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* o
         ml.PaddedDepthOrArraySize = array_size;
         ml.SampleCount = std::max<uint32_t>(1, desc.SampleDesc.Count);
         ml.Reserved60 = 1;
-        // Mips that fit in half a block share one tail block (mipped textures only).
-        // The test uses the top mip rounded up to a power of two.
+        // Mips that fit in half a micro-tile share one tail block (mipped textures only).
+        // Applies to both 4KB_S (4 KB tail block) and RDNA2 64KB_S/D/Z_X/R_X (64 KB tail block).
+        const uint32_t micro_w = eq ? (1u << AxisBits(*eq, 'x', 12)) : block_w;
+        const uint32_t micro_h = eq ? (1u << AxisBits(*eq, 'y', 12)) : block_h;
         const uint32_t tw = std::max<uint32_t>(1, (1u << Log2(we[0])) >> m);
         const uint32_t th = std::max<uint32_t>(1, (1u << Log2(he[0])) >> m);
-        if (swizzled && mips > 1 && first_tail == mips && tw <= block_w / 2 && th <= block_h) {
+        if ((swizzled || is_64k) && mips > 1 && first_tail == mips && tw <= micro_w / 2 && th <= micro_h) {
             first_tail = m;
         }
     }
@@ -375,6 +385,80 @@ void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* o
     plane.Reserved30 = mips - first_tail;
     plane.SizeBytes = offset * array_size;
     out.SizeBytes = plane.SizeBytes;
+}
+
+void ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT* out_ptr) {
+    XG_RESOURCE_LAYOUT& out = *out_ptr;
+    std::memset(&out, 0, sizeof(out));
+
+    const uint32_t width = std::max<uint32_t>(1, desc.Width);
+    const uint32_t height = std::max<uint32_t>(1, desc.Height);
+    const uint32_t depth = std::max<uint32_t>(1, desc.Depth);
+    const uint32_t mips = std::clamp<uint32_t>(desc.MipLevels == 0 ? 1u : desc.MipLevels, 1u, kMaxMips);
+    const uint32_t bpe = FormatBytesPerElement(desc.Format);
+    const bool bc = IsBlockCompressed(desc.Format);
+    const BlockEquation* eq = FindEquation(bpe);
+    const bool is_64k = Is64KbAddressableMode(desc.SwizzleMode) && eq != nullptr;
+    const bool swizzled = desc.SwizzleMode == kMode4KbS && eq != nullptr;
+
+    const uint32_t block_bytes = swizzled ? kBlockBytes : (is_64k ? kBlockBytes64K : BlockBytesForMode(desc.SwizzleMode));
+    uint32_t block_w = 0, block_h = 0;
+    if (swizzled) {
+        block_w = 1u << AxisBits(*eq, 'x', 12);
+        block_h = 1u << AxisBits(*eq, 'y', 12);
+    } else if (is_64k) {
+        block_w = (1u << AxisBits(*eq, 'x', 12)) * 4u;
+        block_h = (1u << AxisBits(*eq, 'y', 12)) * 4u;
+    } else {
+        const uint32_t elems_log2 = Log2(std::max<uint32_t>(1, block_bytes / std::max<uint32_t>(1, bpe)));
+        block_w = 1u << ((elems_log2 + 1) / 2);
+        block_h = 1u << (elems_log2 / 2);
+    }
+
+    out.Dimension = 4;  // D3D12_RESOURCE_DIMENSION_TEXTURE3D
+    out.MipLevels = mips;
+    out.Planes = 1;
+    out.BaseAlignmentBytes = block_bytes;
+
+    XG_PLANE_LAYOUT& plane = out.Plane[0];
+    plane.Usage = 1;
+    plane.BaseAlignmentBytes = block_bytes;
+    plane.BytesPerElement = bpe;
+
+    uint64_t offset = 0;
+    for (uint32_t m = 0; m < mips; ++m) {
+        const uint32_t mw = std::max<uint32_t>(1, width >> m);
+        const uint32_t mh = std::max<uint32_t>(1, height >> m);
+        const uint32_t md = std::max<uint32_t>(1, depth >> m);
+        const uint32_t we = bc ? std::max<uint32_t>(1, (mw + 3) / 4) : mw;
+        const uint32_t he = bc ? std::max<uint32_t>(1, (mh + 3) / 4) : mh;
+
+        XG_MIPLEVEL_LAYOUT& ml = plane.MipLayout[m];
+        ml.WidthElements = we;
+        ml.HeightElements = he;
+        ml.ReservedWidth = mw;
+        ml.ReservedHeight = mh;
+        ml.DepthOrArraySize = md;
+        ml.PaddedDepthOrArraySize = md;
+        ml.SampleCount = 1;
+        ml.Reserved60 = 1;
+        ml.PaddedWidthElements = AlignUp32(we, block_w);
+        ml.PaddedHeightElements = AlignUp32(he, block_h);
+        ml.PitchPixels = ml.PaddedWidthElements * (bc ? 4u : 1u);
+        ml.PitchBytes = ml.PaddedWidthElements * bpe;
+        ml.AlignmentBytes = block_bytes;
+        ml.SwizzleMode = desc.SwizzleMode;
+        ml.Slice2DSizeBytes = static_cast<uint64_t>(ml.PaddedWidthElements) * ml.PaddedHeightElements * bpe;
+        ml.SizeBytes = ml.Slice2DSizeBytes * md;
+        ml.OffsetBytes = offset;
+        offset += ml.SizeBytes;
+    }
+
+    plane.Reserved10 = offset;
+    plane.Reserved2C = mips;
+    plane.Reserved30 = 0;
+    plane.SizeBytes = offset;
+    out.SizeBytes = offset;
 }
 
 }  // namespace scarlettx::gpu::xg

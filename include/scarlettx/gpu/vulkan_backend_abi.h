@@ -74,6 +74,18 @@ typedef struct VULKAN_XS_STATS {
     uint32_t activePipelines;
 } VULKAN_XS_STATS;
 
+typedef struct VULKAN_XS_COMPUTE_DISPATCH_DESC {
+    const void* spirvBytecode;
+    size_t spirvSize;
+    uint32_t groupCountX;
+    uint32_t groupCountY;
+    uint32_t groupCountZ;
+    const float* uboVec4;         // optional 4 floats bound at Set 0, Binding 0
+    void* inoutSsboData;          // host buffer uploaded before & read back after GPU execution (Set 0, Binding 2)
+    size_t ssboByteSize;
+    uint64_t* outTimelineValue;   // optional signaled Vulkan 1.2 Timeline Semaphore counter
+} VULKAN_XS_COMPUTE_DISPATCH_DESC;
+
 // Backend lifecycle & capabilities
 SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
     const VULKAN_XS_INIT_DESC* desc, VULKAN_XS_BACKEND_HANDLE* outBackend);
@@ -118,6 +130,9 @@ SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsDestroySwapchain(
 
 SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsGetBackendStatistics(
     VULKAN_XS_BACKEND_HANDLE backend, VULKAN_XS_STATS* outStats);
+
+SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsDispatchComputeSpirv(
+    VULKAN_XS_BACKEND_HANDLE backend, const VULKAN_XS_COMPUTE_DISPATCH_DESC* desc);
 
 #ifdef __cplusplus
 }

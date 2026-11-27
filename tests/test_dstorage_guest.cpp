@@ -289,6 +289,33 @@ int main() {
     SX_CHECK(WaitComplete(status, 3));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 3u) == static_cast<int32_t>(0x80004004u));
 
+    // Verify spec-compliant RFC 1950 Zlib decompression through the guest DirectStorage memory queue!
+    {
+        const uint8_t zlib_stream[] = {
+            0x78u, 0x01u, 0x0Bu, 0x4Eu, 0x4Eu, 0x2Cu, 0xCAu, 0x49u, 0x2Du, 0x29u, 0x71u, 0x4Du, 0x49u,
+            0x4Fu, 0x55u, 0x08u, 0x72u, 0x73u, 0x36u, 0xB4u, 0x34u, 0x35u, 0x54u, 0x70u, 0xCBu, 0xACu,
+            0x48u, 0x4Du, 0x51u, 0xF0u, 0x28u, 0x4Du, 0x4Bu, 0xCBu, 0x4Du, 0xCCu, 0x53u, 0x08u, 0x49u,
+            0x2Du, 0x2Eu, 0x51u, 0x54u, 0x08u, 0xA6u, 0xBAu, 0x42u, 0x00u, 0xE2u, 0x05u, 0x28u, 0x69u
+        };
+        const std::string expected_z =
+            "ScarlettEdge RFC1951 Fixed Huffman Test! "
+            "ScarlettEdge RFC1951 Fixed Huffman Test! "
+            "ScarlettEdge RFC1951 Fixed Huffman Test! ";
+        std::vector<uint8_t> z_dst(expected_z.size(), 0);
+        Request rz_valid{};
+        rz_valid.options = kSourceMemory | kZlib;
+        rz_valid.destination = z_dst.data();
+        rz_valid.destination_size = static_cast<uint32_t>(z_dst.size());
+        rz_valid.source = const_cast<uint8_t*>(zlib_stream);
+        rz_valid.source_size = static_cast<uint32_t>(sizeof(zlib_stream));
+        VCall<void>(mem_queue, kEnqueueRequest, &rz_valid);
+        VCall<void>(mem_queue, kEnqueueStatus, status, 0u);
+        VCall<void>(mem_queue, kSubmit);
+        SX_CHECK(WaitComplete(status, 0));
+        SX_CHECK(VCall<int32_t>(status, kGetHResult, 0u) == 0);
+        SX_CHECK(std::memcmp(z_dst.data(), expected_z.data(), expected_z.size()) == 0);
+    }
+
     SX_CHECK(VCall<uint32_t>(mem_queue, kRelease) == 0);
     SX_CHECK(VCall<uint32_t>(queue, kRelease) == 0);
     SX_CHECK(VCall<uint32_t>(status, kRelease) == 0);
