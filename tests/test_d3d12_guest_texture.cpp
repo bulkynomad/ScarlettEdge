@@ -48,6 +48,7 @@ constexpr int kListResourceBarrier = 26;
 constexpr int kQueueExecuteCommandLists = 10;
 constexpr int kQueueSignal = 14;
 constexpr int kFenceGetCompletedValue = 8;
+constexpr int kFenceSetEventOnCompletion = 9;
 
 constexpr uint32_t kWidth = 100;
 constexpr uint32_t kHeight = 60;
@@ -87,8 +88,18 @@ struct Context {
     void* fence = nullptr;
     void* texture = nullptr;
     void* readback = nullptr;
+    HANDLE fence_event = nullptr;
     uint64_t fence_value = 0;
 };
+
+void WaitForFenceValue(Context& c, uint64_t value) {
+    if (static_cast<uint64_t>(Call(c.fence, kFenceGetCompletedValue)) < value) {
+        SX_REQUIRE(Call(c.fence, kFenceSetEventOnCompletion, static_cast<uintptr_t>(value),
+                        reinterpret_cast<uintptr_t>(c.fence_event)) == 0);
+        SX_REQUIRE(WaitForSingleObject(c.fence_event, 5000) == WAIT_OBJECT_0);
+    }
+    SX_REQUIRE(static_cast<uint64_t>(Call(c.fence, kFenceGetCompletedValue)) >= value);
+}
 
 // Copies every mip of the texture into the readback buffer and compares.
 void ReadBackAndCompare(Context& c, const std::vector<Mip>& mips, bool first_pass) {
@@ -125,10 +136,7 @@ void ReadBackAndCompare(Context& c, const std::vector<Mip>& mips, bool first_pas
     Call(c.queue, kQueueExecuteCommandLists, uintptr_t{1}, static_cast<void**>(lists));
     const uint64_t value = ++c.fence_value;
     SX_REQUIRE(Call(c.queue, kQueueSignal, c.fence, static_cast<uintptr_t>(value)) == 0);
-    for (int i = 0; i < 5000 && static_cast<uint64_t>(Call(c.fence, kFenceGetCompletedValue)) < value; ++i) {
-        Sleep(1);
-    }
-    SX_REQUIRE(static_cast<uint64_t>(Call(c.fence, kFenceGetCompletedValue)) >= value);
+    WaitForFenceValue(c, value);
 
     uint8_t* data = nullptr;
     SX_REQUIRE(Call(c.readback, kResMap, uintptr_t{0}, static_cast<void*>(nullptr), &data) == 0 && data);
@@ -165,7 +173,8 @@ int main() {
                     c.allocator, static_cast<void*>(nullptr), static_cast<void*>(nullptr), &c.list) == 0);
     SX_REQUIRE(Call(c.device, kDevCreateFence, uintptr_t{0}, uintptr_t{0}, static_cast<void*>(nullptr),
                     &c.fence) == 0);
-    SX_REQUIRE(c.queue && c.allocator && c.list && c.fence);
+    c.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    SX_REQUIRE(c.queue && c.allocator && c.list && c.fence && c.fence_event);
 
     D3D12_RESOURCE_DESC td = {};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -415,7 +424,7 @@ int main() {
         Call(c.queue, kQueueExecuteCommandLists, uintptr_t{1}, static_cast<void**>(lists));
         const uint64_t fval = ++c.fence_value;
         SX_REQUIRE(Call(c.queue, kQueueSignal, c.fence, static_cast<uintptr_t>(fval)) == 0);
-        while (static_cast<uint64_t>(Call(c.fence, kFenceGetCompletedValue)) < fval) Sleep(1);
+        WaitForFenceValue(c, fval);
 
         void* rb_ptr = nullptr;
         SX_REQUIRE(Call(c.readback, kResMap, uintptr_t{0}, static_cast<void*>(nullptr), &rb_ptr) == 0);
@@ -467,6 +476,7 @@ int main() {
         SX_REQUIRE(Call(rs_proxy, 2) == 0);
     }
 
+    CloseHandle(c.fence_event);
     std::printf("test_d3d12_guest_texture: OK\n");
     return 0;
 }

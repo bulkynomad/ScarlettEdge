@@ -69,6 +69,7 @@ struct MockFence {
     void* vtable[16];
     std::atomic<uint32_t> ref_count{1};
     std::atomic<uint64_t> completed_val{0};
+    HANDLE event = nullptr;
 
     static uint32_t WINAPI AddRef(void* self) {
         return static_cast<MockFence*>(self)->ref_count.fetch_add(1) + 1;
@@ -77,11 +78,23 @@ struct MockFence {
         return static_cast<MockFence*>(self)->ref_count.fetch_sub(1) - 1;
     }
     static uint64_t WINAPI GetCompletedValue(void* self) {
-        return static_cast<MockFence*>(self)->completed_val.load();
+        return static_cast<MockFence*>(self)->completed_val.load(std::memory_order_acquire);
     }
     static int32_t WINAPI Signal(void* self, uint64_t val) {
-        static_cast<MockFence*>(self)->completed_val.store(val);
+        auto* f = static_cast<MockFence*>(self);
+        f->completed_val.store(val, std::memory_order_release);
+        if (f->event) SetEvent(f->event);
         return 0;
+    }
+
+    bool Wait(uint64_t target, DWORD timeout_ms = 5000) {
+        const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+        while (completed_val.load(std::memory_order_acquire) < target) {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline) break;
+            if (WaitForSingleObject(event, static_cast<DWORD>(deadline - now)) == WAIT_TIMEOUT) break;
+        }
+        return completed_val.load(std::memory_order_acquire) >= target;
     }
 
     MockFence() {
@@ -91,17 +104,20 @@ struct MockFence {
         vtable[2] = reinterpret_cast<void*>(&Release);
         vtable[8] = reinterpret_cast<void*>(&GetCompletedValue);
         vtable[10] = reinterpret_cast<void*>(&Signal);
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    ~MockFence() {
+        if (event) CloseHandle(event);
     }
 };
 
 uint8_t Pattern(size_t i) { return static_cast<uint8_t>(i * 7 + (i >> 8) + 3); }
 
-bool WaitComplete(void* status, uint32_t index) {
-    for (int i = 0; i < 5000; ++i) {
-        if (VCall<int32_t>(status, kIsComplete, index)) return true;
-        Sleep(1);
-    }
-    return false;
+bool SubmitAndWaitStatus(void* q, void* status, uint32_t index, MockFence& fence, uint64_t& seq) {
+    const uint64_t target = ++seq;
+    VCall<void>(q, kEnqueueSignal, &fence, target);
+    VCall<void>(q, kSubmit);
+    return fence.Wait(target) && VCall<int32_t>(status, kIsComplete, index) != 0;
 }
 
 Request FileRead(void* file, uint64_t offset, void* destination, uint32_t size) {
@@ -176,6 +192,8 @@ int main() {
     }
 
     // Two reads and a status write; nothing runs before Submit.
+    MockFence wait_fence;
+    uint64_t wait_seq = 0;
     std::vector<uint8_t> a(1000), b(50000);
     Request ra = FileRead(file, 100, a.data(), static_cast<uint32_t>(a.size()));
     Request rb = FileRead(file, 123456, b.data(), static_cast<uint32_t>(b.size()));
@@ -185,10 +203,8 @@ int main() {
     VCall<void>(queue, kEnqueueStatus, status, 0u);
     SX_CHECK(VCall<int32_t>(status, kIsComplete, 0u) == 0);
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 0u) == static_cast<int32_t>(0x8000000Au));
-    Sleep(20);
-    SX_CHECK(VCall<int32_t>(status, kIsComplete, 0u) == 0);
-    VCall<void>(queue, kSubmit);
-    SX_CHECK(WaitComplete(status, 0));
+    SX_CHECK(a[0] == 0 && b[0] == 0);
+    SX_CHECK(SubmitAndWaitStatus(queue, status, 0u, wait_fence, wait_seq));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 0u) == 0);
     SX_CHECK(Matches(a, 100) && Matches(b, 123456));
 
@@ -199,14 +215,12 @@ int main() {
     VCall<void>(queue, kEnqueueRequest, &rc);
     VCall<void>(queue, kEnqueueRequest, &rd);
     VCall<void>(queue, kEnqueueStatus, status, 1u);
-    VCall<void>(queue, kSubmit);
-    SX_CHECK(WaitComplete(status, 1));
+    SX_CHECK(SubmitAndWaitStatus(queue, status, 1u, wait_fence, wait_seq));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 1u) < 0);
     SX_CHECK(Matches(a, 0));
     VCall<void>(queue, kEnqueueRequest, &rb);
     VCall<void>(queue, kEnqueueStatus, status, 2u);
-    VCall<void>(queue, kSubmit);
-    SX_CHECK(WaitComplete(status, 2));
+    SX_CHECK(SubmitAndWaitStatus(queue, status, 2u, wait_fence, wait_seq));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 2u) == 0);
 
     // Decompression is not available: the request fails instead of copying raw bytes.
@@ -215,23 +229,25 @@ int main() {
     std::memset(c.data(), 0x5A, c.size());
     VCall<void>(queue, kEnqueueRequest, &rz);
     VCall<void>(queue, kEnqueueStatus, status, 3u);
-    VCall<void>(queue, kSubmit);
-    SX_CHECK(WaitComplete(status, 3));
+    SX_CHECK(SubmitAndWaitStatus(queue, status, 3u, wait_fence, wait_seq));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 3u) == static_cast<int32_t>(0x80004001u));
     SX_CHECK(c[0] == 0x5A && c[63] == 0x5A);
 
     // More than half the capacity waiting (65 of 128 entries) submits without a Submit call.
-    std::vector<uint8_t> many(64 * 16);
-    for (uint32_t i = 0; i < 64; ++i) {
+    std::vector<uint8_t> many(63 * 16);
+    for (uint32_t i = 0; i < 63; ++i) {
         Request r = FileRead(file, i * 1000, many.data() + i * 16, 16);
         VCall<void>(queue, kEnqueueRequest, &r);
     }
-    Sleep(20);
+    VCall<void>(queue, kEnqueueStatus, status, 0u);  // 64th entry (== half capacity): still buffered!
     SX_CHECK(many[0] == 0 && many[15] == 0);
-    VCall<void>(queue, kEnqueueStatus, status, 0u);
-    SX_CHECK(WaitComplete(status, 0));
+    SX_CHECK(VCall<int32_t>(status, kIsComplete, 0u) == 0);
+    const uint64_t auto_submit_target = ++wait_seq;
+    VCall<void>(queue, kEnqueueSignal, &wait_fence, auto_submit_target);  // 65th entry: auto-submits!
+    SX_CHECK(wait_fence.Wait(auto_submit_target));
+    SX_CHECK(VCall<int32_t>(status, kIsComplete, 0u) != 0);
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 0u) == 0);
-    for (uint32_t i = 0; i < 64; ++i) {
+    for (uint32_t i = 0; i < 63; ++i) {
         SX_CHECK(many[i * 16] == Pattern(i * 1000) && many[i * 16 + 15] == Pattern(i * 1000 + 15));
     }
 
@@ -250,15 +266,13 @@ int main() {
     rm.source_size = static_cast<uint32_t>(src.size());
     VCall<void>(mem_queue, kEnqueueRequest, &rm);
     VCall<void>(mem_queue, kEnqueueStatus, status, 1u);
-    VCall<void>(mem_queue, kSubmit);
-    SX_CHECK(WaitComplete(status, 1));
+    SX_CHECK(SubmitAndWaitStatus(mem_queue, status, 1u, wait_fence, wait_seq));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 1u) == 0);
     SX_CHECK(dst == src);
     // A file request does not belong on it.
     VCall<void>(mem_queue, kEnqueueRequest, &rd);
     VCall<void>(mem_queue, kEnqueueStatus, status, 1u);
-    VCall<void>(mem_queue, kSubmit);
-    SX_CHECK(WaitComplete(status, 1));
+    SX_CHECK(SubmitAndWaitStatus(mem_queue, status, 1u, wait_fence, wait_seq));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 1u) < 0);
 
     // A request still queued keeps its file alive; a closed file fails its reads.
@@ -266,8 +280,7 @@ int main() {
     VCall<void>(queue, kEnqueueRequest, &rd);
     VCall<void>(queue, kEnqueueStatus, status, 2u);
     SX_CHECK(VCall<uint32_t>(file, kRelease) == 1);
-    VCall<void>(queue, kSubmit);
-    SX_CHECK(WaitComplete(status, 2));
+    SX_CHECK(SubmitAndWaitStatus(queue, status, 2u, wait_fence, wait_seq));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 2u) < 0);
 
     // Test EnqueueSignal (slot 5) with a fence.
@@ -276,7 +289,7 @@ int main() {
     VCall<void>(mem_queue, kEnqueueSignal, &fence, 999ull);
     SX_CHECK(fence.completed_val.load() == 0);
     VCall<void>(mem_queue, kSubmit);
-    for (int i = 0; i < 5000 && fence.completed_val.load() < 999ull; ++i) Sleep(1);
+    SX_CHECK(fence.Wait(999ull));
     SX_CHECK(fence.completed_val.load() == 999ull);
 
     // Test CancelRequestsWithTag (slot 7).
@@ -287,8 +300,7 @@ int main() {
     VCall<void>(mem_queue, kEnqueueRequest, &r_cancel);
     VCall<void>(mem_queue, kCancelRequestsWithTag, 0xFFFFull, 0xCAFEull);
     VCall<void>(mem_queue, kEnqueueStatus, status, 3u);
-    VCall<void>(mem_queue, kSubmit);
-    SX_CHECK(WaitComplete(status, 3));
+    SX_CHECK(SubmitAndWaitStatus(mem_queue, status, 3u, wait_fence, wait_seq));
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 3u) == static_cast<int32_t>(0x80004004u));
 
     // Verify spec-compliant RFC 1950 Zlib decompression through the guest DirectStorage memory queue!
@@ -312,8 +324,7 @@ int main() {
         rz_valid.source_size = static_cast<uint32_t>(sizeof(zlib_stream));
         VCall<void>(mem_queue, kEnqueueRequest, &rz_valid);
         VCall<void>(mem_queue, kEnqueueStatus, status, 0u);
-        VCall<void>(mem_queue, kSubmit);
-        SX_CHECK(WaitComplete(status, 0));
+        SX_CHECK(SubmitAndWaitStatus(mem_queue, status, 0u, wait_fence, wait_seq));
         SX_CHECK(VCall<int32_t>(status, kGetHResult, 0u) == 0);
         SX_CHECK(std::memcmp(z_dst.data(), expected_z.data(), expected_z.size()) == 0);
     }
@@ -347,8 +358,7 @@ int main() {
         r_swiz.source_size = static_cast<uint32_t>(linear_tex.size());
         VCall<void>(mem_queue, kEnqueueRequest, &r_swiz);
         VCall<void>(mem_queue, kEnqueueStatus, status, 2u);
-        VCall<void>(mem_queue, kSubmit);
-        SX_CHECK(WaitComplete(status, 2));
+        SX_CHECK(SubmitAndWaitStatus(mem_queue, status, 2u, wait_fence, wait_seq));
         SX_CHECK(VCall<int32_t>(status, kGetHResult, 2u) == 0);
 
         std::vector<uint8_t> unswizzled(linear_tex.size(), 0);

@@ -28,25 +28,13 @@ namespace {
 thread_local volatile uint8_t g_scarlettx_slot0_anchor[64] = {};
 
 #if defined(_WIN32)
-std::atomic<bool> g_ctrl_handler_running{false};
-
-BOOL WINAPI ScarlettConsoleCtrlHandler(DWORD ctrl_type) {
+// Async-signal-safe console interrupt handler: sets only an atomic shutdown flag
+// with zero mutex locks, heap allocations, GetModuleFileName* calls, or ExitProcess(0) leaks.
+BOOL WINAPI ScarlettConsoleCtrlHandler(DWORD ctrl_type) noexcept {
     if (ctrl_type != CTRL_C_EVENT && ctrl_type != CTRL_BREAK_EVENT && ctrl_type != CTRL_CLOSE_EVENT) {
         return FALSE;
     }
-    if (g_ctrl_handler_running.exchange(true)) {
-        return TRUE;
-    }
-    if (scarlettx::FlightRecorder::IsEnabled()) {
-        scarlettx::FlightRecorder::Instance().RecordEvent(
-            scarlettx::FlightEventCategory::Lifecycle,
-            "cli",
-            "Console interrupt -> flushing flight summary",
-            static_cast<int32_t>(ctrl_type));
-        scarlettx::FlightRecorder::Instance().WriteSummaryReport();
-        scarlettx::FlightRecorder::Instance().Disable();
-    }
-    ExitProcess(0);
+    scarlettx::RequestAsyncShutdown(static_cast<uint32_t>(ctrl_type));
     return TRUE;
 }
 #endif

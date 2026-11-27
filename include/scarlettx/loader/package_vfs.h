@@ -8,12 +8,16 @@
 #include <vector>
 
 #include "scarlettx/core/status.h"
-#include "scarlettx/loader/xvd_container.h"
 
 namespace scarlettx {
 
+class XvdContainer;
+
 class PackageVfs {
 public:
+    PackageVfs();
+    ~PackageVfs();
+
     static PackageVfs& Global();
 
     void Reset();

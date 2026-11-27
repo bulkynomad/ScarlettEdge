@@ -4,8 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ScarlettEdge — Status Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@400;500;600;700&display=swap">
 <style>
   :root {
     --bg: #0d1117;
@@ -37,7 +35,7 @@
     margin: 0;
     background: var(--bg);
     color: var(--fg);
-    font-family: 'Mona Sans', -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+    font-family: -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
   }
   .page {
     width: 920px;
@@ -104,154 +102,107 @@
   .row .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .count { color: var(--fg-muted); font-variant-numeric: tabular-nums; }
   .row .pct { width: 40px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .callout { display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--fork); color: var(--fg-soft); font-size: 13px; }
-  .callout strong { color: var(--fork); }
-  @media (max-width: 640px) {
-    .page { padding: 20px 16px; }
-    .graph { justify-content: flex-start; }
-    .list { grid-template-columns: minmax(0, 1fr); }
-  }
+  .callout { display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--warn); color: var(--fg-soft); font-size: 13px; }
+  .callout strong { color: var(--warn); }
 </style>
 </head>
 <body>
 <main class="page">
   <section class="panel">
-    <h2>Phase 4: Clean-Room Governance &amp; Commercial Retail Bring-Up: 90.0%</h2>
+    <h2>Retail Xbox ABI &amp; COM Surface Coverage: 63.9%</h2>
     <div class="badges">
-      <span class="badge"><span class="k">phase 4</span><span class="v-fn">45/50 (90.0%)</span></span>
-      <span class="badge"><span class="k">clean-room CI</span><span class="v-exports">Automated Gate</span></span>
+      <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">227/573</span></span>
+      <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+139</span></span>
+      <span class="badge"><span class="k">retail exports</span><span class="v-exports">261</span></span>
+      <span class="badge"><span class="k">COM vtable slots</span><span class="v-target">235</span></span>
+      <span class="badge"><span class="k">synthetic test exports</span><span class="v-tests-warn">251</span></span>
+      <span class="badge"><span class="k">tests</span><span class="v-tests">42/42 passing</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-abi"></div><div class="legend" id="leg-abi"></div></div>
+    <div class="list" id="list-abi"></div>
+    <div class="callout">
+      <span><strong>Empirical Separation:</strong> Retail Xbox DLL exports (<code>261</code>) and wired COM vtable slots (<code>235</code>) are tracked separately from synthetic C-ABI test-harness exports (<code>251</code>), with zero <code>target = implemented</code> self-clamping.</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Clean-Room Governance &amp; Retail Readiness: 80.0%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">readiness</span><span class="v-fn">16/20 (80.0%)</span></span>
       <span class="badge"><span class="k">CI tests</span><span class="v-tests">42/42 passing</span></span>
-      <span class="badge"><span class="k">focus</span><span class="v-target">ATG &amp; Retail Wave 1</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-p4"></div><div class="legend" id="leg-p4"></div></div>
     <div class="list" id="list-p4"></div>
   </section>
 
   <section class="panel">
-    <h2>Phase 3: Unification, Retail Parity, Diagnostics &amp; GDK 2510: 100.0%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">phase 3</span><span class="v-fn">30/30 (100.0%)</span></span>
-      <span class="badge"><span class="k">GDK silicon</span><span class="v-exports">2510.5.6322 + DXR/MeshShader</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="v-tests">42/42 passing</span></span>
-      <span class="badge"><span class="k">next wave</span><span class="v-target">Commercial Retail Bring-Up</span></span>
-    </div>
+    <h2>Empirical Subsystem Verification: 75.0%</h2>
     <div class="graph-box"><div class="graph" id="graph-p3"></div><div class="legend" id="leg-p3"></div></div>
     <div class="list" id="list-p3"></div>
   </section>
 
   <section class="panel">
-    <h2>Phase 2: Retail AAA Execution Roadmap: 100.0%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">phase 2 AAA</span><span class="v-fn">72/72 (100.0%)</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="v-tests">42/42 passing</span></span>
-      <span class="badge"><span class="k">target</span><span class="v-target">Unmodified Retail AAA Titles</span></span>
-    </div>
+    <h2>Multi-Wave Advancement Roadmap: 36.8%</h2>
     <div class="graph-box"><div class="graph" id="graph-aaa"></div><div class="legend" id="leg-aaa"></div></div>
     <div class="list" id="list-aaa"></div>
   </section>
 
   <section class="panel">
-    <h2>ABI Coverage (Upstream Purple + Fork Green): 100.0%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">281/517</span></span>
-      <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+236</span></span>
-      <span class="badge"><span class="k">exports</span><span class="v-exports">513</span></span>
-      <span class="badge"><span class="k">tests</span><span class="v-tests">42/42 passing</span></span>
-    </div>
-    <div class="graph-box"><div class="graph" id="graph-abi"></div><div class="legend" id="leg-abi"></div></div>
-    <div class="list" id="list-abi"></div>
-    <div class="callout">
-      <span><strong>Unified Architecture:</strong> Shared <code>scarlettx_core.dll</code>, unified DirectStorage/COM bridges, retail XVD v3 + Merkle + NTFS, 32-lane GPU GDeflate, WMA-Pro XMA2, Vulkan KHR RT &amp; RDNA2 XS2 CFG/SM 6.6 lifting (517/517 functions: 281 upstream + 236 ScarlettEdge).</span>
-    </div>
-  </section>
-
-  <section class="panel">
-    <h2>Phase 1: ScarlettEdge Runtime Optimization &amp; Fidelity: 100.0%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">foundations</span><span class="v-fn">44/44 (100.0%)</span></span>
-      <span class="badge"><span class="k">frame pacing</span><span class="v-exports">0-tear VSync</span></span>
-      <span class="badge"><span class="k">textures</span><span class="v-tests">0-frame lag</span></span>
-    </div>
+    <h2>Wave 1 Engineering Hygiene: 100.0%</h2>
     <div class="graph-box"><div class="graph" id="graph-opt"></div><div class="legend" id="leg-opt"></div></div>
     <div class="list" id="list-opt"></div>
   </section>
 
   <section class="panel">
     <h2>Concept Destruction (Upstream Purple + Fork Green): 100.0%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">milestones</span><span class="v-fn">46/46 (100.0%)</span></span>
-      <span class="badge"><span class="k">state</span><span class="v-target">Full speed on GPU, with sound</span></span>
-      <span class="badge"><span class="k">target</span><span class="v-exports">Concept Destruction (Gen9)</span></span>
-    </div>
     <div class="graph-box"><div class="graph" id="graph-cd"></div><div class="legend" id="leg-cd"></div></div>
     <div class="list" id="list-cd"></div>
   </section>
 </main>
 <script>
   const PANELS = [
+    ['abi', [
+      ['d3d12', 'd3d12_xs COM & Retail ABI', 56, 96, 36],
+      ['XTask', 'XTaskQueue & XAsync', 24, 26, 23],
+      ['Save', 'XGameSave (persistent)', 30, 34, 23],
+      ['XUser', 'XUser & Identity', 32, 34, 13],
+      ['XSys', 'XSystem & Runtime', 34, 60, 17],
+      ['XMem', 'XMem & Threading', 16, 16, 11],
+      ['DXR', 'DXR (d3d12_xs COM)', 6, 14, 0],
+      ['DStor', 'DirectStorage (xcrdapi) & XVD', 2, 28, 2],
+      ['Audio', 'Audio (XAudio2 COM / AcpHal)', 32, 48, 24],
+      ['Input', 'Input (GameInput COM)', 15, 24, 12],
+      ['Midw', 'Middleware (Bink2 / FSR / PIX)', 45, 52, 22],
+      ['Net', 'Networking (HTTP / XCurl)', 50, 64, 38],
+      ['PE64', 'PE64 Loader & Auto-Stubs', 6, 10, 5],
+      ['Kern', 'Xbox Unified Memory & KernelX', 2, 16, 0],
+      ['XS2', 'RDNA2 XS2 & DXIL Shader IR', 4, 16, 1],
+      ['Crypt', 'Retail XVC/XVD & NTFS Crypto', 8, 12, 0],
+      ['XSAPI', 'Live Xbox Services & WinRT', 4, 23, 0],
+    ]],
     ['p4',  [
-      ['CleanRoom', '4A. Clean-Room Governance & CI Guard', 5, 5, -1],
-      ['TriageCLI', '4B. Flight-Recorder Triage CLI', 5, 5, -1],
-      ['GDK-ATG', '4C. Multi-Sample GDK 2510 ATG', 5, 5, -1],
-      ['RetailW1', '4D. Retail Wave 1 Bring-Up', 0, 5, -1],
-      ['EngineHard', '4E. Commercial Engine Hardening', 5, 5, -1],
-      ['CompatDoc', '4F. Compatibility Matrix & Dashboard', 5, 5, -1],
-      ['OS/VFS', '4G. OS, Topology, VFS & Keyring CLI', 5, 5, -1],
-      ['D3D12XS', '4H. d3d12_xs Proxy RTX Torture-Test', 5, 5, -1],
-      ['WinRT/GI', '4I. WinRT & Middleware Expansion', 5, 5, -1],
-      ['Diag/CI', '4J. Diagnostics UX & Portable CI', 5, 5, -1],
+      ['CleanRoom', '4A. Clean-Room Governance & CI Gate', 5, 5, -1],
+      ['TriageCLI', '4B. Flight-Recorder & Triage CLI', 5, 5, -1],
+      ['RealCOM', '4C. Real-Title COM Vertical Slice', 5, 5, -1],
+      ['Retail', '4D. Commercial Retail Title Bring-Up', 1, 5, -1],
     ]],
     ['p3',  [
-      ['Core', 'Shared Core & Loader Unification', 5, 5, -1],
-      ['COM', 'Guest COM Bridge (Real-Title Mode)', 5, 5, -1],
-      ['RetailIO', 'Retail XVD v3, .msixvc & Codecs', 5, 5, -1],
-      ['XS2/RT', 'RDNA2 XS2 CFG, SM 6.6 & Vulkan RT', 5, 5, -1],
-      ['FlightRec', '4-Part Flight-Recorder Suite', 5, 5, -1],
-      ['GDK2510', 'Official GDK 2510 & Gen9 Silicon', 5, 5, -1],
+      ['Core/FR', 'Shared Core & Flight Recorder', 5, 5, -1],
+      ['COM', 'Real-Title COM Bridge (d3d12_xs)', 3, 5, -1],
+      ['XVD/NTFS', 'XVD v3, NTFS $MFT & AES-XTS', 3, 5, -1],
+      ['GDK', 'XTaskQueue, XAsync & XGameSave', 4, 5, -1],
     ]],
     ['aaa', [
-      ['XS2-IR', 'XS2 -> GPU Shader Compiler', 12, 12, -1],
-      ['XG/DCC', 'XG Tiling, MSAA & DCC', 10, 10, -1],
-      ['VkExec', 'Vulkan 1.3 & DXR GPU Exec', 10, 10, -1],
-      ['DS-GPU', 'DirectStorage GPU Codecs', 8, 8, -1],
-      ['D3D12.2', 'D3D12.2 & MEM_GRAPHICS', 10, 10, -1],
-      ['Media', 'Retail XMA2 & Bink2 Media', 8, 8, -1],
-      ['WinRT', 'GDK 2022-2026 & WinRT', 8, 8, -1],
-      ['AAA', 'AAA Engine & XVC Bring-Up', 6, 6, -1],
-    ]],
-    ['abi', [
-      ['d3d12', 'd3d12_xs → PC D3D12 & PSOs', 65, 65, 45],
-      ['XTask', 'XTaskQueue & XAsync', 24, 24, 23],
-      ['Save', 'XGameSave (persistent)', 30, 30, 23],
-      ['XUser', 'XUser & Identity', 32, 32, 13],
-      ['XSys', 'XSystem & Runtime', 34, 34, 17],
-      ['XMem', 'XMem & Threading', 16, 16, 11],
-      ['DXR', 'DXR / XboxBvhBuilder', 15, 15, 12],
-      ['DStor', 'DirectStorage & XVD', 26, 26, 23],
-      ['Audio', 'Audio (XAudio2 / AcpHal)', 46, 46, 33],
-      ['Input', 'Input (GameInput)', 16, 16, 15],
-      ['Midw', 'Middleware (Bink2 / FSR)', 38, 38, 22],
-      ['Net', 'Networking (HTTP / XCurl)', 50, 50, 38],
-      ['PE64', 'PE64 Loader & Auto-Stubs', 6, 6, 6],
-      ['Kern', 'Xbox Unified Memory & KernelX', 19, 19, 0],
-      ['XS2', 'RDNA2 XS2 Shader Lifting', 17, 17, 0],
-      ['Crypt', 'Retail XVC/XVD Crypto', 12, 12, 0],
-      ['Codec', 'Production Codecs (XMA2/GDeflate/Bink)', 19, 19, 0],
-      ['Vulk', 'Hardware DXR & Vulkan Backend', 17, 17, 0],
-      ['XSAPI', 'Live Xbox Services (XSAPI/WinRT)', 35, 35, 0],
+      ['Wave1', 'Wave 1: Build, VEH, CTest & Metrics', 4, 4, -1],
+      ['Wave2A', 'Wave 2A: Multi-DLL Loader & VFS', 1, 5, -1],
+      ['Wave2B', 'Wave 2B: GDK, FFX, Audio & GDeflate', 1, 5, -1],
+      ['Wave3', 'Wave 3: d3d12_xs Sync & Heap Aliasing', 1, 5, -1],
     ]],
     ['opt', [
-      ['VSync', 'Frame Pacing & VSync', 4, 4, -1],
-      ['Loader', 'Bootloader & DLL Priority', 4, 4, -1],
-      ['Texture', 'Sub-Frame Texture Upload', 4, 4, -1],
-      ['DStorage', 'DirectStorage & NVMe', 4, 4, -1],
-      ['RDNA2', 'RDNA2 Microcode Lifter', 4, 4, -1],
-      ['DXR/RT', 'Hardware DXR 1.1 & Vulkan', 4, 4, -1],
-      ['Crypto', 'Retail Container Crypto', 4, 4, -1],
-      ['Memory', 'Unified Memory Aliasing', 4, 4, -1],
-      ['Vtables', 'Xbox COM Vtable Depth', 4, 4, -1],
-      ['Audio', 'Audio DSP & XAPO Effects', 4, 4, -1],
-      ['Network', 'Network & Live Middleware', 4, 4, -1],
+      ['Build', 'Build & PCH Link Hygiene', 4, 4, -1],
+      ['VEH', 'Async-Safe Crash & Ctrl+C', 4, 4, -1],
+      ['CTest', 'Deterministic Isolated CTests', 4, 4, -1],
+      ['Metrics', 'Honest Retail vs Synth Metrics', 4, 4, -1],
     ]],
     ['cd',  [
       ['PE64', 'PE64 Mapping & Imports', 4, 4, 4],

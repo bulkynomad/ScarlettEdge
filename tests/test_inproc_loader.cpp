@@ -34,6 +34,7 @@ uint64_t FakeOrdinalHleHandler(uint64_t a, uint64_t b) {
 }  // namespace
 
 int main() {
+    sx_test::ScopedTempDir sandbox("test_inproc_loader");
     const std::filesystem::path probe_dir =
         std::filesystem::path(SCARLETTX_BINARY_DIR) / "packages" / "iat_probe";
     const std::filesystem::path probe_dll = probe_dir / "iat_probe.dll";
@@ -157,8 +158,7 @@ int main() {
             return reinterpret_cast<IMAGE_NT_HEADERS64*>(
                 pe.data() + reinterpret_cast<const IMAGE_DOS_HEADER*>(pe.data())->e_lfanew);
         };
-        const std::filesystem::path bad_dll =
-            std::filesystem::path(SCARLETTX_BINARY_DIR) / "iat_probe_malformed.dll";
+        const std::filesystem::path bad_dll = sandbox.path() / "iat_probe_malformed.dll";
         const auto map_bytes = [&](const std::vector<char>& pe) {
             std::ofstream(bad_dll, std::ios::binary)
                 .write(pe.data(), static_cast<std::streamsize>(pe.size()));
@@ -276,8 +276,7 @@ int main() {
 
     // 8. An image with stripped relocations must not load away from its preferred base.
     {
-        const std::filesystem::path fixed_dll =
-            std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_inproc_loader_fixed.dll";
+        const std::filesystem::path fixed_dll = sandbox.path() / "test_inproc_loader_fixed.dll";
         std::filesystem::copy_file(probe_dll, fixed_dll,
                                    std::filesystem::copy_options::overwrite_existing);
         {
@@ -305,8 +304,7 @@ int main() {
     //    - Xbox OS/hardware system DLLs (e.g. xgameruntime.dll) strictly resolve from shim_dir
     //      first even if a decoy/Xbox copy sits in the package dir.
     {
-        const std::filesystem::path mw_dir =
-            std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_mw_precedence_pkg";
+        const std::filesystem::path mw_dir = sandbox.path() / "test_mw_precedence_pkg";
         std::filesystem::create_directories(mw_dir);
         const std::filesystem::path mw_probe = mw_dir / "mw_probe.dll";
         const std::filesystem::path mw_bink = mw_dir / "Bink2Scarlett.dll";

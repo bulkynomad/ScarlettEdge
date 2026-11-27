@@ -306,17 +306,26 @@ size_t UnwindX64FramesPod(const CONTEXT* initial_ctx,
                 }
             } else {
                 // Leaf function, StubThunk trampoline, or wild jump to 0/unmapped VA:
-                // on x64, [RSP] holds the return address pushed by CALL.
-                if (!IsCommittedReadableAddress(cur_rsp, sizeof(uint64_t))) {
+                // if RIP sits at StubThunk's `add rsp, imm8` (`48 83 C4 imm8`) epilogue,
+                // advance past the trampoline's stack frame before reading the return address.
+                uint64_t rsp_for_ret = cur_rsp;
+                if (IsCommittedReadableAddress(cur_rip, 4)) {
+                    uint8_t insn[4] = {};
+                    std::memcpy(insn, reinterpret_cast<const void*>(cur_rip), sizeof(insn));
+                    if (insn[0] == 0x48u && insn[1] == 0x83u && insn[2] == 0xC4u) {
+                        rsp_for_ret += static_cast<uint64_t>(insn[3]);
+                    }
+                }
+                if (!IsCommittedReadableAddress(rsp_for_ret, sizeof(uint64_t))) {
                     break;
                 }
                 uint64_t ret_addr = 0;
-                std::memcpy(&ret_addr, reinterpret_cast<const void*>(cur_rsp), sizeof(uint64_t));
+                std::memcpy(&ret_addr, reinterpret_cast<const void*>(rsp_for_ret), sizeof(uint64_t));
                 if (ret_addr == 0 || ret_addr == cur_rip) {
                     break;
                 }
                 ctx.Rip = ret_addr;
-                ctx.Rsp = cur_rsp + 8ull;
+                ctx.Rsp = rsp_for_ret + 8ull;
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -325,26 +334,81 @@ size_t UnwindX64FramesPod(const CONTEXT* initial_ctx,
     return count;
 }
 
+bool IsBenignFirstChanceGuardPageAv(const EXCEPTION_RECORD* er) noexcept {
+    if (!er) return false;
+    if ((er->ExceptionFlags & EXCEPTION_NONCONTINUABLE) != 0) {
+        return false;
+    }
+    const DWORD code = er->ExceptionCode;
+    if (code == STATUS_GUARD_PAGE_VIOLATION) {
+        return true;
+    }
+    if (code != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) {
+        return false;
+    }
+    const ULONG_PTR av_op = er->ExceptionInformation[0];
+    const uint64_t target_va = static_cast<uint64_t>(er->ExceptionInformation[1]);
+    if (av_op == 8 || target_va < 0x10000ull) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(target_va), &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    if ((mbi.Protect & PAGE_GUARD) != 0) {
+        return true;
+    }
+    // Guest VirtualAlloc (MEM_PRIVATE) guard pages (PAGE_NOACCESS) and GC write-watch
+    // pages (WRITE to PAGE_READONLY) raise benign first-chance AVs handled by guest
+    // SEH/VEH; unhandled faults are still captured at FilterGuestEntryException.
+    if (mbi.Type == MEM_PRIVATE) {
+        if ((mbi.Protect & PAGE_NOACCESS) != 0) {
+            return true;
+        }
+        if (av_op == 1 && (mbi.Protect & PAGE_READONLY) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::atomic<uint32_t> g_active_crash_tid{0};
+
+struct ScopedActiveCrashTidGuard {
+    bool active = false;
+    explicit ScopedActiveCrashTidGuard(uint32_t tid) noexcept {
+        const uint32_t non_zero_tid = (tid != 0u) ? tid : 1u;
+        uint32_t expected = 0u;
+        active = g_active_crash_tid.compare_exchange_strong(
+            expected, non_zero_tid, std::memory_order_acq_rel);
+    }
+    ~ScopedActiveCrashTidGuard() noexcept {
+        if (active) {
+            g_active_crash_tid.store(0u, std::memory_order_release);
+        }
+    }
+};
 
 LONG WINAPI FlightVectoredExceptionHandler(PEXCEPTION_POINTERS ep) noexcept {
     if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (!FlightRecorder::IsEnabled()) {
+    if (!FlightRecorder::IsEnabledNoProbe()) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
-    if (!IsFatalHardwareOrFailFastException(code)) {
+    if (!IsFatalHardwareOrFailFastException(code) ||
+        IsBenignFirstChanceGuardPageAv(ep->ExceptionRecord)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    const uint32_t tid = CurrentTid();
-    uint32_t expected = 0;
-    if (!g_active_crash_tid.compare_exchange_strong(expected, tid, std::memory_order_acq_rel)) {
+    ScopedActiveCrashTidGuard crash_tid_guard(CurrentTid());
+    if (!crash_tid_guard.active) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     FlightRecorder::Instance().CaptureCrashReport(ep, "VectoredExceptionHandler", nullptr);
-    g_active_crash_tid.store(0, std::memory_order_release);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -372,6 +436,22 @@ FlightRecorder::FlightRecorder() {
     for (auto& c : category_counts_) {
         c.store(0, std::memory_order_relaxed);
     }
+#if defined(_WIN32)
+    if (HMODULE exe_mod = GetModuleHandleW(nullptr)) {
+        host_exe_base_ = reinterpret_cast<uint64_t>(exe_mod);
+        char exe_path[MAX_PATH + 1] = {};
+        const DWORD n = GetModuleFileNameA(exe_mod, exe_path, MAX_PATH);
+        if (n > 0) {
+            const char* base = exe_path;
+            for (DWORD i = 0; i < n; ++i) {
+                if (exe_path[i] == '\\' || exe_path[i] == '/') {
+                    base = exe_path + i + 1;
+                }
+            }
+            CopyBoundedStr(host_exe_name_, sizeof(host_exe_name_), base);
+        }
+    }
+#endif
 }
 
 FlightRecorder::~FlightRecorder() {
@@ -418,6 +498,10 @@ bool FlightRecorder::IsEnabled() noexcept {
     if (s == 1u) return false;
     Instance().ProbeEnvOnce();
     return s_enabled_state_.load(std::memory_order_relaxed) == 2u;
+}
+
+bool FlightRecorder::IsEnabledNoProbe() noexcept {
+    return s_enabled_state_.load(std::memory_order_acquire) == 2u;
 }
 
 void FlightRecorder::ProbeEnvOnce() noexcept {
@@ -483,9 +567,12 @@ void FlightRecorder::ResetSession() noexcept {
     dred_seq_.store(0, std::memory_order_relaxed);
     shader_seq_.store(0, std::memory_order_relaxed);
     last_crash_sig_.store(0, std::memory_order_relaxed);
+    crash_artifact_count_.store(0, std::memory_order_relaxed);
+    for (auto& p : crash_artifact_paths_) {
+        p[0] = '\0';
+    }
     {
         std::lock_guard<std::mutex> lk(artifacts_mu_);
-        crash_artifacts_.clear();
         hang_artifacts_.clear();
         dred_artifacts_.clear();
         shader_artifacts_.clear();
@@ -509,8 +596,21 @@ void FlightRecorder::Enable(const FlightRecorderOptions& opts) {
         opts_.output_dir = "flight_logs";
     }
     std::error_code ec;
-    opts_.output_dir = std::filesystem::absolute(opts_.output_dir, ec).string();
-    std::filesystem::create_directories(opts_.output_dir, ec);
+    const std::filesystem::path abs_out = std::filesystem::absolute(opts_.output_dir, ec);
+    opts_.output_dir = abs_out.string();
+    std::filesystem::create_directories(abs_out, ec);
+    {
+        ScopedSpinTryLock dlk(output_dir_lock_, 4096);
+        CopyBoundedStr(output_dir_utf8_, sizeof(output_dir_utf8_), opts_.output_dir.c_str());
+#if defined(_WIN32)
+        const std::wstring wdir = abs_out.wstring();
+        const size_t n = std::min<size_t>(wdir.size(), (sizeof(output_dir_wide_) / sizeof(wchar_t)) - 1u);
+        if (n > 0) {
+            std::memcpy(output_dir_wide_, wdir.data(), n * sizeof(wchar_t));
+        }
+        output_dir_wide_[n] = L'\0';
+#endif
+    }
 
     dred_enabled_flag_.store(opts_.enable_dred, std::memory_order_relaxed);
     shader_dump_flag_.store(opts_.dump_failing_shaders, std::memory_order_relaxed);
@@ -849,7 +949,66 @@ void FlightRecorder::BeatProgress(const char* phase) noexcept {
     }
 }
 
-FlightResolvedAddress FlightRecorder::ResolveCodeAddress(uint64_t va) noexcept {
+namespace {
+
+#if defined(_WIN32)
+bool TryExtractPeExportModuleNameLockFree(uint64_t module_base, char (&out_name)[64]) noexcept {
+    out_name[0] = '\0';
+    if (!IsCommittedReadableAddress(module_base, sizeof(IMAGE_DOS_HEADER))) {
+        return false;
+    }
+    IMAGE_DOS_HEADER dos{};
+    std::memcpy(&dos, reinterpret_cast<const void*>(module_base), sizeof(dos));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000) {
+        return false;
+    }
+    const uint64_t nt_va = module_base + static_cast<uint64_t>(dos.e_lfanew);
+    if (!IsCommittedReadableAddress(nt_va, sizeof(IMAGE_NT_HEADERS64))) {
+        return false;
+    }
+    IMAGE_NT_HEADERS64 nt{};
+    std::memcpy(&nt, reinterpret_cast<const void*>(nt_va), sizeof(nt));
+    if (nt.Signature != IMAGE_NT_SIGNATURE ||
+        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) {
+        return false;
+    }
+    const auto& exp_dd = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (exp_dd.VirtualAddress == 0 || exp_dd.Size < sizeof(IMAGE_EXPORT_DIRECTORY)) {
+        return false;
+    }
+    const uint64_t exp_va = module_base + exp_dd.VirtualAddress;
+    if (!IsCommittedReadableAddress(exp_va, sizeof(IMAGE_EXPORT_DIRECTORY))) {
+        return false;
+    }
+    IMAGE_EXPORT_DIRECTORY exp{};
+    std::memcpy(&exp, reinterpret_cast<const void*>(exp_va), sizeof(exp));
+    if (exp.Name == 0 || exp.Name >= nt.OptionalHeader.SizeOfImage) {
+        return false;
+    }
+    const uint64_t name_va = module_base + exp.Name;
+    if (!IsCommittedReadableAddress(name_va, 1)) {
+        return false;
+    }
+    size_t i = 0;
+    while (i + 1 < sizeof(out_name) && IsCommittedReadableAddress(name_va + i, 1)) {
+        char ch = '\0';
+        std::memcpy(&ch, reinterpret_cast<const void*>(name_va + i), 1);
+        if (ch == '\0') break;
+        if (static_cast<unsigned char>(ch) < 0x20u || static_cast<unsigned char>(ch) >= 0x7Fu) {
+            out_name[0] = '\0';
+            return false;
+        }
+        out_name[i++] = ch;
+    }
+    out_name[i] = '\0';
+    return i > 0;
+}
+#endif
+
+}  // namespace
+
+FlightResolvedAddress FlightRecorder::ResolveCodeAddressNoLoaderLock(uint64_t va) noexcept {
     FlightResolvedAddress out{};
     out.raw_va = va;
     if (va < 0x10000ull) {
@@ -869,23 +1028,42 @@ FlightResolvedAddress FlightRecorder::ResolveCodeAddress(uint64_t va) noexcept {
     }
 
 #if defined(_WIN32)
-    using RtlPcToFileHeaderFn = PVOID(WINAPI*)(PVOID, PVOID*);
-    static const RtlPcToFileHeaderFn real_pc_to_hdr = []() noexcept -> RtlPcToFileHeaderFn {
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        return ntdll ? reinterpret_cast<RtlPcToFileHeaderFn>(
-                           reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlPcToFileHeader")))
-                     : nullptr;
-    }();
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(va), &mbi, sizeof(mbi)) != 0 &&
+        mbi.State == MEM_COMMIT && mbi.AllocationBase != nullptr) {
+        const uint64_t alloc_base = reinterpret_cast<uint64_t>(mbi.AllocationBase);
+        const auto& self = Instance();
+        if (alloc_base == self.host_exe_base_ && va >= alloc_base &&
+            (va - alloc_base) <= 0x7FFFFFFFull) {
+            out.resolved = true;
+            out.is_guest = false;
+            out.module_base = alloc_base;
+            out.rva = static_cast<uint32_t>(va - alloc_base);
+            CopyBoundedStr(out.module_name, sizeof(out.module_name), self.host_exe_name_);
+            return out;
+        }
+        if (mbi.Type == MEM_IMAGE && va >= alloc_base && (va - alloc_base) <= 0x7FFFFFFFull) {
+            out.resolved = true;
+            out.is_guest = false;
+            out.module_base = alloc_base;
+            out.rva = static_cast<uint32_t>(va - alloc_base);
+            if (!TryExtractPeExportModuleNameLockFree(alloc_base, out.module_name)) {
+                CopyBoundedStr(out.module_name, sizeof(out.module_name), "host_module");
+            }
+            return out;
+        }
+    }
+#endif
+    return out;
+}
 
-    PVOID base = nullptr;
-    if (real_pc_to_hdr && real_pc_to_hdr(reinterpret_cast<PVOID>(va), &base) && base) {
-        out.resolved = true;
-        out.is_guest = false;
-        out.module_base = reinterpret_cast<uint64_t>(base);
-        out.rva = static_cast<uint32_t>(va - out.module_base);
-
+FlightResolvedAddress FlightRecorder::ResolveCodeAddress(uint64_t va) noexcept {
+    FlightResolvedAddress out = ResolveCodeAddressNoLoaderLock(va);
+#if defined(_WIN32)
+    if (out.resolved && !out.is_guest && std::strcmp(out.module_name, "host_module") == 0) {
         char full_path[MAX_PATH + 1] = {};
-        const DWORD n = GetModuleFileNameA(static_cast<HMODULE>(base), full_path, MAX_PATH);
+        const DWORD n = GetModuleFileNameA(
+            reinterpret_cast<HMODULE>(out.module_base), full_path, MAX_PATH);
         if (n > 0) {
             const char* slash = full_path;
             for (DWORD i = 0; i < n; ++i) {
@@ -894,8 +1072,6 @@ FlightResolvedAddress FlightRecorder::ResolveCodeAddress(uint64_t va) noexcept {
                 }
             }
             CopyBoundedStr(out.module_name, sizeof(out.module_name), slash);
-        } else {
-            CopyBoundedStr(out.module_name, sizeof(out.module_name), "host_module");
         }
     }
 #endif
@@ -1005,12 +1181,250 @@ FlightRecorderStats FlightRecorder::GetStats() const noexcept {
             st.unique_vfs_misses = vfs_miss_count_;
         }
     }
-    st.crash_reports_written = crash_seq_.load(std::memory_order_relaxed);
-    st.hang_snapshots_written = hang_seq_.load(std::memory_order_relaxed);
-    st.dred_reports_written = dred_seq_.load(std::memory_order_relaxed);
-    st.shader_dumps_written = shader_seq_.load(std::memory_order_relaxed);
+    st.crash_reports_written = crash_artifact_count_.load(std::memory_order_acquire);
+    {
+        std::unique_lock<std::mutex> alk(artifacts_mu_, std::try_to_lock);
+        if (alk.owns_lock()) {
+            st.hang_snapshots_written = static_cast<uint32_t>(hang_artifacts_.size());
+            st.dred_reports_written = static_cast<uint32_t>(dred_artifacts_.size());
+            st.shader_dumps_written = static_cast<uint32_t>(shader_artifacts_.size());
+        } else {
+            st.hang_snapshots_written = hang_seq_.load(std::memory_order_relaxed);
+            st.dred_reports_written = dred_seq_.load(std::memory_order_relaxed);
+            st.shader_dumps_written = shader_seq_.load(std::memory_order_relaxed);
+        }
+    }
     return st;
 }
+
+namespace {
+
+#if defined(_WIN32)
+// Pure POD buffered Win32 HANDLE writer: zero heap allocations, zero CRT FILE* locks.
+struct PodWin32Writer {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    size_t len = 0;
+    char buf[4096] = {};
+
+    void Open(const wchar_t* path) noexcept {
+        len = 0;
+        handle = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+
+    void Flush() noexcept {
+        if (handle != INVALID_HANDLE_VALUE && len > 0) {
+            DWORD written = 0;
+            (void)WriteFile(handle, buf, static_cast<DWORD>(len), &written, nullptr);
+            len = 0;
+        }
+    }
+
+    void Close() noexcept {
+        Flush();
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    void PutChar(char c) noexcept {
+        if (handle == INVALID_HANDLE_VALUE) return;
+        buf[len++] = c;
+        if (len == sizeof(buf)) Flush();
+    }
+
+    void PutBytes(const char* s, size_t n) noexcept {
+        if (handle == INVALID_HANDLE_VALUE || !s || n == 0) return;
+        for (size_t i = 0; i < n; ++i) PutChar(s[i]);
+    }
+
+    void PutStr(const char* s) noexcept {
+        if (!s) return;
+        while (*s) PutChar(*s++);
+    }
+
+    void PutU64(uint64_t v) noexcept {
+        char tmp[24] = {};
+        size_t n = 0;
+        do {
+            tmp[n++] = static_cast<char>('0' + (v % 10ull));
+            v /= 10ull;
+        } while (v != 0 && n < sizeof(tmp));
+        while (n > 0) PutChar(tmp[--n]);
+    }
+
+    void PutHexU64(uint64_t v) noexcept {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        PutStr("0x");
+        if (v == 0) {
+            PutChar('0');
+            return;
+        }
+        char tmp[16] = {};
+        size_t n = 0;
+        while (v != 0 && n < sizeof(tmp)) {
+            tmp[n++] = kHex[v & 0xFu];
+            v >>= 4u;
+        }
+        while (n > 0) PutChar(tmp[--n]);
+    }
+
+    void PutHexU32(uint32_t v) noexcept {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        PutStr("0x");
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            PutChar(kHex[(v >> shift) & 0xFu]);
+        }
+    }
+
+    void PutJsonEscaped(const char* s) noexcept {
+        if (!s) return;
+        static constexpr char kHexLower[] = "0123456789abcdef";
+        while (*s) {
+            const unsigned char c = static_cast<unsigned char>(*s++);
+            switch (c) {
+                case '"': PutStr("\\\""); break;
+                case '\\': PutStr("\\\\"); break;
+                case '\b': PutStr("\\b"); break;
+                case '\f': PutStr("\\f"); break;
+                case '\n': PutStr("\\n"); break;
+                case '\r': PutStr("\\r"); break;
+                case '\t': PutStr("\\t"); break;
+                default:
+                    if (c < 0x20u) {
+                        PutStr("\\u00");
+                        PutChar(kHexLower[(c >> 4u) & 0xFu]);
+                        PutChar(kHexLower[c & 0xFu]);
+                    } else {
+                        PutChar(static_cast<char>(c));
+                    }
+                    break;
+            }
+        }
+    }
+};
+
+void FormatResolvedAddressPod(const FlightResolvedAddress& addr, char (&buf)[192]) noexcept {
+    if (addr.raw_va == 0) {
+        CopyBoundedStr(buf, sizeof(buf), "0x0");
+        return;
+    }
+    PodWin32Writer dummy;
+    // Format without CRT locale/heap using bounded manual formatting
+    size_t pos = 0;
+    auto push_ch = [&](char ch) {
+        if (pos + 1 < sizeof(buf)) buf[pos++] = ch;
+    };
+    auto push_str = [&](const char* s) {
+        if (!s) return;
+        while (*s && pos + 1 < sizeof(buf)) buf[pos++] = *s++;
+    };
+    auto push_hex64 = [&](uint64_t v) {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        push_str("0x");
+        if (v == 0) {
+            push_ch('0');
+            return;
+        }
+        char tmp[16] = {};
+        size_t n = 0;
+        while (v != 0 && n < sizeof(tmp)) {
+            tmp[n++] = kHex[v & 0xFu];
+            v >>= 4u;
+        }
+        while (n > 0) push_ch(tmp[--n]);
+    };
+    (void)dummy;
+    if (!addr.resolved) {
+        push_hex64(addr.raw_va);
+        push_str(" (unmapped)");
+    } else if (addr.is_guest) {
+        push_str(addr.module_name);
+        push_ch('+');
+        push_hex64(addr.rva);
+        push_str(" [guest Ghidra=");
+        push_hex64(addr.ghidra_va);
+        push_str(", raw=");
+        push_hex64(addr.raw_va);
+        push_ch(']');
+    } else {
+        push_str(addr.module_name);
+        push_ch('+');
+        push_hex64(addr.rva);
+        push_str(" [");
+        push_hex64(addr.raw_va);
+        push_ch(']');
+    }
+    buf[pos] = '\0';
+}
+
+struct CrashReportStaticScratch {
+    static constexpr size_t kMaxFrames = 32;
+    static constexpr size_t kMaxEvents = 64;
+    static constexpr size_t kMaxStubs = 64;
+    static constexpr size_t kMaxBcs = 64;
+
+    uint64_t frame_rips[kMaxFrames];
+    uint64_t frame_rsps[kMaxFrames];
+    FlightEvent recent_events[kMaxEvents];
+    FlightStubMissRecord stubs[kMaxStubs];
+    FlightGpuBreadcrumb gpu_bcs[kMaxBcs];
+    char dir_utf8[512];
+    wchar_t dir_wide[260];
+    wchar_t json_path_w[560];
+    wchar_t txt_path_w[560];
+    char json_path_utf8[560];
+    PodWin32Writer writer;
+};
+
+std::atomic_flag g_crash_scratch_lock = ATOMIC_FLAG_INIT;
+CrashReportStaticScratch g_crash_scratch{};
+
+void AppendAsciiToWide(wchar_t* dst, size_t cap, size_t& pos, const char* s) noexcept {
+    if (!dst || cap == 0 || !s) return;
+    while (*s && pos + 1 < cap) {
+        dst[pos++] = static_cast<wchar_t>(static_cast<unsigned char>(*s++));
+    }
+    dst[pos] = L'\0';
+}
+
+void AppendU32ToWide(wchar_t* dst, size_t cap, size_t& pos, uint32_t v) noexcept {
+    char tmp[16] = {};
+    size_t n = 0;
+    do {
+        tmp[n++] = static_cast<char>('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0 && n < sizeof(tmp));
+    while (n > 0 && pos + 1 < cap) {
+        dst[pos++] = static_cast<wchar_t>(tmp[--n]);
+    }
+    dst[pos] = L'\0';
+}
+
+void AppendAsciiToChar(char* dst, size_t cap, size_t& pos, const char* s) noexcept {
+    if (!dst || cap == 0 || !s) return;
+    while (*s && pos + 1 < cap) {
+        dst[pos++] = *s++;
+    }
+    dst[pos] = '\0';
+}
+
+void AppendU32ToChar(char* dst, size_t cap, size_t& pos, uint32_t v) noexcept {
+    char tmp[16] = {};
+    size_t n = 0;
+    do {
+        tmp[n++] = static_cast<char>('0' + (v % 10u));
+        v /= 10u;
+    } while (v != 0 && n < sizeof(tmp));
+    while (n > 0 && pos + 1 < cap) {
+        dst[pos++] = tmp[--n];
+    }
+    dst[pos] = '\0';
+}
+#endif
+
+}  // namespace
 
 bool FlightRecorder::CaptureCrashReport(const void* win32_exception_pointers,
                                         const char* reason,
@@ -1035,24 +1449,43 @@ bool FlightRecorder::CaptureCrashReport(const void* win32_exception_pointers,
         return false;
     }
 
-    try {
-        const std::string out_dir = OutputDirectory().empty() ? "flight_logs" : OutputDirectory();
-        std::error_code ec;
-        std::filesystem::create_directories(out_dir, ec);
+    // Zero heap allocations, zero std::mutex locks, zero PEB Loader Lock calls,
+    // and minimal stack footprint (safe inside STATUS_HEAP_CORRUPTION & STACK_OVERFLOW).
+    ScopedSpinTryLock scratch_lk(g_crash_scratch_lock, 4096);
+    if (!scratch_lk.owns_lock()) {
+        crash_seq_.fetch_sub(1u, std::memory_order_relaxed);
+        return false;
+    }
+    auto& sc = g_crash_scratch;
 
-        const uint32_t pid = CurrentPid();
-        const uint32_t tid = CurrentTid();
-        const FlightResolvedAddress resolved_rip = ResolveCodeAddress(fault_rip);
-
-        std::string av_kind = "n/a";
-        uint64_t av_target_va = 0;
-        if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) &&
-            ep->ExceptionRecord->NumberParameters >= 2) {
-            const ULONG_PTR op = ep->ExceptionRecord->ExceptionInformation[0];
-            av_kind = (op == 0) ? "READ" : (op == 1 ? "WRITE" : (op == 8 ? "EXECUTE_DEP" : "OTHER"));
-            av_target_va = static_cast<uint64_t>(ep->ExceptionRecord->ExceptionInformation[1]);
+    {
+        ScopedSpinTryLock dlk(output_dir_lock_, 64);
+        if (dlk.owns_lock()) {
+            CopyBoundedStr(sc.dir_utf8, sizeof(sc.dir_utf8), output_dir_utf8_);
+            std::memcpy(sc.dir_wide, output_dir_wide_, sizeof(sc.dir_wide));
+        } else {
+            CopyBoundedStr(sc.dir_utf8, sizeof(sc.dir_utf8), "flight_logs");
+            std::memcpy(sc.dir_wide, L"flight_logs", 12 * sizeof(wchar_t));
         }
+    }
+    CreateDirectoryW(sc.dir_wide, nullptr);
 
+    const uint32_t pid = CurrentPid();
+    const uint32_t tid = CurrentTid();
+    const FlightResolvedAddress resolved_rip = ResolveCodeAddressNoLoaderLock(fault_rip);
+    char resolved_rip_str[192] = {};
+    FormatResolvedAddressPod(resolved_rip, resolved_rip_str);
+
+    const char* av_kind = "n/a";
+    uint64_t av_target_va = 0;
+    if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) &&
+        ep->ExceptionRecord->NumberParameters >= 2) {
+        const ULONG_PTR op = ep->ExceptionRecord->ExceptionInformation[0];
+        av_kind = (op == 0) ? "READ" : (op == 1 ? "WRITE" : (op == 8 ? "EXECUTE_DEP" : "OTHER"));
+        av_target_va = static_cast<uint64_t>(ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+
+    if (IsEnabledNoProbe()) {
         RecordEvent(FlightEventCategory::GuestFault,
                     "crash_handler",
                     ExceptionCodeName(code),
@@ -1060,164 +1493,270 @@ bool FlightRecorder::CaptureCrashReport(const void* win32_exception_pointers,
                     fault_rip,
                     av_target_va,
                     seq);
+    }
 
-        constexpr size_t kMaxFrames = 32;
-        uint64_t frame_rips[kMaxFrames] = {};
-        uint64_t frame_rsps[kMaxFrames] = {};
-        const size_t frame_count = UnwindX64FramesPod(ep->ContextRecord, frame_rips, frame_rsps, kMaxFrames);
+    const size_t frame_count = UnwindX64FramesPod(
+        ep->ContextRecord, sc.frame_rips, sc.frame_rsps, CrashReportStaticScratch::kMaxFrames);
 
-        const auto recent_events = SnapshotRecentEvents(128);
-
-        std::vector<FlightStubMissRecord> stubs;
-        std::vector<FlightComQiMissRecord> qi_misses;
-        std::vector<FlightVtableMissRecord> vtbl_misses;
-        std::vector<FlightVfsMissRecord> vfs_misses;
-        {
-            ScopedSpinTryLock mlk(miss_lock_, 64);
-            if (mlk.owns_lock()) {
-                stubs.assign(stub_misses_, stub_misses_ + stub_miss_count_);
-                qi_misses.assign(com_qi_misses_, com_qi_misses_ + com_qi_miss_count_);
-                vtbl_misses.assign(vtable_misses_, vtable_misses_ + vtable_miss_count_);
-                vfs_misses.assign(vfs_misses_, vfs_misses_ + vfs_miss_count_);
-            }
-        }
-
-        std::vector<FlightGpuBreadcrumb> gpu_bcs;
-        {
-            ScopedSpinTryLock blk(gpu_bc_lock_, 64);
-            if (blk.owns_lock() && total_gpu_breadcrumbs_ > 0) {
-                const size_t n = static_cast<size_t>(std::min<uint64_t>(total_gpu_breadcrumbs_, 64ull));
-                for (size_t i = 0; i < n; ++i) {
-                    const uint64_t bidx = (total_gpu_breadcrumbs_ > 64ull) ? (total_gpu_breadcrumbs_ - n + i) : i;
-                    gpu_bcs.push_back(recent_gpu_breadcrumbs_[static_cast<size_t>(bidx % 64ull)]);
+    size_t event_count = 0;
+    {
+        const uint64_t head = write_seq_.load(std::memory_order_acquire);
+        if (head > 0) {
+            const uint64_t start_seq =
+                (head > CrashReportStaticScratch::kMaxEvents)
+                    ? (head - CrashReportStaticScratch::kMaxEvents + 1ull)
+                    : 1ull;
+            for (uint64_t s = start_seq; s <= head && event_count < CrashReportStaticScratch::kMaxEvents; ++s) {
+                const size_t idx = static_cast<size_t>((s - 1ull) & (kRingCapacity - 1u));
+                const uint64_t c1 = committed_seq_[idx].load(std::memory_order_acquire);
+                if (c1 != s) continue;
+                FlightEvent copy = ring_[idx];
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const uint64_t c2 = committed_seq_[idx].load(std::memory_order_relaxed);
+                if (c2 == s && copy.seq == s) {
+                    sc.recent_events[event_count++] = copy;
                 }
             }
         }
+    }
 
-        char phase_copy[48] = {};
-        {
-            ScopedSpinTryLock plk(phase_lock_, 32);
-            if (plk.owns_lock()) {
-                CopyBoundedStr(phase_copy, sizeof(phase_copy), last_phase_);
+    size_t stub_count = 0;
+    {
+        ScopedSpinTryLock mlk(miss_lock_, 64);
+        if (mlk.owns_lock()) {
+            stub_count = std::min<size_t>(stub_miss_count_, CrashReportStaticScratch::kMaxStubs);
+            for (size_t i = 0; i < stub_count; ++i) {
+                sc.stubs[i] = stub_misses_[i];
             }
         }
+    }
 
-        const auto base_name = "crash_report_" + std::to_string(pid) + "_" + std::to_string(seq);
-        const std::string json_path = (std::filesystem::path(out_dir) / (base_name + ".json")).string();
-        const std::string txt_path = (std::filesystem::path(out_dir) / (base_name + ".txt")).string();
-
-        const CONTEXT& c = *ep->ContextRecord;
-        {
-            std::ofstream jf(json_path, std::ios::binary);
-            if (jf) {
-                jf << "{\n"
-                   << "  \"report_type\": \"crash_report\",\n"
-                   << "  \"pid\": " << pid << ",\n"
-                   << "  \"tid\": " << tid << ",\n"
-                   << "  \"sequence\": " << seq << ",\n"
-                   << "  \"reason\": \"" << JsonEscape(reason ? reason : "Exception") << "\",\n"
-                   << "  \"last_phase\": \"" << JsonEscape(phase_copy) << "\",\n"
-                   << "  \"exception_code\": \"" << HexU32(code) << "\",\n"
-                   << "  \"exception_name\": \"" << ExceptionCodeName(code) << "\",\n"
-                   << "  \"access_type\": \"" << av_kind << "\",\n"
-                   << "  \"fault_target_va\": \"" << HexU64(av_target_va) << "\",\n"
-                   << "  \"fault_rip\": \"" << HexU64(fault_rip) << "\",\n"
-                   << "  \"fault_symbol\": \"" << JsonEscape(FormatResolvedAddress(resolved_rip)) << "\",\n"
-                   << "  \"fault_module\": \"" << JsonEscape(resolved_rip.module_name) << "\",\n"
-                   << "  \"fault_rva\": \"" << HexU32(resolved_rip.rva) << "\",\n"
-                   << "  \"fault_ghidra_va\": \"" << HexU64(resolved_rip.ghidra_va) << "\",\n"
-                   << "  \"is_guest_code\": " << (resolved_rip.is_guest ? "true" : "false") << ",\n"
-                   << "  \"registers\": {\n"
-                   << "    \"rax\": \"" << HexU64(c.Rax) << "\", \"rbx\": \"" << HexU64(c.Rbx) << "\",\n"
-                   << "    \"rcx\": \"" << HexU64(c.Rcx) << "\", \"rdx\": \"" << HexU64(c.Rdx) << "\",\n"
-                   << "    \"rsi\": \"" << HexU64(c.Rsi) << "\", \"rdi\": \"" << HexU64(c.Rdi) << "\",\n"
-                   << "    \"rbp\": \"" << HexU64(c.Rbp) << "\", \"rsp\": \"" << HexU64(c.Rsp) << "\",\n"
-                   << "    \"r8\": \"" << HexU64(c.R8) << "\", \"r9\": \"" << HexU64(c.R9) << "\",\n"
-                   << "    \"r10\": \"" << HexU64(c.R10) << "\", \"r11\": \"" << HexU64(c.R11) << "\",\n"
-                   << "    \"r12\": \"" << HexU64(c.R12) << "\", \"r13\": \"" << HexU64(c.R13) << "\",\n"
-                   << "    \"r14\": \"" << HexU64(c.R14) << "\", \"r15\": \"" << HexU64(c.R15) << "\",\n"
-                   << "    \"rip\": \"" << HexU64(c.Rip) << "\", \"eflags\": \"" << HexU32(c.EFlags) << "\"\n"
-                   << "  },\n"
-                   << "  \"stack_frames\": [\n";
-                for (size_t i = 0; i < frame_count; ++i) {
-                    const auto fa = ResolveCodeAddress(frame_rips[i]);
-                    jf << "    {\"index\": " << i
-                       << ", \"rip\": \"" << HexU64(frame_rips[i]) << "\""
-                       << ", \"rsp\": \"" << HexU64(frame_rsps[i]) << "\""
-                       << ", \"module\": \"" << JsonEscape(fa.module_name) << "\""
-                       << ", \"rva\": \"" << HexU32(fa.rva) << "\""
-                       << ", \"ghidra_va\": \"" << HexU64(fa.ghidra_va) << "\""
-                       << ", \"is_guest\": " << (fa.is_guest ? "true" : "false")
-                       << ", \"formatted\": \"" << JsonEscape(FormatResolvedAddress(fa)) << "\"}"
-                       << (i + 1 < frame_count ? "," : "") << "\n";
-                }
-                jf << "  ],\n  \"gpu_breadcrumbs\": [\n";
-                for (size_t i = 0; i < gpu_bcs.size(); ++i) {
-                    jf << "    {\"cmd_list\": " << gpu_bcs[i].command_list_id
-                       << ", \"marker\": " << gpu_bcs[i].marker_value
-                       << ", \"tag\": \"" << JsonEscape(gpu_bcs[i].tag) << "\"}"
-                       << (i + 1 < gpu_bcs.size() ? "," : "") << "\n";
-                }
-                jf << "  ],\n  \"stub_misses\": [\n";
-                for (size_t i = 0; i < stubs.size(); ++i) {
-                    const auto ca = ResolveCodeAddress(stubs[i].first_caller_rip);
-                    jf << "    {\"symbol\": \"" << JsonEscape(stubs[i].module_and_symbol) << "\""
-                       << ", \"hits\": " << stubs[i].hit_count
-                       << ", \"caller\": \"" << JsonEscape(FormatResolvedAddress(ca)) << "\"}"
-                       << (i + 1 < stubs.size() ? "," : "") << "\n";
-                }
-                jf << "  ],\n  \"recent_events\": [\n";
-                for (size_t i = 0; i < recent_events.size(); ++i) {
-                    const auto& ev = recent_events[i];
-                    const auto ca = ResolveCodeAddress(ev.caller_rip);
-                    jf << "    {\"seq\": " << ev.seq
-                       << ", \"t_us\": " << ev.timestamp_us
-                       << ", \"tid\": " << ev.thread_id
-                       << ", \"cat\": \"" << FlightEventCategoryName(ev.category) << "\""
-                       << ", \"sub\": \"" << JsonEscape(ev.subsystem) << "\""
-                       << ", \"detail\": \"" << JsonEscape(ev.detail) << "\""
-                       << ", \"status\": \"" << HexU32(static_cast<uint32_t>(ev.status_code)) << "\""
-                       << ", \"caller\": \"" << JsonEscape(FormatResolvedAddress(ca)) << "\"}"
-                       << (i + 1 < recent_events.size() ? "," : "") << "\n";
-                }
-                jf << "  ]\n}\n";
+    size_t bc_count = 0;
+    {
+        ScopedSpinTryLock blk(gpu_bc_lock_, 64);
+        if (blk.owns_lock() && total_gpu_breadcrumbs_ > 0) {
+            bc_count = static_cast<size_t>(
+                std::min<uint64_t>(total_gpu_breadcrumbs_, CrashReportStaticScratch::kMaxBcs));
+            for (size_t i = 0; i < bc_count; ++i) {
+                const uint64_t bidx = (total_gpu_breadcrumbs_ > 64ull)
+                    ? (total_gpu_breadcrumbs_ - bc_count + i)
+                    : i;
+                sc.gpu_bcs[i] = recent_gpu_breadcrumbs_[static_cast<size_t>(bidx % 64ull)];
             }
         }
+    }
 
-        {
-            std::ofstream tf(txt_path);
-            if (tf) {
-                tf << "=== ScarlettEdge Flight-Recorder Crash Report ===\n"
-                   << "PID / TID:      " << pid << " / " << tid << "\n"
-                   << "Reason:         " << (reason ? reason : "Exception") << " (phase=" << phase_copy << ")\n"
-                   << "Exception:      " << HexU32(code) << " (" << ExceptionCodeName(code) << ")\n"
-                   << "Access Fault:   " << av_kind << " @ " << HexU64(av_target_va) << "\n"
-                   << "Faulting RIP:   " << FormatResolvedAddress(resolved_rip) << "\n"
-                   << "Registers:      RAX=" << HexU64(c.Rax) << " RBX=" << HexU64(c.Rbx)
-                   << " RCX=" << HexU64(c.Rcx) << " RDX=" << HexU64(c.Rdx) << "\n"
-                   << "                RSI=" << HexU64(c.Rsi) << " RDI=" << HexU64(c.Rdi)
-                   << " RBP=" << HexU64(c.Rbp) << " RSP=" << HexU64(c.Rsp) << "\n"
-                   << "                R8=" << HexU64(c.R8) << " R9=" << HexU64(c.R9)
-                   << " R10=" << HexU64(c.R10) << " R11=" << HexU64(c.R11) << "\n\n"
-                   << "Stack Trace (" << frame_count << " frames):\n";
-                for (size_t i = 0; i < frame_count; ++i) {
-                    tf << "  [" << std::setw(2) << i << "] "
-                       << FormatResolvedAddress(ResolveCodeAddress(frame_rips[i]))
-                       << " (RSP=" << HexU64(frame_rsps[i]) << ")\n";
-                }
-            }
+    char phase_copy[48] = "init";
+    {
+        ScopedSpinTryLock plk(phase_lock_, 32);
+        if (plk.owns_lock()) {
+            CopyBoundedStr(phase_copy, sizeof(phase_copy), last_phase_);
         }
+    }
 
-        {
-            std::lock_guard<std::mutex> alk(artifacts_mu_);
-            crash_artifacts_.push_back(json_path);
+    // Build wide & UTF-8 file paths without heap allocation
+    size_t wpos = 0;
+    while (sc.dir_wide[wpos] != L'\0' && wpos + 1 < 560) {
+        sc.json_path_w[wpos] = sc.dir_wide[wpos];
+        sc.txt_path_w[wpos] = sc.dir_wide[wpos];
+        ++wpos;
+    }
+    if (wpos > 0 && sc.json_path_w[wpos - 1] != L'\\' && sc.json_path_w[wpos - 1] != L'/') {
+        sc.json_path_w[wpos] = L'\\';
+        sc.txt_path_w[wpos] = L'\\';
+        ++wpos;
+    }
+    size_t jw = wpos;
+    AppendAsciiToWide(sc.json_path_w, 560, jw, "crash_report_");
+    AppendU32ToWide(sc.json_path_w, 560, jw, pid);
+    AppendAsciiToWide(sc.json_path_w, 560, jw, "_");
+    AppendU32ToWide(sc.json_path_w, 560, jw, seq);
+    AppendAsciiToWide(sc.json_path_w, 560, jw, ".json");
+
+    size_t tw = wpos;
+    AppendAsciiToWide(sc.txt_path_w, 560, tw, "crash_report_");
+    AppendU32ToWide(sc.txt_path_w, 560, tw, pid);
+    AppendAsciiToWide(sc.txt_path_w, 560, tw, "_");
+    AppendU32ToWide(sc.txt_path_w, 560, tw, seq);
+    AppendAsciiToWide(sc.txt_path_w, 560, tw, ".txt");
+
+    size_t cpos = 0;
+    AppendAsciiToChar(sc.json_path_utf8, sizeof(sc.json_path_utf8), cpos, sc.dir_utf8);
+    if (cpos > 0 && sc.json_path_utf8[cpos - 1] != '\\' && sc.json_path_utf8[cpos - 1] != '/') {
+        AppendAsciiToChar(sc.json_path_utf8, sizeof(sc.json_path_utf8), cpos, "\\");
+    }
+    AppendAsciiToChar(sc.json_path_utf8, sizeof(sc.json_path_utf8), cpos, "crash_report_");
+    AppendU32ToChar(sc.json_path_utf8, sizeof(sc.json_path_utf8), cpos, pid);
+    AppendAsciiToChar(sc.json_path_utf8, sizeof(sc.json_path_utf8), cpos, "_");
+    AppendU32ToChar(sc.json_path_utf8, sizeof(sc.json_path_utf8), cpos, seq);
+    AppendAsciiToChar(sc.json_path_utf8, sizeof(sc.json_path_utf8), cpos, ".json");
+
+    const CONTEXT& c = *ep->ContextRecord;
+    bool wrote_json = false;
+    sc.writer.Open(sc.json_path_w);
+    if (sc.writer.handle != INVALID_HANDLE_VALUE) {
+        auto& w = sc.writer;
+        w.PutStr("{\n  \"report_type\": \"crash_report\",\n  \"pid\": ");
+        w.PutU64(pid);
+        w.PutStr(",\n  \"tid\": ");
+        w.PutU64(tid);
+        w.PutStr(",\n  \"sequence\": ");
+        w.PutU64(seq);
+        w.PutStr(",\n  \"reason\": \"");
+        w.PutJsonEscaped(reason ? reason : "Exception");
+        w.PutStr("\",\n  \"last_phase\": \"");
+        w.PutJsonEscaped(phase_copy);
+        w.PutStr("\",\n  \"exception_code\": \"");
+        w.PutHexU32(code);
+        w.PutStr("\",\n  \"exception_name\": \"");
+        w.PutStr(ExceptionCodeName(code));
+        w.PutStr("\",\n  \"access_type\": \"");
+        w.PutStr(av_kind);
+        w.PutStr("\",\n  \"fault_target_va\": \"");
+        w.PutHexU64(av_target_va);
+        w.PutStr("\",\n  \"fault_rip\": \"");
+        w.PutHexU64(fault_rip);
+        w.PutStr("\",\n  \"fault_symbol\": \"");
+        w.PutJsonEscaped(resolved_rip_str);
+        w.PutStr("\",\n  \"fault_module\": \"");
+        w.PutJsonEscaped(resolved_rip.module_name);
+        w.PutStr("\",\n  \"fault_rva\": \"");
+        w.PutHexU32(resolved_rip.rva);
+        w.PutStr("\",\n  \"fault_ghidra_va\": \"");
+        w.PutHexU64(resolved_rip.ghidra_va);
+        w.PutStr("\",\n  \"is_guest_code\": ");
+        w.PutStr(resolved_rip.is_guest ? "true" : "false");
+        w.PutStr(",\n  \"registers\": {\n    \"rax\": \"");
+        w.PutHexU64(c.Rax); w.PutStr("\", \"rbx\": \""); w.PutHexU64(c.Rbx);
+        w.PutStr("\",\n    \"rcx\": \"");
+        w.PutHexU64(c.Rcx); w.PutStr("\", \"rdx\": \""); w.PutHexU64(c.Rdx);
+        w.PutStr("\",\n    \"rsi\": \"");
+        w.PutHexU64(c.Rsi); w.PutStr("\", \"rdi\": \""); w.PutHexU64(c.Rdi);
+        w.PutStr("\",\n    \"rbp\": \"");
+        w.PutHexU64(c.Rbp); w.PutStr("\", \"rsp\": \""); w.PutHexU64(c.Rsp);
+        w.PutStr("\",\n    \"r8\": \"");
+        w.PutHexU64(c.R8); w.PutStr("\", \"r9\": \""); w.PutHexU64(c.R9);
+        w.PutStr("\",\n    \"r10\": \"");
+        w.PutHexU64(c.R10); w.PutStr("\", \"r11\": \""); w.PutHexU64(c.R11);
+        w.PutStr("\",\n    \"r12\": \"");
+        w.PutHexU64(c.R12); w.PutStr("\", \"r13\": \""); w.PutHexU64(c.R13);
+        w.PutStr("\",\n    \"r14\": \"");
+        w.PutHexU64(c.R14); w.PutStr("\", \"r15\": \""); w.PutHexU64(c.R15);
+        w.PutStr("\",\n    \"rip\": \"");
+        w.PutHexU64(c.Rip); w.PutStr("\", \"eflags\": \""); w.PutHexU32(c.EFlags);
+        w.PutStr("\"\n  },\n  \"stack_frames\": [\n");
+        char fmt_buf[192] = {};
+        for (size_t i = 0; i < frame_count; ++i) {
+            const auto fa = ResolveCodeAddressNoLoaderLock(sc.frame_rips[i]);
+            FormatResolvedAddressPod(fa, fmt_buf);
+            w.PutStr("    {\"index\": "); w.PutU64(i);
+            w.PutStr(", \"rip\": \""); w.PutHexU64(sc.frame_rips[i]);
+            w.PutStr("\", \"rsp\": \""); w.PutHexU64(sc.frame_rsps[i]);
+            w.PutStr("\", \"module\": \""); w.PutJsonEscaped(fa.module_name);
+            w.PutStr("\", \"rva\": \""); w.PutHexU32(fa.rva);
+            w.PutStr("\", \"ghidra_va\": \""); w.PutHexU64(fa.ghidra_va);
+            w.PutStr("\", \"is_guest\": "); w.PutStr(fa.is_guest ? "true" : "false");
+            w.PutStr(", \"formatted\": \""); w.PutJsonEscaped(fmt_buf);
+            w.PutStr(i + 1 < frame_count ? "\"},\n" : "\"}\n");
         }
-        if (out_json_path) *out_json_path = json_path;
-        std::fprintf(stderr, "[ScarlettX][FlightRecorder] Wrote post-mortem crash dump: %s\n", json_path.c_str());
-        return true;
-    } catch (...) {
+        w.PutStr("  ],\n  \"gpu_breadcrumbs\": [\n");
+        for (size_t i = 0; i < bc_count; ++i) {
+            w.PutStr("    {\"cmd_list\": "); w.PutU64(sc.gpu_bcs[i].command_list_id);
+            w.PutStr(", \"marker\": "); w.PutU64(sc.gpu_bcs[i].marker_value);
+            w.PutStr(", \"tag\": \""); w.PutJsonEscaped(sc.gpu_bcs[i].tag);
+            w.PutStr(i + 1 < bc_count ? "\"},\n" : "\"}\n");
+        }
+        w.PutStr("  ],\n  \"stub_misses\": [\n");
+        for (size_t i = 0; i < stub_count; ++i) {
+            const auto ca = ResolveCodeAddressNoLoaderLock(sc.stubs[i].first_caller_rip);
+            FormatResolvedAddressPod(ca, fmt_buf);
+            w.PutStr("    {\"symbol\": \""); w.PutJsonEscaped(sc.stubs[i].module_and_symbol);
+            w.PutStr("\", \"hits\": "); w.PutU64(sc.stubs[i].hit_count);
+            w.PutStr(", \"caller\": \""); w.PutJsonEscaped(fmt_buf);
+            w.PutStr(i + 1 < stub_count ? "\"},\n" : "\"}\n");
+        }
+        w.PutStr("  ],\n  \"recent_events\": [\n");
+        for (size_t i = 0; i < event_count; ++i) {
+            const auto& ev = sc.recent_events[i];
+            const auto ca = ResolveCodeAddressNoLoaderLock(ev.caller_rip);
+            FormatResolvedAddressPod(ca, fmt_buf);
+            w.PutStr("    {\"seq\": "); w.PutU64(ev.seq);
+            w.PutStr(", \"t_us\": "); w.PutU64(ev.timestamp_us);
+            w.PutStr(", \"tid\": "); w.PutU64(ev.thread_id);
+            w.PutStr(", \"cat\": \""); w.PutStr(FlightEventCategoryName(ev.category));
+            w.PutStr("\", \"sub\": \""); w.PutJsonEscaped(ev.subsystem);
+            w.PutStr("\", \"detail\": \""); w.PutJsonEscaped(ev.detail);
+            w.PutStr("\", \"status\": \""); w.PutHexU32(static_cast<uint32_t>(ev.status_code));
+            w.PutStr("\", \"caller\": \""); w.PutJsonEscaped(fmt_buf);
+            w.PutStr(i + 1 < event_count ? "\"},\n" : "\"}\n");
+        }
+        w.PutStr("  ]\n}\n");
+        wrote_json = true;
+    }
+    sc.writer.Close();
+
+    sc.writer.Open(sc.txt_path_w);
+    if (sc.writer.handle != INVALID_HANDLE_VALUE) {
+        auto& w = sc.writer;
+        w.PutStr("=== ScarlettEdge Flight-Recorder Crash Report ===\nPID / TID:      ");
+        w.PutU64(pid); w.PutStr(" / "); w.PutU64(tid);
+        w.PutStr("\nReason:         "); w.PutStr(reason ? reason : "Exception");
+        w.PutStr(" (phase="); w.PutStr(phase_copy);
+        w.PutStr(")\nException:      "); w.PutHexU32(code);
+        w.PutStr(" ("); w.PutStr(ExceptionCodeName(code));
+        w.PutStr(")\nAccess Fault:   "); w.PutStr(av_kind);
+        w.PutStr(" @ "); w.PutHexU64(av_target_va);
+        w.PutStr("\nFaulting RIP:   "); w.PutStr(resolved_rip_str);
+        w.PutStr("\nRegisters:      RAX="); w.PutHexU64(c.Rax);
+        w.PutStr(" RBX="); w.PutHexU64(c.Rbx);
+        w.PutStr(" RCX="); w.PutHexU64(c.Rcx);
+        w.PutStr(" RDX="); w.PutHexU64(c.Rdx);
+        w.PutStr("\n                RSI="); w.PutHexU64(c.Rsi);
+        w.PutStr(" RDI="); w.PutHexU64(c.Rdi);
+        w.PutStr(" RBP="); w.PutHexU64(c.Rbp);
+        w.PutStr(" RSP="); w.PutHexU64(c.Rsp);
+        w.PutStr("\n                R8="); w.PutHexU64(c.R8);
+        w.PutStr(" R9="); w.PutHexU64(c.R9);
+        w.PutStr(" R10="); w.PutHexU64(c.R10);
+        w.PutStr(" R11="); w.PutHexU64(c.R11);
+        w.PutStr("\n\nStack Trace ("); w.PutU64(frame_count); w.PutStr(" frames):\n");
+        char fmt_buf[192] = {};
+        for (size_t i = 0; i < frame_count; ++i) {
+            FormatResolvedAddressPod(ResolveCodeAddressNoLoaderLock(sc.frame_rips[i]), fmt_buf);
+            w.PutStr("  ["); w.PutU64(i); w.PutStr("] ");
+            w.PutStr(fmt_buf);
+            w.PutStr(" (RSP="); w.PutHexU64(sc.frame_rsps[i]); w.PutStr(")\n");
+        }
+    }
+    sc.writer.Close();
+
+    if (!wrote_json) {
+        crash_seq_.fetch_sub(1u, std::memory_order_relaxed);
         return false;
     }
+
+    const uint32_t art_idx = seq - 1u;
+    if (art_idx < kMaxCrashReports) {
+        CopyBoundedStr(crash_artifact_paths_[art_idx], sizeof(crash_artifact_paths_[art_idx]), sc.json_path_utf8);
+        uint32_t cur_cnt = crash_artifact_count_.load(std::memory_order_relaxed);
+        while (cur_cnt < seq &&
+               !crash_artifact_count_.compare_exchange_weak(cur_cnt, seq, std::memory_order_release)) {
+        }
+    }
+    if (out_json_path) {
+        *out_json_path = sc.json_path_utf8;
+    }
+    if (HANDLE err_h = GetStdHandle(STD_ERROR_HANDLE);
+        err_h != nullptr && err_h != INVALID_HANDLE_VALUE) {
+        char msg[640] = {};
+        size_t mp = 0;
+        AppendAsciiToChar(msg, sizeof(msg), mp, "[ScarlettX][FlightRecorder] Wrote post-mortem crash dump: ");
+        AppendAsciiToChar(msg, sizeof(msg), mp, sc.json_path_utf8);
+        AppendAsciiToChar(msg, sizeof(msg), mp, "\n");
+        DWORD wr = 0;
+        (void)WriteFile(err_h, msg, static_cast<DWORD>(mp), &wr, nullptr);
+    }
+    return true;
 #else
     (void)win32_exception_pointers;
     (void)reason;
@@ -1643,7 +2182,7 @@ bool FlightRecorder::CaptureHangSnapshot(const char* reason,
                    << "  \"threads\": [\n";
                 for (size_t i = 0; i < sample_count; ++i) {
                     const auto& ts = samples[i];
-                    const auto rip_res = ResolveCodeAddress(ts.rip);
+                    const auto rip_res = ResolveCodeAddressNoLoaderLock(ts.rip);
                     jf << "    {\n"
                        << "      \"tid\": " << ts.tid << ",\n"
                        << "      \"rip\": \"" << HexU64(ts.rip) << "\",\n"
@@ -1655,7 +2194,7 @@ bool FlightRecorder::CaptureHangSnapshot(const char* reason,
                     for (uint32_t w = 0; w < ts.stack_word_count; ++w) {
                         const uint64_t cand = ts.stack_words[w];
                         if (!IsExecutableCodeAddress(cand)) continue;
-                        const auto ca = ResolveCodeAddress(cand);
+                        const auto ca = ResolveCodeAddressNoLoaderLock(cand);
                         if (!ca.resolved) continue;
                         if (!first_cand) jf << ", ";
                         first_cand = false;
@@ -1688,7 +2227,7 @@ bool FlightRecorder::CaptureHangSnapshot(const char* reason,
                    << "Threads (" << sample_count << "):\n";
                 for (size_t i = 0; i < sample_count; ++i) {
                     const auto& ts = samples[i];
-                    tf << "  - TID " << ts.tid << ": RIP=" << FormatResolvedAddress(ResolveCodeAddress(ts.rip))
+                    tf << "  - TID " << ts.tid << ": RIP=" << FormatResolvedAddress(ResolveCodeAddressNoLoaderLock(ts.rip))
                        << " RSP=" << HexU64(ts.rsp) << "\n";
                 }
             }
@@ -1741,9 +2280,15 @@ bool FlightRecorder::WriteSummaryReport(std::string* out_json_path,
     std::sort(vfs_misses.begin(), vfs_misses.end(), [](const auto& a, const auto& b) { return a.hit_count > b.hit_count; });
 
     std::vector<std::string> crashes, hangs, dreds, shaders;
+    const uint32_t crash_cnt = std::min<uint32_t>(
+        crash_artifact_count_.load(std::memory_order_acquire), kMaxCrashReports);
+    for (uint32_t i = 0; i < crash_cnt; ++i) {
+        if (crash_artifact_paths_[i][0] != '\0') {
+            crashes.emplace_back(crash_artifact_paths_[i]);
+        }
+    }
     {
         std::lock_guard<std::mutex> alk(artifacts_mu_);
-        crashes = crash_artifacts_;
         hangs = hang_artifacts_;
         dreds = dred_artifacts_;
         shaders = shader_artifacts_;

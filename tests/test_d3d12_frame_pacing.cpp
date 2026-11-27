@@ -22,6 +22,7 @@ intptr_t Call(void* object, int slot, Args... args) {
 }
 
 constexpr int kDevSetFrameIntervalX = 78;
+constexpr int kDevScheduleFrameEventX = 79;
 constexpr int kDevWaitFrameEventX = 80;
 
 double WaitFrames(void* device, int frames) {
@@ -61,7 +62,12 @@ int main() {
     SX_REQUIRE(ms > 180.0 && ms < 400.0);
 
     // A slow frame is not followed by a burst to catch up.
-    Sleep(100);
+    HANDLE slow_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    SX_REQUIRE(slow_ev != nullptr);
+    SX_REQUIRE(Call(device, kDevScheduleFrameEventX, uintptr_t{0}, uintptr_t{80000},
+                    reinterpret_cast<uintptr_t>(slow_ev)) == 0);
+    SX_REQUIRE(WaitForSingleObject(slow_ev, 2000) == WAIT_OBJECT_0);
+    CloseHandle(slow_ev);
     WaitFrames(device, 1);
     SX_REQUIRE(WaitFrames(device, 3) > 40.0);
 

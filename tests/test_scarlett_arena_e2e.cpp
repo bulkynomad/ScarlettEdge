@@ -28,6 +28,12 @@ int g_failures = 0;
         }                                                                       \
     } while (0)
 
+}  // namespace
+
+#include "sx_check.h"
+
+namespace {
+
 std::vector<SCARLETT_BVH_TRIANGLE> BuildArenaStaticGeometry() {
     std::vector<SCARLETT_BVH_TRIANGLE> tris;
     auto push_tri = [&](float x0, float y0, float z0,
@@ -105,14 +111,15 @@ void SetEnv(const char* name, const std::string& val) {
 }  // namespace
 
 int main() {
+    sx_test::ScopedTempDir sandbox("test_scarlett_arena_e2e");
     const std::filesystem::path bin_dir = SCARLETTX_BINARY_DIR;
     const std::filesystem::path pkg_dir = bin_dir / "packages" / "scarlett_arena";
-    const std::filesystem::path xvd_path = pkg_dir / "arena_assets.xvd";
-    const std::filesystem::path inproc_frame0 = bin_dir / "arena_inproc_frame0.ppm";
-    const std::filesystem::path inproc_frame3 = bin_dir / "arena_inproc_frame3.ppm";
-    const std::filesystem::path inproc_wav = bin_dir / "arena_inproc_audio.wav";
-    const std::filesystem::path proc_frame0 = std::filesystem::absolute("arena_proc_frame0.ppm");
-    const std::filesystem::path proc_frame3 = bin_dir / "arena_proc_frame3.ppm";
+    const std::filesystem::path xvd_path = sandbox.path() / "arena_assets.xvd";
+    const std::filesystem::path inproc_frame0 = sandbox.path() / "arena_inproc_frame0.ppm";
+    const std::filesystem::path inproc_frame3 = sandbox.path() / "arena_inproc_frame3.ppm";
+    const std::filesystem::path inproc_wav = sandbox.path() / "arena_inproc_audio.wav";
+    const std::filesystem::path proc_frame0 = sandbox.path() / "arena_proc_frame0.ppm";
+    const std::filesystem::path proc_frame3 = sandbox.path() / "arena_proc_frame3.ppm";
 
     // 1. Build synthetic XVD asset container with compressed arena geometry + XMA2 SFX.
     const auto static_tris = BuildArenaStaticGeometry();
@@ -153,9 +160,7 @@ int main() {
     }
     SX_CHECK(std::filesystem::exists(xvd_path));
 
-    const auto arena_save_root = bin_dir / "test_arena_saves_tmp";
-    std::error_code save_ec;
-    std::filesystem::remove_all(arena_save_root, save_ec);
+    const auto arena_save_root = sandbox.path() / "saves";
     SetEnv("SCARLETTX_SAVE_ROOT", arena_save_root.string());
 
     // 2. Boot scarlett_arena through the IN-PROCESS PE64 mapper with forced relocation.
@@ -200,10 +205,7 @@ int main() {
     proc_cfg.headless = true;
     proc_cfg.prefer_warp = true;
     proc_cfg.in_process = false;
-    // Relative: has to land in this process's working directory, not the guest's.
-    proc_cfg.rt_dump_path = proc_frame0.filename().string();
-    std::error_code ec;
-    std::filesystem::remove(proc_frame0, ec);
+    proc_cfg.rt_dump_path = proc_frame0.string();
 
     scarlettx::Emulator emu_proc(proc_cfg);
     auto st2 = emu_proc.BootPackage(pkg_dir.string());

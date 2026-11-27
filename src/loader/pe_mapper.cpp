@@ -2934,4 +2934,14 @@ Status MappedPeImage::CallEntryPoint(int& out_exit_code) const {
     return Status::Ok();
 }
 
+void TryAbortActiveInProcessGuest(uint32_t exit_code) noexcept {
+#if defined(_WIN32)
+    if (g_guest_entry_depth > 0) {
+        GuestExitProcess(static_cast<UINT>(exit_code));
+    }
+#else
+    (void)exit_code;
+#endif
+}
+
 }  // namespace scarlettx

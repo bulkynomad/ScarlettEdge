@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="590" viewBox="0 0 1040 590" role="img" aria-label="Phase 2: Retail AAA Execution Roadmap: 100.0%">
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="522" viewBox="0 0 1040 522" role="img" aria-label="Post-Audit Multi-Wave Roadmap: 36.8%">
   <style>
     text { font-family: 'Mona Sans', -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; }
     .h2 { font-size: 26px; font-weight: 600; fill: #e6edf3; }
@@ -10,126 +10,58 @@
     .r-count { font-size: 13px; fill: #9198a1; font-variant-numeric: tabular-nums; }
     .r-pct { font-size: 13px; font-weight: 600; fill: #e6edf3; font-variant-numeric: tabular-nums; }
     .callout-txt { font-size: 13px; fill: #d1d7e0; }
-    .callout-lead { font-size: 13px; font-weight: 600; fill: #39d353; }
+    .callout-lead { font-size: 13px; font-weight: 600; fill: #d29922; }
   </style>
-  <rect width="1040" height="590" fill="#0d1117"/>
+  <rect width="1040" height="522" fill="#0d1117"/>
 
-  <!-- 1. Heading -->
-  <text class="h2" x="36" y="56">Phase 2: Retail AAA Execution Roadmap: 100.0%</text>
+  <text class="h2" x="36" y="56">Post-Audit Multi-Wave Roadmap: 36.8%</text>
   <line x1="36" y1="68" x2="1004" y2="68" stroke="#3d444d" stroke-width="1"/>
 
-  <!-- 2. Badge row -->
-  <clipPath id="bclip0"><rect x="36" y="86" width="188" height="20" rx="3"/></clipPath>
+  <clipPath id="bclip0"><rect x="36" y="86" width="163" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip0)">
-    <rect x="36" y="86" width="84" height="20" fill="#555555"/>
-    <rect x="120" y="86" width="104" height="20" fill="#39d353"/>
-    <text class="badge-txt" x="78.0" y="100" text-anchor="middle">phase 2 AAA</text>
-    <text class="badge-txt-dark" x="172.0" y="100" text-anchor="middle">100.0% (72/72)</text>
+    <rect x="36" y="86" width="72" height="20" fill="#555555"/>
+    <rect x="108" y="86" width="91" height="20" fill="#006d32"/>
+    <text class="badge-txt" x="72.0" y="100" text-anchor="middle">waves 1-3</text>
+    <text class="badge-txt" x="153.5" y="100" text-anchor="middle">36.8% (7/19)</text>
   </g>
-  <clipPath id="bclip1"><rect x="230" y="86" width="194" height="20" rx="3"/></clipPath>
+  <clipPath id="bclip1"><rect x="205" y="86" width="162" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip1)">
-    <rect x="230" y="86" width="46" height="20" fill="#555555"/>
-    <rect x="276" y="86" width="148" height="20" fill="#007ec6"/>
-    <text class="badge-txt" x="253.0" y="100" text-anchor="middle">stage</text>
-    <text class="badge-txt" x="350.0" y="100" text-anchor="middle">Architecture Complete</text>
+    <rect x="205" y="86" width="65" height="20" fill="#555555"/>
+    <rect x="270" y="86" width="97" height="20" fill="#26a641"/>
+    <text class="badge-txt" x="237.5" y="100" text-anchor="middle">CI tests</text>
+    <text class="badge-txt" x="318.5" y="100" text-anchor="middle">42/42 passing</text>
   </g>
-  <clipPath id="bclip2"><rect x="430" y="86" width="162" height="20" rx="3"/></clipPath>
+  <clipPath id="bclip2"><rect x="373" y="86" width="220" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip2)">
-    <rect x="430" y="86" width="65" height="20" fill="#555555"/>
-    <rect x="495" y="86" width="97" height="20" fill="#26a641"/>
-    <text class="badge-txt" x="462.5" y="100" text-anchor="middle">CI tests</text>
-    <text class="badge-txt" x="543.5" y="100" text-anchor="middle">42/42 passing</text>
+    <rect x="373" y="86" width="65" height="20" fill="#555555"/>
+    <rect x="438" y="86" width="155" height="20" fill="#007ec6"/>
+    <text class="badge-txt" x="405.5" y="100" text-anchor="middle">baseline</text>
+    <text class="badge-txt" x="515.5" y="100" text-anchor="middle">docs/AUDIT_BASELINE.md</text>
   </g>
-  <clipPath id="bclip3"><rect x="598" y="86" width="245" height="20" rx="3"/></clipPath>
-  <g clip-path="url(#bclip3)">
-    <rect x="598" y="86" width="52" height="20" fill="#555555"/>
-    <rect x="650" y="86" width="193" height="20" fill="#107c10"/>
-    <text class="badge-txt" x="624.0" y="100" text-anchor="middle">target</text>
-    <text class="badge-txt" x="746.5" y="100" text-anchor="middle">Unmodified Retail AAA Titles</text>
-  </g>
-
-  <!-- 3. Contribution graph box -->
   <rect x="36" y="126" width="968" height="212" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-  <text class="g-label" x="216.5" y="160">XS2-IR</text>
-  <rect x="216.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="216.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="216.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="216.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="216.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="216.5" y="259.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="216.5" y="276.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="233.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="233.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="233.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="233.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="233.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <text class="g-label" x="299.5" y="160">XG/DCC</text>
-  <rect x="299.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="299.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="299.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="299.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="299.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="299.5" y="259.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="299.5" y="276.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="316.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="316.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="316.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <text class="g-label" x="382.5" y="160">VkExec</text>
-  <rect x="382.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="382.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="382.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="382.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="382.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="382.5" y="259.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="382.5" y="276.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="399.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="399.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="399.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <text class="g-label" x="465.5" y="160">DS-GPU</text>
-  <rect x="465.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="465.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="465.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="465.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="465.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="465.5" y="259.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="465.5" y="276.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="482.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <text class="g-label" x="548.5" y="160">D3D12.2</text>
-  <rect x="548.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="548.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="548.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="548.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="548.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="548.5" y="259.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="548.5" y="276.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="565.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="565.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="565.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <text class="g-label" x="638.5" y="160">Media</text>
-  <rect x="638.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="638.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="638.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="638.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="638.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="638.5" y="259.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="638.5" y="276.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="655.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <text class="g-label" x="715.5" y="160">WinRT</text>
-  <rect x="715.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="715.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="715.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="715.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="715.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="715.5" y="259.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="715.5" y="276.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="732.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <text class="g-label" x="792.5" y="160">AAA</text>
-  <rect x="792.5" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="792.5" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="792.5" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="792.5" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="792.5" y="242.0" width="14" height="14" rx="3" fill="#39d353"/>
-  <rect x="792.5" y="259.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <text class="g-label" x="379.0" y="160">Wave1</text>
+  <rect x="379.0" y="174.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="379.0" y="191.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="379.0" y="208.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <rect x="379.0" y="225.0" width="14" height="14" rx="3" fill="#39d353"/>
+  <text class="g-label" x="456.0" y="160">Wave2A</text>
+  <rect x="456.0" y="174.0" width="14" height="14" rx="3" fill="#0e4429"/>
+  <rect x="456.5" y="191.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="456.5" y="208.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="456.5" y="225.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="456.5" y="242.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <text class="g-label" x="539.0" y="160">Wave2B</text>
+  <rect x="539.0" y="174.0" width="14" height="14" rx="3" fill="#0e4429"/>
+  <rect x="539.5" y="191.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="539.5" y="208.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="539.5" y="225.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="539.5" y="242.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <text class="g-label" x="622.0" y="160">Wave3</text>
+  <rect x="622.0" y="174.0" width="14" height="14" rx="3" fill="#0e4429"/>
+  <rect x="622.5" y="191.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="622.5" y="208.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="622.5" y="225.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
+  <rect x="622.5" y="242.5" width="13" height="13" rx="3" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
   <text class="legend-txt" x="980" y="315" text-anchor="end">Done</text>
   <rect x="933.0" y="305.0" width="11" height="11" rx="2" fill="#39d353"/>
   <rect x="918.0" y="305.0" width="11" height="11" rx="2" fill="#26a641"/>
@@ -137,52 +69,28 @@
   <rect x="888.0" y="305.0" width="11" height="11" rx="2" fill="#0e4429"/>
   <rect x="873.5" y="305.5" width="10" height="10" rx="2" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
   <text class="legend-txt" x="869" y="315" text-anchor="end">Not yet</text>
-
-  <!-- 4. Two-column subsystem list -->
   <rect x="40.0" y="367.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="377">XS2 -&gt; GPU Shader Compiler</text>
-  <text class="r-count" x="452.0" y="377" text-anchor="end">12 of 12</text>
+  <text class="r-name" x="61.0" y="377">Wave 1: Build, VEH, CTest &amp; Metrics</text>
+  <text class="r-count" x="452.0" y="377" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="500.0" y="377" text-anchor="end">100%</text>
   <line x1="40.0" y1="392" x2="500.0" y2="392" stroke="#21262d" stroke-width="1"/>
-  <rect x="540.0" y="367.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="561.0" y="377">D3D12.2 &amp; MEM_GRAPHICS</text>
-  <text class="r-count" x="952.0" y="377" text-anchor="end">10 of 10</text>
-  <text class="r-pct" x="1000.0" y="377" text-anchor="end">100%</text>
+  <rect x="540.0" y="367.0" width="11" height="11" rx="2" fill="#0e4429"/>
+  <text class="r-name" x="561.0" y="377">Wave 2A: Multi-DLL Loader &amp; VFS</text>
+  <text class="r-count" x="952.0" y="377" text-anchor="end">1 of 5</text>
+  <text class="r-pct" x="1000.0" y="377" text-anchor="end">20%</text>
   <line x1="540.0" y1="392" x2="1000.0" y2="392" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="401.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="411">Vulkan 1.3 &amp; DXR GPU Exec</text>
-  <text class="r-count" x="452.0" y="411" text-anchor="end">10 of 10</text>
-  <text class="r-pct" x="500.0" y="411" text-anchor="end">100%</text>
+  <rect x="40.0" y="401.0" width="11" height="11" rx="2" fill="#0e4429"/>
+  <text class="r-name" x="61.0" y="411">Wave 2B: GDK, FFX, Audio &amp; GDeflate</text>
+  <text class="r-count" x="452.0" y="411" text-anchor="end">1 of 5</text>
+  <text class="r-pct" x="500.0" y="411" text-anchor="end">20%</text>
   <line x1="40.0" y1="426" x2="500.0" y2="426" stroke="#21262d" stroke-width="1"/>
-  <rect x="540.0" y="401.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="561.0" y="411">XG Tiling, MSAA &amp; DCC</text>
-  <text class="r-count" x="952.0" y="411" text-anchor="end">10 of 10</text>
-  <text class="r-pct" x="1000.0" y="411" text-anchor="end">100%</text>
+  <rect x="540.0" y="401.0" width="11" height="11" rx="2" fill="#0e4429"/>
+  <text class="r-name" x="561.0" y="411">Wave 3: d3d12_xs Sync &amp; Heap Aliasing</text>
+  <text class="r-count" x="952.0" y="411" text-anchor="end">1 of 5</text>
+  <text class="r-pct" x="1000.0" y="411" text-anchor="end">20%</text>
   <line x1="540.0" y1="426" x2="1000.0" y2="426" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="435.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="445">DirectStorage GPU Codecs</text>
-  <text class="r-count" x="452.0" y="445" text-anchor="end">8 of 8</text>
-  <text class="r-pct" x="500.0" y="445" text-anchor="end">100%</text>
-  <line x1="40.0" y1="460" x2="500.0" y2="460" stroke="#21262d" stroke-width="1"/>
-  <rect x="540.0" y="435.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="561.0" y="445">GDK 2022-2026 &amp; WinRT</text>
-  <text class="r-count" x="952.0" y="445" text-anchor="end">8 of 8</text>
-  <text class="r-pct" x="1000.0" y="445" text-anchor="end">100%</text>
-  <line x1="540.0" y1="460" x2="1000.0" y2="460" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="469.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="479">Retail XMA2 &amp; Bink2 Media</text>
-  <text class="r-count" x="452.0" y="479" text-anchor="end">8 of 8</text>
-  <text class="r-pct" x="500.0" y="479" text-anchor="end">100%</text>
-  <line x1="40.0" y1="494" x2="500.0" y2="494" stroke="#21262d" stroke-width="1"/>
-  <rect x="540.0" y="469.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="561.0" y="479">AAA Engine &amp; XVC Bring-Up</text>
-  <text class="r-count" x="952.0" y="479" text-anchor="end">6 of 6</text>
-  <text class="r-pct" x="1000.0" y="479" text-anchor="end">100%</text>
-  <line x1="540.0" y1="494" x2="1000.0" y2="494" stroke="#21262d" stroke-width="1"/>
-
-  <!-- 5. Status callout -->
-  <rect x="36" y="514" width="4" height="46" fill="#39d353"/>
-  <g transform="translate(56,524)"><circle cx="8" cy="8" r="6.5" fill="none" stroke="#39d353" stroke-width="1.5"/><path d="M5.2 8.2 7.1 10.1 11 6.1" fill="none" stroke="#39d353" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
-  <text class="callout-txt" x="82" y="533"><tspan class="callout-lead">Scope note:</tspan> All 72/72 (100.0%) clean-room silicon, Vulkan KHR RT, GPU GDeflate, MSAA/DCC/HTILE &amp; D3D12.2 milestones are active.</text>
-  <text class="callout-txt" x="82" y="550">Passing synthetic &amp; UE5/Open-World vertical-slice suites do not guarantee compatibility with untested commercial retail games.</text>
+  <rect x="36" y="446" width="4" height="46" fill="#d29922"/>
+  <g transform="translate(56,456)"><path d="M8 1.5 15 14H1z" fill="none" stroke="#d29922" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="#d29922" stroke-width="1.5" stroke-linecap="round"/></g>
+  <text class="callout-txt" x="82" y="465"><tspan class="callout-lead">Roadmap note:</tspan> Wave 1 hygiene is complete; Waves 2 and 3 target Multi-DLL Guest Hooking, zero-staging XVC streaming, and d3d12_xs heap aliasing.</text>
+  <text class="callout-txt" x="82" y="482">Passing synthetic tests do not imply commercial retail title compatibility.</text>
 </svg>

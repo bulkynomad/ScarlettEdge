@@ -2,66 +2,6 @@
 
 namespace scarlettx {
 
-void XTaskQueueHle::SubmitWork(std::function<void()> fn) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    work_queue_.push(std::move(fn));
-}
-
-void XTaskQueueHle::SubmitCompletion(std::function<void()> fn) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    completion_queue_.push(std::move(fn));
-}
-
-size_t XTaskQueueHle::DispatchWork(size_t max_items) {
-    size_t count = 0;
-    while (max_items == 0 || count < max_items) {
-        std::function<void()> fn;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (work_queue_.empty()) {
-                break;
-            }
-            fn = std::move(work_queue_.front());
-            work_queue_.pop();
-        }
-        if (fn) {
-            fn();
-        }
-        ++count;
-    }
-    return count;
-}
-
-size_t XTaskQueueHle::DispatchCompletion(size_t max_items) {
-    size_t count = 0;
-    while (max_items == 0 || count < max_items) {
-        std::function<void()> fn;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (completion_queue_.empty()) {
-                break;
-            }
-            fn = std::move(completion_queue_.front());
-            completion_queue_.pop();
-        }
-        if (fn) {
-            fn();
-        }
-        ++count;
-    }
-    return count;
-}
-
-size_t XTaskQueueHle::PendingWorkCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return work_queue_.size();
-}
-
-size_t XTaskQueueHle::PendingCompletionCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return completion_queue_.size();
-}
-
 XGameRuntimeHle& XGameRuntimeHle::Instance() {
     static XGameRuntimeHle instance;
     return instance;
@@ -79,7 +19,6 @@ Status XGameRuntimeHle::Initialize(DeviceType device_type) {
 
 void XGameRuntimeHle::Shutdown() {
     std::lock_guard<std::mutex> lock(mutex_);
-    queues_.clear();
     default_user_ = XUserProfile{};
     initialized_ = false;
 }
@@ -115,24 +54,6 @@ bool XGameRuntimeHle::GetDefaultUser(XUserProfile& out_user) const {
     }
     out_user = default_user_;
     return true;
-}
-
-XHandle XGameRuntimeHle::CreateTaskQueue() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const XHandle h = next_handle_++;
-    queues_[h] = std::make_unique<XTaskQueueHle>();
-    return h;
-}
-
-XTaskQueueHle* XGameRuntimeHle::GetTaskQueue(XHandle handle) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = queues_.find(handle);
-    return it == queues_.end() ? nullptr : it->second.get();
-}
-
-void XGameRuntimeHle::CloseTaskQueue(XHandle handle) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    queues_.erase(handle);
 }
 
 }  // namespace scarlettx

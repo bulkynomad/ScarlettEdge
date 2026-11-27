@@ -36,6 +36,7 @@
 #endif
 
 int main() {
+    sx_test::ScopedTempDir sandbox("test_retail_parity");
     std::cout << "[test_retail_parity] Verifying Retail XVD v3/Merkle/NTFS, 32-lane GPU GDeflate, WMA-Pro XMA2, RDNA2 CFG & AcpHal/PIX...\n";
 
     // -----------------------------------------------------------------------
@@ -91,7 +92,7 @@ int main() {
             scarlettx::XvdContainer::BuildSyntheticNtfsXvc(ntfs_files, key32, sizeof(key32), /*enable_merkle_tree=*/true);
         SX_CHECK(ntfs_xvc_bytes.size() >= 0x10000);
 
-        const auto tmp_xvc = std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_retail_ntfs_v3.xvc";
+        const auto tmp_xvc = sandbox.path() / "test_retail_ntfs_v3.xvc";
         {
             std::ofstream ofs(tmp_xvc, std::ios::binary | std::ios::trunc);
             ofs.write(reinterpret_cast<const char*>(ntfs_xvc_bytes.data()),
@@ -429,7 +430,7 @@ int main() {
         write_u32(msixvc.data() + 0x290, 4096u);         // 32-bit XvcData length -> 1 page
         write_u32(msixvc.data() + 0x298, 0x000AA000u);   // Makepkg Merkle BlockSize
 
-        const auto tmp_msixvc = std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_makepkg_v3.msixvc";
+        const auto tmp_msixvc = sandbox.path() / "test_makepkg_v3.msixvc";
         {
             std::ofstream ofs(tmp_msixvc, std::ios::binary | std::ios::trunc);
             ofs.write(reinterpret_cast<const char*>(msixvc.data()),
@@ -457,8 +458,8 @@ int main() {
         SX_CHECK(!mp_xvd.ReadUserData(fs_md_bytes, 4096u, enc_bin).ok());
 
         // Standard 48-byte binary .cik keyfile ([0..15]=GUID, [16..47]=32B AES-128-XTS key) + text GUID=HEXKEY keyring
-        const auto tmp_cik = std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_makepkg_v3.cik";
-        const auto tmp_txt_cik = std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_makepkg_v3_keyring.txt";
+        const auto tmp_cik = sandbox.path() / "test_makepkg_v3.cik";
+        const auto tmp_txt_cik = sandbox.path() / "test_makepkg_v3_keyring.txt";
         {
             uint8_t cik48[48] = {};
             for (int i = 0; i < 48; ++i) cik48[i] = static_cast<uint8_t>(0x30 + i);

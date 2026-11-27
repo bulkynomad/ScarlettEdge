@@ -183,7 +183,10 @@ bool TestDispatchModes() {
 
     ThreadProbe completion;
     CHECK(Submit(q, kCompletionPort, &completion, ThreadProbeCb) == kOk);
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    // Run another full work-port callback on the pool to verify completion stays manual without sleep.
+    ThreadProbe work_sync;
+    CHECK(Submit(q, kWorkPort, &work_sync, ThreadProbeCb) == kOk);
+    CHECK(WaitFor([&] { return work_sync.ran.load() == 1; }));
     CHECK(completion.ran.load() == 0);
     CHECK(Dispatch(q, kCompletionPort, 0));
     CHECK(completion.ran.load() == 1 && completion.thread == std::this_thread::get_id());
@@ -194,7 +197,7 @@ bool TestDispatchModes() {
     CHECK(CreateQueue(kManual, kManual, &q) == kOk);
     ThreadProbe manual;
     CHECK(Submit(q, kWorkPort, &manual, ThreadProbeCb) == kOk);
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(!Dispatch(q, kCompletionPort, 0));
     CHECK(manual.ran.load() == 0);
     CHECK(Dispatch(q, kWorkPort, 0) && manual.ran.load() == 1);
     CloseQueue(q);
@@ -437,10 +440,15 @@ bool TestTerminate() {
         Counters t;
         CHECK(Submit(q, kCompletionPort, &busy, GateCb) == kOk);
         CHECK(WaitFor([&] { return busy.done.load() == 1; }));
+        HANDLE dispatcher_ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        CHECK(dispatcher_ready != nullptr);
         std::thread dispatcher([&] {
+            SetEvent(dispatcher_ready);
             dispatch_result.store(Dispatch(q, kWorkPort, 0xFFFFFFFFu) ? 1 : 0);
         });
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        CHECK(WaitForSingleObject(dispatcher_ready, 5000) == WAIT_OBJECT_0);
+        CloseHandle(dispatcher_ready);
+        SwitchToThread();
         CHECK(Terminate(q, false, &t, TerminatedCb) == kOk);
         const bool returned = WaitFor([&] { return dispatch_result.load() == 0; }, 5000);
         busy.go.store(1);

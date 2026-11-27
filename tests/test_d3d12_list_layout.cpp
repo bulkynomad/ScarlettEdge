@@ -39,6 +39,7 @@ constexpr int kListCopyTextureRegion = 16;
 constexpr int kListResourceBarrier = 26;
 constexpr int kQueueExecuteCommandLists = 10;
 constexpr int kFenceGetCompletedValue = 8;
+constexpr int kFenceSetEventOnCompletion = 9;
 
 constexpr uint32_t kSize = 8;
 constexpr uint32_t kPitch = 256;  // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
@@ -187,7 +188,13 @@ void Check(const Layout& layout) {
     void* lists[] = {list};
     Call(queue, kQueueExecuteCommandLists, uintptr_t{1}, static_cast<void**>(lists));
     SX_REQUIRE(Call(queue, layout.queue_signal, fence, uintptr_t{1}) == 0);
-    for (int i = 0; i < 5000 && Call(fence, kFenceGetCompletedValue) < 1; ++i) Sleep(1);
+    if (Call(fence, kFenceGetCompletedValue) < 1) {
+        HANDLE fence_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        SX_REQUIRE(fence_ev != nullptr);
+        SX_REQUIRE(Call(fence, kFenceSetEventOnCompletion, uintptr_t{1}, reinterpret_cast<uintptr_t>(fence_ev)) == 0);
+        SX_REQUIRE(WaitForSingleObject(fence_ev, 5000) == WAIT_OBJECT_0);
+        CloseHandle(fence_ev);
+    }
     SX_REQUIRE(Call(fence, kFenceGetCompletedValue) == 1);
 
     uint8_t* data = nullptr;

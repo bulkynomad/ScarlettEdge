@@ -24,6 +24,8 @@
         }                                                                       \
     } while (0)
 
+#include "sx_check.h"
+
 namespace {
 
 void WriteU32LE(uint8_t* p, uint32_t v) {
@@ -85,9 +87,9 @@ void SetEnvStr(const char* k, const std::string& v) {
 }  // namespace
 
 int main() {
+    sx_test::ScopedTempDir sandbox("test_aaa_bringup");
     const std::filesystem::path bin_dir = SCARLETTX_BINARY_DIR;
-    const std::filesystem::path tmp_dir = bin_dir / "test_aaa_bringup_tmp";
-    std::filesystem::create_directories(tmp_dir);
+    const std::filesystem::path& tmp_dir = sandbox.path();
 
     // -----------------------------------------------------------------------
     // 1. Package UE5 Vertical Slice into an AES-256-XTS Encrypted GDFX .xvc

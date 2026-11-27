@@ -70,6 +70,34 @@ __declspec(noinline) int TriggerCaughtHardwareAccessViolation(uintptr_t fault_va
     return caught;
 }
 
+__declspec(noinline) int TriggerBenignGuardPageExceptions() {
+    void* mem = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
+    if (!mem) return 0;
+    int caught_guard = 0;
+    __try {
+        *static_cast<volatile uint32_t*>(mem) = 0x12345678u;
+    } __except (GetExceptionCode() == STATUS_GUARD_PAGE_VIOLATION
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        caught_guard = 1;
+    }
+
+    DWORD old_prot = 0;
+    VirtualProtect(mem, 4096, PAGE_NOACCESS, &old_prot);
+    int caught_noaccess = 0;
+    __try {
+        *static_cast<volatile uint32_t*>(mem) = 0x87654321u;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                    ? (VirtualProtect(mem, 4096, PAGE_READWRITE, &old_prot), EXCEPTION_CONTINUE_EXECUTION)
+                    : EXCEPTION_CONTINUE_SEARCH) {
+    }
+    if (*static_cast<const volatile uint32_t*>(mem) == 0x87654321u) {
+        caught_noaccess = 1;
+    }
+    VirtualFree(mem, 0, MEM_RELEASE);
+    return (caught_guard == 1 && caught_noaccess == 1) ? 1 : 0;
+}
+
 bool RunProcessBlocking(const std::filesystem::path& exe_path, const std::string& args_tail) {
     STARTUPINFOA si{};
     si.cb = sizeof(si);
@@ -96,12 +124,11 @@ int main() {
 #else
     using namespace scarlettx;
 
+    sx_test::ScopedTempDir sandbox("test_flight_recorder");
     const std::filesystem::path bin_dir = SCARLETTX_BINARY_DIR;
-    const std::filesystem::path out_dir = bin_dir / "test_flight_recorder_out_tmp";
-    const std::filesystem::path cli_dir = bin_dir / "test_flight_recorder_cli_tmp";
+    const std::filesystem::path out_dir = sandbox.path() / "out";
+    const std::filesystem::path cli_dir = sandbox.path() / "cli";
     std::error_code ec;
-    std::filesystem::remove_all(out_dir, ec);
-    std::filesystem::remove_all(cli_dir, ec);
 
     // 0. Disabled fast-path must be completely inert (zero events, zero files).
     FlightRecorder::Instance().Disable();
@@ -243,6 +270,12 @@ int main() {
         SX_CHECK(cpp_caught);
         SX_CHECK(FlightRecorder::Instance().GetStats().crash_reports_written == 0);
 
+        // Benign first-chance PAGE_GUARD / MEM_PRIVATE PAGE_NOACCESS guard-page faults
+        // handled by guest SEH/VEH MUST NOT write false-positive crash dumps or leave
+        // g_active_crash_tid stuck!
+        SX_CHECK(TriggerBenignGuardPageExceptions() == 1);
+        SX_CHECK(FlightRecorder::Instance().GetStats().crash_reports_written == 0);
+
         // Real hardware EXCEPTION_ACCESS_VIOLATION (0xC0000005) reading 0xDEAD
         const int hw_caught = TriggerCaughtHardwareAccessViolation(0x000000000000DEADull);
         SX_CHECK(hw_caught == 1);
@@ -338,23 +371,39 @@ int main() {
     // Part 4: Hang/Deadlock Watchdog + Summary Report + CLI Integration
     // -----------------------------------------------------------------------
     {
-        std::atomic<bool> release_worker{false};
-        std::thread stalled_worker([&]() {
-            while (!release_worker.load(std::memory_order_acquire)) {
-                Sleep(5);
-            }
+        HANDLE release_evt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        SX_CHECK(release_evt != nullptr);
+        std::thread stalled_worker([release_evt]() {
+            WaitForSingleObject(release_evt, 5000);
         });
+
+        std::filesystem::create_directories(out_dir, ec);
+        HANDLE dir_chg = FindFirstChangeNotificationW(
+            out_dir.wstring().c_str(),
+            FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE);
 
         FlightRecorderOptions hang_opts = opts;
         hang_opts.hang_timeout_ms = 50;
         hang_opts.reset_history = false;
         FlightRecorder::Instance().Enable(hang_opts);
 
-        // Stall longer than 50 ms without calling BeatProgress
-        Sleep(180);
+        // Deterministically wait on directory notification until the 50 ms watchdog writes the snapshot
+        const ULONGLONG deadline = GetTickCount64() + 3000ull;
+        while (FlightRecorder::Instance().GetStats().hang_snapshots_written < 1 &&
+               GetTickCount64() < deadline) {
+            if (dir_chg != INVALID_HANDLE_VALUE) {
+                WaitForSingleObject(dir_chg, 100);
+                FindNextChangeNotification(dir_chg);
+            }
+        }
+        if (dir_chg != INVALID_HANDLE_VALUE) {
+            FindCloseChangeNotification(dir_chg);
+        }
 
-        release_worker.store(true, std::memory_order_release);
+        SetEvent(release_evt);
         stalled_worker.join();
+        CloseHandle(release_evt);
 
         SX_CHECK(FlightRecorder::Instance().GetStats().hang_snapshots_written >= 1);
         const auto hang_json_path =

@@ -37,7 +37,8 @@ int main() {
     const uint64_t h2 = frame2.ComputeFnv1aHash();
     SX_REQUIRE(h1 == h2);
 
-    const auto ppm_path = std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_rt_pipeline_frame.ppm";
+    sx_test::ScopedTempDir sandbox("test_rt_pipeline");
+    const auto ppm_path = sandbox.path() / "test_rt_pipeline_frame.ppm";
     SX_REQUIRE(frame1.WritePpm(ppm_path.string()).ok());
     SX_REQUIRE(std::filesystem::exists(ppm_path));
 

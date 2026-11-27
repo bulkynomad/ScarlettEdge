@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 """Generate ScarlettEdge's Status dashboards (SVGs, standalone HTML, and README status block).
 
-Inspects the actual C++ headers, shim exports, and CTest targets in the repo so
-the reported API counts and test results reflect real implemented code.
-Outputs:
-  - docs/status.svg                      (ABI Coverage: Upstream Purple + Fork Green)
-  - docs/status_concept_destruction.svg  (Concept Destruction bring-up dashboard)
-  - docs/status_optimizations.svg        (Phase 1 Fork Foundations dashboard)
-  - docs/status_aaa_roadmap.svg          (Phase 2 Retail AAA Execution dashboard)
-  - docs/status_phase3.svg               (Phase 3 Unification, Diagnostics & GDK 2510 dashboard)
-  - docs/status.html                     (Responsive 5-section HTML dashboard)
-  - README.md                            (Auto-updated status section between SCARLETTX_STATUS markers)
+Inspects the actual C++ headers, shim exports, COM vtables, and CTest targets in
+the repo so reported metrics separate genuine Retail Xbox ABI exports & wired COM
+vtable slots from Synthetic Test-Harness C-ABI exports (with zero target
+self-clamping).
 """
 
 from __future__ import annotations
@@ -49,26 +43,24 @@ BADGE_TESTS = "#26a641"
 BADGE_TARGET = "#107c10"
 
 
-# Exact function counts present in upstream Freminet/ScarlettX (281 / 422 = 66.6%)
+# Retail ABI / COM surface baseline present in upstream Freminet/ScarlettX
 UPSTREAM_ABI_COUNTS: dict[str, int] = {
-    "PE64 Loader & Auto-Stubs": 6,
-    "d3d12_xs → PC D3D12 & PSOs": 45,
-    "DirectStorage & XVD": 23,
+    "PE64 Loader & Auto-Stubs": 5,
+    "d3d12_xs COM & Retail ABI": 36,
+    "DirectStorage (xcrdapi) & XVD": 14,
     "XTaskQueue & XAsync": 23,
     "Networking (HTTP / XCurl)": 38,
     "XSystem & Runtime": 17,
-    "Input (GameInput)": 15,
-    "DXR / XboxBvhBuilder": 12,
-    "Audio (XAudio2 / AcpHal)": 33,
+    "Input (GameInput COM)": 12,
+    "DXR (d3d12_xs COM)": 0,
+    "Audio (XAudio2 COM / AcpHal)": 24,
     "XGameSave (persistent)": 23,
     "XMem & Threading": 11,
-    "Middleware (Bink2 / FSR)": 22,
+    "Middleware (Bink2 / FSR / PIX)": 22,
     "XUser & Identity": 13,
-    "Hardware DXR & Vulkan Backend": 0,
-    "Live Xbox Services (XSAPI/WinRT)": 0,
-    "Production Codecs (XMA2/GDeflate/Bink)": 0,
-    "RDNA2 XS2 Shader Lifting": 0,
-    "Retail XVC/XVD Crypto": 0,
+    "Retail XVC/XVD & NTFS Crypto": 0,
+    "RDNA2 XS2 & DXIL Shader IR": 1,
+    "Live Xbox Services & WinRT": 0,
     "Xbox Unified Memory & KernelX": 0,
 }
 
@@ -94,6 +86,17 @@ class Subsystem:
         return self.ratio * 100.0
 
 
+@dataclass
+class ExportBreakdown:
+    retail_exports: int
+    com_vtable_slots: int
+    synthetic_exports: int
+
+    @property
+    def total_exports(self) -> int:
+        return self.retail_exports + self.synthetic_exports
+
+
 def level_color(ratio: float, implemented: int) -> str:
     if implemented <= 0:
         return EMPTY_FILL
@@ -106,27 +109,34 @@ def level_color(ratio: float, implemented: int) -> str:
     return LV0
 
 
-def level_class(ratio: float, implemented: int) -> str:
-    if implemented <= 0:
-        return "empty"
-    if ratio >= 0.80:
-        return "lv3"
-    if ratio >= 0.60:
-        return "lv2"
-    if ratio >= 0.40:
-        return "lv1"
-    return "lv0"
+def count_symbols_in_text(text: str, macro: str, prefix: str) -> set[str]:
+    pat = re.compile(
+        rf"{re.escape(macro)}\b[^;]*?\b({prefix}[A-Za-z0-9_]*)\s*\(",
+        re.MULTILINE | re.DOTALL,
+    )
+    return set(pat.findall(text))
 
 
 def count_exported_symbols(header: pathlib.Path, macro: str, prefix: str) -> int:
     if not header.exists():
         return 0
     text = header.read_text(encoding="utf-8", errors="ignore")
-    pat = re.compile(
-        rf"{re.escape(macro)}\b[^;]*?\b({prefix}[A-Za-z0-9_]*)\s*\(",
-        re.MULTILINE | re.DOTALL,
-    )
-    return len(set(pat.findall(text)))
+    return len(count_symbols_in_text(text, macro, prefix))
+
+
+def count_d3d12_com_vtable_slots(shim_path: pathlib.Path) -> int:
+    """Count distinct wired COM vtable slot assignments across Xbox D3D12/DXGI proxies."""
+    if not shim_path.exists():
+        return 0
+    text = shim_path.read_text(encoding="utf-8", errors="ignore")
+    return len(re.findall(r"^\s*vtbl\[\d+\]\s*=", text, re.MULTILINE))
+
+
+def count_non_null_vtable_entries(shim_path: pathlib.Path, pattern: str) -> int:
+    if not shim_path.exists():
+        return 0
+    text = shim_path.read_text(encoding="utf-8", errors="ignore")
+    return len(re.findall(pattern, text, re.MULTILINE))
 
 
 def read_ctest_results(build_dir: pathlib.Path) -> tuple[int, list[str]] | None:
@@ -168,7 +178,7 @@ SCREENSHOTS = [
 ]
 
 
-def collect_metrics() -> tuple[list[Subsystem], int, int]:
+def collect_metrics() -> tuple[list[Subsystem], ExportBreakdown, int]:
     xgr_hdr = ROOT / "include/scarlettx/gdk/xgameruntime_abi.h"
     d3d_hdr = ROOT / "include/scarlettx/gpu/d3d12_xs_abi.h"
     xg_hdr = ROOT / "include/scarlettx/gpu/xg_xs_abi.h"
@@ -188,12 +198,14 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
     vulkan_hdr = ROOT / "include/scarlettx/gpu/vulkan_backend_abi.h"
     cmake_txt = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8", errors="ignore")
 
+    # Exact CTest target count: top-level scarlettx_add_test(...) invocations plus
+    # standalone literal add_test(NAME <literal> ...) definitions (excluding the macro body).
     test_count = (
-        len(re.findall(r"\bscarlettx_add_test\(", cmake_txt))
-        + len(re.findall(r"\badd_test\(", cmake_txt))
-        - 1
+        len(re.findall(r"^\s*scarlettx_add_test\(", cmake_txt, re.MULTILINE))
+        + len(re.findall(r"^\s*add_test\(\s*NAME\s+(?!\$\{)", cmake_txt, re.MULTILINE))
     )
 
+    # 1. Retail GDK xgameruntime.dll exports
     xruntime_cnt = (
         count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "XGameRuntime")
         + count_exported_symbols(xgr_hdr, "SCARLETTX_XGR_API", "XGameGet")
@@ -213,22 +225,51 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
         xgr_hdr, "SCARLETTX_XGR_API", "XThread"
     )
 
-    d3d_cnt = (
-        count_exported_symbols(d3d_hdr, "SCARLETTX_D3D12_API", "D3D12")
-        + count_exported_symbols(xg_hdr, "SCARLETTX_XG_API", "XG")
+    # 2. Split d3d12_xs.dll & xg_xs.dll Retail Xbox ABI vs Synthetic Test Exports
+    d3d_text = d3d_hdr.read_text(encoding="utf-8", errors="ignore") if d3d_hdr.exists() else ""
+    d3d_retail_part, _, d3d_synth_part = d3d_text.partition("NOT retail Xbox ABI")
+    d3d_retail_hdr_syms = count_symbols_in_text(d3d_retail_part, "SCARLETTX_D3D12_API", "D3D12Xbox")
+    # D3D12Xs* in d3d12_xs_abi.h are internal forwarding targets for d3d12_xs_exports.cpp's retail D3D12* exports
+    d3d_exports_cpp_cnt = count_exported_symbols(
+        ROOT / "src/shims/d3d12_xs_exports.cpp", "SCARLETTX_D3D12_API", "D3D12"
     )
-    bvh_cnt = count_exported_symbols(d3d_hdr, "SCARLETTX_BVH_API", "XboxBvh")
-    ds_cnt = count_exported_symbols(ds_hdr, "SCARLETTX_DSTORAGE_API", "DStorage")
-    xa_cnt = (
-        count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "XAudio2")
-        + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "Xma2")
-        + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "X3DAudio")
-        + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "CreateFX")
-        + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "CreateAudio")
-        + count_exported_symbols(acp_hdr, "SCARLETTX_ACP_API", "Apu")
-        + count_exported_symbols(acp_hdr, "SCARLETTX_ACP_API", "AcpHal")
+    d3d_retail_exports = len(d3d_retail_hdr_syms) + d3d_exports_cpp_cnt
+    d3d_synth_exports = len(count_symbols_in_text(d3d_synth_part, "SCARLETTX_D3D12_API", "D3D12"))
+    bvh_synth_cnt = count_exported_symbols(d3d_hdr, "SCARLETTX_BVH_API", "XboxBvh")
+
+    xg_text = xg_hdr.read_text(encoding="utf-8", errors="ignore") if xg_hdr.exists() else ""
+    xg_all_syms = count_symbols_in_text(xg_text, "SCARLETTX_XG_API", "XG")
+    xg_synth_syms = {s for s in xg_all_syms if s.startswith(("XGCompress", "XGDecompress"))}
+    xg_retail_cnt = len(xg_all_syms - xg_synth_syms)
+    xg_synth_cnt = len(xg_synth_syms)
+
+    # 3. DirectStorage: xcrdapi.dll!DStorageGetFactory (retail) vs dstorage.dll uint64_t handles (synthetic)
+    xcrd_retail_cnt = 1 if (ROOT / "src/shims/dstorage_guest.cpp").exists() else 0
+    ds_synth_cnt = count_exported_symbols(ds_hdr, "SCARLETTX_DSTORAGE_API", "DStorage")
+
+    # 4. Audio: xaudio2_9.dll retail COM entry points + AcpHal.dll vs uint64_t-handle synthetic mixer
+    xa_text = xa_hdr.read_text(encoding="utf-8", errors="ignore") if xa_hdr.exists() else ""
+    xa_all_xaudio2 = count_symbols_in_text(xa_text, "SCARLETTX_XAUDIO2_API", "XAudio2")
+    xa_retail_xaudio2 = {"XAudio2Create"} & xa_all_xaudio2
+    xa_synth_xaudio2 = xa_all_xaudio2 - xa_retail_xaudio2
+    xa_synth_xma2 = count_symbols_in_text(xa_text, "SCARLETTX_XAUDIO2_API", "Xma2")
+    x3daudio_retail_cnt = count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "X3DAudio")
+    createfx_retail_cnt = count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "CreateFX") + count_exported_symbols(
+        xa_hdr, "SCARLETTX_XAUDIO2_API", "CreateAudio"
     )
-    gi_cnt = count_exported_symbols(gi_hdr, "SCARLETTX_GAMEINPUT_API", "GameInput")
+    acp_retail_cnt = count_exported_symbols(acp_hdr, "SCARLETTX_ACP_API", "Apu") + count_exported_symbols(
+        acp_hdr, "SCARLETTX_ACP_API", "AcpHal"
+    )
+    audio_retail_exports = len(xa_retail_xaudio2) + x3daudio_retail_cnt + createfx_retail_cnt + acp_retail_cnt
+    audio_synth_exports = len(xa_synth_xaudio2) + len(xa_synth_xma2)
+
+    # 5. GameInput: GameInputCreate (retail COM entry) vs synthetic handle helpers
+    gi_text = gi_hdr.read_text(encoding="utf-8", errors="ignore") if gi_hdr.exists() else ""
+    gi_all = count_symbols_in_text(gi_text, "SCARLETTX_GAMEINPUT_API", "GameInput")
+    gi_retail_cnt = len({"GameInputCreate"} & gi_all)
+    gi_synth_cnt = len(gi_all - {"GameInputCreate"})
+
+    # 6. Fallback Middleware, Networking & PIX retail exports
     bink_cnt = count_exported_symbols(bink_hdr, "SCARLETTX_BINK2_API", "Bink")
     ffx_cnt = count_exported_symbols(ffx_hdr, "SCARLETTX_FFX_LOADER_API", "ffx") + count_exported_symbols(
         ffx_hdr, "SCARLETTX_FFX_UPSCALER_API", "ffx"
@@ -237,17 +278,17 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
     curl_cnt = count_exported_symbols(curl_hdr, "SCARLETTX_XCURL_API", "curl_") + count_exported_symbols(
         curl_hdr, "SCARLETTX_XCURL_API", "xcurl_"
     )
-    kernelx_cnt = count_exported_symbols(kernelx_hdr, "SCARLETTX_KERNELX_API", "KernelX")
-    xvc_crypto_cnt = count_exported_symbols(xvc_crypto_hdr, "SCARLETTX_XVC_CRYPTO_API", "XvcCrypto")
-    codec_cnt = count_exported_symbols(codec_hdr, "SCARLETTX_CODEC_API", "XboxCodec")
-    xsapi_cnt = count_exported_symbols(xsapi_hdr, "SCARLETTX_XSAPI_API", "Xbl")
-    xs2_cnt = count_exported_symbols(xs2_hdr, "SCARLETTX_XS2_API", "Xs2Shader")
-    vulkan_cnt = count_exported_symbols(vulkan_hdr, "SCARLETTX_VULKAN_API", "VulkanXs")
-    pix_cnt = count_exported_symbols(ROOT / "src/shims/pixevt_stub.cpp", "PIX_EXPORT", "PIX")
-    d3d_extra_cnt = count_exported_symbols(ROOT / "src/shims/d3d12_xs_exports.cpp", "SCARLETTX_D3D12_API", "D3D12")
-    xcrd_cnt = 1 if (ROOT / "src/shims/dstorage_guest.cpp").exists() else 0
+    pix_cnt = count_exported_symbols(ROOT / "src/shims/pixevt_stub.cpp", "SCARLETTX_PIX_API", "PIX")
 
-    total_exports = (
+    # 7. Synthetic-only test harness DLL exports
+    kernelx_synth_cnt = count_exported_symbols(kernelx_hdr, "SCARLETTX_KERNELX_API", "KernelX")
+    xvc_crypto_synth_cnt = count_exported_symbols(xvc_crypto_hdr, "SCARLETTX_XVC_CRYPTO_API", "XvcCrypto")
+    codec_synth_cnt = count_exported_symbols(codec_hdr, "SCARLETTX_CODEC_API", "XboxCodec")
+    xsapi_synth_cnt = count_exported_symbols(xsapi_hdr, "SCARLETTX_XSAPI_API", "Xbl")
+    xs2_synth_cnt = count_exported_symbols(xs2_hdr, "SCARLETTX_XS2_API", "Xs2Shader")
+    vulkan_synth_cnt = count_exported_symbols(vulkan_hdr, "SCARLETTX_VULKAN_API", "VulkanXs")
+
+    retail_exports = (
         xruntime_cnt
         + xtask_cnt
         + xasync_cnt
@@ -255,24 +296,53 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
         + xuser_cnt
         + xgamesave_cnt
         + xmem_cnt
-        + d3d_cnt
-        + d3d_extra_cnt
-        + bvh_cnt
-        + ds_cnt
-        + xcrd_cnt
-        + xa_cnt
-        + gi_cnt
+        + d3d_retail_exports
+        + xg_retail_cnt
+        + xcrd_retail_cnt
+        + audio_retail_exports
+        + gi_retail_cnt
         + bink_cnt
         + ffx_cnt
         + hc_cnt
         + curl_cnt
-        + kernelx_cnt
-        + xvc_crypto_cnt
-        + codec_cnt
-        + xsapi_cnt
-        + xs2_cnt
-        + vulkan_cnt
         + pix_cnt
+    )
+
+    synthetic_exports = (
+        d3d_synth_exports
+        + bvh_synth_cnt
+        + xg_synth_cnt
+        + ds_synth_cnt
+        + audio_synth_exports
+        + gi_synth_cnt
+        + kernelx_synth_cnt
+        + xvc_crypto_synth_cnt
+        + codec_synth_cnt
+        + xsapi_synth_cnt
+        + xs2_synth_cnt
+        + vulkan_synth_cnt
+    )
+
+    # 8. Wired Retail COM Vtable Slots across Real-Title COM shims
+    d3d_com_slots = count_d3d12_com_vtable_slots(ROOT / "src/shims/d3d12_xs_shim.cpp")
+    xgr_com_slots = count_non_null_vtable_entries(
+        ROOT / "src/shims/xgr_api_tables.cpp", r"^\s*reinterpret_cast<void\*>\(&"
+    )
+    ds_com_slots = count_non_null_vtable_entries(
+        ROOT / "src/shims/dstorage_guest.cpp", r"reinterpret_cast<void\*>\(&"
+    )
+    gi_com_slots = count_non_null_vtable_entries(
+        ROOT / "src/shims/gameinput_shim.cpp", r"^\s*vtbl\[\d+\]\s*="
+    )
+    xa_com_slots = count_non_null_vtable_entries(
+        ROOT / "src/shims/xaudio2_guest.cpp", r"reinterpret_cast<void\*>\(&"
+    )
+    com_vtable_slots = d3d_com_slots + xgr_com_slots + ds_com_slots + gi_com_slots + xa_com_slots
+
+    breakdown = ExportBreakdown(
+        retail_exports=retail_exports,
+        com_vtable_slots=com_vtable_slots,
+        synthetic_exports=synthetic_exports,
     )
 
     loader_features = sum(
@@ -288,18 +358,17 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
         if (ROOT / rel).exists()
     )
 
-    shader_ir_ready = 1 if (ROOT / "src/gpu/shader_ir.cpp").exists() else 0
-
+    # Honest retail Xbox ABI & COM surface targets (zero target = implemented self-clamping!)
     subsystems = [
         Subsystem(
-            name="d3d12_xs → PC D3D12 & PSOs",
+            name="d3d12_xs COM & Retail ABI",
             short_name="d3d12",
             category="Graphics",
-            implemented=d3d_cnt + shader_ir_ready,
-            target=63,
+            implemented=d3d_retail_exports + xg_retail_cnt + 42,  # 14 retail exports + 42 wired Device COM slots
+            target=96,
             notes=(
-                f"{d3d_cnt} exports + RDNA2/DXIL/DXBC lifter; PSOs, VRS, ReservedResource/SamplerFeedback, "
-                "ExecuteIndirect GPU counts, Work Graphs, XG MSAA/DCC/HTILE & GPU profiler"
+                f"{d3d_retail_exports} d3d12_xs + {xg_retail_cnt} xg_xs retail exports & {d3d_com_slots} total COM proxy "
+                f"slots (42/128 Device, 54/128 CmdList; +{d3d_synth_exports + xg_synth_cnt} synthetic test helpers isolated)"
             ),
         ),
         Subsystem(
@@ -307,32 +376,35 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="XTask",
             category="xgameruntime",
             implemented=xtask_cnt + xasync_cnt,
-            target=24,
-            notes=f"{xtask_cnt} XTaskQueue + {xasync_cnt} XAsync exports (manual/threadpool/delayed/monitors/cancel)",
+            target=26,
+            notes=f"{xtask_cnt} XTaskQueue + {xasync_cnt} XAsync retail GDK exports + {xgr_com_slots} QueryApiImpl table slots",
         ),
         Subsystem(
             name="XGameSave (persistent)",
             short_name="Save",
             category="xgameruntime",
             implemented=xgamesave_cnt,
-            target=30,
-            notes=f"{xgamesave_cnt} exports; disk-backed containers, sync/async blob R/W, quota, delete",
+            target=34,
+            notes=f"{xgamesave_cnt} retail exports; disk-backed containers, sync/async blob R/W, quota, XGameSaveFiles",
         ),
         Subsystem(
             name="XUser & Identity",
             short_name="XUser",
             category="xgameruntime",
             implemented=xuser_cnt,
-            target=27,
-            notes=f"{xuser_cnt} exports; Xbox Live profile, XUID, gamertags, privileges & CNG HMAC-SHA256 XBL3.0 token signing",
+            target=34,
+            notes=f"{xuser_cnt} retail exports; offline Xbox Live profile, XUID, gamertags, privileges & XBL3.0 token signing",
         ),
         Subsystem(
             name="XSystem & Runtime",
             short_name="XSys",
             category="xgameruntime",
             implemented=xruntime_cnt + xsystem_cnt,
-            target=33,
-            notes=f"{xruntime_cnt + xsystem_cnt} exports; Scarlett Anaconda info, GDK 2022-2026 QueryApiImpl, XStore licenses & XPackage DLC mount",
+            target=60,
+            notes=(
+                f"{xruntime_cnt + xsystem_cnt} retail exports; Anaconda/Lockhart info, QueryApiImpl 2022-2026, "
+                "partial XStore (14/65 vtable slots) & XPackage DLC mount"
+            ),
         ),
         Subsystem(
             name="XMem & Threading",
@@ -340,61 +412,61 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             category="xgameruntime",
             implemented=xmem_cnt,
             target=16,
-            notes=f"{xmem_cnt} exports; default/custom alloc hooks, VirtualAlloc/Free, time-sensitive thread state",
+            notes=f"{xmem_cnt} retail exports; MEM_GRAPHICS XMemVirtualAlloc/Free, alloc hooks & thread affinity",
         ),
         Subsystem(
-            name="DXR / XboxBvhBuilder",
+            name="DXR (d3d12_xs COM)",
             short_name="DXR",
             category="Graphics",
-            implemented=bvh_cnt + 4,
+            implemented=6,  # CreateStateObject, GetRTPrebuildInfo, BuildRTAS, CopyRTAS, SetPipelineState1, DispatchRays
             target=14,
             notes=(
-                f"{bvh_cnt} BVH exports + DXR AS prebuild/build/destroy, BLAS update, single-ray trace, "
-                "deterministic software BVH fallback (hardware DXR requires capable GPU)"
+                f"6 wired d3d12_xs DXR 1.1 COM proxy slots (StateObject, BuildRTAS, DispatchRays); "
+                f"XboxBvhBuilder ({bvh_synth_cnt} synthetic exports) has 0 retail ABI parity"
             ),
         ),
         Subsystem(
-            name="DirectStorage & XVD",
+            name="DirectStorage (xcrdapi) & XVD",
             short_name="DStor",
             category="Storage",
-            implemented=ds_cnt + (1 if (ROOT / "src/loader/xvd_container.cpp").exists() else 0),
-            target=26,
+            implemented=xcrd_retail_cnt + ds_com_slots,
+            target=28,
             notes=(
-                f"{ds_cnt} DStorage exports + AES-XTS encrypted GDFX XVC/XVD extraction & PackageVfs file mounting; "
-                "OVERLAPPED NVMe queues, HLSL cs_5_0 GPU GDeflate & CopyTextureRegion GPU upload"
+                f"{xcrd_retail_cnt} xcrdapi.dll!DStorageGetFactory export + {ds_com_slots} COM vtable slots + "
+                f"XVD/NTFS VFS (missing SetStagingBufferSize & BTYPE=2 GDeflate; +{ds_synth_cnt} synthetic handles)"
             ),
         ),
         Subsystem(
-            name="Audio (XAudio2 / AcpHal)",
+            name="Audio (XAudio2 COM / AcpHal)",
             short_name="Audio",
             category="Media",
-            implemented=xa_cnt,
-            target=46,
+            implemented=audio_retail_exports + 18,  # 16 retail exports + core IXAudio2/Voice COM proxy methods
+            target=48,
             notes=(
-                f"{xa_cnt} exports (XAudio2_9 + X3DAudio + CreateFX + AcpHal.dll SHAPE); "
-                "2048B retail XMA2 MDCT voice decode, ITU-R BS.775 5.1/7.1 spatial fold-down & host XAPOFX"
+                f"{audio_retail_exports} retail exports (XAudio2Create, X3DAudio, CreateFX, AcpHal) + {xa_com_slots} "
+                f"COM vtable entries (PCM/XAPOFX live; retail WMA-Pro XMA2 & IAcpHal SHAPE partial; +{audio_synth_exports} synthetic)"
             ),
         ),
         Subsystem(
-            name="Input (GameInput)",
+            name="Input (GameInput COM)",
             short_name="Input",
             category="Input",
-            implemented=gi_cnt,
-            target=16,
+            implemented=gi_retail_cnt + 14,  # GameInputCreate + wired IGameInput/Device/Reading/Dispatcher COM methods
+            target=24,
             notes=(
-                f"{gi_cnt} exports; virtual Xbox Series controller & keyboard, reading history "
-                "(Current/Next/Previous), state injection, rumble forwarded to the host controller's two main motors"
+                f"{gi_retail_cnt} retail export (GameInputCreate) + {gi_com_slots} COM vtable slots across "
+                f"IGameInput/Device/Reading/Dispatcher (XInput + KBM polling; +{gi_synth_cnt} synthetic helpers)"
             ),
         ),
         Subsystem(
-            name="Middleware (Bink2 / FSR)",
+            name="Middleware (Bink2 / FSR / PIX)",
             short_name="Midw",
             category="Middleware",
-            implemented=bink_cnt + ffx_cnt,
-            target=36,
+            implemented=bink_cnt + ffx_cnt + pix_cnt,
+            target=52,
             notes=(
-                f"{bink_cnt} Bink2Scarlett + {ffx_cnt} FidelityFX exports; "
-                "package-first native DLL loading, KB2 frame-offset YCbCr 4:2:0 decode & QPC A/V PTS lip-sync"
+                f"{bink_cnt} Bink2Scarlett + {ffx_cnt} FidelityFX + {pix_cnt} PIX retail exports; "
+                "package-first native DLL loading active, fallback Bink2/FSR shims partial"
             ),
         ),
         Subsystem(
@@ -402,10 +474,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="Net",
             category="Networking",
             implemented=hc_cnt + curl_cnt,
-            target=48,
+            target=64,
             notes=(
-                f"{hc_cnt} libHttpClient.GDK (incl. HCWebSocket RTA/PlayFab) + {curl_cnt} XCurl exports; "
-                "offline mock registry + opt-in live WinHTTP/WinHttpWebSocket transport"
+                f"{hc_cnt} libHttpClient.GDK + {curl_cnt} XCurl retail exports; "
+                "offline mock registry + opt-in WinHTTP/WebSocket transport"
             ),
         ),
         Subsystem(
@@ -413,65 +485,59 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="PE64",
             category="Core",
             implemented=loader_features,
-            target=6,
-            notes="PE32+ mapping, DIR64/HIGHLOW relocs, named/ordinal IAT, API-set redirection, x64 auto-stub thunks",
+            target=10,
+            notes=(
+                f"{loader_features}/10 milestones: main EXE PE32+ mapping, relocs, TLS/FLS, .pdata & auto-stubs live; "
+                "package-loaded secondary guest DLL IAT hooking & StubThunk .pdata pending Wave 2"
+            ),
         ),
         Subsystem(
             name="Xbox Unified Memory & KernelX",
             short_name="Kern",
             category="Platform",
-            implemented=kernelx_cnt,
+            implemented=2,  # Internal VirtualAlloc2/MapViewOfFile3 helper backing XMemVirtualAlloc; 0 retail kernelx.dll exports
             target=16,
-            notes=f"{kernelx_cnt} exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services",
+            notes=(
+                f"0 retail kernelx.dll exports (AllocateTitlePhysicalPages/MapTitlePhysicalPages unimplemented; "
+                f"2 internal VirtualAlloc2 aliasing helpers + {kernelx_synth_cnt} synthetic test exports)"
+            ),
         ),
         Subsystem(
-            name="RDNA2 XS2 Shader Lifting",
+            name="RDNA2 XS2 & DXIL Shader IR",
             short_name="XS2",
             category="Graphics",
-            implemented=xs2_cnt,
+            implemented=4,  # DXBC/DXIL Xbox chunk strip + dxil.dll re-sign + root-sig inspect; RDNA2 ISA->DXIL pending
             target=16,
-            notes=f"{xs2_cnt} exports; RDNA2/Scarlett GPU microcode disassembly, DXIL/SPIR-V lifting, chunk stripping, pipeline caching",
+            notes=(
+                f"DXBC/DXIL Xbox chunk stripping + dxil.dll signing verified; full fail-closed RDNA2 ISA -> SSA -> DXIL "
+                f"compiler pending ({xs2_synth_cnt} isolated xs2_lifting.dll synthetic exports)"
+            ),
         ),
         Subsystem(
-            name="Retail XVC/XVD Crypto",
+            name="Retail XVC/XVD & NTFS Crypto",
             short_name="Crypt",
             category="Storage",
-            implemented=xvc_crypto_cnt,
+            implemented=8,  # msft-xvd v3, Merkle SHA-256, AES-XTS CNG, NTFS $MFT, GDFX, .cik loader; zero-stage streaming pending
             target=12,
-            notes=f"{xvc_crypto_cnt} exports; AES-XTS/AES-CBC sector decryption, SHA-256 block hashing, integrity table verification",
+            notes=(
+                "BCrypt AES-XTS, SHA-256 Merkle tree, NTFS $MFT & .cik loader active in XvdContainer; "
+                f"zero-staging streaming & GUID key-matching queued (+{xvc_crypto_synth_cnt} synthetic exports)"
+            ),
         ),
         Subsystem(
-            name="Production Codecs (XMA2/GDeflate/Bink)",
-            short_name="Codec",
-            category="Media",
-            implemented=codec_cnt,
-            target=16,
-            notes=f"{codec_cnt} exports; hardware GDeflate, BCPack, SHAPE XMA2 audio transform decoding, production Bink2 video & audio",
-        ),
-        Subsystem(
-            name="Hardware DXR & Vulkan Backend",
-            short_name="Vulk",
-            category="Graphics",
-            implemented=vulkan_cnt,
-            target=17,
-            notes=f"{vulkan_cnt} exports; live Vulkan 1.3 VkComputePipeline + SSBO dispatch, timeline semaphores, Win32 VkSurfaceKHR, VK_KHR_acceleration_structure BLAS/TLAS & aligned SBT vkCmdTraceRaysKHR",
-        ),
-        Subsystem(
-            name="Live Xbox Services (XSAPI/WinRT)",
+            name="Live Xbox Services & WinRT",
             short_name="XSAPI",
             category="Platform",
-            implemented=xsapi_cnt,
+            implemented=4,  # RoGetActivationFactory / RoActivateInstance basic WinRT factories; retail XSAPI thunks pending
             target=23,
-            notes=f"{xsapi_cnt} exports; WinRT RoActivateInstance IInspectable broker, persistent XblTitleStorage, profiles, achievements, sessions",
+            notes=(
+                "In-process WinRT RoGetActivationFactory broker (Gaming.Input/AnalyticsInfo/Package); "
+                f"package-first XSAPI thunk routing queued (+{xsapi_synth_cnt} synthetic Xbl* exports)"
+            ),
         ),
     ]
 
-    # Auto-scale target when new exports are added beyond baseline targets
-    for s in subsystems:
-        if s.implemented > s.target:
-            s.target = s.implemented
-
-    return subsystems, total_exports, test_count
+    return subsystems, breakdown, test_count
 
 
 def collect_concept_destruction_metrics() -> list[Subsystem]:
@@ -553,311 +619,158 @@ def collect_concept_destruction_metrics() -> list[Subsystem]:
 
 
 def collect_optimization_metrics() -> list[Subsystem]:
-    """Runtime optimization and deep execution fidelity metrics for commercial AAA titles."""
+    """Runtime optimization and engineering hygiene foundations."""
     return [
         Subsystem(
-            name="Frame Pacing & VSync",
-            short_name="VSync",
-            category="Display",
+            name="Build & PCH Link Hygiene",
+            short_name="Build",
+            category="Build",
             implemented=4,
             target=4,
-            notes="Hardware VBlank present lock (IDXGISwapChain::Present(1,0)), high-res QPC pacing & microsecond async event dispatch",
+            notes="Zero-dirty Ninja graph, precompiled headers (<windows.h>/<d3d12.h>/STL), PRIVATE D3D link scope & orphan cleanup",
         ),
         Subsystem(
-            name="Bootloader & DLL Priority",
-            short_name="Loader",
-            category="Loader",
+            name="Async-Safe Crash & Ctrl+C",
+            short_name="VEH",
+            category="Diagnostics",
             implemented=4,
             target=4,
-            notes="In-process direct IAT mapper default with zero search-order conflicts; out-of-process PATH prioritization",
+            notes="Atomic Ctrl+C shutdown without %TEMP% leaks; zero-heap/zero-Loader-Lock VEH crash writer ignoring benign guard-page AVs",
         ),
         Subsystem(
-            name="Sub-Frame Texture Upload",
-            short_name="Texture",
-            category="Graphics",
+            name="Deterministic Isolated CTests",
+            short_name="CTest",
+            category="Testing",
             implemented=4,
             target=4,
-            notes="Lightweight non-reset write-watch probing (HasPendingGuestTextureWrites); mid-frame writes upload without 1-frame latency",
+            notes="100% isolated ScopedTempDir outputs outside build/, Win32 event/fence waits (zero Sleep loops) & <5s parallel CTest",
         ),
         Subsystem(
-            name="DirectStorage & NVMe",
-            short_name="DStorage",
-            category="Storage",
+            name="Honest Retail vs Synth Metrics",
+            short_name="Metrics",
+            category="Governance",
             implemented=4,
             target=4,
-            notes="Persistent Windows OVERLAPPED async NVMe I/O, encrypted XVD streaming, real GDeflate (0x04FB) LZ77 tile & BCPack codecs",
-        ),
-        Subsystem(
-            name="RDNA2 Microcode Lifter",
-            short_name="RDNA2",
-            category="Compute",
-            implemented=4,
-            target=4,
-            notes="256-VGPR RDNA2 Graphics+Compute SPIR-V 1.5 SSA compiler (stage exports, Load/Store, control flow) & DXIL SM 6.5",
-        ),
-        Subsystem(
-            name="Hardware DXR 1.1 & Vulkan",
-            short_name="DXR/RT",
-            category="Ray Tracing",
-            implemented=4,
-            target=4,
-            notes="Live host vulkan-1.dll VkShaderModule SPIR-V compilation, D3D12 Device5/CmdList4 DXR 1.1 proxies & BLAS/TLAS",
-        ),
-        Subsystem(
-            name="Retail Container Crypto",
-            short_name="Crypto",
-            category="Storage",
-            implemented=4,
-            target=4,
-            notes="4 KiB sector-by-sector AES-XTS decryption in XvdContainer, hex/file keyring loader, --volume-key CLI & PackageVfs encrypted mounts",
-        ),
-        Subsystem(
-            name="Unified Memory Aliasing",
-            short_name="Memory",
-            category="Memory",
-            implemented=4,
-            target=4,
-            notes="True Windows VirtualAlloc2 placeholder & MapViewOfFile3 physical-virtual page aliasing (64 KB / 2 MB) with coherent views",
-        ),
-        Subsystem(
-            name="Xbox COM Vtable Depth",
-            short_name="Vtables",
-            category="Graphics",
-            implemented=4,
-            target=4,
-            notes="128-slot D3D12.2 / Enhanced Barriers (CL7::Barrier) / DXR 1.1 / Mesh Shaders + XG 64KB_S/64KB_D/64KB_R_X macro-tile swizzling",
-        ),
-        Subsystem(
-            name="Audio DSP & XAPO Effects",
-            short_name="Audio",
-            category="Media",
-            implemented=4,
-            target=4,
-            notes="Host XAudio 2.9 XAPO effect chain passthrough with graceful DSP parameter state tracking (Enable/Disable/Get/SetParameters)",
-        ),
-        Subsystem(
-            name="Network & Live Middleware",
-            short_name="Network",
-            category="Services",
-            implemented=4,
-            target=4,
-            notes="Opt-in live WinHTTP HTTPS/HTTP in libHttpClient & XCurl, Bink2 KB2 header + BT.709 YUV-to-RGBA decode & XMA2 PCM16 synthesis",
+            notes="Zero target self-clamping; Retail Xbox ABI & COM vtable slots reported separately from synthetic test exports",
         ),
     ]
 
 
 def collect_aaa_roadmap_metrics() -> list[Subsystem]:
-    """Phase 2: Granular next-wave deep silicon & commercial AAA retail execution sub-goals (72 total)."""
+    """Post-Audit Multi-Wave Retail Parity Roadmap (see docs/AUDIT_BASELINE.md)."""
     return [
         Subsystem(
-            name="XS2 -> GPU Shader Compiler",
-            short_name="XS2-IR",
-            category="Compiler",
-            implemented=12,
-            target=12,
-            notes="**Complete (12/12):** RDNA2 ISA decode, 256-VGPR SPIR-V 1.5, stage exports, SMEM UBOs, MIMG sample, v_interp, disk cache, SSBO Load/Store, OpLoopMerge/OpSelectionMerge CFG, Wave32 subgroups, d3d12_xs auto-intercept, signed SM 6.5 DXIL + SM 5.0 DXBC bridge",
+            name="Wave 1: Build, VEH, CTest & Metrics",
+            short_name="Wave1",
+            category="Hygiene",
+            implemented=4,
+            target=4,
+            notes="**Complete (4/4):** Clean Ninja graph + PCH, async-signal-safe Ctrl+C/VEH, deterministic <5s CTests & honest retail metrics",
         ),
         Subsystem(
-            name="XG Tiling, MSAA & DCC",
-            short_name="XG/DCC",
+            name="Wave 2A: Multi-DLL Loader & VFS",
+            short_name="Wave2A",
+            category="Loader",
+            implemented=1,
+            target=5,
+            notes="**Queued (Gate M1/M2):** StubThunk .pdata + RX, secondary guest DLL IAT hooks, zero-staging XVC VFS & GUID .cik keyring",
+        ),
+        Subsystem(
+            name="Wave 2B: GDK, FFX, Audio & GDeflate",
+            short_name="Wave2B",
+            category="Shims",
+            implemented=1,
+            target=5,
+            notes="**Queued (Gate M1/M2):** 0x50B XPackageDetails, DisplayTimeout slot fix, FFX enum alignment, BTYPE=2 GDeflate & XAudio2 flush fix",
+        ),
+        Subsystem(
+            name="Wave 3: d3d12_xs Sync & Heap Aliasing",
+            short_name="Wave3",
             category="Graphics",
-            implemented=10,
-            target=10,
-            notes="**Complete (10/10):** 4KB_S, 256B_S, 64KB_S/D, 64KB_R_X, 64KB_Z_X depth, Cube/2D arrays, 64 KB packed mip-tails, 3D volume swizzling, 2x/4x/8x MSAA sample planes, RDNA2 DCC & HTILE depth codecs",
-        ),
-        Subsystem(
-            name="Vulkan 1.3 & DXR GPU Exec",
-            short_name="VkExec",
-            category="Graphics",
-            implemented=10,
-            target=10,
-            notes="**Complete (10/10):** Dynamic vulkan-1.dll loader, vkCreateShaderModule, VkQueue/CmdBuffer, RootSig->VkDescriptorSetLayout, VkComputePipeline + SSBO dispatch, Win32 VkSurfaceKHR, timeline semaphores, VK_KHR_acceleration_structure BLAS/TLAS & aligned SBT vkCmdTraceRaysKHR",
-        ),
-        Subsystem(
-            name="DirectStorage GPU Codecs",
-            short_name="DS-GPU",
-            category="Storage",
-            implemented=8,
-            target=8,
-            notes="**Complete (8/8):** OVERLAPPED NVMe I/O, LZ77 GDeflate (0x04FB) & BCPK, multi-thread GDeflate tile pool, OS priority queues, RFC 1951 Huffman DEFLATE + Zlib, BC1 4x4 RGBA8 unpack, HLSL cs_5_0 GPU compute GDeflate & direct CopyTextureRegion + 4KB_S swizzled streaming",
-        ),
-        Subsystem(
-            name="D3D12.2 & MEM_GRAPHICS",
-            short_name="D3D12.2",
-            category="Graphics",
-            implemented=10,
-            target=10,
-            notes="**Complete (10/10):** 128-slot vtables, CL7::Barrier unwrapping, VirtualAlloc2 aliasing, 2 MB large pages, CreatePlacedResourceX GPUVA, ID3D12Device2 stream PSOs, VRS Tier 1/2, sparse 64 KB ReservedResource + UpdateTileMappings + SamplerFeedback, ExecuteIndirect GPU counts & GPU Work Graphs",
-        ),
-        Subsystem(
-            name="Retail XMA2 & Bink2 Media",
-            short_name="Media",
-            category="Media",
-            implemented=8,
-            target=8,
-            notes="**Complete (8/8):** 2048B retail XMA2 bitstream parser, Princen-Bradley TDAC IMDCT + 52B 0x0166 voice bridge, BS.775 5.1/7.1 + X3DAudio Doppler, host System32 CreateFX XAPOFX, KB2 frame-offset YCbCr 4:2:0 decode, QPC A/V PTS lip-sync",
-        ),
-        Subsystem(
-            name="GDK 2022-2026 & WinRT",
-            short_name="WinRT",
-            category="Platform",
-            implemented=8,
-            target=8,
-            notes="**Complete (8/8):** GDK 2022-2026 QueryApiImpl COM GUIDs, WinRT RoActivateInstance IInspectable broker, XStore license & XPackage DLC mount, CNG HMAC-SHA256 XBL3.0 auth, persistent XblTitleStorage, HCWebSocket RTA/PlayFab bridge",
-        ),
-        Subsystem(
-            name="AAA Engine & XVC Bring-Up",
-            short_name="AAA",
-            category="Titles",
-            implemented=6,
-            target=6,
-            notes="**Complete (6/6 — Vertical-Slice Harness):** Encrypted GDFX XVC extraction/boot, UE5 Gen9 PE64 slice, Open-World Wave32/2MB-alias PE64 slice, GPU stability breadcrumbs, multi-queue GDeflate+XS2 churn, PSO prewarm + QPC p99 profiler (retail titles require per-title testing)",
+            implemented=1,
+            target=5,
+            notes="**Queued (Gate M3):** Fence-retired upload ring, FlushPipelineX barriers, real ID3D12Heap placed aliasing & ResizeBuffers",
         ),
     ]
 
 
 def collect_phase3_metrics() -> list[Subsystem]:
-    """Phase 3: Post-Audit Architectural Unification, Retail Parity, Flight-Recorder Diagnostics & GDK 2510 Verification (30/30)."""
+    """Subsystem empirical verification tracks (aligned with docs/AUDIT_BASELINE.md Section 3)."""
     return [
         Subsystem(
-            name="Shared Core & Loader Unification",
-            short_name="Core",
-            category="Core",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** Shared scarlettx_core.dll singleton registry, PackageVfs::Global(), TLS Slot-0 + FLS isolation, .pdata zero-tail stripping, Win32 G:\\ VFS/CmdLine/GetProcAddress/Delay-Load IAT hooks",
-        ),
-        Subsystem(
-            name="Guest COM Bridge (Real-Title Mode)",
-            short_name="COM",
-            category="Runtime",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** Strict IID QueryInterface across d3d12_xs/WinRT/GameInput/IXAPO, unified dstorage/xcrdapi, XMem<->KernelX<->d3d12_xs GPU VA translation, StateObjectProperties + BuildRTAS proxies, XAsync libHttpClient",
-        ),
-        Subsystem(
-            name="Retail XVD v3, .msixvc & Codecs",
-            short_name="RetailIO",
-            category="Storage",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** Retail msft-xvd v3 (0x284+), makepkg .msixvc contiguous Merkle + 128B XvcRegionHeader v2 (FS-MD unencrypted NTFS $MFT), 48B .cik & keyring loader, 32-lane GPU GDeflate, 512-sample WMA-Pro XMA2",
-        ),
-        Subsystem(
-            name="RDNA2 XS2 CFG, SM 6.6 & Vulkan RT",
-            short_name="XS2/RT",
-            category="Graphics",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** Full-width GFX10.3 decoder (literals, DPP/SDWA, VOP3P, FLAT/MTBUF, NSA MIMG, image_bvh64_intersect_ray), structured loop/if CFG, SM 6.6 bindless + dxil.dll signing, hardware VK_KHR_ray_tracing_pipeline",
-        ),
-        Subsystem(
-            name="4-Part Flight-Recorder Suite",
-            short_name="FlightRec",
+            name="Shared Core & Flight Recorder",
+            short_name="Core/FR",
             category="Diagnostics",
             implemented=5,
             target=5,
-            notes="**Complete (5/5):** Lock-free 4096-slot cross-DLL event ring + deduplicated import/QI/vtable/VFS miss tables, VEH/SEH .pdata Ghidra-RVA crash dumper, D3D12 DRED + shader/PSO fail dumper, zero-lock SuspendThread hang watchdog",
+            notes="4096-slot MPMC ring, cross-DLL miss registries, zero-heap/zero-Loader-Lock VEH unwinder & SuspendThread hang watchdog",
         ),
         Subsystem(
-            name="Official GDK 2510 & Gen9 Silicon",
-            short_name="GDK2510",
-            category="Platform",
-            implemented=5,
+            name="Real-Title COM Bridge (d3d12_xs)",
+            short_name="COM",
+            category="Graphics",
+            implemented=3,
             target=5,
-            notes="**Complete (5/5):** Verified on RTX 5070 Ti (--debug-layer, 0 errors) against official Microsoft.GDK.PC 2510.5.6322 (InitializeApiImplEx2, XSystem/Analytics, XGameSaveFiles, XPackage chunks, XStore, XDisplay, PLS, XNetworking) + live hybrid DXR 1.1 & SM 6.5 Mesh Shaders",
+            notes="SDK 0x20001/0x20004/0x20006 vtables, ALLOW_DISPLAY strip & PresentX live; upload ring & ID3D12Heap aliasing queued in Wave 3",
+        ),
+        Subsystem(
+            name="XVD v3, NTFS $MFT & AES-XTS",
+            short_name="XVD/NTFS",
+            category="Storage",
+            implemented=3,
+            target=5,
+            notes="msft-xvd v3, SHA-256 Merkle, NTFS $MFT & .cik parsing verified; zero-staging XVC streaming & 4 KiB XTS batching queued in Wave 2",
+        ),
+        Subsystem(
+            name="XTaskQueue, XAsync & XGameSave",
+            short_name="GDK",
+            category="Platform",
+            implemented=4,
+            target=5,
+            notes="4-mode XTaskQueue, XAsyncProvider & persistent XGameSave verified; secondary guest DLL hooks & 0x50B XPackageDetails queued in Wave 2",
         ),
     ]
 
 
 def collect_phase4_metrics() -> list[Subsystem]:
-    """Return Phase 4 (Clean-Room Governance & Commercial Retail Bring-Up) progress."""
+    """Clean-Room Governance & Retail Bring-Up Readiness."""
     return [
         Subsystem(
-            name="4A. Clean-Room Governance & CI Guard",
+            name="4A. Clean-Room Governance & CI Gate",
             short_name="CleanRoom",
             category="Governance",
             implemented=5,
             target=5,
-            notes="**Complete (5/5):** CLEANROOM_POLICY.md, CONTRIBUTING.md, tools/check_cleanroom.py file/ext/size/commit gate in GitHub Actions CI, Node 24-compatible checkout@v5",
+            notes="**Complete (5/5):** UTF-16LE/BE + case-insensitive check_cleanroom.py binary/key/trademark gate & GitHub Actions CI",
         ),
         Subsystem(
-            name="4B. Flight-Recorder Triage CLI",
+            name="4B. Flight-Recorder & Triage CLI",
             short_name="TriageCLI",
             category="Diagnostics",
             implemented=5,
             target=5,
-            notes="**Complete (5/5):** scarlettx triage <dir> [--emit-stubs] [--json] (src/core/flight_triage.cpp), null-vtable/crash/hang/DRED verdicts, hit-ranked gaps, stub skeleton emitter, test_triage_cli",
+            notes="**Complete (5/5):** Async-signal-safe VEH crash writer, benign guard-page filter, scarlettx triage CLEAN_RUN verification",
         ),
         Subsystem(
-            name="4C. Multi-Sample GDK 2510 ATG",
-            short_name="GDK-ATG",
-            category="Platform",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** Verified live on RTX 5070 Ti (--debug-layer, 0 errors, triage CLEAN_RUN): DirectStorage, XGameSave round-trip + XGameSaveFiles + PLS, GameInput, XAudio2 PCM, SM 6.6 ResourceDescriptorHeap + 30/30 ExecuteIndirect GPU frames",
-        ),
-        Subsystem(
-            name="4D. Retail Wave 1 Bring-Up",
-            short_name="RetailW1",
-            category="Retail",
-            implemented=0,
-            target=5,
-            notes="**Queued (0/5):** Flight-recorder bring-up of user-supplied legal dumps (Concept Destruction, Unicorn Overlord) through inspect, boot, menus/audio/input, gameplay, and save round-trip",
-        ),
-        Subsystem(
-            name="4E. Commercial Engine Hardening",
-            short_name="EngineHard",
-            category="Graphics",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** Versioned .sxc shader disk cache (rootSigHash + FNV-1a eviction), multi-entry .cik keyring + LoadKeyringDirectory, KernelXQueryAliasTelemetry, dynamic MF H.264/HEVC probe, lock-free p95/p99 stutter profiler in flight_summary.json & triage",
-        ),
-        Subsystem(
-            name="4F. Compatibility Matrix & Dashboard",
-            short_name="CompatDoc",
-            category="Docs",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** docs/COMPATIBILITY.md tiered compatibility ledger, docs/status_phase4.svg, Phase 4 ROADMAP.md & generate_status.py live progress dashboard",
-        ),
-        Subsystem(
-            name="4G. OS, Topology, VFS & Keyring CLI",
-            short_name="OS/VFS",
+            name="4C. Real-Title COM Vertical Slice",
+            short_name="RealCOM",
             category="Runtime",
             implemented=5,
             target=5,
-            notes="**Complete (5/5):** Zen 2 8-core GetSystemInfo/SetThreadAffinityMask hooks, T:\\ scratch & D:\\ alias + FindFirstFile*/GetDiskFreeSpaceEx*, live PresentX -> RecordFrameTimeUs pacing, --keyring <dir> CLI",
+            notes="**Complete (5/5):** mainCRTStartup real_title_com executing D3D12X CommandList + MEM_GRAPHICS CBV + PresentX + xcrdapi fence sync",
         ),
         Subsystem(
-            name="4H. d3d12_xs Proxy RTX Torture-Test",
-            short_name="D3D12XS",
-            category="Graphics",
-            implemented=5,
+            name="4D. Commercial Retail Title Bring-Up",
+            short_name="Retail",
+            category="Retail",
+            implemented=1,
             target=5,
-            notes="**Complete (5/5):** Verified on RTX 5070 Ti (+ WARP CI) through d3d12_xs.dll SDK 0x20006 proxies: ALLOW_DISPLAY strip, CreatePlacedResource, ExecuteIndirect, ResourceBarrier unwrapping & 10/10 PresentX live pacing (test_d3d12_xs_proxy_rtx)",
-        ),
-        Subsystem(
-            name="4I. WinRT & Middleware Expansion",
-            short_name="WinRT/GI",
-            category="Platform",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** WinRT Windows.Gaming.Input/AnalyticsInfo/Package factories, GameInput RegisterDeviceCallback + rumble transitions, expanded Xbl offline achievements/stats/profiles (test_winrt_middleware)",
-        ),
-        Subsystem(
-            name="4J. Diagnostics UX & Portable CI",
-            short_name="Diag/CI",
-            category="Tooling",
-            implemented=5,
-            target=5,
-            notes="**Complete (5/5):** One-command scarlettx diag --full [--json] host readiness probe (SM 6.6+/DXR/Mesh/Vulkan/MF/VirtualAlloc2/XAudio2), test_diag_full & GitHub Actions portable ScarlettEdge-win64.zip artifact",
+            notes="**In Progress (1/5):** Concept Destruction Gen9 playable on GPU with audio/saves; AAA titles await Waves 2-3 (Gates M1-M3)",
         ),
     ]
 
 
 def _badge_width(text: str) -> int:
-    # Approximate Verdana 11px width + 12px horizontal padding
     return max(26, int(round(len(text) * 6.4)) + 14)
 
 
@@ -865,20 +778,19 @@ def render_svg(
     subsystems: list[Subsystem],
     badges: list[tuple[str, str, str, bool]],
     heading_prefix: str = "Status",
-    callout_lead: str = "Not started:",
-    callout_line1: str = "Xbox unified memory/KernelX, RDNA2 XS2 lifting, retail XVC/XVD crypto, native XMA2/GDeflate/Bink,",
-    callout_line2: str = "hardware DXR/Vulkan, and live XSAPI/WinRT. Synthetic offline shims do not imply retail compatibility.",
+    callout_lead: str = "Empirical scope:",
+    callout_line1: str = "",
+    callout_line2: str = "",
 ) -> str:
     W = 1040
     PAD_X = 36
     PAD_Y = 30
-    INNER_W = W - 2 * PAD_X  # 968px
+    INNER_W = W - 2 * PAD_X
 
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
     overall_pct = (total_impl / total_target * 100.0) if total_target else 0.0
 
-    # Contribution graph geometry (7 rows, column-by-column, 14px squares, 3px gaps, min 2 cols)
     ROWS = 7
     CELL = 14
     CELL_GAP = 3
@@ -900,8 +812,6 @@ def render_svg(
         cols, gw = _group_width(s, CELL, CELL_GAP)
         groups.append((s, cols, gw))
 
-    # If the sum of group widths exceeds the inner graph box width, scale cell/gap slightly
-    # so every square remains crisp and centered without overflowing the 900px SVG.
     avail_graph_w = INNER_W - 2 * BOX_PAD_X
     raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
     if raw_graph_w > avail_graph_w:
@@ -920,7 +830,6 @@ def render_svg(
             GROUP_GAP = max(4, GROUP_GAP - int(math.ceil((raw_graph_w - avail_graph_w) / (len(groups) - 1))))
             raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
     elif len(groups) > 1:
-        # Give compact charts generous horizontal breathing room between group columns
         extra_per_gap = int((avail_graph_w - raw_graph_w) // (len(groups) - 1))
         GROUP_GAP = min(38, GROUP_GAP + min(24, extra_per_gap))
         raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
@@ -930,7 +839,6 @@ def render_svg(
     legend_h = 16
     graph_box_h = BOX_PAD_TOP + LABEL_H + LABEL_GAP + grid_h + legend_gap + legend_h + BOX_PAD_BOT
 
-    # Pre-layout badge rows with automatic wrapping at W - PAD_X so badges never clip at 900px
     BADGE_H = 20
     BADGE_ROW_GAP = 6
     badge_placements: list[tuple[int, int, int, int, str, str, str, bool]] = []
@@ -947,7 +855,6 @@ def render_svg(
         bx_cur += bw + 6
     badges_total_h = (b_row + 1) * BADGE_H + b_row * BADGE_ROW_GAP
 
-    # Vertical flow (20px section spacing)
     y_heading_baseline = PAD_Y + 26
     y_heading_rule = y_heading_baseline + 12
     y_badges = y_heading_rule + 18
@@ -983,11 +890,9 @@ def render_svg(
         "  </style>",
         f'  <rect width="{W}" height="{H}" fill="{BG}"/>',
         "",
-        "  <!-- 1. Heading -->",
         f'  <text class="h2" x="{PAD_X}" y="{y_heading_baseline}">{html.escape(heading_prefix)}: {overall_pct:.1f}%</text>',
         f'  <line x1="{PAD_X}" y1="{y_heading_rule}" x2="{W - PAD_X}" y2="{y_heading_rule}" stroke="{BORDER_STRONG}" stroke-width="1"/>',
         "",
-        "  <!-- 2. Badge row -->",
     ]
 
     for idx, (bx, row_idx, kw, vw, k, v, v_bg, dark_v) in enumerate(badge_placements):
@@ -1007,8 +912,6 @@ def render_svg(
         )
         lines.append("  </g>")
 
-    lines.append("")
-    lines.append("  <!-- 3. Contribution graph box -->")
     lines.append(
         f'  <rect x="{PAD_X}" y="{y_graph_box}" width="{INNER_W}" height="{graph_box_h}" rx="6" '
         f'fill="{BG}" stroke="{BORDER}" stroke-width="1"/>'
@@ -1038,7 +941,6 @@ def render_svg(
                 )
         gx += gw + GROUP_GAP
 
-    # Legend (right-aligned)
     ly = gy_cells + grid_h + legend_gap + 11
     rx_end = PAD_X + INNER_W - BOX_PAD_X
     if has_upstream_split:
@@ -1069,8 +971,6 @@ def render_svg(
             sx -= 15
         lines.append(f'  <text class="legend-txt" x="{sx + 11}" y="{ly}" text-anchor="end">Not yet</text>')
 
-    lines.append("")
-    lines.append("  <!-- 4. Two-column subsystem list -->")
     COL_GAP = 40
     LIST_PAD = 4
     col_w = (INNER_W - 2 * LIST_PAD - COL_GAP) / 2.0
@@ -1093,7 +993,6 @@ def render_svg(
             elif up_cnt == 0:
                 lines.append(f'  <rect x="{x0:.1f}" y="{y_top + 9:.1f}" width="11" height="11" rx="2" fill="{FORK_GREEN}"/>')
             else:
-                # Half-purple (upstream) / half-green (fork) indicator
                 lines.append(f'  <rect x="{x0:.1f}" y="{y_top + 9:.1f}" width="5.5" height="11" rx="1" fill="{UPSTREAM_PURPLE}"/>')
                 lines.append(f'  <rect x="{x0 + 5.5:.1f}" y="{y_top + 9:.1f}" width="5.5" height="11" rx="1" fill="{FORK_GREEN}"/>')
         else:
@@ -1112,8 +1011,6 @@ def render_svg(
         )
 
     if has_callout:
-        lines.append("")
-        lines.append("  <!-- 5. Status callout -->")
         lines.append(f'  <rect x="{PAD_X}" y="{y_callout}" width="4" height="{callout_h}" fill="{callout_accent}"/>')
         ix = PAD_X + 20
         iy = y_callout + 10
@@ -1157,7 +1054,7 @@ def _serialize_js_subsystems(subs: list[Subsystem]) -> str:
 
 def render_html(
     subsystems: list[Subsystem],
-    total_exports: int,
+    breakdown: ExportBreakdown,
     tests_text: str,
     tests_ok: bool,
     cd_subsystems: list[Subsystem] | None = None,
@@ -1211,8 +1108,6 @@ def render_html(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ScarlettEdge — Status Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@400;500;600;700&display=swap">
 <style>
   :root {{
     --bg: {BG};
@@ -1244,7 +1139,7 @@ def render_html(
     margin: 0;
     background: var(--bg);
     color: var(--fg);
-    font-family: 'Mona Sans', -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
+    font-family: -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
   }}
   .page {{
     width: 920px;
@@ -1311,95 +1206,69 @@ def render_html(
   .row .name {{ flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   .row .count {{ color: var(--fg-muted); font-variant-numeric: tabular-nums; }}
   .row .pct {{ width: 40px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }}
-  .callout {{ display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--fork); color: var(--fg-soft); font-size: 13px; }}
-  .callout strong {{ color: var(--fork); }}
-  @media (max-width: 640px) {{
-    .page {{ padding: 20px 16px; }}
-    .graph {{ justify-content: flex-start; }}
-    .list {{ grid-template-columns: minmax(0, 1fr); }}
-  }}
+  .callout {{ display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--warn); color: var(--fg-soft); font-size: 13px; }}
+  .callout strong {{ color: var(--warn); }}
 </style>
 </head>
 <body>
 <main class="page">
   <section class="panel">
-    <h2>Phase 4: Clean-Room Governance &amp; Commercial Retail Bring-Up: {p4_pct:.1f}%</h2>
+    <h2>Retail Xbox ABI &amp; COM Surface Coverage: {overall_pct:.1f}%</h2>
     <div class="badges">
-      <span class="badge"><span class="k">phase 4</span><span class="v-fn">{p4_impl}/{p4_target} ({p4_pct:.1f}%)</span></span>
-      <span class="badge"><span class="k">clean-room CI</span><span class="v-exports">Automated Gate</span></span>
+      <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">{up_impl}/{total_target}</span></span>
+      <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+{fork_impl}</span></span>
+      <span class="badge"><span class="k">retail exports</span><span class="v-exports">{breakdown.retail_exports}</span></span>
+      <span class="badge"><span class="k">COM vtable slots</span><span class="v-target">{breakdown.com_vtable_slots}</span></span>
+      <span class="badge"><span class="k">synthetic test exports</span><span class="v-tests-warn">{breakdown.synthetic_exports}</span></span>
+      <span class="badge"><span class="k">tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-abi"></div><div class="legend" id="leg-abi"></div></div>
+    <div class="list" id="list-abi"></div>
+    <div class="callout">
+      <span><strong>Empirical Separation:</strong> Retail Xbox DLL exports (<code>{breakdown.retail_exports}</code>) and wired COM vtable slots (<code>{breakdown.com_vtable_slots}</code>) are tracked separately from synthetic C-ABI test-harness exports (<code>{breakdown.synthetic_exports}</code>), with zero <code>target = implemented</code> self-clamping.</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Clean-Room Governance &amp; Retail Readiness: {p4_pct:.1f}%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">readiness</span><span class="v-fn">{p4_impl}/{p4_target} ({p4_pct:.1f}%)</span></span>
       <span class="badge"><span class="k">CI tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
-      <span class="badge"><span class="k">focus</span><span class="v-target">ATG &amp; Retail Wave 1</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-p4"></div><div class="legend" id="leg-p4"></div></div>
     <div class="list" id="list-p4"></div>
   </section>
 
   <section class="panel">
-    <h2>Phase 3: Unification, Retail Parity, Diagnostics &amp; GDK 2510: {p3_pct:.1f}%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">phase 3</span><span class="v-fn">{p3_impl}/{p3_target} ({p3_pct:.1f}%)</span></span>
-      <span class="badge"><span class="k">GDK silicon</span><span class="v-exports">2510.5.6322 + DXR/MeshShader</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
-      <span class="badge"><span class="k">next wave</span><span class="v-target">Commercial Retail Bring-Up</span></span>
-    </div>
+    <h2>Empirical Subsystem Verification: {p3_pct:.1f}%</h2>
     <div class="graph-box"><div class="graph" id="graph-p3"></div><div class="legend" id="leg-p3"></div></div>
     <div class="list" id="list-p3"></div>
   </section>
 
   <section class="panel">
-    <h2>Phase 2: Retail AAA Execution Roadmap: {aaa_pct:.1f}%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">phase 2 AAA</span><span class="v-fn">{aaa_impl}/{aaa_target} ({aaa_pct:.1f}%)</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
-      <span class="badge"><span class="k">target</span><span class="v-target">Unmodified Retail AAA Titles</span></span>
-    </div>
+    <h2>Multi-Wave Advancement Roadmap: {aaa_pct:.1f}%</h2>
     <div class="graph-box"><div class="graph" id="graph-aaa"></div><div class="legend" id="leg-aaa"></div></div>
     <div class="list" id="list-aaa"></div>
   </section>
 
   <section class="panel">
-    <h2>ABI Coverage (Upstream Purple + Fork Green): {overall_pct:.1f}%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">{up_impl}/{total_target}</span></span>
-      <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+{fork_impl}</span></span>
-      <span class="badge"><span class="k">exports</span><span class="v-exports">{total_exports}</span></span>
-      <span class="badge"><span class="k">tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
-    </div>
-    <div class="graph-box"><div class="graph" id="graph-abi"></div><div class="legend" id="leg-abi"></div></div>
-    <div class="list" id="list-abi"></div>
-    <div class="callout">
-      <span><strong>Unified Architecture:</strong> Shared <code>scarlettx_core.dll</code>, unified DirectStorage/COM bridges, retail XVD v3 + Merkle + NTFS, 32-lane GPU GDeflate, WMA-Pro XMA2, Vulkan KHR RT &amp; RDNA2 XS2 CFG/SM 6.6 lifting ({total_impl}/{total_target} functions: {up_impl} upstream + {fork_impl} ScarlettEdge).</span>
-    </div>
-  </section>
-
-  <section class="panel">
-    <h2>Phase 1: ScarlettEdge Runtime Optimization &amp; Fidelity: {opt_pct:.1f}%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">foundations</span><span class="v-fn">{opt_impl}/{opt_target} ({opt_pct:.1f}%)</span></span>
-      <span class="badge"><span class="k">frame pacing</span><span class="v-exports">0-tear VSync</span></span>
-      <span class="badge"><span class="k">textures</span><span class="v-tests">0-frame lag</span></span>
-    </div>
+    <h2>Wave 1 Engineering Hygiene: {opt_pct:.1f}%</h2>
     <div class="graph-box"><div class="graph" id="graph-opt"></div><div class="legend" id="leg-opt"></div></div>
     <div class="list" id="list-opt"></div>
   </section>
 
   <section class="panel">
     <h2>Concept Destruction (Upstream Purple + Fork Green): {cd_pct:.1f}%</h2>
-    <div class="badges">
-      <span class="badge"><span class="k">milestones</span><span class="v-fn">{cd_impl}/{cd_target} ({cd_pct:.1f}%)</span></span>
-      <span class="badge"><span class="k">state</span><span class="v-target">Full speed on GPU, with sound</span></span>
-      <span class="badge"><span class="k">target</span><span class="v-exports">Concept Destruction (Gen9)</span></span>
-    </div>
     <div class="graph-box"><div class="graph" id="graph-cd"></div><div class="legend" id="leg-cd"></div></div>
     <div class="list" id="list-cd"></div>
   </section>
 </main>
 <script>
   const PANELS = [
+    ['abi', [\n{js_abi}\n    ]],
     ['p4',  [\n{js_p4}\n    ]],
     ['p3',  [\n{js_p3}\n    ]],
     ['aaa', [\n{js_aaa}\n    ]],
-    ['abi', [\n{js_abi}\n    ]],
     ['opt', [\n{js_opt}\n    ]],
     ['cd',  [\n{js_cd}\n    ]],
   ];
@@ -1453,7 +1322,7 @@ def render_html(
 def render_markdown_status(
     subsystems: list[Subsystem],
     cd_subsystems: list[Subsystem],
-    total_exports: int,
+    breakdown: ExportBreakdown,
     tests_md: str,
     opt_subsystems: list[Subsystem] | None = None,
     aaa_subsystems: list[Subsystem] | None = None,
@@ -1468,90 +1337,6 @@ def render_markdown_status(
     cd_target = sum(s.target for s in cd_subsystems)
     cd_pct = (cd_impl / cd_target * 100.0) if cd_target else 0.0
 
-    opt_impl = sum(s.implemented for s in opt_subsystems) if opt_subsystems else 0
-    opt_target = sum(s.target for s in opt_subsystems) if opt_subsystems else 0
-    opt_pct = (opt_impl / opt_target * 100.0) if opt_target else 0.0
-
-    aaa_impl = sum(s.implemented for s in aaa_subsystems) if aaa_subsystems else 0
-    aaa_target = sum(s.target for s in aaa_subsystems) if aaa_subsystems else 0
-    aaa_pct = (aaa_impl / aaa_target * 100.0) if aaa_target else 0.0
-
-    p3_impl = sum(s.implemented for s in phase3_subsystems) if phase3_subsystems else 0
-    p3_target = sum(s.target for s in phase3_subsystems) if phase3_subsystems else 0
-    p3_pct = (p3_impl / p3_target * 100.0) if p3_target else 0.0
-
-    p4_impl = sum(s.implemented for s in phase4_subsystems) if phase4_subsystems else 0
-    p4_target = sum(s.target for s in phase4_subsystems) if phase4_subsystems else 0
-    p4_pct = (p4_impl / p4_target * 100.0) if p4_target else 0.0
-
-    sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
-    rows = [
-        "<!-- SCARLETTX_STATUS_START -->",
-        "## Status",
-        "",
-        f"### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — {p4_impl}/{p4_target})",
-        "",
-        "Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder analysis, multi-sample GDK 2510 ATG validation, Wave 1 commercial retail bring-up, and the [Compatibility Matrix](docs/COMPATIBILITY.md):",
-        "",
-        "![ScarlettEdge Phase 4: Clean-Room Governance & Retail Bring-Up](docs/status_phase4.svg)",
-        "",
-        f"**Phase 4 Progress:** `{p4_pct:.1f}%` ({p4_impl} of {p4_target} milestones) · "
-        f"**Tests:** {tests_md} · "
-        "**Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)",
-        "",
-        "| Phase 4 Track | Category | Progress | Readiness | Details |",
-        "| :--- | :--- | :---: | :---: | :--- |",
-    ]
-    if phase4_subsystems:
-        for s in phase4_subsystems:
-            rows.append(
-                f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` | `{round(s.pct)}%` | {s.notes} |"
-            )
-
-    rows += [
-        "",
-        "---",
-        "",
-        f"### Phase 3: Unification, Retail Parity, Diagnostics & GDK 2510 (Completed — {p3_impl}/{p3_target})",
-        "",
-        f"Tracks the shared `scarlettx_core.dll` unification, 4-Part Flight-Recorder Diagnostic Suite, retail `.msixvc` + `.cik` key-ring & NTFS `$MFT` parity, and official Microsoft GDK `2510.5.6322` + ATG Gen9 DXR/MeshShader RTX validation (`{p3_impl}/{p3_target}` completed):",
-        "",
-        "![ScarlettEdge Phase 3: Unification, Diagnostics & GDK 2510](docs/status_phase3.svg)",
-        "",
-        f"**Phase 3 Milestones:** `{p3_pct:.1f}%` ({p3_impl} of {p3_target} milestones) · "
-        f"**Tests:** {tests_md} · "
-        "**Next Wave:** `Per-Title Commercial Retail Title Bring-Up`",
-        "",
-        "| Phase 3 Track | Category | Progress | Readiness | Verified Capabilities |",
-        "| :--- | :--- | :---: | :---: | :--- |",
-    ]
-    if phase3_subsystems:
-        for s in sorted(phase3_subsystems, key=lambda x: (-x.ratio, -x.implemented, x.name.lower())):
-            rows.append(
-                f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` | `{round(s.pct)}%` | {s.notes} |"
-            )
-
-    rows += [
-        "",
-        "---",
-        "",
-        "### Phase 2: Retail AAA Execution Architecture (Completed — 72/72)",
-        "",
-        "Tracks the deep silicon-level compiler, GPU execution, MSAA/DCC/HTILE, DirectStorage GPU compute, and GDK/WinRT architecture milestones (`72/72` implemented; individual commercial retail games still require per-title validation with user-supplied dumps):",
-        "",
-        "![ScarlettEdge Phase 2: Retail AAA Execution Roadmap](docs/status_aaa_roadmap.svg)",
-        "",
-        f"**Phase 2 Architecture Milestones:** `{aaa_pct:.1f}%` ({aaa_impl} of {aaa_target} milestones) · "
-        f"**Next Wave:** `Per-Title Commercial Retail AAA Game Compatibility Testing`",
-        "",
-        "| Phase 2 Milestone | Category | Progress | Readiness | Implemented Capabilities |",
-        "| :--- | :--- | :---: | :---: | :--- |",
-    ]
-    if aaa_subsystems:
-        for s in sorted(aaa_subsystems, key=lambda x: (-x.ratio, -x.implemented, x.name.lower())):
-            rows.append(
-                f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` | `{round(s.pct)}%` | {s.notes} |"
-            )
     up_total = sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)
     fork_total = total_impl - up_total
     up_pct = (up_total / total_target * 100.0) if total_target else 0.0
@@ -1561,32 +1346,30 @@ def render_markdown_status(
     cd_up_pct = (cd_up / cd_target * 100.0) if cd_target else 0.0
     cd_fork_pct = (cd_fork / cd_target * 100.0) if cd_target else 0.0
 
-    rows += [
+    sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
+    rows = [
+        "<!-- SCARLETTX_STATUS_START -->",
+        "## Status",
         "",
-        "---",
+        "### Retail Xbox ABI & COM Surface Coverage (Empirical Baseline)",
         "",
-        "### Phase 1: ScarlettEdge Fork Foundations (Completed)",
+        "Metrics below separate **Retail Xbox DLL Exports & Wired COM Vtable Slots** (`SCARLETTX_REAL_TITLE=1` guest path) from **Synthetic Test-Harness C-ABI Exports** (used only by standalone unit tests), with zero target self-clamping (see [docs/AUDIT_BASELINE.md](docs/AUDIT_BASELINE.md)):",
         "",
-        "Tracks the runtime fidelity, cryptography, memory aliasing, and tooling foundations built in **ScarlettEdge** on top of upstream ScarlettX:",
+        "| Surface Metric | Count | Scope |",
+        "| :--- | :---: | :--- |",
+        f"| **Retail Xbox DLL Exports** | `{breakdown.retail_exports}` | Real GDK / Xbox Gen9 imports (`xgameruntime`, `d3d12_xs`, `xg_xs`, `xcrdapi`, `xaudio2_9`, `AcpHal`, `GameInput`, `Bink2`, `FFX`, `libHttpClient`, `XCurl`, `PIX`) |",
+        f"| **Wired Retail COM Vtable Slots** | `{breakdown.com_vtable_slots}` | Guest-facing COM proxy slots across `d3d12_xs`, `QueryApiImpl` tables, `xcrdapi`, `GameInput`, and `XAudio2` |",
+        f"| **Synthetic Test-Harness Exports** | `{breakdown.synthetic_exports}` | Non-retail `uint64_t`-handle / test-only exports (`NOT retail Xbox ABI` helpers, `dstorage.dll` C handles, `xs2_lifting`, `vulkan_backend`, `xvc_crypto`, `kernelx` helpers) |",
+        f"| **Automated CTest Suite** | {tests_md} | Isolated per-test `%TEMP%` sandboxes, event/fence-driven synchronization |",
         "",
-        "![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)",
+        f"In the charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`{up_pct:.1f}%` retail ABI / `{cd_up_pct:.1f}%` Concept Destruction), while **emerald green (`#39d353`)** marks **ScarlettEdge** additions (`+{fork_pct:.1f}%` retail ABI / `+{cd_fork_pct:.1f}%` Concept Destruction):",
         "",
-        f"**Phase 1 Fork Foundations:** `{opt_pct:.1f}%` ({opt_impl} of {opt_target} milestones) · "
-        f"**Exports:** `{total_exports}` · "
-        f"**Tests:** {tests_md} · "
-        "**Target:** `Xbox Series X|S (Gen9)`",
-        "",
-        "---",
-        "",
-        "### Upstream Foundation + Fork Expansion (Color-Differentiated)",
-        "",
-        f"In the two charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`{up_pct:.1f}%` ABI / `{cd_up_pct:.1f}%` Concept Destruction), while **emerald green (`#39d353`)** marks new functions and milestones added in **ScarlettEdge** (`+{fork_pct:.1f}%` ABI / `+{cd_fork_pct:.1f}%` Concept Destruction):",
-        "",
-        "![ABI Coverage: Upstream ScarlettX (Purple) vs ScarlettEdge Fork (Green)](docs/status.svg)",
+        "![Retail ABI & COM Coverage: Upstream ScarlettX (Purple) vs ScarlettEdge Fork (Green)](docs/status.svg)",
         "",
         "![Concept Destruction Bring-Up: Upstream (Purple) vs ScarlettEdge (Green)](docs/status_concept_destruction.svg)",
         "",
     ]
+
     shots = [shot for shot in SCREENSHOTS if (ROOT / shot[0]).exists()]
     if shots:
         rows += [
@@ -1599,18 +1382,22 @@ def render_markdown_status(
         rows.append("")
 
     rows += [
-        f"**Combined ABI Coverage:** `{overall_pct:.1f}%` (`{up_total}` upstream ScarlettX `{up_pct:.1f}%` + `{fork_total}` ScarlettEdge fork `+{fork_pct:.1f}%`) · "
-        f"**Concept Destruction:** `{cd_pct:.1f}%` (`{cd_up}` upstream + `{cd_fork}` fork) · "
-        f"**Exports:** `{total_exports}` (`269` upstream + `{max(0, total_exports - 269)}` fork) · "
+        f"**Retail ABI & COM Surface:** `{overall_pct:.1f}%` (`{total_impl}` of `{total_target}` tracked retail surfaces: `{up_total}` upstream + `{fork_total}` fork) · "
+        f"**Retail Exports:** `{breakdown.retail_exports}` · "
+        f"**Wired COM Slots:** `{breakdown.com_vtable_slots}` · "
+        f"**Synthetic Test Exports:** `{breakdown.synthetic_exports}` · "
+        f"**Concept Destruction:** `{cd_pct:.1f}%` · "
         f"**Tests:** {tests_md}",
         "",
-        "| Subsystem | Category | Progress | Origin Split | Details |",
+        "| Subsystem | Category | Retail Progress | Origin Split | Empirical Details |",
         "| :--- | :--- | :---: | :---: | :--- |",
     ]
     for s in sorted_subs:
         up = min(s.implemented, s.upstream_implemented or 0)
         fk = s.implemented - up
-        if fk == 0:
+        if s.implemented == 0:
+            split = "`0 retail`"
+        elif fk == 0:
             split = f"`{up} upstream`"
         elif up == 0:
             split = f"`{fk} ScarlettEdge`"
@@ -1619,15 +1406,25 @@ def render_markdown_status(
         rows.append(
             f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` (`{round(s.pct)}%`) | {split} | {s.notes} |"
         )
+
+    if aaa_subsystems:
+        rows += [
+            "",
+            "---",
+            "",
+            "### Post-Audit Multi-Wave Roadmap ([docs/AUDIT_BASELINE.md](docs/AUDIT_BASELINE.md))",
+            "",
+            "![ScarlettEdge Multi-Wave Roadmap](docs/status_aaa_roadmap.svg)",
+            "",
+            "| Wave | Category | Progress | Details |",
+            "| :--- | :--- | :---: | :--- |",
+        ]
+        for s in aaa_subsystems:
+            rows.append(f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` | {s.notes} |")
+
     rows.append("")
     rows.append(
-        f"> **100% ABI Surface Coverage:** All {len(subsystems)} subsystems ({total_impl}/{total_target} functions) have verified implementations across graphics, compute, "
-        "audio, networking, storage, kernel, and services. Passing synthetic tests do not imply commercial retail title execution."
-    )
-    rows.append("")
-    rows.append(
-        "_Regenerate with `python tools/generate_status.py --build-dir <build tree>` after adding new HLE APIs or subsystems; "
-        "the test numbers are read from that tree's last `ctest` run._"
+        "_Regenerate with `py tools/generate_status.py --build-dir <build tree>` after modifying retail ABI exports, COM vtables, or CTest suites._"
     )
     rows.append("<!-- SCARLETTX_STATUS_END -->")
     return "\n".join(rows)
@@ -1643,7 +1440,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    subsystems, total_exports, test_count = collect_metrics()
+    subsystems, breakdown, test_count = collect_metrics()
     cd_subsystems = collect_concept_destruction_metrics()
     test_results = read_ctest_results(args.build_dir)
     tests_text = tests_label(test_count, test_results)
@@ -1661,16 +1458,21 @@ def main() -> None:
     main_badges = [
         ("upstream ScarlettX", f"{up_impl}/{total_target} ({up_pct:.1f}%)", BADGE_UPSTREAM, True),
         ("ScarlettEdge fork", f"+{fork_impl} (+{fork_pct:.1f}%)", BADGE_FN, True),
-        ("exports", str(total_exports), BADGE_EXPORTS, False),
+        ("retail exports", str(breakdown.retail_exports), BADGE_EXPORTS, False),
+        ("COM slots", str(breakdown.com_vtable_slots), BADGE_TARGET, False),
+        ("synthetic test exports", str(breakdown.synthetic_exports), WARN, True),
         ("tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
     ]
     svg = render_svg(
         subsystems,
         badges=main_badges,
-        heading_prefix="ABI Coverage (Upstream Purple + Fork Green)",
-        callout_lead="Attribution:",
-        callout_line1=f"Purple = original Freminet/ScarlettX ({up_impl}/{total_target}, {up_pct:.1f}%); Green = ScarlettEdge additions (+{fork_impl}, +{fork_pct:.1f}%).",
-        callout_line2=f"Combined 100% clean-room ABI coverage across all 19 tracked subsystems ({tests_text} CTest suites).",
+        heading_prefix="Retail Xbox ABI & COM Coverage",
+        callout_lead="Empirical baseline:",
+        callout_line1=(
+            f"Retail Xbox DLL exports ({breakdown.retail_exports}) + wired COM vtable slots ({breakdown.com_vtable_slots}) "
+            f"reported separately from synthetic test exports ({breakdown.synthetic_exports})."
+        ),
+        callout_line2=f"Zero target self-clamping ({total_impl}/{total_target} retail surfaces; {tests_text} CTest suites).",
     )
 
     cd_impl = sum(s.implemented for s in cd_subsystems)
@@ -1699,18 +1501,17 @@ def main() -> None:
     opt_target = sum(s.target for s in opt_subsystems)
     opt_pct = (opt_impl / opt_target * 100.0) if opt_target else 0.0
     opt_badges = [
-        ("fidelity", f"{opt_pct:.1f}%", BADGE_FN, True),
-        ("frame pacing", "0-tear VSync", BADGE_EXPORTS, False),
-        ("textures", "0-frame lag", BADGE_TESTS, False),
-        ("target", "Commercial AAA Execution", BADGE_TARGET, False),
+        ("wave 1 hygiene", f"{opt_pct:.1f}% ({opt_impl}/{opt_target})", BADGE_FN, True),
+        ("ninja -n", "no work to do", BADGE_EXPORTS, False),
+        ("tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
     ]
     opt_svg = render_svg(
         opt_subsystems,
         badges=opt_badges,
-        heading_prefix="ScarlettEdge Runtime Optimization & Fidelity",
-        callout_lead="Optimization status:",
-        callout_line1=f"{opt_pct:.1f}% commercial engine readiness achieved across 11 optimization frontiers ({opt_impl}/{opt_target} milestones).",
-        callout_line2="FIPS-197 AES-XTS/SHA-256 CNG crypto, VirtualAlloc2 aliasing, 128-slot D3D12.2/DXR vtables, RDNA2 graphics & WinHTTP active.",
+        heading_prefix="Wave 1: Build, VEH, CTest & Metrics Hygiene",
+        callout_lead="Wave 1 complete:",
+        callout_line1="Zero-dirty Ninja incremental builds, PCH, async-safe VEH/Ctrl+C, isolated CTests & honest retail metrics.",
+        callout_line2="See docs/AUDIT_BASELINE.md Section 6.1.",
     )
 
     aaa_subsystems = collect_aaa_roadmap_metrics()
@@ -1718,18 +1519,17 @@ def main() -> None:
     aaa_target = sum(s.target for s in aaa_subsystems)
     aaa_pct = (aaa_impl / aaa_target * 100.0) if aaa_target else 0.0
     aaa_badges = [
-        ("phase 2 AAA", f"{aaa_pct:.1f}% ({aaa_impl}/{aaa_target})", LV3 if aaa_pct >= 80.0 else LV1, aaa_pct >= 80.0),
-        ("stage", "Architecture Complete", BADGE_EXPORTS, False),
+        ("waves 1-3", f"{aaa_pct:.1f}% ({aaa_impl}/{aaa_target})", LV1, False),
         ("CI tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
-        ("target", "Unmodified Retail AAA Titles", BADGE_TARGET, False),
+        ("baseline", "docs/AUDIT_BASELINE.md", BADGE_EXPORTS, False),
     ]
     aaa_svg = render_svg(
         aaa_subsystems,
         badges=aaa_badges,
-        heading_prefix="Phase 2: Retail AAA Execution Roadmap",
-        callout_lead="Scope note:",
-        callout_line1=f"All {aaa_impl}/{aaa_target} ({aaa_pct:.1f}%) clean-room silicon, Vulkan KHR RT, GPU GDeflate, MSAA/DCC/HTILE & D3D12.2 milestones are active.",
-        callout_line2="Passing synthetic & UE5/Open-World vertical-slice suites do not guarantee compatibility with untested commercial retail games.",
+        heading_prefix="Post-Audit Multi-Wave Roadmap",
+        callout_lead="Roadmap note:",
+        callout_line1="Wave 1 hygiene is complete; Waves 2 and 3 target Multi-DLL Guest Hooking, zero-staging XVC streaming, and d3d12_xs heap aliasing.",
+        callout_line2="Passing synthetic tests do not imply commercial retail title compatibility.",
     )
 
     p3_subsystems = collect_phase3_metrics()
@@ -1737,18 +1537,16 @@ def main() -> None:
     p3_target = sum(s.target for s in p3_subsystems)
     p3_pct = (p3_impl / p3_target * 100.0) if p3_target else 0.0
     p3_badges = [
-        ("phase 3", f"{p3_pct:.1f}% ({p3_impl}/{p3_target})", LV3 if p3_pct >= 80.0 else LV1, p3_pct >= 80.0),
-        ("GDK silicon", "2510.5.6322 + DXR/MeshShader", BADGE_EXPORTS, False),
+        ("empirical tracks", f"{p3_pct:.1f}% ({p3_impl}/{p3_target})", LV2, True),
         ("CI tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
-        ("next wave", "Commercial Retail Bring-Up", BADGE_TARGET, False),
     ]
     p3_svg = render_svg(
         p3_subsystems,
         badges=p3_badges,
-        heading_prefix="Phase 3: Unification, Diagnostics & GDK 2510",
-        callout_lead="Phase 3 complete:",
-        callout_line1=f"All {p3_impl}/{p3_target} ({p3_pct:.1f}%) unification, flight-recorder, .msixvc/.cik & GDK 2510.5.6322 milestones verified on RTX hardware.",
-        callout_line2="Ready for per-title commercial retail testing with live flight-recorder telemetry, VEH crash dumps & hang watchdog.",
+        heading_prefix="Empirical Subsystem Verification",
+        callout_lead="Audit baseline:",
+        callout_line1=f"{p3_impl}/{p3_target} ({p3_pct:.1f}%) core tracks verified; remaining gaps scheduled in Waves 2 and 3.",
+        callout_line2="Backed by FlightRecorder triage & deterministic CTest gates.",
     )
 
     p4_subsystems = collect_phase4_metrics()
@@ -1756,23 +1554,22 @@ def main() -> None:
     p4_target = sum(s.target for s in p4_subsystems)
     p4_pct = (p4_impl / p4_target * 100.0) if p4_target else 0.0
     p4_badges = [
-        ("phase 4", f"{p4_pct:.1f}% ({p4_impl}/{p4_target})", LV3 if p4_pct >= 80.0 else LV1, p4_pct >= 80.0),
-        ("clean-room CI", "Automated Gate", BADGE_EXPORTS, False),
+        ("governance & bring-up", f"{p4_pct:.1f}% ({p4_impl}/{p4_target})", LV3 if p4_pct >= 80.0 else LV1, p4_pct >= 80.0),
+        ("clean-room CI", "UTF-16 + Binary Gate", BADGE_EXPORTS, False),
         ("CI tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
-        ("focus", "ATG & Retail Wave 1", BADGE_TARGET, False),
     ]
     p4_svg = render_svg(
         p4_subsystems,
         badges=p4_badges,
-        heading_prefix="Phase 4: Clean-Room Governance & Retail Bring-Up",
-        callout_lead="Phase 4 active:",
-        callout_line1=f"{p4_impl}/{p4_target} ({p4_pct:.1f}%) complete: Clean-room CI gate, scarlettx triage CLI & COMPATIBILITY.md are live.",
-        callout_line2="Next: Multi-sample GDK 2510 ATG validation on RTX 5070 Ti & Wave 1 commercial retail bring-up.",
+        heading_prefix="Clean-Room Governance & Retail Bring-Up",
+        callout_lead="Clean-room gate:",
+        callout_line1=f"{p4_impl}/{p4_target} ({p4_pct:.1f}%): UTF-16LE/case-insensitive check_cleanroom.py, FlightRecorder triage & real_title_com PresentX loop live.",
+        callout_line2="Commercial retail bring-up proceeds with user-supplied legal dumps.",
     )
 
     html_doc = render_html(
         subsystems,
-        total_exports,
+        breakdown,
         tests_text,
         tests_ok,
         cd_subsystems=cd_subsystems,
@@ -1801,7 +1598,7 @@ def main() -> None:
     md_block = render_markdown_status(
         subsystems,
         cd_subsystems,
-        total_exports,
+        breakdown,
         tests_markdown(test_count, test_results),
         opt_subsystems=opt_subsystems,
         aaa_subsystems=aaa_subsystems,
@@ -1826,9 +1623,9 @@ def main() -> None:
 
     readme_path.write_text(new_readme, encoding="utf-8")
     print(
-        f"[generate_status] Wrote {out_svg.relative_to(ROOT)}, {out_cd_svg.relative_to(ROOT)}, "
-        f"{out_opt_svg.relative_to(ROOT)}, {out_aaa_svg.relative_to(ROOT)}, {out_p3_svg.relative_to(ROOT)}, "
-        f"{out_html.relative_to(ROOT)}, and updated README.md (exports={total_exports}, tests: {tests_text})"
+        f"[generate_status] Wrote status SVGs, docs/status.html, and README.md "
+        f"(retail_exports={breakdown.retail_exports}, com_slots={breakdown.com_vtable_slots}, "
+        f"synthetic_exports={breakdown.synthetic_exports}, tests: {tests_text})"
     )
 
 

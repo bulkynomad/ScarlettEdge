@@ -10,13 +10,12 @@
 #include <iostream>
 
 int main() {
+    sx_test::ScopedTempDir sandbox("test_real_title_com_e2e");
     const std::filesystem::path bin_dir = SCARLETTX_BINARY_DIR;
     const std::filesystem::path pkg_dir = bin_dir / "packages" / "real_title_com";
-    const auto save_root = bin_dir / "test_real_title_com_saves_tmp";
-    const auto dlc_root = bin_dir / "test_real_title_com_dlc_tmp";
+    const auto save_root = sandbox.path() / "saves";
+    const auto dlc_root = sandbox.path() / "dlc";
     std::error_code ec;
-    std::filesystem::remove_all(save_root, ec);
-    std::filesystem::remove_all(dlc_root, ec);
     std::filesystem::create_directories(dlc_root / "expansion_pack_01", ec);
 #if defined(_WIN32)
     _putenv_s("SCARLETTX_SAVE_ROOT", save_root.string().c_str());

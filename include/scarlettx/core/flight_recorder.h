@@ -162,6 +162,9 @@ public:
     // then executes as a single relaxed atomic load).
     static bool IsEnabled() noexcept;
 
+    // Pure lock-free / allocation-free check safe inside VEH / signal contexts.
+    static bool IsEnabledNoProbe() noexcept;
+
     void Enable(const FlightRecorderOptions& opts);
     void Disable() noexcept;
     void ResetSession() noexcept;
@@ -221,6 +224,7 @@ public:
     // Part 2: Crash handler (VEH / SEH) + x64 RVA stack-walk dumper
     // -----------------------------------------------------------------------
     static FlightResolvedAddress ResolveCodeAddress(uint64_t va) noexcept;
+    static FlightResolvedAddress ResolveCodeAddressNoLoaderLock(uint64_t va) noexcept;
     static std::string FormatResolvedAddress(const FlightResolvedAddress& addr);
 
     // Captures a full post-mortem JSON + text crash dump from Win32 EXCEPTION_POINTERS*.
@@ -287,6 +291,13 @@ private:
     std::atomic<bool> dred_applied_{false};
     std::atomic<bool> shader_dump_flag_{false};
 
+    // Cached at startup/Enable so VEH/hang dumpers never lock mutexes or PEB Loader Lock.
+    uint64_t host_exe_base_ = 0;
+    char host_exe_name_[64] = "host.exe";
+    mutable std::atomic_flag output_dir_lock_ = ATOMIC_FLAG_INIT;
+    char output_dir_utf8_[512] = "flight_logs";
+    wchar_t output_dir_wide_[260] = L"flight_logs";
+
     int64_t start_qpc_ = 0;
 
     // Lock-free MPMC ring buffer
@@ -329,15 +340,16 @@ private:
     std::atomic<uint64_t> frame_time_count_{0};
     std::atomic<uint64_t> frame_stutter_count_{0};
 
-    // Crash/artifact counters & deduplication
+    // Crash/artifact counters & deduplication (crash paths are lock-free POD slots)
     std::atomic<uint32_t> crash_seq_{0};
     std::atomic<uint32_t> hang_seq_{0};
     std::atomic<uint32_t> dred_seq_{0};
     std::atomic<uint32_t> shader_seq_{0};
     std::atomic<uint64_t> last_crash_sig_{0};
+    std::atomic<uint32_t> crash_artifact_count_{0};
+    char crash_artifact_paths_[kMaxCrashReports][512] = {};
 
     mutable std::mutex artifacts_mu_;
-    std::vector<std::string> crash_artifacts_;
     std::vector<std::string> hang_artifacts_;
     std::vector<std::string> dred_artifacts_;
     std::vector<std::string> shader_artifacts_;

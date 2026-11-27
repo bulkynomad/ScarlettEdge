@@ -1,4 +1,5 @@
 #include "scarlettx/loader/package_vfs.h"
+#include "scarlettx/loader/xvd_container.h"
 
 #include <algorithm>
 #include <cctype>
@@ -69,6 +70,9 @@ Status ResolvePathUnlocked(const std::unordered_map<std::string, std::string>& m
 }
 
 }  // namespace
+
+PackageVfs::PackageVfs() = default;
+PackageVfs::~PackageVfs() = default;
 
 PackageVfs& PackageVfs::Global() {
     static PackageVfs instance;

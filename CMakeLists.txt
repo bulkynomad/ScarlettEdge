@@ -37,9 +37,7 @@ add_library(scarlettx_core SHARED
     src/loader/stub_thunk.cpp
     src/loader/package_vfs.cpp
     src/loader/xvd_container.cpp
-    src/kernel/xmemory.cpp
     src/kernel/xruntime.cpp
-    src/kernel/xstorage.cpp
     src/gpu/d3d12_backend.cpp
     src/gpu/rt_bvh.cpp
     src/gpu/shader_ir.cpp
@@ -64,20 +62,24 @@ if(WIN32)
         SCARLETTX_PLATFORM_WINDOWS=1
     )
     if(MSVC)
-        target_link_libraries(scarlettx_core PUBLIC
-            d3d12
-            dxgi
-            d3dcompiler
-            ole32
-            uuid
+        target_link_libraries(scarlettx_core
+            PRIVATE
+                d3d12
+                dxgi
+                d3dcompiler
+            PUBLIC
+                ole32
+                uuid
         )
     else()
-        target_link_libraries(scarlettx_core PUBLIC
-            d3d12
-            dxgi
-            d3dcompiler_47
-            ole32
-            uuid
+        target_link_libraries(scarlettx_core
+            PRIVATE
+                d3d12
+                dxgi
+                d3dcompiler_47
+            PUBLIC
+                ole32
+                uuid
         )
         # Also the thread runtime (libwinpthread): a shim that needs a DLL from
         # the toolchain only loads while the toolchain is on PATH.
@@ -85,12 +87,30 @@ if(WIN32)
     endif()
 endif()
 
+target_precompile_headers(scarlettx_core PRIVATE
+    $<$<AND:$<BOOL:${WIN32}>,$<COMPILE_LANGUAGE:CXX>>:<windows.h>>
+    $<$<AND:$<BOOL:${WIN32}>,$<COMPILE_LANGUAGE:CXX>>:<d3d12.h>>
+    $<$<COMPILE_LANGUAGE:CXX>:<algorithm>>
+    $<$<COMPILE_LANGUAGE:CXX>:<array>>
+    $<$<COMPILE_LANGUAGE:CXX>:<atomic>>
+    $<$<COMPILE_LANGUAGE:CXX>:<cstdint>>
+    $<$<COMPILE_LANGUAGE:CXX>:<cstring>>
+    $<$<COMPILE_LANGUAGE:CXX>:<filesystem>>
+    $<$<COMPILE_LANGUAGE:CXX>:<fstream>>
+    $<$<COMPILE_LANGUAGE:CXX>:<iostream>>
+    $<$<COMPILE_LANGUAGE:CXX>:<memory>>
+    $<$<COMPILE_LANGUAGE:CXX>:<mutex>>
+    $<$<COMPILE_LANGUAGE:CXX>:<string>>
+    $<$<COMPILE_LANGUAGE:CXX>:<unordered_map>>
+    $<$<COMPILE_LANGUAGE:CXX>:<vector>>
+)
+
 # ---------------------------------------------------------------------------
 # Scarlett HLE System DLL Shims
 # ---------------------------------------------------------------------------
 add_library(d3d12_xs SHARED src/shims/d3d12_xs_shim.cpp src/shims/d3d12_xs_exports.cpp)
 set_target_properties(d3d12_xs PROPERTIES PREFIX "" OUTPUT_NAME "d3d12_xs")
-target_link_libraries(d3d12_xs PRIVATE scarlettx_core $<$<BOOL:${WIN32}>:user32>)
+target_link_libraries(d3d12_xs PRIVATE scarlettx_core $<$<BOOL:${WIN32}>:dxgi> $<$<BOOL:${WIN32}>:user32>)
 target_compile_definitions(d3d12_xs PRIVATE SCARLETTX_BUILDING_D3D12_XS=1)
 
 add_library(xg_xs SHARED src/shims/xg_xs_shim.cpp)
@@ -122,7 +142,12 @@ target_link_libraries(xcrdapi PRIVATE scarlettx_core xbox_codecs)
 
 add_library(dstorage SHARED src/shims/dstorage_shim.cpp)
 set_target_properties(dstorage PROPERTIES PREFIX "" OUTPUT_NAME "dstorage")
-target_link_libraries(dstorage PRIVATE scarlettx_core xbox_codecs)
+target_link_libraries(dstorage PRIVATE
+    scarlettx_core
+    xbox_codecs
+    $<$<BOOL:${WIN32}>:d3d12>
+    $<$<BOOL:${WIN32}>:$<IF:$<CXX_COMPILER_ID:MSVC>,d3dcompiler,d3dcompiler_47>>
+)
 target_compile_definitions(dstorage PRIVATE SCARLETTX_BUILDING_DSTORAGE=1)
 
 add_library(dstorage_xs SHARED src/shims/dstorage_xs_forward.cpp src/shims/dstorage_xs.def)
@@ -269,13 +294,18 @@ if(WIN32)
         set_target_properties(${target_name} PROPERTIES
             PREFIX ""
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dummy_import_dlls"
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dummy_import_dlls"
             ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/dummy_import_libs"
         )
-        # Remove the dummy runtime DLL so it cannot be loaded by Windows LoadLibrary;
-        # only its import library (.lib/.dll.a) is used at link time.
-        add_custom_command(TARGET ${target_name} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E remove -f "$<TARGET_FILE:${target_name}>"
-        )
+        # Keep the dummy runtime DLL isolated outside CMAKE_BINARY_DIR so Windows
+        # LoadLibrary cannot resolve it while Ninja's build outputs stay clean.
+        foreach(_sx_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+            set_target_properties(${target_name} PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY_${_sx_cfg} "${CMAKE_BINARY_DIR}/dummy_import_dlls"
+                LIBRARY_OUTPUT_DIRECTORY_${_sx_cfg} "${CMAKE_BINARY_DIR}/dummy_import_dlls"
+                ARCHIVE_OUTPUT_DIRECTORY_${_sx_cfg} "${CMAKE_BINARY_DIR}/dummy_import_libs"
+            )
+        endforeach()
     endfunction()
 
     scarlettx_add_dummy_import_lib(xordinal_hle
@@ -379,7 +409,6 @@ target_link_libraries(real_title_com PRIVATE
     xcrdapi
     xaudio2_9
     GameInput
-    kernelx
     libHttpClient_GDK
     $<$<BOOL:${WIN32}>:ole32>
 )
@@ -417,6 +446,7 @@ if(WIN32)
     add_dependencies(test_inproc_loader iat_probe xgameruntime xvc_crypto pixevt_stub)
     set_tests_properties(test_inproc_loader PROPERTIES RESOURCE_LOCK "virtual_drive_g")
     scarlettx_add_test(test_guest_loader tests/test_guest_loader.cpp)
+    set_tests_properties(test_guest_loader PROPERTIES RESOURCE_LOCK "virtual_drive_g")
 endif()
 
 scarlettx_add_test(test_kernel_hle tests/test_kernel_hle.cpp)
@@ -442,7 +472,11 @@ scarlettx_add_test(test_d3d12_frame_pacing tests/test_d3d12_frame_pacing.cpp)
 target_link_libraries(test_d3d12_frame_pacing PRIVATE d3d12_xs)
 set_tests_properties(test_d3d12_frame_pacing PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
 scarlettx_add_test(test_d3d12_xs_abi tests/test_d3d12_xs_abi.cpp)
-target_link_libraries(test_d3d12_xs_abi PRIVATE d3d12_xs XboxBvhBuilder)
+target_link_libraries(test_d3d12_xs_abi PRIVATE
+    d3d12_xs
+    XboxBvhBuilder
+    $<$<BOOL:${WIN32}>:$<IF:$<CXX_COMPILER_ID:MSVC>,d3dcompiler,d3dcompiler_47>>
+)
 scarlettx_add_test(test_rt_pipeline tests/test_rt_pipeline.cpp)
 scarlettx_add_test(test_dstorage_xvd tests/test_dstorage_xvd.cpp)
 target_link_libraries(test_dstorage_xvd PRIVATE dstorage)
@@ -510,7 +544,10 @@ add_test(
 set_tests_properties(test_boot_hello_scarlett PROPERTIES RESOURCE_LOCK "virtual_drive_g")
 add_test(
     NAME test_boot_rt_showcase
-    COMMAND $<TARGET_FILE:scarlettx> boot "${CMAKE_BINARY_DIR}/packages/rt_showcase" --headless --warp --frames 2 --rt-dump "${CMAKE_BINARY_DIR}/rt_showcase_frame.ppm"
+    COMMAND ${CMAKE_COMMAND}
+        -DSCARLETTX_EXE=$<TARGET_FILE:scarlettx>
+        -DPACKAGE_DIR=${CMAKE_BINARY_DIR}/packages/rt_showcase
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_boot_rt_showcase.cmake"
 )
 set_tests_properties(test_boot_rt_showcase PROPERTIES RESOURCE_LOCK "virtual_drive_g")
 
@@ -556,7 +593,6 @@ add_dependencies(test_real_title_com_e2e
     dstorage_xs
     xaudio2_9
     GameInput
-    kernelx
     libHttpClient_GDK
     xsapi
 )

@@ -25,6 +25,8 @@
 #include "scarlettx/gpu/d3d12_backend.h"
 #include "scarlettx/gpu/rt_bvh.h"
 #include "scarlettx/gpu/shader_ir.h"
+#include "scarlettx/loader/pe_mapper.h"
+#include "scarlettx/runtime/emulator.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -4368,6 +4370,11 @@ void EnsurePresentSwapChain(XboxD3D12CommandQueueProxy* obj, UINT w, UINT h, DXG
     if (!obj || obj->present_init_attempted || !obj->pc_device || !obj->pc_queue) return;
     obj->present_init_attempted = true;
 
+    const char* headless_env = std::getenv("SCARLETTX_HEADLESS");
+    if (headless_env && headless_env[0] != '\0' && headless_env[0] != '0') {
+        return;
+    }
+
     StartPresentWindow(obj);
     if (!obj->present_hwnd) return;
 
@@ -4423,6 +4430,10 @@ void EnsurePresentSwapChain(XboxD3D12CommandQueueProxy* obj, UINT w, UINT h, DXG
 
 intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
     void* self, uintptr_t planeCount, uintptr_t pPlaneParams, uintptr_t pPresentParams) {
+    if (scarlettx::IsAsyncShutdownRequested()) {
+        scarlettx::TryAbortActiveInProcessGuest(0);
+        return 0;
+    }
     static std::atomic<uint64_t> present_count{0};
     const uint64_t n = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     g_frame_epoch.fetch_add(1, std::memory_order_relaxed);

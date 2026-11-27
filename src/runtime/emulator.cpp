@@ -27,6 +27,8 @@ namespace {
 constexpr uint64_t kStreamChunkBytes = 4ull * 1024ull * 1024ull;  // 4 MiB streaming buffer
 
 std::atomic<uint64_t> g_temp_seq{0};
+std::atomic<bool> g_async_shutdown_requested{false};
+std::atomic<uint32_t> g_async_shutdown_ctrl_type{0};
 
 uint64_t CurrentProcessIdPortable() {
 #if defined(_WIN32)
@@ -158,6 +160,9 @@ Status StreamXvdEmbeddedToFile(const XvdContainer& xvd,
     uint64_t remaining = entry.size_bytes;
     uint64_t cur_offset = 0;
     while (remaining > 0) {
+        if (IsAsyncShutdownRequested()) {
+            return Status::Error(StatusCode::DeviceError, "Interrupted by console shutdown signal");
+        }
         const uint64_t to_read = std::min<uint64_t>(remaining, kStreamChunkBytes);
         Status st = xvd.ReadEmbeddedFile(entry.relative_path, cur_offset, to_read, chunk);
         if (!st.ok()) {
@@ -274,6 +279,24 @@ std::string FindGameConfigInDir(const std::string& package_dir) {
 }
 
 }  // namespace
+
+void RequestAsyncShutdown(uint32_t ctrl_type) noexcept {
+    g_async_shutdown_ctrl_type.store(ctrl_type, std::memory_order_relaxed);
+    g_async_shutdown_requested.store(true, std::memory_order_release);
+}
+
+bool IsAsyncShutdownRequested() noexcept {
+    return g_async_shutdown_requested.load(std::memory_order_acquire);
+}
+
+uint32_t GetAsyncShutdownCtrlType() noexcept {
+    return g_async_shutdown_ctrl_type.load(std::memory_order_relaxed);
+}
+
+void ClearAsyncShutdownRequest() noexcept {
+    g_async_shutdown_requested.store(false, std::memory_order_release);
+    g_async_shutdown_ctrl_type.store(0, std::memory_order_relaxed);
+}
 
 Emulator::Emulator(EmulatorConfig config) : config_(std::move(config)) {}
 
@@ -474,6 +497,13 @@ Status Emulator::BootPackage(const std::string& package_input) {
         void Flush() {
             if (!active) return;
             active = false;
+            if (IsAsyncShutdownRequested()) {
+                FlightRecorder::Instance().RecordEvent(
+                    FlightEventCategory::Lifecycle,
+                    "cli",
+                    "Console interrupt -> flushing flight summary",
+                    static_cast<int32_t>(GetAsyncShutdownCtrlType()));
+            }
             FlightRecorder::Instance().BeatProgress("shutdown");
             std::string json_out;
             if (FlightRecorder::Instance().WriteSummaryReport(&json_out, nullptr)) {
@@ -620,6 +650,9 @@ Status Emulator::BootPackage(const std::string& package_input) {
         FlightRecorder::Instance().BeatProgress("guest_exited");
         // Flush summary BEFORE MappedPeImage::Unmap() runs so guest caller RVAs resolve cleanly!
         flight_guard.Flush();
+        if (IsAsyncShutdownRequested()) {
+            return Status::Error(StatusCode::DeviceError, "Guest interrupted by console shutdown signal");
+        }
         if (!call_st.ok()) {
             return call_st;
         }
@@ -672,9 +705,36 @@ Status Emulator::BootPackage(const std::string& package_input) {
     } else if (config_.max_frames > 0) {
         timeout_ms = 60000;
     }
-    const bool timed_out = WaitForSingleObject(pi.hProcess, timeout_ms) == WAIT_TIMEOUT;
-    if (timed_out) {
-        TerminateProcess(pi.hProcess, 1);
+    bool timed_out = false;
+    bool interrupted = false;
+    DWORD elapsed_wait_ms = 0;
+    for (;;) {
+        if (IsAsyncShutdownRequested()) {
+            interrupted = true;
+            break;
+        }
+        DWORD slice_ms = 50;
+        if (timeout_ms != INFINITE) {
+            if (elapsed_wait_ms >= timeout_ms) {
+                timed_out = true;
+                break;
+            }
+            const DWORD rem_ms = timeout_ms - elapsed_wait_ms;
+            if (rem_ms < slice_ms) slice_ms = rem_ms;
+        }
+        const DWORD wait_rc = WaitForSingleObject(pi.hProcess, slice_ms);
+        if (wait_rc == WAIT_OBJECT_0) {
+            break;
+        }
+        if (wait_rc != WAIT_TIMEOUT) {
+            break;
+        }
+        if (timeout_ms != INFINITE) {
+            elapsed_wait_ms += slice_ms;
+        }
+    }
+    if (timed_out || interrupted) {
+        TerminateProcess(pi.hProcess, interrupted ? 130u : 1u);
         WaitForSingleObject(pi.hProcess, 5000);
     }
     DWORD exit_code = 1;
@@ -682,6 +742,9 @@ Status Emulator::BootPackage(const std::string& package_input) {
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
+    if (interrupted) {
+        return Status::Error(StatusCode::DeviceError, "Guest process interrupted by console shutdown signal");
+    }
     if (timed_out) {
         return Status::Error(StatusCode::DeviceError, "Guest process timed out and was stopped");
     }

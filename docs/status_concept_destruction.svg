@@ -14,11 +14,9 @@
   </style>
   <rect width="1040" height="590" fill="#0d1117"/>
 
-  <!-- 1. Heading -->
   <text class="h2" x="36" y="56">Concept Destruction (Upstream Purple + Fork Green): 100.0%</text>
   <line x1="36" y1="68" x2="1004" y2="68" stroke="#3d444d" stroke-width="1"/>
 
-  <!-- 2. Badge row -->
   <clipPath id="bclip0"><rect x="36" y="86" width="226" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip0)">
     <rect x="36" y="86" width="129" height="20" fill="#555555"/>
@@ -47,8 +45,6 @@
     <text class="badge-txt" x="753.0" y="100" text-anchor="middle">target</text>
     <text class="badge-txt" x="869.0" y="100" text-anchor="middle">Concept Destruction (Gen9)</text>
   </g>
-
-  <!-- 3. Contribution graph box -->
   <rect x="36" y="126" width="968" height="212" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
   <text class="g-label" x="247.0" y="160">PE64</text>
   <rect x="247.0" y="174.0" width="14" height="14" rx="3" fill="#a371f7"/>
@@ -110,8 +106,6 @@
   <rect x="730.0" y="305.0" width="11" height="11" rx="2" fill="#a371f7"/>
   <text class="legend-txt" x="718.0" y="315" text-anchor="end">Not yet</text>
   <rect x="670.5" y="305.5" width="10" height="10" rx="2" fill="#151b23" stroke="rgba(240,246,252,0.08)" stroke-width="1"/>
-
-  <!-- 4. Two-column subsystem list -->
   <rect x="40.0" y="367.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
   <rect x="45.5" y="367.0" width="5.5" height="11" rx="1" fill="#39d353"/>
   <text class="r-name" x="61.0" y="377">d3d12_xs CmdList &amp; Uploads</text>
@@ -155,8 +149,6 @@
   <text class="r-count" x="952.0" y="479" text-anchor="end">4 of 4</text>
   <text class="r-pct" x="1000.0" y="479" text-anchor="end">100%</text>
   <line x1="540.0" y1="494" x2="1000.0" y2="494" stroke="#21262d" stroke-width="1"/>
-
-  <!-- 5. Status callout -->
   <rect x="36" y="514" width="4" height="46" fill="#39d353"/>
   <g transform="translate(56,524)"><circle cx="8" cy="8" r="6.5" fill="none" stroke="#39d353" stroke-width="1.5"/><path d="M5.2 8.2 7.1 10.1 11 6.1" fill="none" stroke="#39d353" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
   <text class="callout-txt" x="82" y="533"><tspan class="callout-lead">Attribution:</tspan> Original ScarlettX achieved 42/46 (91.3%) real-title bring-up; ScarlettEdge completed the remaining +4 milestones.</text>

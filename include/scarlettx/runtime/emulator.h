@@ -1,14 +1,20 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include "scarlettx/core/config.h"
 #include "scarlettx/core/status.h"
 #include "scarlettx/loader/game_config.h"
-#include "scarlettx/loader/package_vfs.h"
 #include "scarlettx/loader/pe_loader.h"
 
 namespace scarlettx {
+
+// Async-signal-safe process-wide shutdown flag set by SetConsoleCtrlHandler.
+void RequestAsyncShutdown(uint32_t ctrl_type = 0) noexcept;
+bool IsAsyncShutdownRequested() noexcept;
+uint32_t GetAsyncShutdownCtrlType() noexcept;
+void ClearAsyncShutdownRequest() noexcept;
 
 struct PackageInspectionReport {
     GameConfig config;

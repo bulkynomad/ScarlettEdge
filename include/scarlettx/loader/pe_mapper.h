@@ -111,4 +111,7 @@ private:
 // (api-ms-win-core-*, api-ms-win-crt-*, ext-ms-win-*) to concrete host DLLs.
 std::string ResolveApiSetDll(const std::string& dll_name);
 
+// Aborts an active in-process guest call via longjmp if executing on the guest entry thread.
+void TryAbortActiveInProcessGuest(uint32_t exit_code) noexcept;
+
 }  // namespace scarlettx

@@ -54,16 +54,24 @@ const Guid kIidOther = {0x12345678, 0x1234, 0x5678, {1, 2, 3, 4, 5, 6, 7, 8}};
 
 // The title's IXAudio2VoiceCallback.
 struct VoiceCallback {
-    void* const* vtbl;
+    void* const* vtbl = nullptr;
     std::atomic<int> pass_start{0}, pass_end{0}, stream_end{0}, buffer_start{0}, buffer_end{0}, loop_end{0};
     std::atomic<void*> last_context{nullptr};
+    HANDLE wake = nullptr;
+
+    explicit VoiceCallback(void* const* v) : vtbl(v), wake(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
+    ~VoiceCallback() {
+        if (wake) CloseHandle(wake);
+    }
+    VoiceCallback(const VoiceCallback&) = delete;
+    VoiceCallback& operator=(const VoiceCallback&) = delete;
 };
-void WINAPI OnPassStart(VoiceCallback* c, uint32_t) { ++c->pass_start; }
-void WINAPI OnPassEnd(VoiceCallback* c) { ++c->pass_end; }
-void WINAPI OnStreamEnd(VoiceCallback* c) { ++c->stream_end; }
-void WINAPI OnBufferStart(VoiceCallback* c, void* ctx) { c->last_context = ctx; ++c->buffer_start; }
-void WINAPI OnBufferEnd(VoiceCallback* c, void* ctx) { c->last_context = ctx; ++c->buffer_end; }
-void WINAPI OnLoopEnd(VoiceCallback* c, void*) { ++c->loop_end; }
+void WINAPI OnPassStart(VoiceCallback* c, uint32_t) { ++c->pass_start; if (c->wake) SetEvent(c->wake); }
+void WINAPI OnPassEnd(VoiceCallback* c) { ++c->pass_end; if (c->wake) SetEvent(c->wake); }
+void WINAPI OnStreamEnd(VoiceCallback* c) { ++c->stream_end; if (c->wake) SetEvent(c->wake); }
+void WINAPI OnBufferStart(VoiceCallback* c, void* ctx) { c->last_context = ctx; ++c->buffer_start; if (c->wake) SetEvent(c->wake); }
+void WINAPI OnBufferEnd(VoiceCallback* c, void* ctx) { c->last_context = ctx; ++c->buffer_end; if (c->wake) SetEvent(c->wake); }
+void WINAPI OnLoopEnd(VoiceCallback* c, void*) { ++c->loop_end; if (c->wake) SetEvent(c->wake); }
 void WINAPI OnVoiceError(VoiceCallback*, void*, int32_t) {}
 void* const kVoiceCallbackVtbl[] = {
     reinterpret_cast<void*>(&OnPassStart), reinterpret_cast<void*>(&OnPassEnd),
@@ -74,11 +82,19 @@ void* const kVoiceCallbackVtbl[] = {
 
 // The title's IXAudio2EngineCallback.
 struct EngineCallback {
-    void* const* vtbl;
+    void* const* vtbl = nullptr;
     std::atomic<int> pass_start{0}, pass_end{0};
+    HANDLE wake = nullptr;
+
+    explicit EngineCallback(void* const* v) : vtbl(v), wake(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
+    ~EngineCallback() {
+        if (wake) CloseHandle(wake);
+    }
+    EngineCallback(const EngineCallback&) = delete;
+    EngineCallback& operator=(const EngineCallback&) = delete;
 };
-void WINAPI OnEnginePassStart(EngineCallback* c) { ++c->pass_start; }
-void WINAPI OnEnginePassEnd(EngineCallback* c) { ++c->pass_end; }
+void WINAPI OnEnginePassStart(EngineCallback* c) { ++c->pass_start; if (c->wake) SetEvent(c->wake); }
+void WINAPI OnEnginePassEnd(EngineCallback* c) { ++c->pass_end; if (c->wake) SetEvent(c->wake); }
 void WINAPI OnCriticalError(EngineCallback*, int32_t) {}
 void* const kEngineCallbackVtbl[] = {
     reinterpret_cast<void*>(&OnEnginePassStart), reinterpret_cast<void*>(&OnEnginePassEnd),
@@ -86,10 +102,14 @@ void* const kEngineCallbackVtbl[] = {
 };
 
 template <typename Pred>
-bool WaitFor(Pred pred, int timeout_ms = 5000) {
-    for (int waited = 0; waited < timeout_ms; waited += 5) {
-        if (pred()) return true;
-        Sleep(5);
+bool WaitForEvent(HANDLE wake, Pred pred, DWORD timeout_ms = 5000) {
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    while (!pred()) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) break;
+        if (!wake || WaitForSingleObject(wake, static_cast<DWORD>(deadline - now)) == WAIT_TIMEOUT) {
+            break;
+        }
     }
     return pred();
 }
@@ -222,7 +242,7 @@ int RunEngine(bool force_silent) {
     SX_CHECK(voice_cb.buffer_start == 0);  // not started yet
 
     SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(source, 19, 0u, 0u) == 0);
-    SX_CHECK(WaitFor([&] { return voice_cb.buffer_end == 1; }));
+    SX_CHECK(WaitForEvent(voice_cb.wake, [&] { return voice_cb.buffer_end == 1; }));
     SX_CHECK(voice_cb.buffer_start == 1);
     SX_CHECK(voice_cb.last_context.load() == buffer.context);
     SX_CHECK(voice_cb.stream_end == 0);
@@ -233,7 +253,7 @@ int RunEngine(bool force_silent) {
     buffer.flags = 0x40;  // XAUDIO2_END_OF_STREAM
     buffer.context = reinterpret_cast<void*>(uintptr_t{0x2222});
     SX_CHECK(VCall<int32_t, const Buffer*, const void*>(source, 21, &buffer, nullptr) == 0);
-    SX_CHECK(WaitFor([&] { return voice_cb.stream_end == 1; }));
+    SX_CHECK(WaitForEvent(voice_cb.wake, [&] { return voice_cb.stream_end == 1; }));
     SX_CHECK(voice_cb.buffer_start == 2 && voice_cb.buffer_end == 2);
     SX_CHECK(voice_cb.last_context.load() == buffer.context);
     SX_CHECK(voice_cb.pass_start > 0 && voice_cb.pass_end > 0);
@@ -241,15 +261,20 @@ int RunEngine(bool force_silent) {
     SX_CHECK(state.queued == 0);
     if (force_silent) SX_CHECK(state.samples_played == 0);  // counted per stream
 
-    SX_CHECK(WaitFor([&] { return engine_cb.pass_start > 0 && engine_cb.pass_end > 0; }));
+    SX_CHECK(WaitForEvent(engine_cb.wake, [&] { return engine_cb.pass_start > 0 && engine_cb.pass_end > 0; }));
     SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(source, 20, 0u, 0u) == 0);
 
-    // No callback may arrive once these return.
+    // No callback may arrive once DestroyVoice / UnregisterForCallbacks return.
+    // Observe two subsequent mixing passes via a separate EngineCallback event wait.
+    EngineCallback observer_cb{kEngineCallbackVtbl};
+    SX_CHECK(VCall<int32_t, void*>(engine, 3, &observer_cb) == 0);
     VCall<void>(source, 18);
     VCall<void, void*>(engine, 4, &engine_cb);
     const int voice_passes = voice_cb.pass_start;
     const int engine_passes = engine_cb.pass_start;
-    Sleep(50);
+    observer_cb.pass_end.store(0);
+    SX_CHECK(WaitForEvent(observer_cb.wake, [&] { return observer_cb.pass_end.load() >= 2; }));
+    VCall<void, void*>(engine, 4, &observer_cb);
     SX_CHECK(voice_cb.pass_start == voice_passes);
     SX_CHECK(engine_cb.pass_start == engine_passes);
 
@@ -307,7 +332,7 @@ int RunEngine(bool force_silent) {
         xbuf.context = reinterpret_cast<void*>(uintptr_t{0x5CA2});
         SX_CHECK(VCall<int32_t, const Buffer*, const void*>(xma_voice, 21, &xbuf, nullptr) == 0);
         SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(xma_voice, 19, 0u, 0u) == 0);
-        SX_CHECK(WaitFor([&] { return xma_cb.buffer_end == 1; }));
+        SX_CHECK(WaitForEvent(xma_cb.wake, [&] { return xma_cb.buffer_end == 1; }));
         SX_CHECK(xma_cb.last_context.load() == xbuf.context);
         VCall<void>(xma_voice, 18);
     }
@@ -342,7 +367,7 @@ int RunSilentQueue() {
     buffer.loop_count = 1;
     SX_CHECK(VCall<int32_t, const Buffer*, const void*>(source, 21, &buffer, nullptr) == 0);
     SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(source, 19, 0u, 0u) == 0);
-    SX_CHECK(WaitFor([&] { return cb.buffer_end == 1; }));
+    SX_CHECK(WaitForEvent(cb.wake, [&] { return cb.buffer_end == 1; }));
     SX_CHECK(cb.loop_end == 1);
     VCall<void, VoiceState*, uint32_t>(source, 25, &state, 0u);
     SX_CHECK(state.samples_played == 6000);
@@ -353,14 +378,14 @@ int RunSilentQueue() {
     buffer.audio_data = pcm.data();
     SX_CHECK(VCall<int32_t, const Buffer*, const void*>(source, 21, &buffer, nullptr) == 0);
     SX_CHECK(VCall<int32_t>(source, 23) == 0);
-    SX_CHECK(WaitFor([&] { return cb.stream_end == 1; }));
+    SX_CHECK(WaitForEvent(cb.wake, [&] { return cb.stream_end == 1; }));
     SX_CHECK(cb.buffer_end == 2);
 
     // Flush keeps the playing buffer of a started voice, and nothing once stopped.
     buffer.audio_bytes = static_cast<uint32_t>(pcm.size());
     SX_CHECK(VCall<int32_t, const Buffer*, const void*>(source, 21, &buffer, nullptr) == 0);
     SX_CHECK(VCall<int32_t, const Buffer*, const void*>(source, 21, &buffer, nullptr) == 0);
-    SX_CHECK(WaitFor([&] { return cb.buffer_start == 3; }));
+    SX_CHECK(WaitForEvent(cb.wake, [&] { return cb.buffer_start == 3; }));
     SX_CHECK(VCall<int32_t>(source, 22) == 0);
     VCall<void, VoiceState*, uint32_t>(source, 25, &state, 0u);
     SX_CHECK(state.queued == 1);

@@ -27,6 +27,8 @@
         }                                                                       \
     } while (0)
 
+#include "sx_check.h"
+
 int main() {
     uint64_t engine = 0;
     SX_CHECK_EQ(XAudio2CreateEngine(0, &engine), 0);
@@ -153,7 +155,8 @@ int main() {
     SX_CHECK(right_energy > 1.0f);
 
     // 4. Write deterministic WAV file
-    const auto wav_path = (std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_xaudio2_mix.wav").string();
+    sx_test::ScopedTempDir sandbox("test_xaudio2");
+    const auto wav_path = (sandbox.path() / "test_xaudio2_mix.wav").string();
     SX_CHECK_EQ(XAudio2WriteWavFile(wav_path.c_str(), 48000, 2, mixed.data(), kFrames), 0);
     SX_CHECK(std::filesystem::exists(wav_path));
     SX_CHECK_EQ(std::filesystem::file_size(wav_path), 44u + kFrames * 2u * sizeof(int16_t));

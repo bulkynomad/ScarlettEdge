@@ -42,6 +42,8 @@
         }                                                                       \
     } while (0)
 
+#include "sx_check.h"
+
 namespace {
 
 void OnSignal(uint64_t value, void* ctx) {
@@ -158,9 +160,8 @@ int TestQueueSubmission(uint64_t factory) {
 }  // namespace
 
 int main() {
-    const std::filesystem::path tmp_dir =
-        std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_dstorage_tmp";
-    std::filesystem::create_directories(tmp_dir);
+    sx_test::ScopedTempDir sandbox("test_dstorage_xvd");
+    const std::filesystem::path& tmp_dir = sandbox.path();
 
     // 1. Synthetic XVD parsing & encrypted rejection
     {

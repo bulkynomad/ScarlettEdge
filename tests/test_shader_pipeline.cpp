@@ -9,6 +9,8 @@
         }                                                                       \
     } while (0)
 
+#include "sx_check.h"
+
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -210,7 +212,8 @@ int main() {
     SX_CHECK(gfx_pso1 != 0 && gfx_pso2 != 0 && gfx_pso1 != gfx_pso2);
 
     // Render using the custom Graphics PSO and verify deterministic pixel hash
-    const std::string ppm_path = std::string(SCARLETTX_BINARY_DIR) + "/shader_pso_frame.ppm";
+    sx_test::ScopedTempDir sandbox("test_shader_pipeline");
+    const std::string ppm_path = (sandbox.path() / "shader_pso_frame.ppm").string();
     uint64_t hash1 = 0, hash2 = 0;
     SX_CHECK(D3D12XboxRenderWithPipelineState(dev, gfx_pso1, 128, 128, 3, ppm_path.c_str(), &hash1) == 0);
     SX_CHECK(D3D12XboxRenderWithPipelineState(dev, gfx_pso2, 128, 128, 3, nullptr, &hash2) == 0);
