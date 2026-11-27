@@ -837,10 +837,10 @@ def render_svg(
     callout_line1: str = "Xbox unified memory/KernelX, RDNA2 XS2 lifting, retail XVC/XVD crypto, native XMA2/GDeflate/Bink,",
     callout_line2: str = "hardware DXR/Vulkan, and live XSAPI/WinRT. Synthetic offline shims do not imply retail compatibility.",
 ) -> str:
-    W = 900
+    W = 1040
     PAD_X = 36
     PAD_Y = 30
-    INNER_W = W - 2 * PAD_X  # 828px
+    INNER_W = W - 2 * PAD_X  # 968px
 
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
@@ -874,15 +874,19 @@ def render_svg(
     raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
     if raw_graph_w > avail_graph_w:
         scale = avail_graph_w / raw_graph_w
-        CELL = max(7, int(math.floor(CELL * scale)))
+        CELL = max(8, int(math.floor(CELL * scale)))
         CELL_GAP = max(2, int(math.floor(CELL_GAP * scale)))
-        GROUP_GAP = max(6, int(math.floor(GROUP_GAP * scale)))
+        GROUP_GAP = max(8, int(math.floor(GROUP_GAP * scale)))
         groups = []
         for s in subsystems:
             cols = max(2, math.ceil(s.target / ROWS))
-            gw = cols * CELL + (cols - 1) * CELL_GAP
-            groups.append((s, cols, gw))
+            cells_w = cols * CELL + (cols - 1) * CELL_GAP
+            label_w = int(math.ceil(len(s.short_name) * 6.5)) + 6
+            groups.append((s, cols, max(cells_w, label_w)))
         raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
+        if raw_graph_w > avail_graph_w and len(groups) > 1:
+            GROUP_GAP = max(4, GROUP_GAP - int(math.ceil((raw_graph_w - avail_graph_w) / (len(groups) - 1))))
+            raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
     elif len(groups) > 1:
         # Give compact charts generous horizontal breathing room between group columns
         extra_per_gap = int((avail_graph_w - raw_graph_w) // (len(groups) - 1))
