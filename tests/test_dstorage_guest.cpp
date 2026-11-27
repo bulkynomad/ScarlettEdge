@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "scarlettx/gpu/xg_layout.h"
+
 #if defined(_WIN32)
 #include <windows.h>
 
@@ -314,6 +316,44 @@ int main() {
         SX_CHECK(WaitComplete(status, 0));
         SX_CHECK(VCall<int32_t>(status, kGetHResult, 0u) == 0);
         SX_CHECK(std::memcmp(z_dst.data(), expected_z.data(), expected_z.size()) == 0);
+    }
+
+    // Verify kOptSwizzle (XG_SWIZZLE_MODE_4KB_S = 5) direct swizzled texture streaming!
+    {
+        XG_TEXTURE2D_DESC td{};
+        td.Width = 32;
+        td.Height = 32;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = 28;  // RGBA8_UNORM
+        td.SampleDesc.Count = 1;
+        td.SwizzleMode = XG_SWIZZLE_MODE_4KB_S;
+        XG_RESOURCE_LAYOUT layout{};
+        scarlettx::gpu::xg::ComputeTexture2DLayout(td, &layout);
+        SX_CHECK(layout.SizeBytes == 4096u);
+
+        std::vector<uint8_t> linear_tex(32u * 32u * 4u);
+        for (size_t i = 0; i < linear_tex.size(); ++i) {
+            linear_tex[i] = static_cast<uint8_t>((i * 23u + 9u) & 0xFFu);
+        }
+        std::vector<uint8_t> swizzled_dst(static_cast<size_t>(layout.SizeBytes), 0);
+
+        Request r_swiz{};
+        r_swiz.options = kSourceMemory | (static_cast<uint64_t>(XG_SWIZZLE_MODE_4KB_S) << 5u);
+        r_swiz.destination = swizzled_dst.data();
+        r_swiz.destination_size = static_cast<uint32_t>(swizzled_dst.size());
+        r_swiz.reserved = (32u) | (32u << 16u);
+        r_swiz.source = linear_tex.data();
+        r_swiz.source_size = static_cast<uint32_t>(linear_tex.size());
+        VCall<void>(mem_queue, kEnqueueRequest, &r_swiz);
+        VCall<void>(mem_queue, kEnqueueStatus, status, 2u);
+        VCall<void>(mem_queue, kSubmit);
+        SX_CHECK(WaitComplete(status, 2));
+        SX_CHECK(VCall<int32_t>(status, kGetHResult, 2u) == 0);
+
+        std::vector<uint8_t> unswizzled(linear_tex.size(), 0);
+        SX_CHECK(scarlettx::gpu::xg::CopyFromSubresource(layout, swizzled_dst.data(), 0u, 0u, unswizzled.data(), 32u * 4u));
+        SX_CHECK(unswizzled == linear_tex);
     }
 
     SX_CHECK(VCall<uint32_t>(mem_queue, kRelease) == 0);

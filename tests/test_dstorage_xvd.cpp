@@ -11,8 +11,15 @@
 #include <vector>
 
 #include "scarlettx/io/dstorage_abi.h"
+#include "scarlettx/gpu/d3d12_backend.h"
+#include "scarlettx/gpu/xg_layout.h"
 #include "scarlettx/loader/package_vfs.h"
 #include "scarlettx/loader/xvd_container.h"
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <d3d12.h>
+#endif
 
 #define SX_CHECK(cond)                                                          \
     do {                                                                        \
@@ -426,6 +433,238 @@ int main() {
     SX_CHECK_EQ(err.FailureCount, 1u);
     SX_CHECK_EQ(err.FirstFailureHResult, invalid_arg);
     SX_CHECK_EQ(std::string(err.FailedRequestName), std::string("ReadPastEof"));
+
+#if defined(_WIN32)
+    // 6. GPU Compute GDeflate Decompression (DSTORAGE_REQUEST_DESTINATION_BUFFER & DStorageDecompressGpuCompute)
+    //    and Direct DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION GPU CopyTextureRegion Upload!
+    {
+        scarlettx::D3D12Backend gpu_backend;
+        SX_CHECK(gpu_backend.Initialize(true /* WARP-safe */, false).ok());
+        auto* d3d_dev = static_cast<ID3D12Device*>(gpu_backend.NativeDevice());
+        SX_CHECK(d3d_dev != nullptr);
+
+        D3D12_HEAP_PROPERTIES def_hp{};
+        def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_HEAP_PROPERTIES rb_hp{};
+        rb_hp.Type = D3D12_HEAP_TYPE_READBACK;
+
+        D3D12_RESOURCE_DESC buf_desc{};
+        buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buf_desc.Width = original.size() + 256ull;
+        buf_desc.Height = 1;
+        buf_desc.DepthOrArraySize = 1;
+        buf_desc.MipLevels = 1;
+        buf_desc.SampleDesc.Count = 1;
+        buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        ID3D12Resource* gpu_dst_buf = nullptr;
+        ID3D12Resource* gpu_rb_buf = nullptr;
+        SX_CHECK(SUCCEEDED(d3d_dev->CreateCommittedResource(
+            &def_hp, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&gpu_dst_buf))));
+        SX_CHECK(SUCCEEDED(d3d_dev->CreateCommittedResource(
+            &rb_hp, D3D12_HEAP_FLAG_NONE, &buf_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gpu_rb_buf))));
+
+        // Test 6a: Enqueue DSTORAGE_REQUEST_DESTINATION_BUFFER directly from XVD into DEFAULT-heap ID3D12Resource*
+        DSTORAGE_REQUEST gpu_buf_req{};
+        gpu_buf_req.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+        gpu_buf_req.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
+        gpu_buf_req.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
+        gpu_buf_req.SourceFileHandle = xvd_file;
+        gpu_buf_req.SourceFileOffset = 0;
+        gpu_buf_req.SourceSize = comp_size;
+        gpu_buf_req.DestinationMemory = gpu_dst_buf;
+        gpu_buf_req.DestinationSize = static_cast<uint32_t>(original.size());
+        gpu_buf_req.UncompressedSize = static_cast<uint32_t>(original.size());
+        gpu_buf_req.Name = "GpuComputeGDeflateFromXvd";
+
+        SX_CHECK_EQ(DStorageEnqueueRequest(queue, &gpu_buf_req), 0);
+        SX_CHECK_EQ(DStorageEnqueueStatus(queue, status_arr, 3), 0);
+        SX_CHECK_EQ(DStorageSubmit(queue), 0);
+        SX_CHECK_EQ(DStorageWaitForIdle(queue, 5000), 0);
+        SX_CHECK_EQ(DStorageIsStatusComplete(status_arr, 3), 1u);
+        SX_CHECK_EQ(DStorageGetStatusHResult(status_arr, 3), 0);
+
+        // Also test standalone DStorageDecompressGpuCompute at non-zero offset (64)
+        std::vector<uint8_t> mini_plain(253);  // non-multiple-of-4 size
+        for (size_t i = 0; i < mini_plain.size(); ++i) {
+            mini_plain[i] = (i < 100) ? 0xE7u : static_cast<uint8_t>((i * 19u + 5u) & 0xFFu);
+        }
+        std::vector<uint8_t> mini_comp(512);
+        uint32_t mini_comp_sz = 0;
+        SX_CHECK_EQ(DStorageCompressBuffer(DSTORAGE_COMPRESSION_FORMAT_GDEFLATE, mini_plain.data(),
+                                           static_cast<uint32_t>(mini_plain.size()), mini_comp.data(),
+                                           static_cast<uint32_t>(mini_comp.size()), &mini_comp_sz), 0);
+
+        // Read back gpu_dst_buf to verify GPU compute GDeflate output matches `original` byte-for-byte!
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ID3D12CommandQueue* d3d_q = nullptr;
+        ID3D12CommandAllocator* d3d_alloc = nullptr;
+        ID3D12GraphicsCommandList* d3d_cmd = nullptr;
+        ID3D12Fence* d3d_fence = nullptr;
+        SX_CHECK(SUCCEEDED(d3d_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&d3d_q))));
+        SX_CHECK(SUCCEEDED(d3d_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&d3d_alloc))));
+        SX_CHECK(SUCCEEDED(d3d_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, d3d_alloc, nullptr, IID_PPV_ARGS(&d3d_cmd))));
+        SX_CHECK(SUCCEEDED(d3d_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d3d_fence))));
+        HANDLE d3d_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        SX_CHECK(d3d_ev != nullptr);
+        uint64_t fval = 0;
+
+        auto copy_and_wait = [&](auto&& record_fn) {
+            d3d_alloc->Reset();
+            d3d_cmd->Reset(d3d_alloc, nullptr);
+            record_fn(d3d_cmd);
+            d3d_cmd->Close();
+            ID3D12CommandList* lists[] = {d3d_cmd};
+            d3d_q->ExecuteCommandLists(1, lists);
+            const uint64_t v = ++fval;
+            d3d_q->Signal(d3d_fence, v);
+            if (d3d_fence->GetCompletedValue() < v) {
+                d3d_fence->SetEventOnCompletion(v, d3d_ev);
+                WaitForSingleObject(d3d_ev, 5000);
+            }
+        };
+
+        copy_and_wait([&](ID3D12GraphicsCommandList* cl) {
+            cl->CopyBufferRegion(gpu_rb_buf, 0, gpu_dst_buf, 0, original.size());
+        });
+        void* mapped = nullptr;
+        SX_CHECK(SUCCEEDED(gpu_rb_buf->Map(0, nullptr, &mapped)) && mapped != nullptr);
+        SX_CHECK(std::memcmp(mapped, original.data(), original.size()) == 0);
+        gpu_rb_buf->Unmap(0, nullptr);
+
+        // Verify DStorageDecompressGpuCompute with non-zero destination offset (64) & odd byte length (253)
+        SX_CHECK_EQ(DStorageDecompressGpuCompute(
+                        d3d_dev, d3d_q, DSTORAGE_COMPRESSION_FORMAT_GDEFLATE,
+                        mini_comp.data(), mini_comp_sz, gpu_dst_buf, 64ull,
+                        static_cast<uint32_t>(mini_plain.size())),
+                    0);
+        copy_and_wait([&](ID3D12GraphicsCommandList* cl) {
+            cl->CopyBufferRegion(gpu_rb_buf, 0, gpu_dst_buf, 64ull, mini_plain.size());
+        });
+        mapped = nullptr;
+        SX_CHECK(SUCCEEDED(gpu_rb_buf->Map(0, nullptr, &mapped)) && mapped != nullptr);
+        SX_CHECK(std::memcmp(mapped, mini_plain.data(), mini_plain.size()) == 0);
+        gpu_rb_buf->Unmap(0, nullptr);
+
+        // Test 6b: Direct DStorageEnqueueTextureRegion (GDeflate-compressed + 4KB_S swizzled 32x32 RGBA8 texture!)
+        XG_TEXTURE2D_DESC xgt{};
+        xgt.Width = 32;
+        xgt.Height = 32;
+        xgt.MipLevels = 1;
+        xgt.ArraySize = 1;
+        xgt.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        xgt.SampleDesc.Count = 1;
+        xgt.SwizzleMode = XG_SWIZZLE_MODE_4KB_S;
+        XG_RESOURCE_LAYOUT xgl{};
+        scarlettx::gpu::xg::ComputeTexture2DLayout(xgt, &xgl);
+
+        std::vector<uint8_t> linear_rgba(32u * 32u * 4u);
+        for (size_t i = 0; i < linear_rgba.size(); ++i) {
+            linear_rgba[i] = static_cast<uint8_t>((i * 37u + 11u) & 0xFFu);
+        }
+        std::vector<uint8_t> swizzled_rgba(static_cast<size_t>(xgl.SizeBytes), 0);
+        SX_CHECK(scarlettx::gpu::xg::CopyIntoSubresource(xgl, swizzled_rgba.data(), 0u, 0u, linear_rgba.data(), 32u * 4u));
+
+        std::vector<uint8_t> comp_tex(8192);
+        uint32_t comp_tex_sz = 0;
+        SX_CHECK_EQ(DStorageCompressBuffer(DSTORAGE_COMPRESSION_FORMAT_GDEFLATE, swizzled_rgba.data(),
+                                           static_cast<uint32_t>(swizzled_rgba.size()), comp_tex.data(),
+                                           static_cast<uint32_t>(comp_tex.size()), &comp_tex_sz), 0);
+
+        D3D12_RESOURCE_DESC tex_desc{};
+        tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tex_desc.Width = 32;
+        tex_desc.Height = 32;
+        tex_desc.DepthOrArraySize = 1;
+        tex_desc.MipLevels = 1;
+        tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        tex_desc.SampleDesc.Count = 1;
+        ID3D12Resource* gpu_tex = nullptr;
+        SX_CHECK(SUCCEEDED(d3d_dev->CreateCommittedResource(
+            &def_hp, D3D12_HEAP_FLAG_NONE, &tex_desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&gpu_tex))));
+
+        DSTORAGE_QUEUE_DESC mem_qd{};
+        mem_qd.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        mem_qd.Capacity = 16;
+        mem_qd.Name = "GpuTexUploadQueue";
+        uint64_t mem_q = 0;
+        SX_CHECK_EQ(DStorageCreateQueue(factory, &mem_qd, &mem_q), 0);
+
+        DSTORAGE_TEXTURE_REGION_DESC tex_req{};
+        tex_req.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
+        tex_req.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_GDEFLATE;
+        tex_req.SwizzleMode = static_cast<uint16_t>(XG_SWIZZLE_MODE_4KB_S);
+        tex_req.SourceMemory = comp_tex.data();
+        tex_req.SourceSize = comp_tex_sz;
+        tex_req.UncompressedSize = static_cast<uint32_t>(swizzled_rgba.size());
+        tex_req.D3D12Device = d3d_dev;
+        tex_req.D3D12CommandQueue = d3d_q;
+        tex_req.DestinationTexture = gpu_tex;
+        tex_req.SubresourceIndex = 0;
+        tex_req.InitialResourceState = D3D12_RESOURCE_STATE_COMMON;
+        tex_req.Name = "UploadSwizzledGDeflateTex";
+
+        SX_CHECK_EQ(DStorageEnqueueTextureRegion(mem_q, &tex_req), 0);
+        SX_CHECK_EQ(DStorageEnqueueStatus(mem_q, status_arr, 4), 0);
+        SX_CHECK_EQ(DStorageSubmit(mem_q), 0);
+        SX_CHECK_EQ(DStorageWaitForIdle(mem_q, 5000), 0);
+        SX_CHECK_EQ(DStorageIsStatusComplete(status_arr, 4), 1u);
+        SX_CHECK_EQ(DStorageGetStatusHResult(status_arr, 4), 0);
+        SX_CHECK_EQ(DStorageDestroyQueue(mem_q), 0);
+
+        // Read back gpu_tex via CopyTextureRegion (256-byte row pitch) and verify every texel matches linear_rgba!
+        D3D12_RESOURCE_DESC tex_rb_desc = buf_desc;
+        tex_rb_desc.Width = 256ull * 32ull;
+        ID3D12Resource* tex_rb = nullptr;
+        SX_CHECK(SUCCEEDED(d3d_dev->CreateCommittedResource(
+            &rb_hp, D3D12_HEAP_FLAG_NONE, &tex_rb_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&tex_rb))));
+
+        copy_and_wait([&](ID3D12GraphicsCommandList* cl) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.pResource = gpu_tex;
+            b.Transition.Subresource = 0;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cl->ResourceBarrier(1, &b);
+
+            D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+            dst_loc.pResource = tex_rb;
+            dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst_loc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            dst_loc.PlacedFootprint.Footprint.Width = 32;
+            dst_loc.PlacedFootprint.Footprint.Height = 32;
+            dst_loc.PlacedFootprint.Footprint.Depth = 1;
+            dst_loc.PlacedFootprint.Footprint.RowPitch = 256;
+
+            D3D12_TEXTURE_COPY_LOCATION src_loc{};
+            src_loc.pResource = gpu_tex;
+            src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src_loc.SubresourceIndex = 0;
+            cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+        });
+
+        mapped = nullptr;
+        SX_CHECK(SUCCEEDED(tex_rb->Map(0, nullptr, &mapped)) && mapped != nullptr);
+        for (uint32_t y = 0; y < 32u; ++y) {
+            SX_CHECK(std::memcmp(static_cast<const uint8_t*>(mapped) + y * 256u,
+                                 linear_rgba.data() + y * 128u,
+                                 128u) == 0);
+        }
+        tex_rb->Unmap(0, nullptr);
+
+        tex_rb->Release();
+        gpu_tex->Release();
+        CloseHandle(d3d_ev);
+        d3d_fence->Release();
+        d3d_cmd->Release();
+        d3d_alloc->Release();
+        d3d_q->Release();
+        gpu_rb_buf->Release();
+        gpu_dst_buf->Release();
+    }
+#endif
 
     SX_CHECK_EQ(DStorageCloseFile(xvd_file), 0);
     SX_CHECK_EQ(DStorageDestroyStatusArray(status_arr), 0);

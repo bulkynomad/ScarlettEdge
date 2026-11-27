@@ -35,6 +35,7 @@ enum DSTORAGE_PRIORITY : int8_t {
 enum DSTORAGE_COMPRESSION_FORMAT : uint8_t {
     DSTORAGE_COMPRESSION_FORMAT_NONE = 0,
     DSTORAGE_COMPRESSION_FORMAT_GDEFLATE = 1,
+    DSTORAGE_COMPRESSION_FORMAT_BCPACK = 2,
     DSTORAGE_COMPRESSION_FORMAT_LZ_RLE = 0x80,
 };
 
@@ -81,6 +82,31 @@ struct DSTORAGE_ERROR_RECORD {
     uint32_t CommandType;
     uint32_t Reserved;
     char FailedRequestName[64];
+};
+
+struct DSTORAGE_TEXTURE_REGION_DESC {
+    uint32_t SourceType;           // DSTORAGE_REQUEST_SOURCE_FILE or MEMORY
+    uint8_t CompressionFormat;     // DSTORAGE_COMPRESSION_FORMAT_*
+    uint8_t BcPackFormat;          // DXGI_FORMAT when CompressionFormat == BCPACK
+    uint16_t SwizzleMode;          // 0 = linear, else XG_SWIZZLE_MODE to deswizzle before GPU upload
+    uint64_t SourceFileHandle;
+    uint64_t SourceFileOffset;
+    const void* SourceMemory;
+    uint32_t SourceSize;
+    uint32_t UncompressedSize;
+    void* D3D12Device;             // Optional ID3D12Device* (queried from DestinationTexture if null)
+    void* D3D12CommandQueue;       // Optional ID3D12CommandQueue* (temporary DIRECT queue created if null)
+    void* DestinationTexture;      // Target ID3D12Resource* texture
+    uint32_t SubresourceIndex;     // Mip + ArraySlice * MipLevels
+    uint32_t DstX;
+    uint32_t DstY;
+    uint32_t DstZ;
+    uint32_t RegionWidth;          // 0 => full mip width
+    uint32_t RegionHeight;         // 0 => full mip height
+    uint32_t RegionDepth;          // 0 => 1
+    uint32_t InitialResourceState; // D3D12_RESOURCE_STATES (0 = D3D12_RESOURCE_STATE_COMMON)
+    uint64_t CancellationTag;
+    const char* Name;
 };
 
 typedef void (*DSTORAGE_SIGNAL_CALLBACK)(uint64_t value, void* context);
@@ -154,5 +180,21 @@ SCARLETTX_DSTORAGE_API int32_t DStorageDecompressBuffer(
     void* dst,
     uint32_t dst_capacity,
     uint32_t* out_decompressed_size);
+
+// Hardware D3D12 Compute Shader GDeflate/LZ-RLE tile unpacker into a GPU DEFAULT-heap ID3D12Resource* buffer
+SCARLETTX_DSTORAGE_API int32_t DStorageDecompressGpuCompute(
+    void* d3d12_device,
+    void* d3d12_command_queue,
+    uint8_t format,
+    const void* compressed_src,
+    uint32_t compressed_size,
+    void* dst_d3d12_buffer,
+    uint64_t dst_buffer_offset,
+    uint32_t uncompressed_size);
+
+// Direct asynchronous DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION GPU CopyTextureRegion upload
+SCARLETTX_DSTORAGE_API int32_t DStorageEnqueueTextureRegion(
+    uint64_t queue,
+    const DSTORAGE_TEXTURE_REGION_DESC* desc);
 
 }  // extern "C"

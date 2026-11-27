@@ -1,9 +1,13 @@
 #include "scarlettx/io/dstorage_abi.h"
+#include "scarlettx/gpu/xg_layout.h"
+#include "scarlettx/io/deflate_rfc1951.h"
 #include "scarlettx/media/codecs_abi.h"
 
 #include <algorithm>
 #if defined(_WIN32)
 #include <windows.h>
+#include <d3d12.h>
+#include <d3dcompiler.h>
 #endif
 #include <atomic>
 #include <chrono>
@@ -167,6 +171,7 @@ struct StatusArrayObject {
 
 enum class QueueItemKind {
     kRequest,
+    kTextureRegion,
     kSignal,
     kStatus,
 };
@@ -174,6 +179,7 @@ enum class QueueItemKind {
 struct QueueItem {
     QueueItemKind kind = QueueItemKind::kRequest;
     DSTORAGE_REQUEST req{};
+    DSTORAGE_TEXTURE_REGION_DESC tex_req{};
     std::string req_name;
     uint64_t* fence_ptr = nullptr;
     uint64_t fence_val = 0;
@@ -243,46 +249,46 @@ int32_t EnqueueItem(QueueObject& q, QueueItem item) {
     return kS_OK;
 }
 
-int32_t ExecuteRequest(const DSTORAGE_REQUEST& req) {
-    if (!req.DestinationMemory || req.DestinationSize == 0) {
-        return kE_INVALIDARG;
-    }
-
-    std::vector<uint8_t> raw;
-    if (req.SourceType == DSTORAGE_REQUEST_SOURCE_FILE) {
+int32_t ReadSourcePayload(
+    uint32_t source_type,
+    uint64_t file_handle,
+    uint64_t file_offset,
+    const void* source_memory,
+    uint32_t source_size,
+    std::vector<uint8_t>& out_raw) {
+    if (source_type == DSTORAGE_REQUEST_SOURCE_FILE) {
         std::shared_ptr<FileObject> file;
         {
             std::lock_guard<std::mutex> lk(State().mu);
-            auto it = State().files.find(req.SourceFileHandle);
+            auto it = State().files.find(file_handle);
             if (it == State().files.end()) return kE_HANDLE;
             file = it->second;
         }
-        if (req.SourceFileOffset > file->size ||
-            req.SourceSize > file->size - req.SourceFileOffset) {
+        if (file_offset > file->size || source_size > file->size - file_offset) {
             return kE_INVALIDARG;
         }
         if (file->is_xvd) {
-            auto st = file->xvd.ReadUserData(req.SourceFileOffset, req.SourceSize, raw);
+            auto st = file->xvd.ReadUserData(file_offset, source_size, out_raw);
             if (!st.ok()) return kE_FAIL;
         } else {
-            raw.resize(req.SourceSize);
+            out_raw.resize(source_size);
             bool read_done = false;
 #if defined(_WIN32)
-            if (file->hFile && file->hFile != INVALID_HANDLE_VALUE && req.SourceSize > 0) {
+            if (file->hFile && file->hFile != INVALID_HANDLE_VALUE && source_size > 0) {
                 HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
                 if (ev) {
                     OVERLAPPED ov{};
-                    ov.Offset = static_cast<DWORD>(req.SourceFileOffset & 0xFFFFFFFFull);
-                    ov.OffsetHigh = static_cast<DWORD>(req.SourceFileOffset >> 32);
+                    ov.Offset = static_cast<DWORD>(file_offset & 0xFFFFFFFFull);
+                    ov.OffsetHigh = static_cast<DWORD>(file_offset >> 32);
                     ov.hEvent = ev;
                     DWORD bytes_read = 0;
-                    BOOL ok = ReadFile(static_cast<HANDLE>(file->hFile), raw.data(),
-                                       static_cast<DWORD>(req.SourceSize), &bytes_read, &ov);
+                    BOOL ok = ReadFile(static_cast<HANDLE>(file->hFile), out_raw.data(),
+                                       static_cast<DWORD>(source_size), &bytes_read, &ov);
                     if (!ok && GetLastError() == ERROR_IO_PENDING) {
                         ok = GetOverlappedResult(static_cast<HANDLE>(file->hFile), &ov, &bytes_read, TRUE);
                     }
                     CloseHandle(ev);
-                    if (ok && bytes_read == req.SourceSize) {
+                    if (ok && bytes_read == source_size) {
                         read_done = true;
                     }
                 }
@@ -291,20 +297,685 @@ int32_t ExecuteRequest(const DSTORAGE_REQUEST& req) {
             if (!read_done) {
                 std::ifstream ifs(file->path, std::ios::binary);
                 if (!ifs) return kE_DSTORAGE_FILE_NOT_FOUND;
-                ifs.seekg(static_cast<std::streamoff>(req.SourceFileOffset), std::ios::beg);
-                ifs.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(req.SourceSize));
-                if (static_cast<uint32_t>(ifs.gcount()) != req.SourceSize) return kE_FAIL;
+                ifs.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
+                ifs.read(reinterpret_cast<char*>(out_raw.data()), static_cast<std::streamsize>(source_size));
+                if (static_cast<uint32_t>(ifs.gcount()) != source_size) return kE_FAIL;
             }
         }
-    } else if (req.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY) {
-        if (!req.SourceMemory) return kE_INVALIDARG;
-        raw.resize(req.SourceSize);
-        if (req.SourceSize > 0) {
-            std::memcpy(raw.data(), req.SourceMemory, req.SourceSize);
+        return kS_OK;
+    }
+    if (source_type == DSTORAGE_REQUEST_SOURCE_MEMORY) {
+        if (!source_memory && source_size > 0) return kE_INVALIDARG;
+        out_raw.resize(source_size);
+        if (source_size > 0) {
+            std::memcpy(out_raw.data(), source_memory, source_size);
         }
-    } else {
+        return kS_OK;
+    }
+    return kE_INVALIDARG;
+}
+
+#if defined(_WIN32)
+struct GpuLzPacket {
+    uint32_t dst_start;
+    uint32_t length;
+    uint32_t src_offset_or_val;
+    uint32_t is_rle;
+};
+
+const std::vector<uint8_t>& GetGpuLzComputeBytecode() {
+    static const std::vector<uint8_t> bytecode = []() -> std::vector<uint8_t> {
+        static const char kHlsl[] = R"(
+cbuffer Params : register(b0) {
+    uint g_UncompressedBytes;
+    uint g_PacketCount;
+    uint g_CompressedBytes;
+    uint g_Pad;
+};
+ByteAddressBuffer g_Packets    : register(t0);
+ByteAddressBuffer g_Compressed : register(t1);
+RWByteAddressBuffer g_Output   : register(u0);
+
+uint ReadCompressedByte(uint byteIdx) {
+    if (byteIdx >= g_CompressedBytes) return 0u;
+    uint word = g_Compressed.Load(byteIdx & ~3u);
+    uint shift = (byteIdx & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+uint DecodeOutputByte(uint outByteIdx) {
+    if (outByteIdx >= g_UncompressedBytes || g_PacketCount == 0u) return 0u;
+    uint lo = 0u;
+    uint hi = g_PacketCount - 1u;
+    [loop]
+    for (uint iter = 0u; iter < 24u && lo < hi; ++iter) {
+        uint mid = (lo + hi + 1u) >> 1u;
+        uint midStart = g_Packets.Load(mid * 16u);
+        if (midStart <= outByteIdx) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    uint4 pkt = g_Packets.Load4(lo * 16u);
+    if (pkt.w != 0u) {
+        return pkt.z & 0xFFu;
+    }
+    return ReadCompressedByte(pkt.z + (outByteIdx - pkt.x));
+}
+
+[numthreads(64, 1, 1)]
+void main(uint3 dtid : SV_DispatchThreadID) {
+    uint baseByte = dtid.x * 4u;
+    if (baseByte >= g_UncompressedBytes) return;
+    uint b0 = DecodeOutputByte(baseByte + 0u);
+    uint b1 = DecodeOutputByte(baseByte + 1u);
+    uint b2 = DecodeOutputByte(baseByte + 2u);
+    uint b3 = DecodeOutputByte(baseByte + 3u);
+    g_Output.Store(baseByte, b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u));
+}
+)";
+        ID3DBlob* cs_blob = nullptr;
+        ID3DBlob* err_blob = nullptr;
+        HRESULT hr = D3DCompile(kHlsl, sizeof(kHlsl) - 1, "DStorageGpuGDeflate.hlsl",
+                                nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                &cs_blob, &err_blob);
+        if (err_blob) err_blob->Release();
+        std::vector<uint8_t> out;
+        if (SUCCEEDED(hr) && cs_blob) {
+            const auto* ptr = static_cast<const uint8_t*>(cs_blob->GetBufferPointer());
+            out.assign(ptr, ptr + cs_blob->GetBufferSize());
+            cs_blob->Release();
+        }
+        return out;
+    }();
+    return bytecode;
+}
+
+bool ParseSxcrPacketsForGpu(const uint8_t* src, uint32_t src_size,
+                            std::vector<GpuLzPacket>& out_packets, uint32_t* out_expected) {
+    if (!src || src_size < 8 || std::memcmp(src, kCodecMagic, 4) != 0) return false;
+    const uint32_t expected =
+        static_cast<uint32_t>(src[4]) |
+        (static_cast<uint32_t>(src[5]) << 8) |
+        (static_cast<uint32_t>(src[6]) << 16) |
+        (static_cast<uint32_t>(src[7]) << 24);
+    out_packets.clear();
+    uint32_t in_pos = 8;
+    uint32_t out_pos = 0;
+    while (in_pos < src_size && out_pos < expected) {
+        const uint8_t ctrl = src[in_pos++];
+        if (ctrl & 0x80u) {
+            if (in_pos >= src_size) return false;
+            const uint32_t run = static_cast<uint32_t>(ctrl & 0x7Fu) + 3u;
+            const uint8_t val = src[in_pos++];
+            if (out_pos + run > expected) return false;
+            out_packets.push_back({out_pos, run, val, 1u});
+            out_pos += run;
+        } else {
+            const uint32_t lit = static_cast<uint32_t>(ctrl) + 1u;
+            if (in_pos + lit > src_size || out_pos + lit > expected) return false;
+            out_packets.push_back({out_pos, lit, in_pos, 0u});
+            in_pos += lit;
+            out_pos += lit;
+        }
+    }
+    if (out_pos != expected) return false;
+    if (out_expected) *out_expected = expected;
+    return true;
+}
+
+int32_t ExecuteGpuBufferDecompress(
+    ID3D12Device* ext_dev,
+    ID3D12CommandQueue* ext_queue,
+    uint8_t format,
+    const uint8_t* compressed_src,
+    uint32_t compressed_size,
+    ID3D12Resource* dst_buf,
+    uint64_t dst_offset,
+    uint32_t uncompressed_size) {
+    if (!dst_buf || uncompressed_size == 0 || (!compressed_src && compressed_size > 0)) {
         return kE_INVALIDARG;
     }
+
+    ID3D12Device* dev = ext_dev;
+    bool owns_dev = false;
+    if (!dev) {
+        if (FAILED(dst_buf->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) || !dev) {
+            return kE_INVALIDARG;
+        }
+        owns_dev = true;
+    }
+
+    std::vector<GpuLzPacket> packets;
+    std::vector<uint8_t> fallback_stream;
+    const uint8_t* gpu_stream_ptr = compressed_src;
+    uint32_t gpu_stream_len = compressed_size;
+    uint32_t target_bytes = uncompressed_size;
+
+    if (format == DSTORAGE_COMPRESSION_FORMAT_NONE) {
+        if (compressed_size < uncompressed_size) {
+            if (owns_dev) dev->Release();
+            return kE_DSTORAGE_BUFFER_TOO_SMALL;
+        }
+        packets.push_back({0u, uncompressed_size, 0u, 0u});
+    } else if (format == DSTORAGE_COMPRESSION_FORMAT_GDEFLATE ||
+               format == DSTORAGE_COMPRESSION_FORMAT_LZ_RLE) {
+        uint32_t parsed_expected = 0;
+        if (ParseSxcrPacketsForGpu(compressed_src, compressed_size, packets, &parsed_expected)) {
+            if (uncompressed_size < parsed_expected) {
+                if (owns_dev) dev->Release();
+                return kE_DSTORAGE_BUFFER_TOO_SMALL;
+            }
+            target_bytes = parsed_expected;
+        } else if (compressed_size >= 8 && compressed_src[0] == 0x04u && compressed_src[1] == 0xFBu) {
+            fallback_stream.resize(uncompressed_size);
+            size_t written = 0;
+            if (XboxCodecGDeflateDecompress(
+                    compressed_src, compressed_size, fallback_stream.data(), uncompressed_size, &written) != 0 ||
+                written == 0) {
+                if (owns_dev) dev->Release();
+                return kE_FAIL;
+            }
+            target_bytes = static_cast<uint32_t>(written);
+            gpu_stream_ptr = fallback_stream.data();
+            gpu_stream_len = target_bytes;
+            packets.push_back({0u, target_bytes, 0u, 0u});
+        } else if (scarlettx::io::LooksLikeRfc1950ZlibHeader(compressed_src, compressed_size)) {
+            fallback_stream.resize(uncompressed_size);
+            size_t written = 0;
+            if (!scarlettx::io::InflateZlibRfc1950(
+                    compressed_src, compressed_size, fallback_stream.data(), uncompressed_size, written) ||
+                written == 0) {
+                if (owns_dev) dev->Release();
+                return kE_FAIL;
+            }
+            target_bytes = static_cast<uint32_t>(written);
+            gpu_stream_ptr = fallback_stream.data();
+            gpu_stream_len = target_bytes;
+            packets.push_back({0u, target_bytes, 0u, 0u});
+        } else {
+            if (owns_dev) dev->Release();
+            return kE_FAIL;
+        }
+    } else {
+        if (owns_dev) dev->Release();
+        return kE_NOTIMPL;
+    }
+
+    const auto& cs_dxbc = GetGpuLzComputeBytecode();
+    if (cs_dxbc.empty()) {
+        if (owns_dev) dev->Release();
+        return kE_FAIL;
+    }
+
+    ID3D12CommandQueue* queue = ext_queue;
+    bool owns_queue = false;
+    ID3D12RootSignature* root_sig = nullptr;
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* cmd = nullptr;
+    ID3D12Resource* pkt_buf = nullptr;
+    ID3D12Resource* cmp_buf = nullptr;
+    ID3D12Resource* uav_buf = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE ev = nullptr;
+
+    auto cleanup = [&]() {
+        if (ev) CloseHandle(ev);
+        if (fence) fence->Release();
+        if (uav_buf) uav_buf->Release();
+        if (cmp_buf) cmp_buf->Release();
+        if (pkt_buf) pkt_buf->Release();
+        if (cmd) cmd->Release();
+        if (alloc) alloc->Release();
+        if (pso) pso->Release();
+        if (root_sig) root_sig->Release();
+        if (owns_queue && queue) queue->Release();
+        if (owns_dev && dev) dev->Release();
+    };
+
+    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (queue) {
+        list_type = queue->GetDesc().Type;
+    } else {
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) || !queue) {
+            cleanup();
+            return kE_FAIL;
+        }
+        owns_queue = true;
+    }
+
+    D3D12_ROOT_PARAMETER params[4]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.ShaderRegister = 0;
+    params[0].Constants.Num32BitValues = 4;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor.ShaderRegister = 0;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[2].Descriptor.ShaderRegister = 1;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[3].Descriptor.ShaderRegister = 0;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 4;
+    rsd.pParameters = params;
+    ID3DBlob* rs_blob = nullptr;
+    ID3DBlob* rs_err = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err)) || !rs_blob) {
+        if (rs_err) rs_err->Release();
+        cleanup();
+        return kE_FAIL;
+    }
+    if (rs_err) rs_err->Release();
+    HRESULT hr = dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&root_sig));
+    rs_blob->Release();
+    if (FAILED(hr) || !root_sig) {
+        cleanup();
+        return kE_FAIL;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root_sig;
+    pso_desc.CS.pShaderBytecode = cs_dxbc.data();
+    pso_desc.CS.BytecodeLength = cs_dxbc.size();
+    if (FAILED(dev->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso))) || !pso) {
+        cleanup();
+        return kE_FAIL;
+    }
+
+    auto make_buf = [&](D3D12_HEAP_TYPE htype, uint64_t bytes, D3D12_RESOURCE_FLAGS flags,
+                        D3D12_RESOURCE_STATES state, ID3D12Resource** out_res) -> bool {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = htype;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = std::max<uint64_t>(16ull, (bytes + 3ull) & ~3ull);
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = flags;
+        return SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(out_res)));
+    };
+
+    const uint64_t pkt_bytes = std::max<uint64_t>(16ull, packets.size() * sizeof(GpuLzPacket));
+    const uint64_t cmp_bytes = std::max<uint64_t>(16ull, (static_cast<uint64_t>(gpu_stream_len) + 3ull) & ~3ull);
+    const uint64_t uav_bytes = std::max<uint64_t>(16ull, (static_cast<uint64_t>(target_bytes) + 3ull) & ~3ull);
+
+    if (!make_buf(D3D12_HEAP_TYPE_UPLOAD, pkt_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &pkt_buf) ||
+        !make_buf(D3D12_HEAP_TYPE_UPLOAD, cmp_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &cmp_buf) ||
+        !make_buf(D3D12_HEAP_TYPE_DEFAULT, uav_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &uav_buf)) {
+        cleanup();
+        return kE_OUTOFMEMORY;
+    }
+
+    void* mapped = nullptr;
+    if (SUCCEEDED(pkt_buf->Map(0, nullptr, &mapped)) && mapped) {
+        std::memset(mapped, 0, static_cast<size_t>(pkt_bytes));
+        if (!packets.empty()) std::memcpy(mapped, packets.data(), packets.size() * sizeof(GpuLzPacket));
+        pkt_buf->Unmap(0, nullptr);
+    }
+    mapped = nullptr;
+    if (SUCCEEDED(cmp_buf->Map(0, nullptr, &mapped)) && mapped) {
+        std::memset(mapped, 0, static_cast<size_t>(cmp_bytes));
+        if (gpu_stream_len > 0) std::memcpy(mapped, gpu_stream_ptr, gpu_stream_len);
+        cmp_buf->Unmap(0, nullptr);
+    }
+
+    if (FAILED(dev->CreateCommandAllocator(list_type, IID_PPV_ARGS(&alloc))) ||
+        FAILED(dev->CreateCommandList(0, list_type, alloc, pso, IID_PPV_ARGS(&cmd)))) {
+        cleanup();
+        return kE_FAIL;
+    }
+
+    D3D12_RESOURCE_BARRIER to_uav{};
+    to_uav.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_uav.Transition.pResource = uav_buf;
+    to_uav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_uav.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    cmd->ResourceBarrier(1, &to_uav);
+
+    const uint32_t consts[4] = {
+        target_bytes,
+        static_cast<uint32_t>(packets.size()),
+        gpu_stream_len,
+        0u,
+    };
+    cmd->SetComputeRootSignature(root_sig);
+    cmd->SetComputeRoot32BitConstants(0, 4, consts, 0);
+    cmd->SetComputeRootShaderResourceView(1, pkt_buf->GetGPUVirtualAddress());
+    cmd->SetComputeRootShaderResourceView(2, cmp_buf->GetGPUVirtualAddress());
+    cmd->SetComputeRootUnorderedAccessView(3, uav_buf->GetGPUVirtualAddress());
+
+    const uint32_t dwords = (target_bytes + 3u) / 4u;
+    const uint32_t groups_x = std::max<uint32_t>(1u, (dwords + 63u) / 64u);
+    cmd->Dispatch(groups_x, 1u, 1u);
+
+    D3D12_RESOURCE_BARRIER to_src{};
+    to_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_src.Transition.pResource = uav_buf;
+    to_src.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_src.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    to_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cmd->ResourceBarrier(1, &to_src);
+
+    cmd->CopyBufferRegion(dst_buf, dst_offset, uav_buf, 0ull, target_bytes);
+
+    if (FAILED(cmd->Close())) {
+        cleanup();
+        return kE_FAIL;
+    }
+
+    ID3D12CommandList* lists[] = {cmd};
+    queue->ExecuteCommandLists(1, lists);
+
+    if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        cleanup();
+        return kE_FAIL;
+    }
+    ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) {
+        cleanup();
+        return kE_FAIL;
+    }
+    queue->Signal(fence, 1ull);
+    if (fence->GetCompletedValue() < 1ull) {
+        fence->SetEventOnCompletion(1ull, ev);
+        WaitForSingleObject(ev, 5000);
+    }
+
+    cleanup();
+    return kS_OK;
+}
+
+int32_t ExecuteTextureRegion(const DSTORAGE_TEXTURE_REGION_DESC& desc) {
+    if (!desc.DestinationTexture) return kE_INVALIDARG;
+
+    std::vector<uint8_t> raw;
+    const int32_t io_hr = ReadSourcePayload(
+        desc.SourceType, desc.SourceFileHandle, desc.SourceFileOffset,
+        desc.SourceMemory, desc.SourceSize, raw);
+    if (io_hr != kS_OK) return io_hr;
+
+    auto* dst_tex = static_cast<ID3D12Resource*>(desc.DestinationTexture);
+    ID3D12Device* dev = static_cast<ID3D12Device*>(desc.D3D12Device);
+    bool owns_dev = false;
+    if (!dev) {
+        if (FAILED(dst_tex->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) || !dev) {
+            return kE_INVALIDARG;
+        }
+        owns_dev = true;
+    }
+
+    const D3D12_RESOURCE_DESC tex_desc = dst_tex->GetDesc();
+    const uint32_t mips = std::max<uint32_t>(1u, tex_desc.MipLevels);
+    const uint32_t mip = desc.SubresourceIndex % mips;
+    const uint32_t mip_w = std::max<uint32_t>(1u, static_cast<uint32_t>(tex_desc.Width >> mip));
+    const uint32_t mip_h = std::max<uint32_t>(1u, tex_desc.Height >> mip);
+    const uint32_t reg_w = (desc.RegionWidth > 0) ? desc.RegionWidth : mip_w;
+    const uint32_t reg_h = (desc.RegionHeight > 0) ? desc.RegionHeight : mip_h;
+    const uint32_t reg_d = (desc.RegionDepth > 0) ? desc.RegionDepth : 1u;
+
+    const uint32_t dxgi_fmt = static_cast<uint32_t>(tex_desc.Format);
+    const uint32_t bpe = scarlettx::gpu::xg::FormatBytesPerElement(dxgi_fmt);
+    const bool is_bc = scarlettx::gpu::xg::IsBlockCompressed(dxgi_fmt);
+    const uint32_t elems_x = is_bc ? std::max<uint32_t>(1u, (reg_w + 3u) / 4u) : reg_w;
+    const uint32_t elems_y = is_bc ? std::max<uint32_t>(1u, (reg_h + 3u) / 4u) : reg_h;
+    const uint32_t tight_row_bytes = elems_x * bpe;
+    const uint32_t tight_slice_bytes = tight_row_bytes * elems_y;
+    const uint32_t expected_linear_bytes = tight_slice_bytes * reg_d;
+    const uint32_t decompress_cap = std::max<uint32_t>(
+        desc.UncompressedSize ? desc.UncompressedSize : expected_linear_bytes,
+        expected_linear_bytes);
+
+    std::vector<uint8_t> decoded;
+    if (desc.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_NONE) {
+        decoded = std::move(raw);
+    } else if (desc.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_GDEFLATE ||
+               desc.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_LZ_RLE) {
+        decoded.resize(decompress_cap);
+        uint32_t out_sz = 0;
+        int32_t d_hr = DecompressLzRle(raw.data(), static_cast<uint32_t>(raw.size()),
+                                       decoded.data(), decompress_cap, &out_sz);
+        if (d_hr != kS_OK) {
+            size_t written = 0;
+            if (XboxCodecGDeflateDecompress(raw.data(), raw.size(), decoded.data(), decompress_cap, &written) == 0 &&
+                written > 0) {
+                out_sz = static_cast<uint32_t>(written);
+                d_hr = kS_OK;
+            } else if (scarlettx::io::LooksLikeRfc1950ZlibHeader(raw.data(), raw.size()) &&
+                       scarlettx::io::InflateZlibRfc1950(raw.data(), raw.size(), decoded.data(), decompress_cap, written) &&
+                       written > 0) {
+                out_sz = static_cast<uint32_t>(written);
+                d_hr = kS_OK;
+            }
+        }
+        if (d_hr != kS_OK) {
+            if (owns_dev) dev->Release();
+            return d_hr;
+        }
+        decoded.resize(out_sz);
+    } else if (desc.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_BCPACK) {
+        decoded.resize(decompress_cap);
+        const uint32_t bcfmt = desc.BcPackFormat ? desc.BcPackFormat : dxgi_fmt;
+        if (XboxCodecBcPackDecompress(raw.data(), raw.size(), decoded.data(), decompress_cap, bcfmt) != 0) {
+            if (owns_dev) dev->Release();
+            return kE_FAIL;
+        }
+    } else {
+        if (owns_dev) dev->Release();
+        return kE_NOTIMPL;
+    }
+
+    std::vector<uint8_t> linear_texels;
+    const uint8_t* linear_src = decoded.data();
+    size_t linear_avail = decoded.size();
+    if (desc.SwizzleMode != 0) {
+        XG_TEXTURE2D_DESC td{};
+        td.Width = reg_w;
+        td.Height = reg_h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = dxgi_fmt;
+        td.SampleDesc.Count = 1;
+        td.SwizzleMode = desc.SwizzleMode;
+        XG_RESOURCE_LAYOUT xgl{};
+        scarlettx::gpu::xg::ComputeTexture2DLayout(td, &xgl);
+        if (scarlettx::gpu::xg::IsAddressable(xgl) && decoded.size() >= xgl.SizeBytes) {
+            linear_texels.resize(expected_linear_bytes, 0);
+            if (!scarlettx::gpu::xg::CopyFromSubresource(xgl, decoded.data(), 0u, 0u, linear_texels.data(), tight_row_bytes)) {
+                if (owns_dev) dev->Release();
+                return kE_FAIL;
+            }
+            linear_src = linear_texels.data();
+            linear_avail = linear_texels.size();
+        }
+    }
+
+    if (linear_avail < expected_linear_bytes) {
+        if (owns_dev) dev->Release();
+        return kE_DSTORAGE_BUFFER_TOO_SMALL;
+    }
+
+    const uint32_t aligned_pitch =
+        ((tight_row_bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) *
+        D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    const uint64_t upload_bytes = static_cast<uint64_t>(aligned_pitch) * elems_y * reg_d;
+
+    ID3D12CommandQueue* queue = static_cast<ID3D12CommandQueue*>(desc.D3D12CommandQueue);
+    bool owns_queue = false;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* cmd = nullptr;
+    ID3D12Resource* upload_buf = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE ev = nullptr;
+
+    auto cleanup = [&]() {
+        if (ev) CloseHandle(ev);
+        if (fence) fence->Release();
+        if (upload_buf) upload_buf->Release();
+        if (cmd) cmd->Release();
+        if (alloc) alloc->Release();
+        if (owns_queue && queue) queue->Release();
+        if (owns_dev && dev) dev->Release();
+    };
+
+    if (!queue) {
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue))) || !queue) {
+            cleanup();
+            return kE_FAIL;
+        }
+        owns_queue = true;
+    }
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC up_desc{};
+    up_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    up_desc.Width = std::max<uint64_t>(256ull, upload_bytes);
+    up_desc.Height = 1;
+    up_desc.DepthOrArraySize = 1;
+    up_desc.MipLevels = 1;
+    up_desc.SampleDesc.Count = 1;
+    up_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &up_desc,
+                                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload_buf)))) {
+        cleanup();
+        return kE_OUTOFMEMORY;
+    }
+
+    void* mapped = nullptr;
+    if (FAILED(upload_buf->Map(0, nullptr, &mapped)) || !mapped) {
+        cleanup();
+        return kE_FAIL;
+    }
+    auto* dst_rows = static_cast<uint8_t*>(mapped);
+    for (uint32_t z = 0; z < reg_d; ++z) {
+        for (uint32_t y = 0; y < elems_y; ++y) {
+            std::memcpy(dst_rows + (static_cast<size_t>(z) * elems_y + y) * aligned_pitch,
+                        linear_src + (static_cast<size_t>(z) * elems_y + y) * tight_row_bytes,
+                        tight_row_bytes);
+        }
+    }
+    upload_buf->Unmap(0, nullptr);
+
+    const D3D12_COMMAND_LIST_TYPE q_type = queue->GetDesc().Type;
+    if (FAILED(dev->CreateCommandAllocator(q_type, IID_PPV_ARGS(&alloc))) ||
+        FAILED(dev->CreateCommandList(0, q_type, alloc, nullptr, IID_PPV_ARGS(&cmd)))) {
+        cleanup();
+        return kE_FAIL;
+    }
+
+    const auto init_state = static_cast<D3D12_RESOURCE_STATES>(desc.InitialResourceState);
+    if (q_type != D3D12_COMMAND_LIST_TYPE_COPY && init_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = dst_tex;
+        b.Transition.Subresource = desc.SubresourceIndex;
+        b.Transition.StateBefore = init_state;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmd->ResourceBarrier(1, &b);
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = upload_buf;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src_loc.PlacedFootprint.Offset = 0;
+    src_loc.PlacedFootprint.Footprint.Format = tex_desc.Format;
+    src_loc.PlacedFootprint.Footprint.Width = reg_w;
+    src_loc.PlacedFootprint.Footprint.Height = reg_h;
+    src_loc.PlacedFootprint.Footprint.Depth = reg_d;
+    src_loc.PlacedFootprint.Footprint.RowPitch = aligned_pitch;
+
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+    dst_loc.pResource = dst_tex;
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst_loc.SubresourceIndex = desc.SubresourceIndex;
+
+    D3D12_BOX src_box{0u, 0u, 0u, reg_w, reg_h, reg_d};
+    cmd->CopyTextureRegion(&dst_loc, desc.DstX, desc.DstY, desc.DstZ, &src_loc, &src_box);
+
+    if (q_type != D3D12_COMMAND_LIST_TYPE_COPY && init_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = dst_tex;
+        b.Transition.Subresource = desc.SubresourceIndex;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = init_state;
+        cmd->ResourceBarrier(1, &b);
+    }
+
+    if (FAILED(cmd->Close())) {
+        cleanup();
+        return kE_FAIL;
+    }
+
+    ID3D12CommandList* lists[] = {cmd};
+    queue->ExecuteCommandLists(1, lists);
+
+    if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        cleanup();
+        return kE_FAIL;
+    }
+    ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) {
+        cleanup();
+        return kE_FAIL;
+    }
+    queue->Signal(fence, 1ull);
+    if (fence->GetCompletedValue() < 1ull) {
+        fence->SetEventOnCompletion(1ull, ev);
+        WaitForSingleObject(ev, 5000);
+    }
+
+    cleanup();
+    return kS_OK;
+}
+#endif
+
+int32_t ExecuteRequest(const DSTORAGE_REQUEST& req) {
+    if (!req.DestinationMemory || req.DestinationSize == 0) {
+        return kE_INVALIDARG;
+    }
+
+    std::vector<uint8_t> raw;
+    const int32_t io_hr = ReadSourcePayload(
+        req.SourceType, req.SourceFileHandle, req.SourceFileOffset,
+        req.SourceMemory, req.SourceSize, raw);
+    if (io_hr != kS_OK) return io_hr;
+
+#if defined(_WIN32)
+    if (req.DestinationType == DSTORAGE_REQUEST_DESTINATION_BUFFER) {
+        bool gpu_disabled = false;
+        {
+            std::lock_guard<std::mutex> lk(State().mu);
+            gpu_disabled = (State().config.DisableGpuDecompression != 0);
+        }
+        const uint32_t target_sz = req.UncompressedSize ? req.UncompressedSize : req.DestinationSize;
+        if (!gpu_disabled) {
+            return ExecuteGpuBufferDecompress(
+                nullptr, nullptr, req.CompressionFormat,
+                raw.data(), static_cast<uint32_t>(raw.size()),
+                static_cast<ID3D12Resource*>(req.DestinationMemory),
+                0ull, target_sz);
+        }
+    }
+#endif
 
     if (req.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_NONE) {
         if (raw.size() > req.DestinationSize) {
@@ -373,9 +1044,20 @@ void QueueWorkerLoop(std::shared_ptr<QueueObject> q) {
             q->busy = true;
         }
 
-        if (item.kind == QueueItemKind::kRequest) {
+        if (item.kind == QueueItemKind::kRequest || item.kind == QueueItemKind::kTextureRegion) {
             // Cancelled requests retire in queue order without recording a failure.
-            const int32_t hr = item.cancelled ? kS_OK : ExecuteRequest(item.req);
+            int32_t hr = kS_OK;
+            if (!item.cancelled) {
+                if (item.kind == QueueItemKind::kRequest) {
+                    hr = ExecuteRequest(item.req);
+                } else {
+#if defined(_WIN32)
+                    hr = ExecuteTextureRegion(item.tex_req);
+#else
+                    hr = kE_NOTIMPL;
+#endif
+                }
+            }
             if (hr < 0) {
                 std::lock_guard<std::mutex> lk(q->mu);
                 if (q->error_record.FailureCount == 0) {
@@ -683,7 +1365,11 @@ int32_t DStorageCancelRequestsWithTag(uint64_t queue, uint64_t mask, uint64_t va
     }
     std::lock_guard<std::mutex> lk(q->mu);
     for (auto& item : q->entries) {
-        if (item.kind == QueueItemKind::kRequest && (item.req.CancellationTag & mask) == value) {
+        const uint64_t tag = (item.kind == QueueItemKind::kTextureRegion)
+                                 ? item.tex_req.CancellationTag
+                                 : item.req.CancellationTag;
+        if ((item.kind == QueueItemKind::kRequest || item.kind == QueueItemKind::kTextureRegion) &&
+            (tag & mask) == value) {
             item.cancelled = true;
         }
     }
@@ -808,6 +1494,56 @@ int32_t DStorageDecompressBuffer(
             out_decompressed_size);
     }
     return kE_NOTIMPL;
+}
+
+int32_t DStorageDecompressGpuCompute(
+    void* d3d12_device,
+    void* d3d12_command_queue,
+    uint8_t format,
+    const void* compressed_src,
+    uint32_t compressed_size,
+    void* dst_d3d12_buffer,
+    uint64_t dst_buffer_offset,
+    uint32_t uncompressed_size) {
+#if defined(_WIN32)
+    return ExecuteGpuBufferDecompress(
+        static_cast<ID3D12Device*>(d3d12_device),
+        static_cast<ID3D12CommandQueue*>(d3d12_command_queue),
+        format,
+        static_cast<const uint8_t*>(compressed_src),
+        compressed_size,
+        static_cast<ID3D12Resource*>(dst_d3d12_buffer),
+        dst_buffer_offset,
+        uncompressed_size);
+#else
+    (void)d3d12_device;
+    (void)d3d12_command_queue;
+    (void)format;
+    (void)compressed_src;
+    (void)compressed_size;
+    (void)dst_d3d12_buffer;
+    (void)dst_buffer_offset;
+    (void)uncompressed_size;
+    return kE_NOTIMPL;
+#endif
+}
+
+int32_t DStorageEnqueueTextureRegion(
+    uint64_t queue,
+    const DSTORAGE_TEXTURE_REGION_DESC* desc) {
+    if (!desc) return kE_INVALIDARG;
+    std::shared_ptr<QueueObject> q;
+    {
+        std::lock_guard<std::mutex> lk(State().mu);
+        auto it = State().queues.find(queue);
+        if (it == State().queues.end()) return kE_HANDLE;
+        q = it->second;
+    }
+    QueueItem item;
+    item.kind = QueueItemKind::kTextureRegion;
+    item.tex_req = *desc;
+    if (desc->Name) item.req_name = desc->Name;
+    return EnqueueItem(*q, std::move(item));
 }
 
 }  // extern "C"

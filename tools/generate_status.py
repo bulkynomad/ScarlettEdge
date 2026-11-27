@@ -283,10 +283,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="d3d12",
             category="Graphics",
             implemented=d3d_cnt + shader_ir_ready,
-            target=50,
+            target=63,
             notes=(
-                f"{d3d_cnt} exports + RDNA2/DXIL/DXBC shader lifter & Xbox-chunk stripper; "
-                "PSOs, CreatePlacedResourceX GPUVA, GPU stability breadcrumbs & QPC frame-time profiler"
+                f"{d3d_cnt} exports + RDNA2/DXIL/DXBC lifter; PSOs, VRS, ReservedResource/SamplerFeedback, "
+                "ExecuteIndirect GPU counts, Work Graphs, XG MSAA/DCC/HTILE & GPU profiler"
             ),
         ),
         Subsystem(
@@ -345,10 +345,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="DStor",
             category="Storage",
             implemented=ds_cnt + (1 if (ROOT / "src/loader/xvd_container.cpp").exists() else 0),
-            target=24,
+            target=26,
             notes=(
                 f"{ds_cnt} DStorage exports + AES-XTS encrypted GDFX XVC/XVD extraction & PackageVfs file mounting; "
-                "OVERLAPPED NVMe queues, RFC 1951 GDeflate & BCPK BC1"
+                "OVERLAPPED NVMe queues, HLSL cs_5_0 GPU GDeflate & CopyTextureRegion GPU upload"
             ),
         ),
         Subsystem(
@@ -440,8 +440,8 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             short_name="Vulk",
             category="Graphics",
             implemented=vulkan_cnt,
-            target=15,
-            notes=f"{vulkan_cnt} exports; live Vulkan 1.3 VkComputePipeline + UBO/SSBO dispatch, timeline semaphores, Win32 VkSurfaceKHR, GPU AS backing",
+            target=17,
+            notes=f"{vulkan_cnt} exports; live Vulkan 1.3 VkComputePipeline + SSBO dispatch, timeline semaphores, Win32 VkSurfaceKHR, VK_KHR_acceleration_structure BLAS/TLAS & aligned SBT vkCmdTraceRaysKHR",
         ),
         Subsystem(
             name="Live Xbox Services (XSAPI/WinRT)",
@@ -643,33 +643,33 @@ def collect_aaa_roadmap_metrics() -> list[Subsystem]:
             name="XG Tiling, MSAA & DCC",
             short_name="XG/DCC",
             category="Graphics",
-            implemented=8,
+            implemented=10,
             target=10,
-            notes="**Done (8):** 4KB_S, 256B_S, 64KB_S/D, 64KB_R_X, 64KB_Z_X depth, Cube/2D arrays, 64 KB packed mip-tails, 3D volume swizzling · **Next (2):** 2x/4x/8x MSAA, DCC color & HTILE depth decompression",
+            notes="**Complete (10/10):** 4KB_S, 256B_S, 64KB_S/D, 64KB_R_X, 64KB_Z_X depth, Cube/2D arrays, 64 KB packed mip-tails, 3D volume swizzling, 2x/4x/8x MSAA sample planes, RDNA2 DCC & HTILE depth codecs",
         ),
         Subsystem(
             name="Vulkan 1.3 & DXR GPU Exec",
             short_name="VkExec",
             category="Graphics",
-            implemented=8,
+            implemented=10,
             target=10,
-            notes="**Done (8):** Dynamic vulkan-1.dll loader, live vkCreateShaderModule, VkQueue/CmdBuffer, RootSig->VkDescriptorSetLayout, live VkComputePipeline + SSBO GPU dispatch, Win32 VkSurfaceKHR, GPU AS backing, Vulkan 1.2 timeline semaphores · **Next (2):** VK_KHR_acceleration_structure build, vkCmdTraceRaysKHR SBT",
+            notes="**Complete (10/10):** Dynamic vulkan-1.dll loader, vkCreateShaderModule, VkQueue/CmdBuffer, RootSig->VkDescriptorSetLayout, VkComputePipeline + SSBO dispatch, Win32 VkSurfaceKHR, timeline semaphores, VK_KHR_acceleration_structure BLAS/TLAS & aligned SBT vkCmdTraceRaysKHR",
         ),
         Subsystem(
             name="DirectStorage GPU Codecs",
             short_name="DS-GPU",
             category="Storage",
-            implemented=6,
+            implemented=8,
             target=8,
-            notes="**Done (6):** OVERLAPPED NVMe I/O, LZ77 GDeflate (0x04FB) & BCPK, multi-thread GDeflate tile pool, OS priority queues, RFC 1951 Huffman DEFLATE + RFC 1950 Zlib, hardware BC1 4x4 RGBA8 unpack · **Next (2):** GPU compute GDeflate, direct TextureRegion GPU upload",
+            notes="**Complete (8/8):** OVERLAPPED NVMe I/O, LZ77 GDeflate (0x04FB) & BCPK, multi-thread GDeflate tile pool, OS priority queues, RFC 1951 Huffman DEFLATE + Zlib, BC1 4x4 RGBA8 unpack, HLSL cs_5_0 GPU compute GDeflate & direct CopyTextureRegion + 4KB_S swizzled streaming",
         ),
         Subsystem(
             name="D3D12.2 & MEM_GRAPHICS",
             short_name="D3D12.2",
             category="Graphics",
-            implemented=6,
+            implemented=10,
             target=10,
-            notes="**Done (6):** 128-slot vtables, CL7::Barrier unwrapping, VirtualAlloc2 aliasing, 2 MB large pages, CreatePlacedResourceX on KernelX/alias GPUVA, ID3D12Device2 stream PSOs (VS/PS/CS/AS/MS) · **Next (4):** VRS, Sampler Feedback/Tiled, ExecuteIndirect counts, Work Graphs",
+            notes="**Complete (10/10):** 128-slot vtables, CL7::Barrier unwrapping, VirtualAlloc2 aliasing, 2 MB large pages, CreatePlacedResourceX GPUVA, ID3D12Device2 stream PSOs, VRS Tier 1/2, sparse 64 KB ReservedResource + UpdateTileMappings + SamplerFeedback, ExecuteIndirect GPU counts & GPU Work Graphs",
         ),
         Subsystem(
             name="Retail XMA2 & Bink2 Media",
@@ -693,7 +693,7 @@ def collect_aaa_roadmap_metrics() -> list[Subsystem]:
             category="Titles",
             implemented=6,
             target=6,
-            notes="**Complete (6/6 — Vertical-Slice Harness):** Encrypted GDFX XVC extraction/boot, UE5 Gen9 PE64 slice, Open-World Wave32/2MB-alias PE64 slice, GPU stability breadcrumbs, multi-queue GDeflate+XS2 churn, PSO prewarm + QPC p99 profiler (external retail games still need Option A)",
+            notes="**Complete (6/6 — Vertical-Slice Harness):** Encrypted GDFX XVC extraction/boot, UE5 Gen9 PE64 slice, Open-World Wave32/2MB-alias PE64 slice, GPU stability breadcrumbs, multi-queue GDeflate+XS2 churn, PSO prewarm + QPC p99 profiler (retail titles require per-title testing)",
         ),
     ]
 
@@ -1158,16 +1158,16 @@ def render_markdown_status(
         "<!-- SCARLETTX_STATUS_START -->",
         "## Status",
         "",
-        "### Phase 2: Retail AAA Execution Roadmap (Active Next Wave)",
+        "### Phase 2: Retail AAA Execution Architecture (Completed — 72/72)",
         "",
-        "While Phase 1 foundations and ABI coverage are at `100%`, running unmodified heavy commercial AAA retail titles (UE5, Open-World, Creation Engine) requires deeper silicon-level compiler, GPU execution, and codec milestones tracked honestly below:",
+        "Tracks the deep silicon-level compiler, GPU execution, MSAA/DCC/HTILE, DirectStorage GPU compute, and GDK/WinRT architecture milestones (`72/72` implemented; individual commercial retail games still require per-title validation with user-supplied dumps):",
         "",
         "![ScarlettEdge Phase 2: Retail AAA Execution Roadmap](docs/status_aaa_roadmap.svg)",
         "",
-        f"**Phase 2 AAA Readiness:** `{aaa_pct:.1f}%` ({aaa_impl} of {aaa_target} milestones) · "
-        f"**Active Focus:** `Option A Hardware Silicon (MSAA/DCC/HTILE, Vulkan KHR Ray Tracing, GPU GDeflate & D3D12.2 VRS/Work Graphs)`",
+        f"**Phase 2 Architecture Milestones:** `{aaa_pct:.1f}%` ({aaa_impl} of {aaa_target} milestones) · "
+        f"**Next Wave:** `Per-Title Commercial Retail AAA Game Compatibility Testing`",
         "",
-        "| Phase 2 Milestone | Category | Progress | Readiness | Remaining Work |",
+        "| Phase 2 Milestone | Category | Progress | Readiness | Implemented Capabilities |",
         "| :--- | :--- | :---: | :---: | :--- |",
     ]
     if aaa_subsystems:
@@ -1342,7 +1342,7 @@ def main() -> None:
     aaa_pct = (aaa_impl / aaa_target * 100.0) if aaa_target else 0.0
     aaa_badges = [
         ("phase 2 AAA", f"{aaa_pct:.1f}% ({aaa_impl}/{aaa_target})", LV3 if aaa_pct >= 80.0 else LV1, aaa_pct >= 80.0),
-        ("stage", "Active Development", BADGE_EXPORTS, False),
+        ("stage", "Architecture Complete", BADGE_EXPORTS, False),
         ("CI tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
         ("target", "Unmodified Retail AAA Titles", BADGE_TARGET, False),
     ]
@@ -1350,9 +1350,9 @@ def main() -> None:
         aaa_subsystems,
         badges=aaa_badges,
         heading_prefix="Phase 2: Retail AAA Execution Roadmap",
-        callout_lead="Remaining 10 sub-goals (Option A):",
-        callout_line1=f"{aaa_pct:.1f}% complete ({aaa_impl}/{aaa_target} Phase 2 milestones) — MSAA/DCC/HTILE, VK_KHR_ray_tracing, GPU GDeflate & VRS/Work Graphs remain.",
-        callout_line2="Vertical-slice UE5 & Open-World harnesses verify encrypted XVC boot & HLE subsystems; external retail titles require Option A.",
+        callout_lead="Scope note:",
+        callout_line1=f"All {aaa_impl}/{aaa_target} ({aaa_pct:.1f}%) clean-room silicon, Vulkan KHR RT, GPU GDeflate, MSAA/DCC/HTILE & D3D12.2 milestones are active.",
+        callout_line2="Passing synthetic & UE5/Open-World vertical-slice suites do not guarantee compatibility with untested commercial retail games.",
     )
 
     html_doc = render_html(subsystems, total_exports, tests_text, tests_ok)

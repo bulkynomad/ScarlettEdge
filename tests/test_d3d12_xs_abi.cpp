@@ -30,6 +30,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #endif
 
 namespace {
@@ -257,7 +258,138 @@ int main() {
 
     SX_CHECK_EQ(D3D12XboxDestroyRaytracingAccelerationStructure(dev, dxr_tlas), 0);
     SX_CHECK_EQ(D3D12XboxDestroyRaytracingAccelerationStructure(dev, dxr_blas), 0);
-    SX_CHECK(D3D12XboxDestroyRaytracingAccelerationStructure(dev, dxr_blas) != 0);
+    SX_CHECK_EQ(D3D12XboxDestroyRaytracingAccelerationStructure(dev, dxr_blas) != 0, true);
+
+#if defined(_WIN32)
+    // 3b. D3D12.2 Ultimate: VRS, Tiled (Reserved) Resources, ExecuteIndirect GPU Counts, & Work Graphs!
+    {
+        // (1) Variable Rate Shading (VRS) query & command-list state
+        D3D12XBOX_VRS_CAPABILITIES vrs_caps{};
+        SX_CHECK_EQ(D3D12XboxQueryVrsCapabilities(dev, &vrs_caps), 0);
+        SX_CHECK(vrs_caps.ShadingRateImageTileSize >= 8u);
+        const uint32_t combiners[2] = {0u /* PASSTHROUGH */, 1u /* OVERRIDE */};
+        SX_CHECK_EQ(D3D12XboxSetShadingRate(dev, 0x5u /* D3D12_SHADING_RATE_2X2 */, combiners), 0);
+
+        // (2) Tiled (Reserved) Resource creation + 64 KB sparse tile mapping + GPU R/W round-trip
+        uint64_t reserved_res = 0;
+        SX_CHECK_EQ(D3D12XboxCreateReservedResource(dev, 131072ull /* 2 x 64 KB tiles */, &reserved_res), 0);
+        SX_CHECK(reserved_res != 0);
+
+        std::vector<uint32_t> tile1_in(1024);
+        for (size_t i = 0; i < tile1_in.size(); ++i) tile1_in[i] = static_cast<uint32_t>(0xA50000u + i * 7u);
+        std::vector<uint32_t> tile1_out(1024, 0u);
+        SX_CHECK_EQ(D3D12XboxUpdateTileMappings(
+                        dev, reserved_res, 1u /* map tile #1 at +64 KB */, 1u,
+                        tile1_in.data(), tile1_in.size() * sizeof(uint32_t),
+                        tile1_out.data(), tile1_out.size() * sizeof(uint32_t)),
+                    0);
+        SX_CHECK(tile1_out == tile1_in);
+        SX_CHECK_EQ(D3D12XboxDestroyReservedResource(dev, reserved_res), 0);
+
+        // (3) ExecuteIndirect with GPU Count Buffer:
+        //     4 indirect commands submitted (max=4), GPU count buffer = 2 -> only first 2 dispatches execute!
+        auto compile_cs = [](const char* src) {
+            ID3DBlob* cs = nullptr;
+            ID3DBlob* err = nullptr;
+            const HRESULT hr = D3DCompile(src, std::strlen(src), "d3d12_2_test.hlsl",
+                                          nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err);
+            if (err) err->Release();
+            std::vector<uint8_t> bytes;
+            if (SUCCEEDED(hr) && cs) {
+                const auto* p = static_cast<const uint8_t*>(cs->GetBufferPointer());
+                bytes.assign(p, p + cs->GetBufferSize());
+                cs->Release();
+            }
+            return bytes;
+        };
+
+        const auto indirect_cs = compile_cs(R"(
+RWByteAddressBuffer g_Out : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {
+    uint prev = 0;
+    g_Out.InterlockedAdd(0, 1u, prev);
+    g_Out.InterlockedAdd(4, gid.x + 1u, prev);
+}
+)");
+        SX_CHECK(!indirect_cs.empty());
+
+        D3D12XBOX_ROOT_SIGNATURE_DESC irs_desc{};
+        irs_desc.NumUavs = 1;
+        uint64_t irs = 0;
+        SX_CHECK_EQ(D3D12XboxCreateRootSignature(dev, &irs_desc, &irs), 0);
+
+        D3D12XBOX_COMPUTE_PSO_DESC ipso_desc{};
+        ipso_desc.RootSignatureHandle = irs;
+        ipso_desc.CS = {indirect_cs.data(), indirect_cs.size()};
+        uint64_t ipso = 0;
+        SX_CHECK_EQ(D3D12XboxCreateComputePipelineState(dev, &ipso_desc, &ipso), 0);
+
+        // 4 candidate indirect dispatches: GroupCountX = {3, 5, 100, 200}; GPU count buffer = 2 -> 3 + 5 = 8 groups!
+        const uint32_t triplets[12] = {
+            3u, 1u, 1u,
+            5u, 1u, 1u,
+            100u, 1u, 1u,
+            200u, 1u, 1u,
+        };
+        uint32_t indirect_uav[4] = {0u, 0u, 0xCAFEBABEu, 0u};
+        SX_CHECK_EQ(D3D12XboxExecuteIndirectWithCount(
+                        dev, ipso, 4u /* max_command_count */, triplets, 2u /* gpu_count_buffer_value */,
+                        indirect_uav, sizeof(indirect_uav)),
+                    0);
+        SX_CHECK_EQ(indirect_uav[0], 8u);  // 3 + 5 = 8 total groups (commands 2 & 3 skipped by GPU count buffer!)
+        SX_CHECK_EQ(indirect_uav[2], 0xCAFEBABEu);
+        SX_CHECK_EQ(D3D12XboxDestroyPipelineState(dev, ipso), 0);
+        SX_CHECK_EQ(D3D12XboxDestroyRootSignature(dev, irs), 0);
+
+        // (4) GPU Producer -> Consumer Work Graph (zero CPU readback between Producer and Consumer!)
+        const auto producer_cs = compile_cs(R"(
+cbuffer Constants : register(b0) { uint g_RecordCount; uint g_BaseVal; uint g_P2; uint g_P3; };
+RWByteAddressBuffer g_DispatchArgs : register(u0);
+RWByteAddressBuffer g_Records      : register(u1);
+RWByteAddressBuffer g_UnusedOut    : register(u2);
+[numthreads(1, 1, 1)]
+void main(uint3 dtid : SV_DispatchThreadID) {
+    if (dtid.x == 0u) {
+        g_DispatchArgs.Store3(0, uint3(g_RecordCount, 1u, 1u));
+        for (uint i = 0u; i < g_RecordCount; ++i) {
+            g_Records.Store(i * 4u, g_BaseVal + i * 10u);
+        }
+    }
+}
+)");
+        const auto consumer_cs = compile_cs(R"(
+cbuffer Constants : register(b0) { uint g_RecordCount; uint g_BaseVal; uint g_Mul; uint g_P3; };
+RWByteAddressBuffer g_DispatchArgs : register(u0);
+RWByteAddressBuffer g_Records      : register(u1);
+RWByteAddressBuffer g_FinalOut     : register(u2);
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {
+    uint rec = g_Records.Load(gid.x * 4u);
+    g_FinalOut.Store(gid.x * 4u, rec * g_Mul + 1u);
+}
+)");
+        SX_CHECK(!producer_cs.empty() && !consumer_cs.empty());
+
+        D3D12XBOX_WORK_GRAPH_DESC wg_desc{};
+        wg_desc.ProducerCS = {producer_cs.data(), producer_cs.size()};
+        wg_desc.ConsumerCS = {consumer_cs.data(), consumer_cs.size()};
+        wg_desc.MaxNodeRecords = 16;
+        wg_desc.RecordStrideBytes = 4;
+        uint64_t wg = 0;
+        SX_CHECK_EQ(D3D12XboxCreateWorkGraph(dev, &wg_desc, &wg), 0);
+        SX_CHECK(wg != 0);
+
+        const uint32_t wg_consts[4] = {6u /* 6 consumer groups emitted by Producer */, 100u, 3u, 0u};
+        uint32_t wg_out[8] = {};
+        SX_CHECK_EQ(D3D12XboxDispatchWorkGraph(dev, wg, 1u, wg_consts, 4u, wg_out, sizeof(wg_out)), 0);
+        for (uint32_t i = 0; i < 6u; ++i) {
+            SX_CHECK_EQ(wg_out[i], (100u + i * 10u) * 3u + 1u);
+        }
+        SX_CHECK_EQ(wg_out[6], 0u);  // Unlaunched consumer slot stays 0!
+        SX_CHECK_EQ(D3D12XboxDestroyWorkGraph(dev, wg), 0);
+    }
+#endif
 
     SX_CHECK_EQ(D3D12XboxDestroyDevice(dev), 0);
 

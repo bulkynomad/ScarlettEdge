@@ -5,6 +5,7 @@
 #include "scarlettx/gpu/xg_xs_abi.h"
 #include "sx_check.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -350,6 +351,220 @@ void TestComputer() {
     SX_REQUIRE(Slot<RefFn>(linear, 1)(linear) == 0);
 }
 
+void TestMsaaAddressing() {
+    // 2x, 4x, and 8x MSAA optimal swizzle modes and disjoint sample-plane swizzled addressing.
+    SX_REQUIRE(XGComputeOptimalSwizzleMode(3, kRgba8, 1920, 1080, 1, 4, 0x20, 0) == XG_SWIZZLE_MODE_64KB_R_X);
+    SX_REQUIRE(XGComputeOptimalSwizzleMode(3, 40, 1920, 1080, 1, 8, 0x40, 0) == XG_SWIZZLE_MODE_64KB_Z_X);
+    SX_REQUIRE(XGComputeOptimalSwizzleMode(3, kRgba8, 1280, 720, 1, 2, 0x08, 0) == XG_SWIZZLE_MODE_64KB_D_X);
+
+    const uint32_t sample_counts[3] = {2u, 4u, 8u};
+    for (uint32_t samples : sample_counts) {
+        XG_TEXTURE2D_DESC d = Desc(130, 70, 1, kRgba8, 2);
+        d.SampleDesc.Count = samples;
+        d.BindFlags = 0x20;
+        d.SwizzleMode = XGComputeOptimalSwizzleMode(3, d.Format, d.Width, d.Height, d.ArraySize, samples, d.BindFlags, 0);
+
+        void* comp = nullptr;
+        SX_REQUIRE(XGCreateTexture2DComputer(&d, &comp) == 0 && comp != nullptr);
+
+        XG_RESOURCE_LAYOUT layout{};
+        using LayoutFn = int32_t (SCARLETTX_XG_CALL*)(void*, XG_RESOURCE_LAYOUT*);
+        using TexelFn = uint64_t (SCARLETTX_XG_CALL*)(void*, uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t);
+        using RefFn = uint32_t (SCARLETTX_XG_CALL*)(void*);
+        SX_REQUIRE(Slot<LayoutFn>(comp, 2)(comp, &layout) == 0);
+        SX_REQUIRE(layout.MipLevels == 1u);
+        SX_REQUIRE(layout.Plane[0].MipLayout[0].SampleCount == samples);
+        SX_REQUIRE(xg::IsAddressable(layout));
+
+        std::vector<uint8_t> mem(static_cast<size_t>(layout.SizeBytes), 0);
+        std::vector<uint32_t> owner(mem.size(), 0);
+        uint32_t tag = 0;
+
+        for (uint32_t slice = 0; slice < d.ArraySize; ++slice) {
+            for (uint32_t s = 0; s < samples; ++s) {
+                std::vector<uint8_t> src(d.Width * d.Height * 4u);
+                for (size_t i = 0; i < src.size(); ++i) {
+                    src[i] = static_cast<uint8_t>((i * 13u + s * 41u + slice * 89u + samples) & 0xFFu);
+                }
+                SX_REQUIRE(xg::CopyIntoMsaaSample(layout, mem.data(), 0, slice, s, src.data(), d.Width * 4u));
+
+                for (uint32_t y = 0; y < d.Height; ++y) {
+                    for (uint32_t x = 0; x < d.Width; ++x) {
+                        uint64_t off = ~0ull;
+                        SX_REQUIRE(xg::TexelElementOffsetSample(layout, 0, slice, x, y, s, &off));
+                        const uint64_t vtbl_off = Slot<TexelFn>(comp, 6)(comp, 0, 0, x, y, slice, s);
+                        SX_REQUIRE(off == vtbl_off);
+                        SX_REQUIRE(off + 4u <= mem.size());
+                        ++tag;
+                        for (uint32_t b = 0; b < 4u; ++b) {
+                            SX_REQUIRE(owner[off + b] == 0u);
+                            owner[off + b] = tag;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify out-of-range sample index is rejected cleanly.
+        uint64_t bad_off = 0;
+        SX_REQUIRE(!xg::TexelElementOffsetSample(layout, 0, 0, 0, 0, samples, &bad_off));
+
+        // Read back every MSAA sample plane and verify bit-exact data integrity.
+        for (uint32_t slice = 0; slice < d.ArraySize; ++slice) {
+            for (uint32_t s = 0; s < samples; ++s) {
+                std::vector<uint8_t> dst(d.Width * d.Height * 4u, 0);
+                SX_REQUIRE(xg::CopyFromMsaaSample(layout, mem.data(), 0, slice, s, dst.data(), d.Width * 4u));
+                for (size_t i = 0; i < dst.size(); ++i) {
+                    const uint8_t exp = static_cast<uint8_t>((i * 13u + s * 41u + slice * 89u + samples) & 0xFFu);
+                    SX_REQUIRE(dst[i] == exp);
+                }
+            }
+        }
+
+        SX_REQUIRE(Slot<RefFn>(comp, 1)(comp) == 0);
+    }
+}
+
+void TestDccAndHtileCodecs() {
+    // Non-multiple-of-8 surface (29x19 -> 4x3 = 12 tiles) exercising all 6 RDNA2 DCC sector key codes:
+    //   tile (0,0): 0x00 fast-clear (0,0,0,0)
+    //   tile (1,0): 0x20 fast-clear (0,0,0,255)
+    //   tile (2,0): 0x80 fast-clear (255,255,255,255)
+    //   tile (3,0): 0x40 solid arbitrary color (42, 128, 200, 255) on partial right-edge tile
+    //   row 1 tiles: 0xC0 4-bit delta blocks (max-min <= 15 per channel)
+    //   row 2 tiles: 0xFF high-frequency uncompressed blocks (max-min > 15)
+    const uint32_t w = 29u, h = 19u;
+    const uint32_t src_pitch = w * 4u + 16u;
+    std::vector<uint8_t> src(static_cast<size_t>(src_pitch) * h, 0xAA);
+
+    for (uint32_t y = 0; y < h; ++y) {
+        uint8_t* row = src.data() + static_cast<size_t>(y) * src_pitch;
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint32_t tx = x / 8u;
+            const uint32_t ty = y / 8u;
+            uint8_t rgba[4] = {0, 0, 0, 0};
+            if (ty == 0u) {
+                if (tx == 0u) {
+                    rgba[0] = 0; rgba[1] = 0; rgba[2] = 0; rgba[3] = 0;
+                } else if (tx == 1u) {
+                    rgba[0] = 0; rgba[1] = 0; rgba[2] = 0; rgba[3] = 255;
+                } else if (tx == 2u) {
+                    rgba[0] = 255; rgba[1] = 255; rgba[2] = 255; rgba[3] = 255;
+                } else {
+                    rgba[0] = 42; rgba[1] = 128; rgba[2] = 200; rgba[3] = 255;
+                }
+            } else if (ty == 1u) {
+                const uint8_t dx = static_cast<uint8_t>(x & 7u);
+                const uint8_t dy = static_cast<uint8_t>(y & 7u);
+                rgba[0] = static_cast<uint8_t>(60u + dx + dy);       // delta <= 14
+                rgba[1] = static_cast<uint8_t>(100u + dx * 2u);      // delta <= 14
+                rgba[2] = static_cast<uint8_t>(180u + dy * 2u);      // delta <= 14
+                rgba[3] = static_cast<uint8_t>(240u + (dx ^ dy));    // delta <= 7
+            } else {
+                rgba[0] = static_cast<uint8_t>((x * 73u + y * 19u) & 0xFFu);
+                rgba[1] = static_cast<uint8_t>((x * 151u + y * 43u) & 0xFFu);
+                rgba[2] = static_cast<uint8_t>((x * 29u + y * 211u) & 0xFFu);
+                rgba[3] = static_cast<uint8_t>((x * 97u + y * 131u) & 0xFFu);
+            }
+            std::memcpy(row + static_cast<size_t>(x) * 4u, rgba, 4u);
+        }
+    }
+
+    uint64_t needed_payload = 0;
+    XG_DCC_STATS stats{};
+    SX_REQUIRE(XGCompressDccSurface(src.data(), w, h, src_pitch, nullptr, 0, nullptr, 0, &needed_payload, &stats) == 0);
+    SX_REQUIRE(stats.TileCount == 12u);
+    SX_REQUIRE(stats.FastClearTiles == 3u);
+    SX_REQUIRE(stats.SolidColorTiles == 1u);
+    SX_REQUIRE(stats.DeltaTiles == 4u);
+    SX_REQUIRE(stats.UncompressedTiles == 4u);
+    SX_REQUIRE(needed_payload == 4u + 4u * 132u + 4u * 256u);
+    SX_REQUIRE(needed_payload < 12u * 256u);
+
+    std::vector<uint8_t> meta(stats.TileCount, 0);
+    std::vector<uint8_t> payload(static_cast<size_t>(needed_payload), 0);
+    uint64_t written_payload = 0;
+    SX_REQUIRE(XGCompressDccSurface(src.data(), w, h, src_pitch, meta.data(), stats.TileCount,
+                                    payload.data(), payload.size(), &written_payload, nullptr) == 0);
+    SX_REQUIRE(written_payload == needed_payload);
+    SX_REQUIRE(meta[0] == XG_DCC_KEY_CLEAR_0000);
+    SX_REQUIRE(meta[1] == XG_DCC_KEY_CLEAR_0001);
+    SX_REQUIRE(meta[2] == XG_DCC_KEY_CLEAR_1111);
+    SX_REQUIRE(meta[3] == XG_DCC_KEY_SOLID_COLOR);
+    SX_REQUIRE(meta[4] == XG_DCC_KEY_DELTA_4BIT);
+    SX_REQUIRE(meta[8] == XG_DCC_KEY_UNCOMPRESSED);
+
+    const uint32_t dst_pitch = w * 4u + 8u;
+    std::vector<uint8_t> dst(static_cast<size_t>(dst_pitch) * h, 0x55);
+    SX_REQUIRE(XGDecompressDccSurface(meta.data(), static_cast<uint32_t>(meta.size()),
+                                      payload.data(), payload.size(), dst.data(), w, h, dst_pitch) == 0);
+    for (uint32_t y = 0; y < h; ++y) {
+        SX_REQUIRE(std::memcmp(src.data() + static_cast<size_t>(y) * src_pitch,
+                               dst.data() + static_cast<size_t>(y) * dst_pitch,
+                               w * 4u) == 0);
+        // Verify row padding outside width was untouched!
+        for (uint32_t pad = w * 4u; pad < dst_pitch; ++pad) {
+            SX_REQUIRE(dst[static_cast<size_t>(y) * dst_pitch + pad] == 0x55);
+        }
+    }
+
+    // Metadata-only fast-clear render target decompression (zero payload bytes).
+    std::vector<uint8_t> fc_meta(4, XG_DCC_KEY_CLEAR_0001);
+    std::vector<uint8_t> fc_dst(16u * 16u * 4u, 0);
+    SX_REQUIRE(XGDecompressDccSurface(fc_meta.data(), 4u, nullptr, 0, fc_dst.data(), 16u, 16u, 64u) == 0);
+    for (size_t p = 0; p < 16u * 16u; ++p) {
+        SX_REQUIRE(fc_dst[p * 4u + 0u] == 0 && fc_dst[p * 4u + 1u] == 0 &&
+                   fc_dst[p * 4u + 2u] == 0 && fc_dst[p * 4u + 3u] == 255);
+    }
+
+    // RDNA2 HTILE 8x8 hierarchical depth metadata: fast-clear 1.0f, constant 0.25f, and expanded depth plane.
+    const uint32_t dw = 25u, dh = 17u;  // 4x3 = 12 HTILE words
+    std::vector<float> depth_in(dw * dh, 1.0f);
+    for (uint32_t y = 0; y < dh; ++y) {
+        for (uint32_t x = 0; x < dw; ++x) {
+            const uint32_t tx = x / 8u, ty = y / 8u;
+            if (ty == 0u && tx < 2u) {
+                depth_in[y * dw + x] = 1.0f;  // fast-clear ZMax = 1.0
+            } else if (ty == 0u && tx >= 2u) {
+                depth_in[y * dw + x] = 0.0f;  // reversed-Z fast-clear ZMax = 0.0
+            } else if (ty == 1u) {
+                depth_in[y * dw + x] = static_cast<float>(4096) / 16383.0f;  // constant ZMin
+            } else {
+                depth_in[y * dw + x] = static_cast<float>(x + y * 3u) / 100.0f;  // expanded depth plane
+            }
+        }
+    }
+
+    std::vector<uint32_t> htile(12u, 0);
+    std::vector<float> expanded(12u * 64u, 0.0f);
+    uint32_t exp_written = 0;
+    SX_REQUIRE(XGBuildHtileMetadata(depth_in.data(), dw, dh, dw, htile.data(), 12u,
+                                    expanded.data(), static_cast<uint32_t>(expanded.size()), &exp_written) == 0);
+    // Row 2 has 3 varying 8x1 tiles (expanded) and 1 single-pixel corner tile (24,16) compressed as CONST_ZMIN!
+    SX_REQUIRE(exp_written == 3u * 64u);
+    SX_REQUIRE((htile[0] & 0xFu) == XG_HTILE_ZMASK_CLEAR_ZMAX);
+    SX_REQUIRE(((htile[0] >> 18u) & 0x3FFFu) == 0x3FFFu);
+    SX_REQUIRE((htile[2] & 0xFu) == XG_HTILE_ZMASK_CLEAR_ZMAX);
+    SX_REQUIRE(((htile[2] >> 18u) & 0x3FFFu) == 0u);
+    SX_REQUIRE((htile[4] & 0xFu) == XG_HTILE_ZMASK_CONST_ZMIN);
+    SX_REQUIRE((htile[8] & 0xFu) == XG_HTILE_ZMASK_EXPANDED);
+    SX_REQUIRE((htile[11] & 0xFu) == XG_HTILE_ZMASK_CONST_ZMIN);
+
+    std::vector<float> depth_out(dw * dh, -1.0f);
+    SX_REQUIRE(XGDecompressHtileDepth(htile.data(), 12u, expanded.data(), exp_written,
+                                      depth_out.data(), dw, dh, dw) == 0);
+    for (size_t i = 0; i < depth_in.size(); ++i) {
+        SX_REQUIRE(std::fabs(depth_out[i] - depth_in[i]) <= 1e-4f);
+    }
+
+    // Also verify metadata-only Hi-Z conservative depth decompression (expandedTiles == nullptr).
+    std::vector<float> hiz_out(dw * dh, -1.0f);
+    SX_REQUIRE(XGDecompressHtileDepth(htile.data(), 12u, nullptr, 0, hiz_out.data(), dw, dh, dw) == 0);
+    for (size_t i = 0; i < hiz_out.size(); ++i) {
+        SX_REQUIRE(hiz_out[i] >= 0.0f && hiz_out[i] <= 1.0f);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -357,6 +572,8 @@ int main() {
     TestMipChain();
     TestRoundTrip();
     TestComputer();
+    TestMsaaAddressing();
+    TestDccAndHtileCodecs();
     std::printf("test_xg_layout: OK\n");
     return 0;
 }

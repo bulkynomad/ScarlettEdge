@@ -180,6 +180,36 @@ struct PipelineStateEntry {
 #endif
 };
 
+struct ReservedResourceEntry {
+#if defined(_WIN32)
+    ID3D12Resource* resource = nullptr;
+    ID3D12Heap* tile_heap = nullptr;
+    ~ReservedResourceEntry() {
+        if (resource) resource->Release();
+        if (tile_heap) tile_heap->Release();
+    }
+#endif
+    uint64_t byte_size = 0;
+    bool is_true_reserved = false;
+};
+
+struct WorkGraphEntry {
+#if defined(_WIN32)
+    ID3D12RootSignature* root_sig = nullptr;
+    ID3D12PipelineState* producer_pso = nullptr;
+    ID3D12PipelineState* consumer_pso = nullptr;
+    ID3D12CommandSignature* cmd_sig = nullptr;
+    ~WorkGraphEntry() {
+        if (cmd_sig) cmd_sig->Release();
+        if (consumer_pso) consumer_pso->Release();
+        if (producer_pso) producer_pso->Release();
+        if (root_sig) root_sig->Release();
+    }
+#endif
+    uint32_t max_records = 64;
+    uint32_t record_stride = 16;
+};
+
 struct D3D12XsDeviceState {
     std::unique_ptr<scarlettx::D3D12Backend> backend;
     uint64_t next_frame_token = 1;
@@ -197,9 +227,13 @@ struct D3D12XsDeviceState {
     uint64_t next_root_sig_handle = 0x21000001ull;
     uint64_t next_heap_handle = 0x22000001ull;
     uint64_t next_pso_handle = 0x23000001ull;
+    uint64_t next_reserved_handle = 0x24000001ull;
+    uint64_t next_work_graph_handle = 0x25000001ull;
     std::unordered_map<uint64_t, std::unique_ptr<RootSignatureEntry>> root_signatures;
     std::unordered_map<uint64_t, std::unique_ptr<DescriptorHeapEntry>> descriptor_heaps;
     std::unordered_map<uint64_t, std::unique_ptr<PipelineStateEntry>> psos;
+    std::unordered_map<uint64_t, std::unique_ptr<ReservedResourceEntry>> reserved_resources;
+    std::unordered_map<uint64_t, std::unique_ptr<WorkGraphEntry>> work_graphs;
     uint64_t pso_cache_hits = 0;
     uint64_t pso_cache_misses = 0;
 #if defined(_WIN32)
@@ -209,6 +243,8 @@ struct D3D12XsDeviceState {
             if (kv.second) kv.second->Release();
         }
         pso_cache.clear();
+        work_graphs.clear();
+        reserved_resources.clear();
         psos.clear();
         descriptor_heaps.clear();
         root_signatures.clear();
@@ -830,6 +866,8 @@ struct XboxD3D12HeapProxy {
     std::atomic<uint32_t> ref_count{1};
 #if defined(_WIN32)
     D3D12_HEAP_DESC desc{};
+    ID3D12Heap* pc_heap = nullptr;
+    std::mutex tile_mu;
 #endif
 };
 const ProxyGuid kIidID3D12Heap = {0x6b3b2502u, 0x6e51u, 0x45b3u, {0x90, 0xee, 0x98, 0x84, 0x26, 0x5e, 0x8d, 0xf3}};
@@ -854,7 +892,12 @@ intptr_t SCARLETTX_GDK_CALLBACK HeapAddRef(void* self, uintptr_t, uintptr_t, uin
 intptr_t SCARLETTX_GDK_CALLBACK HeapRelease(void* self, uintptr_t, uintptr_t, uintptr_t) {
     auto* obj = static_cast<XboxD3D12HeapProxy*>(self);
     const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (rem == 0) delete obj;
+    if (rem == 0) {
+#if defined(_WIN32)
+        if (obj->pc_heap) obj->pc_heap->Release();
+#endif
+        delete obj;
+    }
     return static_cast<intptr_t>(rem);
 }
 template <int Slot>
@@ -2351,6 +2394,56 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListDispatchRays(
 #endif
     return 0;
 }
+intptr_t SCARLETTX_GDK_CALLBACK CmdListRSSetShadingRate(
+    void* self, uintptr_t baseShadingRate, uintptr_t pCombiners, uintptr_t) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
+    if (obj && obj->pc_list && obj->pc_device) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 opts6{};
+        if (SUCCEEDED(obj->pc_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &opts6, sizeof(opts6))) &&
+            opts6.VariableShadingRateTier != D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED) {
+            ID3D12GraphicsCommandList5* cl5 = nullptr;
+            if (SUCCEEDED(obj->pc_list->QueryInterface(IID_PPV_ARGS(&cl5))) && cl5) {
+                auto rate = static_cast<D3D12_SHADING_RATE>(baseShadingRate);
+                if (!opts6.AdditionalShadingRatesSupported && rate > D3D12_SHADING_RATE_2X2) {
+                    rate = D3D12_SHADING_RATE_2X2;
+                }
+                cl5->RSSetShadingRate(rate, reinterpret_cast<const D3D12_SHADING_RATE_COMBINER*>(pCombiners));
+                cl5->Release();
+            }
+        }
+    }
+#else
+    (void)self;
+    (void)baseShadingRate;
+    (void)pCombiners;
+#endif
+    return 0;
+}
+intptr_t SCARLETTX_GDK_CALLBACK CmdListRSSetShadingRateImage(
+    void* self, uintptr_t pShadingRateImage, uintptr_t, uintptr_t) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
+    if (obj && obj->pc_list && obj->pc_device) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 opts6{};
+        if (SUCCEEDED(obj->pc_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &opts6, sizeof(opts6))) &&
+            opts6.VariableShadingRateTier >= D3D12_VARIABLE_SHADING_RATE_TIER_2) {
+            ID3D12GraphicsCommandList5* cl5 = nullptr;
+            if (SUCCEEDED(obj->pc_list->QueryInterface(IID_PPV_ARGS(&cl5))) && cl5) {
+                ID3D12Resource* img = pShadingRateImage
+                    ? reinterpret_cast<XboxD3D12ResourceProxy*>(pShadingRateImage)->pc_res
+                    : nullptr;
+                cl5->RSSetShadingRateImage(img);
+                cl5->Release();
+            }
+        }
+    }
+#else
+    (void)self;
+    (void)pShadingRateImage;
+#endif
+    return 0;
+}
 intptr_t SCARLETTX_GDK_CALLBACK CmdListDispatchMesh(
     void* self, uintptr_t x, uintptr_t y, uintptr_t z) {
 #if defined(_WIN32)
@@ -2518,6 +2611,8 @@ std::array<ComVtableFn, 128> BuildCmdListVtable() {
     vtbl[67] = &CmdListFlushPipelineX;
     vtbl[70] = &CmdListSetPipelineState1;
     vtbl[71] = &CmdListDispatchRays;
+    vtbl[74] = &CmdListRSSetShadingRate;
+    vtbl[75] = &CmdListRSSetShadingRateImage;
     vtbl[76] = &CmdListDispatchMesh;
     vtbl[90] = &CmdListBarrier;
     return vtbl;
@@ -2643,6 +2738,93 @@ constexpr std::array<ComVtableFn, sizeof...(Is) + 3> MakeQueueProxyVtable(std::i
         &QueueProxyRelease,
         &QueueProxyTracedSlot<static_cast<int>(Is + 3)>...,
     };
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK QueueProxyUpdateTileMappings(
+    void* self, uintptr_t pResource, uintptr_t numResourceRegions,
+    uintptr_t pResourceRegionStartCoordinates, uintptr_t pResourceRegionSizes,
+    uintptr_t pHeap, uintptr_t numRanges, uintptr_t pRangeFlags,
+    uintptr_t pHeapRangeStartOffsets, uintptr_t pRangeTileCounts, uintptr_t flags) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12CommandQueueProxy*>(self);
+    auto* res_proxy = reinterpret_cast<XboxD3D12ResourceProxy*>(pResource);
+    if (!obj || !obj->pc_queue || !obj->pc_device || !res_proxy || !res_proxy->pc_res || numResourceRegions == 0) {
+        return 0;
+    }
+    ID3D12Heap* pc_heap = nullptr;
+    if (pHeap) {
+        auto* heap_proxy = reinterpret_cast<XboxD3D12HeapProxy*>(pHeap);
+        std::lock_guard<std::mutex> lk(heap_proxy->tile_mu);
+        if (!heap_proxy->pc_heap) {
+            D3D12_HEAP_DESC hd = heap_proxy->desc;
+            if (hd.Properties.Type == D3D12_HEAP_TYPE_CUSTOM) {
+                hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                hd.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+                hd.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+            }
+            if (hd.SizeInBytes < 65536ull) hd.SizeInBytes = 65536ull;
+            hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+            const D3D12_RESOURCE_DESC rd = res_proxy->pc_res->GetDesc();
+            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+            } else if ((rd.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0) {
+                hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+            } else {
+                hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+            }
+            (void)obj->pc_device->CreateHeap(&hd, IID_PPV_ARGS(&heap_proxy->pc_heap));
+        }
+        pc_heap = heap_proxy->pc_heap;
+    }
+    const D3D12_TILE_RANGE_FLAGS default_null_flag = D3D12_TILE_RANGE_FLAG_NULL;
+    UINT eff_num_ranges = static_cast<UINT>(numRanges);
+    const auto* eff_range_flags = reinterpret_cast<const D3D12_TILE_RANGE_FLAGS*>(pRangeFlags);
+    if (!pc_heap && (eff_num_ranges == 0 || !eff_range_flags)) {
+        eff_num_ranges = 1u;
+        eff_range_flags = &default_null_flag;
+    }
+    obj->pc_queue->UpdateTileMappings(
+        res_proxy->pc_res,
+        static_cast<UINT>(numResourceRegions),
+        reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(pResourceRegionStartCoordinates),
+        reinterpret_cast<const D3D12_TILE_REGION_SIZE*>(pResourceRegionSizes),
+        pc_heap,
+        eff_num_ranges,
+        eff_range_flags,
+        reinterpret_cast<const UINT*>(pHeapRangeStartOffsets),
+        reinterpret_cast<const UINT*>(pRangeTileCounts),
+        static_cast<D3D12_TILE_MAPPING_FLAGS>(flags));
+#else
+    (void)self; (void)pResource; (void)numResourceRegions;
+    (void)pResourceRegionStartCoordinates; (void)pResourceRegionSizes;
+    (void)pHeap; (void)numRanges; (void)pRangeFlags;
+    (void)pHeapRangeStartOffsets; (void)pRangeTileCounts; (void)flags;
+#endif
+    return 0;
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK QueueProxyCopyTileMappings(
+    void* self, uintptr_t pDstResource, uintptr_t pDstStartCoord,
+    uintptr_t pSrcResource, uintptr_t pSrcStartCoord,
+    uintptr_t pRegionSize, uintptr_t flags) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12CommandQueueProxy*>(self);
+    auto* dst = reinterpret_cast<XboxD3D12ResourceProxy*>(pDstResource);
+    auto* src = reinterpret_cast<XboxD3D12ResourceProxy*>(pSrcResource);
+    if (obj && obj->pc_queue && dst && dst->pc_res && src && src->pc_res) {
+        obj->pc_queue->CopyTileMappings(
+            dst->pc_res,
+            reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(pDstStartCoord),
+            src->pc_res,
+            reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(pSrcStartCoord),
+            reinterpret_cast<const D3D12_TILE_REGION_SIZE*>(pRegionSize),
+            static_cast<D3D12_TILE_MAPPING_FLAGS>(flags));
+    }
+#else
+    (void)self; (void)pDstResource; (void)pDstStartCoord;
+    (void)pSrcResource; (void)pSrcStartCoord; (void)pRegionSize; (void)flags;
+#endif
+    return 0;
 }
 
 intptr_t SCARLETTX_GDK_CALLBACK QueueProxyExecuteCommandLists(
@@ -3226,6 +3408,8 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
 std::array<ComVtableFn, 64> BuildQueueProxyVtable() {
     auto vtbl = MakeQueueProxyVtable(std::make_index_sequence<61>{});
     vtbl[6] = &QueueProxySetName;
+    vtbl[8] = reinterpret_cast<ComVtableFn>(&QueueProxyUpdateTileMappings);
+    vtbl[9] = reinterpret_cast<ComVtableFn>(&QueueProxyCopyTileMappings);
     vtbl[10] = &QueueProxyExecuteCommandLists;
     vtbl[11] = &QueueProxyNoop;  // SetMarker
     vtbl[12] = &QueueProxyNoop;  // BeginEvent
@@ -3247,6 +3431,8 @@ const auto kXboxCommandQueueProxyVtbl = BuildQueueProxyVtable();
 std::array<ComVtableFn, 64> BuildQueueProxyVtableV4() {
     auto vtbl = MakeQueueProxyVtable(std::make_index_sequence<61>{});
     vtbl[6] = &QueueProxySetName;
+    vtbl[8] = reinterpret_cast<ComVtableFn>(&QueueProxyUpdateTileMappings);
+    vtbl[9] = reinterpret_cast<ComVtableFn>(&QueueProxyCopyTileMappings);
     vtbl[10] = &QueueProxyExecuteCommandLists;
     vtbl[11] = &QueueProxyNoop;
     vtbl[12] = &QueueProxyNoop;
@@ -4836,6 +5022,80 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePlacedResourceX(
 #endif
 }
 
+// ID3D12Device::CreateReservedResource (slot 30, +0xF0) & ID3D12Device8::CreateSamplerFeedbackUnorderedAccessView (slot 65)
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateReservedResource(
+    void* self, uintptr_t pDesc, uintptr_t initialState,
+    uintptr_t pClearVal, uintptr_t riid, uintptr_t ppvRes) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
+    auto** out = reinterpret_cast<void**>(ppvRes);
+    if (out) *out = nullptr;
+    if (!obj || !obj->pc_device || !pDesc || !out) return static_cast<intptr_t>(E_INVALIDARG);
+
+    D3D12_RESOURCE_DESC desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(pDesc);
+    desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<uint32_t>(desc.Flags) & 0x3Fu);
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    } else if (desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN) {
+        desc.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+    }
+    const auto pc_state = SanitizePcResourceState(static_cast<D3D12_RESOURCE_STATES>(initialState), desc.Dimension);
+    ID3D12Resource* pc_res = nullptr;
+    const HRESULT hr = obj->pc_device->CreateReservedResource(
+        &desc, pc_state, reinterpret_cast<const D3D12_CLEAR_VALUE*>(pClearVal), IID_PPV_ARGS(&pc_res));
+    if (SUCCEEDED(hr) && pc_res) {
+        auto* proxy = new XboxD3D12ResourceProxy();
+        proxy->lpVtbl = kXboxResourceProxyVtbl.data();
+        proxy->device = obj;
+        obj->ref_count.fetch_add(1, std::memory_order_relaxed);
+        proxy->pc_res = pc_res;
+        proxy->tracked_state.store(static_cast<uint32_t>(pc_state), std::memory_order_relaxed);
+        proxy->guest_format = desc.Format;
+        *out = proxy;
+        return 0;
+    }
+    // Clean fallback to committed resource when host adapter lacks TiledResourcesTier for this format/dimension
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC fb_desc = *reinterpret_cast<const D3D12_RESOURCE_DESC*>(pDesc);
+    if (fb_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        fb_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
+    return ProxyCreateCommittedResource(
+        self, reinterpret_cast<uintptr_t>(&hp), 0u, reinterpret_cast<uintptr_t>(&fb_desc),
+        initialState, pClearVal, riid, ppvRes);
+#else
+    (void)self; (void)pDesc; (void)initialState; (void)pClearVal; (void)riid; (void)ppvRes;
+    return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
+#endif
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateSamplerFeedbackUAV(
+    void* self, uintptr_t pTargetedResource, uintptr_t pFeedbackResource, uintptr_t destDescriptor) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
+    if (obj && obj->pc_device && pFeedbackResource && destDescriptor) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS7 opts7{};
+        if (SUCCEEDED(obj->pc_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opts7, sizeof(opts7))) &&
+            opts7.SamplerFeedbackTier != D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED) {
+            ID3D12Device8* dev8 = nullptr;
+            if (SUCCEEDED(obj->pc_device->QueryInterface(IID_PPV_ARGS(&dev8))) && dev8) {
+                ID3D12Resource* tgt = pTargetedResource
+                    ? reinterpret_cast<XboxD3D12ResourceProxy*>(pTargetedResource)->pc_res
+                    : nullptr;
+                ID3D12Resource* fb = reinterpret_cast<XboxD3D12ResourceProxy*>(pFeedbackResource)->pc_res;
+                D3D12_CPU_DESCRIPTOR_HANDLE h{destDescriptor};
+                if (fb) dev8->CreateSamplerFeedbackUnorderedAccessView(tgt, fb, h);
+                dev8->Release();
+            }
+        }
+    }
+#else
+    (void)self; (void)pTargetedResource; (void)pFeedbackResource; (void)destDescriptor;
+#endif
+    return 0;
+}
+
 std::array<ComVtableFn, 128> BuildXboxDeviceProxyVtable() {
     auto vtbl = MakeProxyVtable(std::make_index_sequence<125>{});
     vtbl[6] = &ProxySetName;                                                           // +0x30
@@ -4862,6 +5122,7 @@ std::array<ComVtableFn, 128> BuildXboxDeviceProxyVtable() {
     vtbl[27] = reinterpret_cast<ComVtableFn>(&ProxyCreateCommittedResource);           // +0xd8
     vtbl[28] = &ProxyCreateHeap;                                                       // +0xe0
     vtbl[29] = reinterpret_cast<ComVtableFn>(&ProxyCreatePlacedResource);              // +0xe8
+    vtbl[30] = reinterpret_cast<ComVtableFn>(&ProxyCreateReservedResource);            // +0xf0
     vtbl[36] = reinterpret_cast<ComVtableFn>(&ProxyCreateFence);                       // +0x120
     vtbl[37] = &ProxyGetDeviceRemovedReason;                                           // +0x128
     vtbl[38] = reinterpret_cast<ComVtableFn>(&ProxyGetCopyableFootprints);             // +0x130
@@ -4873,6 +5134,7 @@ std::array<ComVtableFn, 128> BuildXboxDeviceProxyVtable() {
     vtbl[50] = &ProxyCreatePipelineState;                                              // +0x190 (ID3D12Device2 stream PSO)
     vtbl[55] = &ProxyCreateStateObject;                                                // +0x1b8
     vtbl[57] = &ProxyGetRaytracingPrebuildInfo;                                        // +0x1c8
+    vtbl[65] = &ProxyCreateSamplerFeedbackUAV;                                         // +0x208 (ID3D12Device8 SamplerFeedback)
     vtbl[68] = &ProxySlot68XboxInfo;                                                   // +0x220
     vtbl[69] = &ProxySlot69XboxSetting;                                                // +0x228
     vtbl[73] = reinterpret_cast<ComVtableFn>(&ProxyCreateCommandListX);                // +0x248
@@ -6493,6 +6755,785 @@ int32_t D3D12XboxGetGpuStabilityReport(
 
     g_gpu_profiler.FillReport(*out_report);
     return 0;
+}
+
+int32_t D3D12XboxQueryVrsCapabilities(
+    uint64_t device_handle,
+    D3D12XBOX_VRS_CAPABILITIES* out_caps) {
+    if (!out_caps) return -1;
+    std::memset(out_caps, 0, sizeof(*out_caps));
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+#if defined(_WIN32)
+    auto* native_dev = static_cast<ID3D12Device*>(it->second->backend->NativeDevice());
+    if (!native_dev) return -3;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS6 opts6{};
+    if (SUCCEEDED(native_dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &opts6, sizeof(opts6)))) {
+        out_caps->VariableShadingRateTier = static_cast<uint32_t>(opts6.VariableShadingRateTier);
+        out_caps->AdditionalShadingRatesSupported = opts6.AdditionalShadingRatesSupported ? 1u : 0u;
+        out_caps->PerPrimitiveShadingRateSupported =
+            opts6.PerPrimitiveShadingRateSupportedWithViewportIndexing ? 1u : 0u;
+        out_caps->ShadingRateImageTileSize = opts6.ShadingRateImageTileSize > 0 ? opts6.ShadingRateImageTileSize : 16u;
+    } else {
+        out_caps->ShadingRateImageTileSize = 16u;
+    }
+    return 0;
+#else
+    return -3;
+#endif
+}
+
+int32_t D3D12XboxSetShadingRate(
+    uint64_t device_handle,
+    uint32_t base_shading_rate,
+    const uint32_t* combiners_pair) {
+    // Valid D3D12_SHADING_RATE values: 0x0 (1X1), 0x1 (1X2), 0x4 (2X1), 0x5 (2X2), 0x6 (2X4), 0x9 (4X2), 0xA (4X4)
+    if (base_shading_rate > 0xAu) return -1;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+#if defined(_WIN32)
+    auto* native_dev = static_cast<ID3D12Device*>(it->second->backend->NativeDevice());
+    if (!native_dev) return -3;
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS6 opts6{};
+    const bool has_hw_vrs =
+        SUCCEEDED(native_dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS6, &opts6, sizeof(opts6))) &&
+        opts6.VariableShadingRateTier != D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
+    if (!has_hw_vrs) {
+        return 0;  // Clean software acceptance on Tier-0 / headless WARP adapters
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* q = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* cl = nullptr;
+    ID3D12GraphicsCommandList5* cl5 = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE ev = nullptr;
+    auto cleanup = [&]() {
+        if (ev) CloseHandle(ev);
+        if (fence) fence->Release();
+        if (cl5) cl5->Release();
+        if (cl) cl->Release();
+        if (alloc) alloc->Release();
+        if (q) q->Release();
+    };
+
+    if (FAILED(native_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) ||
+        FAILED(native_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(native_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cl)))) {
+        cleanup();
+        return -3;
+    }
+
+    if (SUCCEEDED(cl->QueryInterface(IID_PPV_ARGS(&cl5))) && cl5) {
+        auto rate = static_cast<D3D12_SHADING_RATE>(base_shading_rate);
+        if (!opts6.AdditionalShadingRatesSupported && rate > D3D12_SHADING_RATE_2X2) {
+            rate = D3D12_SHADING_RATE_2X2;
+        }
+        D3D12_SHADING_RATE_COMBINER combs[2] = {
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+            D3D12_SHADING_RATE_COMBINER_PASSTHROUGH,
+        };
+        if (combiners_pair) {
+            combs[0] = static_cast<D3D12_SHADING_RATE_COMBINER>(combiners_pair[0] % 5u);
+            combs[1] = static_cast<D3D12_SHADING_RATE_COMBINER>(combiners_pair[1] % 5u);
+        }
+        cl5->RSSetShadingRate(rate, combs);
+    }
+    cl->Close();
+    ID3D12CommandList* lists[] = {cl};
+    q->ExecuteCommandLists(1, lists);
+    if (SUCCEEDED(native_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        q->Signal(fence, 1ull);
+        if (ev && fence->GetCompletedValue() < 1ull) {
+            fence->SetEventOnCompletion(1ull, ev);
+            WaitForSingleObject(ev, 5000);
+        }
+    }
+    cleanup();
+    return 0;
+#else
+    (void)combiners_pair;
+    return -3;
+#endif
+}
+
+int32_t D3D12XboxCreateReservedResource(
+    uint64_t device_handle,
+    uint64_t byte_size_aligned_64kb,
+    uint64_t* out_reserved_handle) {
+    if (!out_reserved_handle || byte_size_aligned_64kb == 0) return -1;
+    *out_reserved_handle = 0;
+    const uint64_t aligned_bytes = (byte_size_aligned_64kb + 65535ull) & ~65535ull;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+#if defined(_WIN32)
+    auto* native_dev = static_cast<ID3D12Device*>(it->second->backend->NativeDevice());
+    if (!native_dev) return -3;
+
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = aligned_bytes;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    auto entry = std::make_unique<ReservedResourceEntry>();
+    entry->byte_size = aligned_bytes;
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS opts{};
+    if (SUCCEEDED(native_dev->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opts, sizeof(opts))) &&
+        opts.TiledResourcesTier != D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED &&
+        SUCCEEDED(native_dev->CreateReservedResource(&rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&entry->resource))) &&
+        entry->resource) {
+        D3D12_HEAP_DESC hd{};
+        hd.SizeInBytes = aligned_bytes;
+        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        if (SUCCEEDED(native_dev->CreateHeap(&hd, IID_PPV_ARGS(&entry->tile_heap))) && entry->tile_heap) {
+            entry->is_true_reserved = true;
+        } else {
+            entry->resource->Release();
+            entry->resource = nullptr;
+        }
+    }
+
+    if (!entry->resource) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(native_dev->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&entry->resource)))) {
+            return -3;
+        }
+    }
+
+    const uint64_t h = it->second->next_reserved_handle++;
+    it->second->reserved_resources.emplace(h, std::move(entry));
+    *out_reserved_handle = h;
+    return 0;
+#else
+    return -3;
+#endif
+}
+
+int32_t D3D12XboxUpdateTileMappings(
+    uint64_t device_handle,
+    uint64_t reserved_handle,
+    uint32_t start_tile_index,
+    uint32_t num_tiles_64kb,
+    const void* optional_upload_data,
+    uint64_t upload_byte_size,
+    void* optional_readback_data,
+    uint64_t readback_byte_size) {
+    if (num_tiles_64kb == 0) return -1;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+    auto rit = it->second->reserved_resources.find(reserved_handle);
+    if (rit == it->second->reserved_resources.end() || !rit->second->resource) return -2;
+
+    const uint64_t total_tiles = rit->second->byte_size / 65536ull;
+    if (static_cast<uint64_t>(start_tile_index) + num_tiles_64kb > total_tiles) return -1;
+
+#if defined(_WIN32)
+    auto* native_dev = static_cast<ID3D12Device*>(it->second->backend->NativeDevice());
+    if (!native_dev) return -3;
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ID3D12CommandQueue* q = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* cl = nullptr;
+    ID3D12Resource* up_buf = nullptr;
+    ID3D12Resource* rb_buf = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE ev = nullptr;
+    auto cleanup = [&]() {
+        if (ev) CloseHandle(ev);
+        if (fence) fence->Release();
+        if (rb_buf) rb_buf->Release();
+        if (up_buf) up_buf->Release();
+        if (cl) cl->Release();
+        if (alloc) alloc->Release();
+        if (q) q->Release();
+    };
+
+    if (FAILED(native_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q)))) {
+        cleanup();
+        return -3;
+    }
+
+    if (rit->second->is_true_reserved && rit->second->tile_heap) {
+        D3D12_TILED_RESOURCE_COORDINATE coord{start_tile_index, 0u, 0u, 0u};
+        D3D12_TILE_REGION_SIZE region{};
+        region.NumTiles = num_tiles_64kb;
+        region.UseBox = FALSE;
+        const D3D12_TILE_RANGE_FLAGS range_flag = D3D12_TILE_RANGE_FLAG_NONE;
+        const UINT heap_offset = start_tile_index;
+        const UINT range_cnt = num_tiles_64kb;
+        q->UpdateTileMappings(rit->second->resource, 1u, &coord, &region,
+                              rit->second->tile_heap, 1u, &range_flag, &heap_offset, &range_cnt,
+                              D3D12_TILE_MAPPING_FLAG_NONE);
+    }
+
+    const uint64_t byte_offset = static_cast<uint64_t>(start_tile_index) * 65536ull;
+    const uint64_t max_region_bytes = static_cast<uint64_t>(num_tiles_64kb) * 65536ull;
+
+    if ((optional_upload_data && upload_byte_size > 0) || (optional_readback_data && readback_byte_size > 0)) {
+        if (upload_byte_size > max_region_bytes || readback_byte_size > max_region_bytes) {
+            cleanup();
+            return -1;
+        }
+        if (FAILED(native_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+            FAILED(native_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, nullptr, IID_PPV_ARGS(&cl)))) {
+            cleanup();
+            return -3;
+        }
+
+        if (optional_upload_data && upload_byte_size > 0) {
+            D3D12_HEAP_PROPERTIES up_hp{};
+            up_hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = upload_byte_size;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(native_dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                           D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&up_buf)))) {
+                cleanup();
+                return -3;
+            }
+            void* mapped = nullptr;
+            if (SUCCEEDED(up_buf->Map(0, nullptr, &mapped)) && mapped) {
+                std::memcpy(mapped, optional_upload_data, static_cast<size_t>(upload_byte_size));
+                up_buf->Unmap(0, nullptr);
+            }
+            cl->CopyBufferRegion(rit->second->resource, byte_offset, up_buf, 0ull, upload_byte_size);
+        }
+
+        if (optional_readback_data && readback_byte_size > 0) {
+            if (optional_upload_data && upload_byte_size > 0) {
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = rit->second->resource;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                cl->ResourceBarrier(1, &b);
+            }
+            D3D12_HEAP_PROPERTIES rb_hp{};
+            rb_hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC bd{};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = readback_byte_size;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(native_dev->CreateCommittedResource(&rb_hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                           D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rb_buf)))) {
+                cleanup();
+                return -3;
+            }
+            cl->CopyBufferRegion(rb_buf, 0ull, rit->second->resource, byte_offset, readback_byte_size);
+            D3D12_RESOURCE_BARRIER back{};
+            back.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            back.Transition.pResource = rit->second->resource;
+            back.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            back.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            cl->ResourceBarrier(1, &back);
+        }
+
+        cl->Close();
+        ID3D12CommandList* lists[] = {cl};
+        q->ExecuteCommandLists(1, lists);
+    }
+
+    if (FAILED(native_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        cleanup();
+        return -3;
+    }
+    ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    q->Signal(fence, 1ull);
+    if (ev && fence->GetCompletedValue() < 1ull) {
+        fence->SetEventOnCompletion(1ull, ev);
+        WaitForSingleObject(ev, 5000);
+    }
+
+    if (optional_readback_data && readback_byte_size > 0 && rb_buf) {
+        void* mapped = nullptr;
+        if (SUCCEEDED(rb_buf->Map(0, nullptr, &mapped)) && mapped) {
+            std::memcpy(optional_readback_data, mapped, static_cast<size_t>(readback_byte_size));
+            rb_buf->Unmap(0, nullptr);
+        }
+    }
+
+    cleanup();
+    return 0;
+#else
+    (void)optional_upload_data; (void)upload_byte_size;
+    (void)optional_readback_data; (void)readback_byte_size;
+    return -3;
+#endif
+}
+
+int32_t D3D12XboxDestroyReservedResource(
+    uint64_t device_handle,
+    uint64_t reserved_handle) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+    return it->second->reserved_resources.erase(reserved_handle) ? 0 : -2;
+}
+
+int32_t D3D12XboxExecuteIndirectWithCount(
+    uint64_t device_handle,
+    uint64_t compute_pso_handle,
+    uint32_t max_command_count,
+    const uint32_t* dispatch_triplets_xyz,
+    uint32_t gpu_count_buffer_value,
+    void* inout_uav_data,
+    uint32_t uav_byte_size) {
+    if (max_command_count == 0 || !dispatch_triplets_xyz || !inout_uav_data || uav_byte_size == 0) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+    auto& dev = *it->second;
+    auto pso_it = dev.psos.find(compute_pso_handle);
+    if (pso_it == dev.psos.end() || !pso_it->second->is_compute) return -2;
+    auto rs_it = dev.root_signatures.find(pso_it->second->root_sig_handle);
+    if (rs_it == dev.root_signatures.end()) return -2;
+
+#if defined(_WIN32)
+    auto* native_dev = static_cast<ID3D12Device*>(dev.backend->NativeDevice());
+    if (!native_dev || !pso_it->second->native || !rs_it->second->native) return -3;
+
+    D3D12_INDIRECT_ARGUMENT_DESC arg_desc{};
+    arg_desc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC sig_desc{};
+    sig_desc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    sig_desc.NumArgumentDescs = 1;
+    sig_desc.pArgumentDescs = &arg_desc;
+
+    ID3D12CommandSignature* cmd_sig = nullptr;
+    ID3D12CommandQueue* q = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* cl = nullptr;
+    ID3D12Resource* up_args = nullptr;
+    ID3D12Resource* up_cnt = nullptr;
+    ID3D12Resource* up_uav = nullptr;
+    ID3D12Resource* def_args = nullptr;
+    ID3D12Resource* def_cnt = nullptr;
+    ID3D12Resource* def_uav = nullptr;
+    ID3D12Resource* rb_uav = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE ev = nullptr;
+
+    auto cleanup = [&]() {
+        if (ev) CloseHandle(ev);
+        if (fence) fence->Release();
+        if (rb_uav) rb_uav->Release();
+        if (def_uav) def_uav->Release();
+        if (def_cnt) def_cnt->Release();
+        if (def_args) def_args->Release();
+        if (up_uav) up_uav->Release();
+        if (up_cnt) up_cnt->Release();
+        if (up_args) up_args->Release();
+        if (cl) cl->Release();
+        if (alloc) alloc->Release();
+        if (q) q->Release();
+        if (cmd_sig) cmd_sig->Release();
+    };
+
+    if (FAILED(native_dev->CreateCommandSignature(&sig_desc, nullptr, IID_PPV_ARGS(&cmd_sig))) || !cmd_sig) {
+        cleanup();
+        return -3;
+    }
+
+    auto make_buf = [&](D3D12_HEAP_TYPE htype, uint64_t bytes, D3D12_RESOURCE_FLAGS flags,
+                        D3D12_RESOURCE_STATES state, ID3D12Resource** out) -> bool {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = htype;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = std::max<uint64_t>(16ull, (bytes + 15ull) & ~15ull);
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = flags;
+        return SUCCEEDED(native_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(out)));
+    };
+
+    const uint64_t args_bytes = static_cast<uint64_t>(max_command_count) * sizeof(D3D12_DISPATCH_ARGUMENTS);
+    if (!make_buf(D3D12_HEAP_TYPE_UPLOAD, args_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &up_args) ||
+        !make_buf(D3D12_HEAP_TYPE_UPLOAD, 16ull, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &up_cnt) ||
+        !make_buf(D3D12_HEAP_TYPE_UPLOAD, uav_byte_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &up_uav) ||
+        !make_buf(D3D12_HEAP_TYPE_DEFAULT, args_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, &def_args) ||
+        !make_buf(D3D12_HEAP_TYPE_DEFAULT, 16ull, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, &def_cnt) ||
+        !make_buf(D3D12_HEAP_TYPE_DEFAULT, uav_byte_size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &def_uav) ||
+        !make_buf(D3D12_HEAP_TYPE_READBACK, uav_byte_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &rb_uav)) {
+        cleanup();
+        return -3;
+    }
+
+    void* mapped = nullptr;
+    if (SUCCEEDED(up_args->Map(0, nullptr, &mapped)) && mapped) {
+        std::memcpy(mapped, dispatch_triplets_xyz, static_cast<size_t>(args_bytes));
+        up_args->Unmap(0, nullptr);
+    }
+    mapped = nullptr;
+    if (SUCCEEDED(up_cnt->Map(0, nullptr, &mapped)) && mapped) {
+        std::memset(mapped, 0, 16u);
+        std::memcpy(mapped, &gpu_count_buffer_value, sizeof(uint32_t));
+        up_cnt->Unmap(0, nullptr);
+    }
+    mapped = nullptr;
+    if (SUCCEEDED(up_uav->Map(0, nullptr, &mapped)) && mapped) {
+        std::memcpy(mapped, inout_uav_data, uav_byte_size);
+        up_uav->Unmap(0, nullptr);
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(native_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) ||
+        FAILED(native_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(native_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, pso_it->second->native, IID_PPV_ARGS(&cl)))) {
+        cleanup();
+        return -3;
+    }
+
+    cl->CopyBufferRegion(def_args, 0, up_args, 0, args_bytes);
+    cl->CopyBufferRegion(def_cnt, 0, up_cnt, 0, sizeof(uint32_t));
+    cl->CopyBufferRegion(def_uav, 0, up_uav, 0, uav_byte_size);
+
+    D3D12_RESOURCE_BARRIER pre[3]{};
+    pre[0] = {D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+              {def_args, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT}};
+    pre[1] = {D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+              {def_cnt, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT}};
+    pre[2] = {D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+              {def_uav, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}};
+    cl->ResourceBarrier(3, pre);
+
+    cl->SetComputeRootSignature(rs_it->second->native);
+    const auto& rs_desc = rs_it->second->desc;
+    uint32_t uav_root_idx = 0;
+    if (rs_desc.NumRootConstants32Bit > 0) ++uav_root_idx;
+    uav_root_idx += rs_desc.NumCbvs + rs_desc.NumSrvs;
+    if (rs_desc.NumUavs > 0) {
+        cl->SetComputeRootUnorderedAccessView(uav_root_idx, def_uav->GetGPUVirtualAddress());
+    }
+
+    cl->ExecuteIndirect(cmd_sig, max_command_count, def_args, 0ull, def_cnt, 0ull);
+
+    D3D12_RESOURCE_BARRIER post{};
+    post.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    post.Transition.pResource = def_uav;
+    post.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    post.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    post.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &post);
+    cl->CopyBufferRegion(rb_uav, 0, def_uav, 0, uav_byte_size);
+
+    cl->Close();
+    ID3D12CommandList* lists[] = {cl};
+    q->ExecuteCommandLists(1, lists);
+    g_submit_count.fetch_add(1, std::memory_order_relaxed);
+
+    if (FAILED(native_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        cleanup();
+        return -3;
+    }
+    ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    q->Signal(fence, 1ull);
+    if (ev && fence->GetCompletedValue() < 1ull) {
+        fence->SetEventOnCompletion(1ull, ev);
+        WaitForSingleObject(ev, 5000);
+    }
+
+    mapped = nullptr;
+    if (SUCCEEDED(rb_uav->Map(0, nullptr, &mapped)) && mapped) {
+        std::memcpy(inout_uav_data, mapped, uav_byte_size);
+        rb_uav->Unmap(0, nullptr);
+    }
+    cleanup();
+    return 0;
+#else
+    return -3;
+#endif
+}
+
+int32_t D3D12XboxCreateWorkGraph(
+    uint64_t device_handle,
+    const D3D12XBOX_WORK_GRAPH_DESC* desc,
+    uint64_t* out_work_graph_handle) {
+    if (!desc || !out_work_graph_handle ||
+        !desc->ProducerCS.Bytecode || desc->ProducerCS.BytecodeLength == 0 ||
+        !desc->ConsumerCS.Bytecode || desc->ConsumerCS.BytecodeLength == 0) {
+        return -1;
+    }
+    *out_work_graph_handle = 0;
+
+    std::vector<uint8_t> prod_raw(
+        static_cast<const uint8_t*>(desc->ProducerCS.Bytecode),
+        static_cast<const uint8_t*>(desc->ProducerCS.Bytecode) + desc->ProducerCS.BytecodeLength);
+    std::vector<uint8_t> cons_raw(
+        static_cast<const uint8_t*>(desc->ConsumerCS.Bytecode),
+        static_cast<const uint8_t*>(desc->ConsumerCS.Bytecode) + desc->ConsumerCS.BytecodeLength);
+
+    scarlettx::ShaderTranslationResult prod_tr{}, cons_tr{};
+    if (!scarlettx::TranslateXboxShaderToPc(prod_raw, prod_tr).ok() ||
+        !scarlettx::TranslateXboxShaderToPc(cons_raw, cons_tr).ok()) {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+#if defined(_WIN32)
+    auto* native_dev = static_cast<ID3D12Device*>(it->second->backend->NativeDevice());
+    if (!native_dev) return -3;
+
+    auto wg = std::make_unique<WorkGraphEntry>();
+    wg->max_records = std::max<uint32_t>(1u, desc->MaxNodeRecords);
+    wg->record_stride = std::max<uint32_t>(4u, desc->RecordStrideBytes);
+
+    // Work Graph Root Signature: b0 (4 root consts), u0 (dispatch args), u1 (node records), u2 (consumer output)
+    D3D12_ROOT_PARAMETER params[4]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.ShaderRegister = 0;
+    params[0].Constants.Num32BitValues = 4;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    for (uint32_t u = 0; u < 3u; ++u) {
+        params[1u + u].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[1u + u].Descriptor.ShaderRegister = u;
+        params[1u + u].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 4;
+    rsd.pParameters = params;
+    ID3DBlob* rs_blob = nullptr;
+    ID3DBlob* rs_err = nullptr;
+    if (FAILED(CallSystemD3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1_0, &rs_blob, &rs_err)) || !rs_blob) {
+        if (rs_err) rs_err->Release();
+        return -3;
+    }
+    if (rs_err) rs_err->Release();
+    HRESULT hr = native_dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+                                                 IID_PPV_ARGS(&wg->root_sig));
+    rs_blob->Release();
+    if (FAILED(hr) || !wg->root_sig) return -3;
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC prod_desc{};
+    prod_desc.pRootSignature = wg->root_sig;
+    prod_desc.CS = {prod_tr.pc_bytecode.data(), prod_tr.pc_bytecode.size()};
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cons_desc{};
+    cons_desc.pRootSignature = wg->root_sig;
+    cons_desc.CS = {cons_tr.pc_bytecode.data(), cons_tr.pc_bytecode.size()};
+
+    if (FAILED(native_dev->CreateComputePipelineState(&prod_desc, IID_PPV_ARGS(&wg->producer_pso))) ||
+        FAILED(native_dev->CreateComputePipelineState(&cons_desc, IID_PPV_ARGS(&wg->consumer_pso)))) {
+        return -3;
+    }
+
+    D3D12_INDIRECT_ARGUMENT_DESC arg_desc{};
+    arg_desc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    D3D12_COMMAND_SIGNATURE_DESC sig_desc{};
+    sig_desc.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    sig_desc.NumArgumentDescs = 1;
+    sig_desc.pArgumentDescs = &arg_desc;
+    if (FAILED(native_dev->CreateCommandSignature(&sig_desc, nullptr, IID_PPV_ARGS(&wg->cmd_sig)))) {
+        return -3;
+    }
+
+    const uint64_t h = it->second->next_work_graph_handle++;
+    it->second->work_graphs.emplace(h, std::move(wg));
+    *out_work_graph_handle = h;
+    return 0;
+#else
+    return -3;
+#endif
+}
+
+int32_t D3D12XboxDispatchWorkGraph(
+    uint64_t device_handle,
+    uint64_t work_graph_handle,
+    uint32_t producer_groups_x,
+    const uint32_t* root_constants,
+    uint32_t root_constant_count,
+    void* out_uav_data,
+    uint32_t uav_byte_size) {
+    if (!out_uav_data || uav_byte_size == 0) return -1;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+    auto wgit = it->second->work_graphs.find(work_graph_handle);
+    if (wgit == it->second->work_graphs.end()) return -2;
+    auto& wg = *wgit->second;
+
+#if defined(_WIN32)
+    auto* native_dev = static_cast<ID3D12Device*>(it->second->backend->NativeDevice());
+    if (!native_dev) return -3;
+
+    ID3D12CommandQueue* q = nullptr;
+    ID3D12CommandAllocator* alloc = nullptr;
+    ID3D12GraphicsCommandList* cl = nullptr;
+    ID3D12Resource* arg_buf = nullptr;
+    ID3D12Resource* rec_buf = nullptr;
+    ID3D12Resource* out_buf = nullptr;
+    ID3D12Resource* rb_buf = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE ev = nullptr;
+
+    auto cleanup = [&]() {
+        if (ev) CloseHandle(ev);
+        if (fence) fence->Release();
+        if (rb_buf) rb_buf->Release();
+        if (out_buf) out_buf->Release();
+        if (rec_buf) rec_buf->Release();
+        if (arg_buf) arg_buf->Release();
+        if (cl) cl->Release();
+        if (alloc) alloc->Release();
+        if (q) q->Release();
+    };
+
+    auto make_buf = [&](D3D12_HEAP_TYPE htype, uint64_t bytes, D3D12_RESOURCE_FLAGS flags,
+                        D3D12_RESOURCE_STATES state, ID3D12Resource** out) -> bool {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = htype;
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = std::max<uint64_t>(16ull, (bytes + 15ull) & ~15ull);
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = flags;
+        return SUCCEEDED(native_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, state, nullptr, IID_PPV_ARGS(out)));
+    };
+
+    const uint64_t rec_bytes = static_cast<uint64_t>(wg.max_records) * wg.record_stride;
+    if (!make_buf(D3D12_HEAP_TYPE_DEFAULT, 16ull, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &arg_buf) ||
+        !make_buf(D3D12_HEAP_TYPE_DEFAULT, rec_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &rec_buf) ||
+        !make_buf(D3D12_HEAP_TYPE_DEFAULT, uav_byte_size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &out_buf) ||
+        !make_buf(D3D12_HEAP_TYPE_READBACK, uav_byte_size, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &rb_buf)) {
+        cleanup();
+        return -3;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(native_dev->CreateCommandQueue(&qd, IID_PPV_ARGS(&q))) ||
+        FAILED(native_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(native_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, wg.producer_pso, IID_PPV_ARGS(&cl)))) {
+        cleanup();
+        return -3;
+    }
+
+    D3D12_RESOURCE_BARRIER to_uav[3]{};
+    to_uav[0] = {D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                 {arg_buf, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}};
+    to_uav[1] = {D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                 {rec_buf, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}};
+    to_uav[2] = {D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                 {out_buf, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}};
+    cl->ResourceBarrier(3, to_uav);
+
+    uint32_t consts[4] = {0, 0, 0, 0};
+    for (uint32_t i = 0; i < std::min<uint32_t>(4u, root_constant_count) && root_constants; ++i) {
+        consts[i] = root_constants[i];
+    }
+
+    // Node 0 (Producer): emits consumer dispatch dimensions into u0 and node records into u1
+    cl->SetComputeRootSignature(wg.root_sig);
+    cl->SetComputeRoot32BitConstants(0, 4, consts, 0);
+    cl->SetComputeRootUnorderedAccessView(1, arg_buf->GetGPUVirtualAddress());
+    cl->SetComputeRootUnorderedAccessView(2, rec_buf->GetGPUVirtualAddress());
+    cl->SetComputeRootUnorderedAccessView(3, out_buf->GetGPUVirtualAddress());
+    cl->Dispatch(std::max<uint32_t>(1u, producer_groups_x), 1u, 1u);
+
+    // Pure GPU Producer->Consumer barrier (zero CPU readback!)
+    D3D12_RESOURCE_BARRIER mid[2]{};
+    mid[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    mid[0].Transition.pResource = arg_buf;
+    mid[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    mid[0].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    mid[0].Transition.StateAfter = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    mid[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    mid[1].UAV.pResource = rec_buf;
+    cl->ResourceBarrier(2, mid);
+
+    // Node 1 (Consumer): launched autonomously by Producer's GPU dispatch record!
+    cl->SetPipelineState(wg.consumer_pso);
+    cl->ExecuteIndirect(wg.cmd_sig, 1u, arg_buf, 0ull, nullptr, 0ull);
+
+    D3D12_RESOURCE_BARRIER to_copy{};
+    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy.Transition.pResource = out_buf;
+    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &to_copy);
+    cl->CopyBufferRegion(rb_buf, 0ull, out_buf, 0ull, uav_byte_size);
+
+    cl->Close();
+    ID3D12CommandList* lists[] = {cl};
+    q->ExecuteCommandLists(1, lists);
+    g_submit_count.fetch_add(1, std::memory_order_relaxed);
+
+    if (FAILED(native_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+        cleanup();
+        return -3;
+    }
+    ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    q->Signal(fence, 1ull);
+    if (ev && fence->GetCompletedValue() < 1ull) {
+        fence->SetEventOnCompletion(1ull, ev);
+        WaitForSingleObject(ev, 5000);
+    }
+
+    void* mapped = nullptr;
+    if (SUCCEEDED(rb_buf->Map(0, nullptr, &mapped)) && mapped) {
+        std::memcpy(out_uav_data, mapped, uav_byte_size);
+        rb_buf->Unmap(0, nullptr);
+    }
+    cleanup();
+    return 0;
+#else
+    (void)producer_groups_x; (void)root_constants; (void)root_constant_count;
+    return -3;
+#endif
+}
+
+int32_t D3D12XboxDestroyWorkGraph(
+    uint64_t device_handle,
+    uint64_t work_graph_handle) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_devices.find(device_handle);
+    if (it == g_devices.end()) return -2;
+    return it->second->work_graphs.erase(work_graph_handle) ? 0 : -2;
 }
 
 }  // extern "C"

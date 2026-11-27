@@ -132,11 +132,41 @@ void Check(const Layout& layout) {
     SX_REQUIRE(Call(list, layout.flush_pipeline_x, uintptr_t{0}, uintptr_t{0}, uintptr_t{0}) == 0);
     SX_REQUIRE(Call(list, layout.other_flush_slot, uintptr_t{0}, uintptr_t{0}, uintptr_t{0}) == kNotImplemented);
 
-    // Verify extended D3D12.2 device & command list COM slots
+    // Verify extended D3D12.2 device, queue & command list COM slots (VRS, ReservedResource, UpdateTileMappings)
     SX_REQUIRE(Call(device, 40, uintptr_t{0}) == 0);  // SetStablePowerState
     LUID adapter_luid{};
     Call(device, 44, &adapter_luid);  // GetAdapterLuid
     SX_REQUIRE(adapter_luid.LowPart != 0 || adapter_luid.HighPart != 0);
+
+    const int vrs_slot = (layout.version >= 0x20004u) ? 76 : 74;
+    SX_REQUIRE(Call(list, vrs_slot, uintptr_t{0x5 /* 2X2 */}, static_cast<void*>(nullptr)) == 0);
+
+    D3D12_RESOURCE_DESC rbd = bd;
+    rbd.Width = 65536ull;
+    void* reserved_buf = nullptr;
+    SX_REQUIRE(Call(device, 30 /* CreateReservedResource */, &rbd, uintptr_t{D3D12_RESOURCE_STATE_COMMON},
+                    static_cast<void*>(nullptr), static_cast<void*>(nullptr), &reserved_buf) == 0 &&
+               reserved_buf != nullptr);
+    D3D12_HEAP_DESC hd{};
+    hd.SizeInBytes = 65536ull;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    const IID heap_iid = __uuidof(ID3D12Heap);
+    void* tile_heap = nullptr;
+    SX_REQUIRE(Call(device, 28 /* CreateHeap */, &hd, &heap_iid, &tile_heap) == 0 && tile_heap != nullptr);
+    D3D12_TILED_RESOURCE_COORDINATE tcoord{0u, 0u, 0u, 0u};
+    D3D12_TILE_REGION_SIZE tregion{1u, FALSE, 0u, 0u, 0u};
+    const D3D12_TILE_RANGE_FLAGS trange_flag = D3D12_TILE_RANGE_FLAG_NONE;
+    const UINT theap_off = 0u;
+    const UINT tcount = 1u;
+    SX_REQUIRE(Call(queue, 8 /* UpdateTileMappings */, reserved_buf, uintptr_t{1}, &tcoord, &tregion,
+                    tile_heap, uintptr_t{1}, &trange_flag, &theap_off, &tcount, uintptr_t{0}) == 0);
+    // Also verify NULL-unmapping safety path
+    SX_REQUIRE(Call(queue, 8 /* UpdateTileMappings */, reserved_buf, uintptr_t{1}, &tcoord, &tregion,
+                    static_cast<void*>(nullptr), uintptr_t{0}, static_cast<void*>(nullptr),
+                    static_cast<void*>(nullptr), static_cast<void*>(nullptr), uintptr_t{0}) == 0);
+    Call(reserved_buf, kRelease);
+    Call(tile_heap, kRelease);
 
     // Upload with CopyTextureRegionX, flags 0, as the title does.
     Call(list, layout.copy_texture_region_x, &in_texture, uintptr_t{0}, uintptr_t{0}, uintptr_t{0}, &in_buffer,

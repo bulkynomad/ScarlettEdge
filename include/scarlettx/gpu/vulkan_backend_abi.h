@@ -67,6 +67,23 @@ typedef struct VULKAN_XS_TRACE_RAYS_DESC {
     VULKAN_XS_AS_HANDLE topLevelAs;
 } VULKAN_XS_TRACE_RAYS_DESC;
 
+typedef struct VULKAN_XS_SBT_REGION {
+    uint64_t deviceAddress;
+    uint64_t stride;
+    uint64_t size;
+} VULKAN_XS_SBT_REGION;
+
+typedef struct VULKAN_XS_SBT_INFO {
+    VULKAN_XS_SBT_REGION raygen;
+    VULKAN_XS_SBT_REGION miss;
+    VULKAN_XS_SBT_REGION hit;
+    VULKAN_XS_SBT_REGION callable;
+    uint32_t handleSize;
+    uint32_t handleAlignment;
+    uint32_t baseAlignment;
+    uint32_t hardwareBacked;
+} VULKAN_XS_SBT_INFO;
+
 typedef struct VULKAN_XS_STATS {
     uint64_t framesPresented;
     uint64_t raysTraced;
@@ -114,6 +131,12 @@ SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsDestroyAccelerationSt
 
 SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsTraceRays(
     VULKAN_XS_BACKEND_HANDLE backend, const VULKAN_XS_TRACE_RAYS_DESC* desc);
+
+SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsGetAccelerationStructureDeviceAddress(
+    VULKAN_XS_BACKEND_HANDLE backend, VULKAN_XS_AS_HANDLE asHandle, uint64_t* outDeviceAddress);
+
+SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsBuildShaderBindingTable(
+    VULKAN_XS_BACKEND_HANDLE backend, VULKAN_XS_RT_PIPELINE_HANDLE pipeline, VULKAN_XS_SBT_INFO* outSbt);
 
 // Layout conversion & Presentation
 SCARLETTX_VULKAN_API int32_t SCARLETTX_VULKAN_CALL VulkanXsTranslateXboxRootSignatureToVulkanLayout(

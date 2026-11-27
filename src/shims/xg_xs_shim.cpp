@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -84,17 +85,21 @@ uint64_t SCARLETTX_XG_CALL XgGetMipLevelOffsetBytes(void* self, uint32_t plane, 
 }
 
 uint64_t SCARLETTX_XG_CALL XgGetTexelElementOffsetBytes(
-    void* self, uint32_t plane, uint32_t miplevel, uint64_t x, uint32_t y, uint32_t zOrSlice, uint32_t /*sample*/) {
+    void* self, uint32_t plane, uint32_t miplevel, uint64_t x, uint32_t y, uint32_t zOrSlice, uint32_t sample) {
     auto* obj = static_cast<XGTexture2DComputerImpl*>(self);
     if (!obj || plane >= obj->layout.Planes || miplevel >= obj->layout.MipLevels) return 0;
     uint64_t offset = 0;
-    if (scarlettx::gpu::xg::TexelElementOffset(obj->layout, miplevel, zOrSlice, static_cast<uint32_t>(x), y, &offset)) {
+    if (scarlettx::gpu::xg::TexelElementOffsetSample(
+            obj->layout, miplevel, zOrSlice, static_cast<uint32_t>(x), y, sample, &offset)) {
         return offset;
     }
-    // Modes without texel addressing: rows inside the mip, slices one mip chain apart.
+    // Modes without texel addressing: rows inside the mip, slices one mip chain apart, samples per-plane.
     const auto& pl = obj->layout.Plane[plane];
     const auto& ml = pl.MipLayout[miplevel];
+    const uint32_t samples = std::max<uint32_t>(1u, ml.SampleCount);
+    const uint64_t sample_stride = ml.Slice2DSizeBytes / samples;
     return ml.OffsetBytes + static_cast<uint64_t>(zOrSlice) * pl.Reserved10 +
+           static_cast<uint64_t>(sample % samples) * sample_stride +
            static_cast<uint64_t>(y) * ml.PitchBytes + x * pl.BytesPerElement;
 }
 
@@ -182,9 +187,10 @@ uint32_t SCARLETTX_XG_CALL XGComputeOptimalSwizzleMode(
                   << ", bind=0x" << std::hex << bindFlags << std::dec << ")\n";
     }
     (void)reserved;  // 0 at every call seen
-    // Matches what the console library answers for these bind flags.
-    if (bindFlags & 0x40u) return XG_SWIZZLE_MODE_64KB_Z_X;  // depth stencil
-    if (bindFlags & 0x20u) return XG_SWIZZLE_MODE_64KB_R_X;  // render target
+    // Matches what the console library answers for these bind flags and MSAA sample counts.
+    if (bindFlags & 0x40u) return XG_SWIZZLE_MODE_64KB_Z_X;  // depth stencil (single or MSAA)
+    if (bindFlags & 0x20u) return XG_SWIZZLE_MODE_64KB_R_X;  // render target (single or MSAA)
+    if (sampleCount > 1u) return XG_SWIZZLE_MODE_64KB_D_X;   // MSAA non-RT/DS surface
     return XG_SWIZZLE_MODE_4KB_S;
 }
 
@@ -218,6 +224,356 @@ int32_t SCARLETTX_XG_CALL XGCreateTexture3DComputer(
     scarlettx::gpu::xg::ComputeTexture3DLayout(*desc, &obj->layout);
     *computer = obj;
     return 0;  // S_OK
+}
+
+int32_t SCARLETTX_XG_CALL XGCompressDccSurface(
+    const uint8_t* srcRgba8,
+    uint32_t width,
+    uint32_t height,
+    uint32_t srcRowPitch,
+    uint8_t* outMetaKeys,
+    uint32_t metaCapacity,
+    uint8_t* outPayload,
+    uint64_t payloadCapacity,
+    uint64_t* outPayloadBytes,
+    XG_DCC_STATS* outStats) {
+    constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
+    constexpr int32_t kInsufficientBuf = static_cast<int32_t>(0x8007007Au);
+    if (!srcRgba8 || width == 0 || height == 0 || !outPayloadBytes) {
+        return kInvalidArg;
+    }
+    const uint32_t pitch = (srcRowPitch == 0) ? (width * 4u) : srcRowPitch;
+    if (pitch < width * 4u) return kInvalidArg;
+
+    const uint32_t tiles_x = (width + 7u) / 8u;
+    const uint32_t tiles_y = (height + 7u) / 8u;
+    const uint32_t total_tiles = tiles_x * tiles_y;
+    const bool size_query_only = (outMetaKeys == nullptr && outPayload == nullptr);
+    if (!size_query_only && (!outMetaKeys || metaCapacity < total_tiles)) {
+        return kInvalidArg;
+    }
+
+    XG_DCC_STATS stats{};
+    stats.TileCount = total_tiles;
+    uint64_t payload_cursor = 0;
+
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            uint8_t tile[64][4];
+            uint8_t min_c[4] = {255, 255, 255, 255};
+            uint8_t max_c[4] = {0, 0, 0, 0};
+
+            for (uint32_t py = 0; py < 8u; ++py) {
+                const uint32_t sy = std::min(ty * 8u + py, height - 1u);
+                const uint8_t* row = srcRgba8 + static_cast<size_t>(sy) * pitch;
+                for (uint32_t px = 0; px < 8u; ++px) {
+                    const uint32_t sx = std::min(tx * 8u + px, width - 1u);
+                    const uint8_t* p = row + static_cast<size_t>(sx) * 4u;
+                    const uint32_t idx = py * 8u + px;
+                    for (uint32_t c = 0; c < 4u; ++c) {
+                        tile[idx][c] = p[c];
+                        min_c[c] = std::min(min_c[c], p[c]);
+                        max_c[c] = std::max(max_c[c], p[c]);
+                    }
+                }
+            }
+
+            const uint32_t tile_index = ty * tiles_x + tx;
+            uint8_t key = XG_DCC_KEY_UNCOMPRESSED;
+            uint64_t tile_bytes = 0;
+
+            const bool uniform = (min_c[0] == max_c[0]) && (min_c[1] == max_c[1]) &&
+                                 (min_c[2] == max_c[2]) && (min_c[3] == max_c[3]);
+            if (uniform) {
+                if (min_c[0] == 0 && min_c[1] == 0 && min_c[2] == 0 && min_c[3] == 0) {
+                    key = XG_DCC_KEY_CLEAR_0000;
+                    ++stats.FastClearTiles;
+                } else if (min_c[0] == 0 && min_c[1] == 0 && min_c[2] == 0 && min_c[3] == 255) {
+                    key = XG_DCC_KEY_CLEAR_0001;
+                    ++stats.FastClearTiles;
+                } else if (min_c[0] == 255 && min_c[1] == 255 && min_c[2] == 255 && min_c[3] == 255) {
+                    key = XG_DCC_KEY_CLEAR_1111;
+                    ++stats.FastClearTiles;
+                } else {
+                    key = XG_DCC_KEY_SOLID_COLOR;
+                    tile_bytes = 4u;
+                    ++stats.SolidColorTiles;
+                }
+            } else if ((max_c[0] - min_c[0] <= 15u) && (max_c[1] - min_c[1] <= 15u) &&
+                       (max_c[2] - min_c[2] <= 15u) && (max_c[3] - min_c[3] <= 15u)) {
+                key = XG_DCC_KEY_DELTA_4BIT;
+                tile_bytes = 132u;  // 4B base RGBA8 + 128B 4-bit unsigned delta stream
+                ++stats.DeltaTiles;
+            } else {
+                key = XG_DCC_KEY_UNCOMPRESSED;
+                tile_bytes = 256u;
+                ++stats.UncompressedTiles;
+            }
+
+            if (!size_query_only) {
+                outMetaKeys[tile_index] = key;
+                if (tile_bytes > 0) {
+                    if (!outPayload || payload_cursor + tile_bytes > payloadCapacity) {
+                        *outPayloadBytes = payload_cursor + tile_bytes;
+                        return kInsufficientBuf;
+                    }
+                    uint8_t* dst = outPayload + payload_cursor;
+                    if (key == XG_DCC_KEY_SOLID_COLOR) {
+                        std::memcpy(dst, min_c, 4u);
+                    } else if (key == XG_DCC_KEY_DELTA_4BIT) {
+                        std::memcpy(dst, min_c, 4u);
+                        for (uint32_t idx = 0; idx < 64u; ++idx) {
+                            const uint8_t d0 = static_cast<uint8_t>(tile[idx][0] - min_c[0]);
+                            const uint8_t d1 = static_cast<uint8_t>(tile[idx][1] - min_c[1]);
+                            const uint8_t d2 = static_cast<uint8_t>(tile[idx][2] - min_c[2]);
+                            const uint8_t d3 = static_cast<uint8_t>(tile[idx][3] - min_c[3]);
+                            dst[4u + idx * 2u + 0u] = static_cast<uint8_t>(d0 | (d1 << 4u));
+                            dst[4u + idx * 2u + 1u] = static_cast<uint8_t>(d2 | (d3 << 4u));
+                        }
+                    } else {
+                        std::memcpy(dst, tile, 256u);
+                    }
+                }
+            }
+            payload_cursor += tile_bytes;
+        }
+    }
+
+    stats.CompressedPayloadBytes = payload_cursor;
+    *outPayloadBytes = payload_cursor;
+    if (outStats) *outStats = stats;
+    return 0;
+}
+
+int32_t SCARLETTX_XG_CALL XGDecompressDccSurface(
+    const uint8_t* metaKeys,
+    uint32_t metaSize,
+    const uint8_t* payload,
+    uint64_t payloadSize,
+    uint8_t* dstRgba8,
+    uint32_t width,
+    uint32_t height,
+    uint32_t dstRowPitch) {
+    constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
+    if (!metaKeys || !dstRgba8 || width == 0 || height == 0) return kInvalidArg;
+    const uint32_t pitch = (dstRowPitch == 0) ? (width * 4u) : dstRowPitch;
+    if (pitch < width * 4u) return kInvalidArg;
+
+    const uint32_t tiles_x = (width + 7u) / 8u;
+    const uint32_t tiles_y = (height + 7u) / 8u;
+    const uint32_t total_tiles = tiles_x * tiles_y;
+    if (metaSize < total_tiles) return kInvalidArg;
+
+    uint64_t payload_cursor = 0;
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            const uint8_t key = metaKeys[ty * tiles_x + tx];
+            uint8_t tile[64][4];
+
+            if (key == XG_DCC_KEY_CLEAR_0000) {
+                std::memset(tile, 0, sizeof(tile));
+            } else if (key == XG_DCC_KEY_CLEAR_0001) {
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    tile[i][0] = 0;
+                    tile[i][1] = 0;
+                    tile[i][2] = 0;
+                    tile[i][3] = 255;
+                }
+            } else if (key == XG_DCC_KEY_CLEAR_1111) {
+                std::memset(tile, 255, sizeof(tile));
+            } else if (key == XG_DCC_KEY_SOLID_COLOR) {
+                if (!payload || payload_cursor + 4u > payloadSize) return kInvalidArg;
+                const uint8_t* c = payload + payload_cursor;
+                payload_cursor += 4u;
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    std::memcpy(tile[i], c, 4u);
+                }
+            } else if (key == XG_DCC_KEY_DELTA_4BIT) {
+                if (!payload || payload_cursor + 132u > payloadSize) return kInvalidArg;
+                const uint8_t* src = payload + payload_cursor;
+                payload_cursor += 132u;
+                const uint8_t base[4] = {src[0], src[1], src[2], src[3]};
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    const uint8_t b0 = src[4u + i * 2u + 0u];
+                    const uint8_t b1 = src[4u + i * 2u + 1u];
+                    tile[i][0] = static_cast<uint8_t>(base[0] + (b0 & 0x0Fu));
+                    tile[i][1] = static_cast<uint8_t>(base[1] + ((b0 >> 4u) & 0x0Fu));
+                    tile[i][2] = static_cast<uint8_t>(base[2] + (b1 & 0x0Fu));
+                    tile[i][3] = static_cast<uint8_t>(base[3] + ((b1 >> 4u) & 0x0Fu));
+                }
+            } else if (key == XG_DCC_KEY_UNCOMPRESSED) {
+                if (!payload || payload_cursor + 256u > payloadSize) return kInvalidArg;
+                std::memcpy(tile, payload + payload_cursor, 256u);
+                payload_cursor += 256u;
+            } else {
+                return kInvalidArg;
+            }
+
+            for (uint32_t py = 0; py < 8u; ++py) {
+                const uint32_t dy = ty * 8u + py;
+                if (dy >= height) break;
+                uint8_t* row = dstRgba8 + static_cast<size_t>(dy) * pitch;
+                for (uint32_t px = 0; px < 8u; ++px) {
+                    const uint32_t dx = tx * 8u + px;
+                    if (dx >= width) break;
+                    std::memcpy(row + static_cast<size_t>(dx) * 4u, tile[py * 8u + px], 4u);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int32_t SCARLETTX_XG_CALL XGBuildHtileMetadata(
+    const float* srcDepth,
+    uint32_t width,
+    uint32_t height,
+    uint32_t srcDepthStrideFloats,
+    uint32_t* outHtileWords,
+    uint32_t htileCapacityWords,
+    float* outExpandedTiles,
+    uint32_t expandedCapacityFloats,
+    uint32_t* outExpandedFloatsWritten) {
+    constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
+    constexpr int32_t kInsufficientBuf = static_cast<int32_t>(0x8007007Au);
+    if (!srcDepth || width == 0 || height == 0 || !outHtileWords) return kInvalidArg;
+    const uint32_t stride = (srcDepthStrideFloats == 0) ? width : srcDepthStrideFloats;
+    if (stride < width) return kInvalidArg;
+
+    const uint32_t tiles_x = (width + 7u) / 8u;
+    const uint32_t tiles_y = (height + 7u) / 8u;
+    const uint32_t total_tiles = tiles_x * tiles_y;
+    if (htileCapacityWords < total_tiles) return kInvalidArg;
+
+    auto quantize14 = [](float z) -> uint32_t {
+        const float clamped = std::clamp(z, 0.0f, 1.0f);
+        return static_cast<uint32_t>(clamped * 16383.0f + 0.5f) & 0x3FFFu;
+    };
+
+    uint32_t expanded_floats = 0;
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            float tile[64];
+            float min_z = 1.0f;
+            float max_z = 0.0f;
+            bool first = true;
+
+            for (uint32_t py = 0; py < 8u; ++py) {
+                const uint32_t sy = std::min(ty * 8u + py, height - 1u);
+                const float* row = srcDepth + static_cast<size_t>(sy) * stride;
+                for (uint32_t px = 0; px < 8u; ++px) {
+                    const uint32_t sx = std::min(tx * 8u + px, width - 1u);
+                    const float z = std::clamp(row[sx], 0.0f, 1.0f);
+                    tile[py * 8u + px] = z;
+                    if (ty * 8u + py < height && tx * 8u + px < width) {
+                        if (first) {
+                            min_z = z;
+                            max_z = z;
+                            first = false;
+                        } else {
+                            min_z = std::min(min_z, z);
+                            max_z = std::max(max_z, z);
+                        }
+                    }
+                }
+            }
+
+            const uint32_t zmin14 = quantize14(min_z);
+            const uint32_t zmax14 = quantize14(max_z);
+            uint32_t zmask = XG_HTILE_ZMASK_EXPANDED;
+            if (std::fabs(max_z - min_z) <= (0.5f / 16383.0f)) {
+                if (zmax14 == 0u || zmax14 == 0x3FFFu) {
+                    zmask = XG_HTILE_ZMASK_CLEAR_ZMAX;
+                } else {
+                    zmask = XG_HTILE_ZMASK_CONST_ZMIN;
+                }
+            } else if (outExpandedTiles != nullptr) {
+                if (expanded_floats + 64u > expandedCapacityFloats) {
+                    if (outExpandedFloatsWritten) *outExpandedFloatsWritten = expanded_floats + 64u;
+                    return kInsufficientBuf;
+                }
+                std::memcpy(outExpandedTiles + expanded_floats, tile, 64u * sizeof(float));
+                expanded_floats += 64u;
+            } else {
+                expanded_floats += 64u;
+            }
+
+            outHtileWords[ty * tiles_x + tx] = (zmax14 << 18u) | (zmin14 << 4u) | zmask;
+        }
+    }
+
+    if (outExpandedFloatsWritten) *outExpandedFloatsWritten = expanded_floats;
+    return 0;
+}
+
+int32_t SCARLETTX_XG_CALL XGDecompressHtileDepth(
+    const uint32_t* htileWords,
+    uint32_t htileWordCount,
+    const float* expandedTiles,
+    uint32_t expandedFloatCount,
+    float* dstDepth,
+    uint32_t width,
+    uint32_t height,
+    uint32_t dstDepthStrideFloats) {
+    constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
+    if (!htileWords || !dstDepth || width == 0 || height == 0) return kInvalidArg;
+    const uint32_t stride = (dstDepthStrideFloats == 0) ? width : dstDepthStrideFloats;
+    if (stride < width) return kInvalidArg;
+
+    const uint32_t tiles_x = (width + 7u) / 8u;
+    const uint32_t tiles_y = (height + 7u) / 8u;
+    const uint32_t total_tiles = tiles_x * tiles_y;
+    if (htileWordCount < total_tiles) return kInvalidArg;
+
+    auto unquantize14 = [](uint32_t q) -> float {
+        return static_cast<float>(q & 0x3FFFu) / 16383.0f;
+    };
+
+    uint32_t exp_cursor = 0;
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            const uint32_t word = htileWords[ty * tiles_x + tx];
+            const uint32_t zmax14 = (word >> 18u) & 0x3FFFu;
+            const uint32_t zmin14 = (word >> 4u) & 0x3FFFu;
+            const uint32_t zmask = word & 0xFu;
+
+            float tile[64];
+            if (zmask == XG_HTILE_ZMASK_CLEAR_ZMAX) {
+                const float v = unquantize14(zmax14);
+                std::fill_n(tile, 64, v);
+            } else if (zmask == XG_HTILE_ZMASK_CONST_ZMIN) {
+                const float v = unquantize14(zmin14);
+                std::fill_n(tile, 64, v);
+            } else if (zmask == XG_HTILE_ZMASK_EXPANDED) {
+                if (expandedTiles != nullptr) {
+                    if (exp_cursor + 64u > expandedFloatCount) return kInvalidArg;
+                    std::memcpy(tile, expandedTiles + exp_cursor, 64u * sizeof(float));
+                    exp_cursor += 64u;
+                } else {
+                    const float z0 = unquantize14(zmin14);
+                    const float z1 = unquantize14(zmax14);
+                    for (uint32_t i = 0; i < 64u; ++i) {
+                        const float t = static_cast<float>(i) / 63.0f;
+                        tile[i] = z0 + (z1 - z0) * t;
+                    }
+                }
+            } else {
+                return kInvalidArg;
+            }
+
+            for (uint32_t py = 0; py < 8u; ++py) {
+                const uint32_t dy = ty * 8u + py;
+                if (dy >= height) break;
+                float* row = dstDepth + static_cast<size_t>(dy) * stride;
+                for (uint32_t px = 0; px < 8u; ++px) {
+                    const uint32_t dx = tx * 8u + px;
+                    if (dx >= width) break;
+                    row[dx] = tile[py * 8u + px];
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 }  // extern "C"

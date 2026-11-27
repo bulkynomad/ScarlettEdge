@@ -172,18 +172,28 @@ uint64_t YOffset(const MipView& v, uint32_t y) {
 }
 
 template <typename Fn>
-bool ForEachElement(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, Fn&& fn) {
+bool ForEachElementSample(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice,
+                          uint32_t sample, Fn&& fn) {
     MipView v;
     if (!ViewMip(layout, mip, slice, &v)) return false;
+    const uint32_t samples = std::max<uint32_t>(1u, v.ml->SampleCount);
+    if (sample >= samples) return false;
+    const uint64_t sample_stride = v.ml->Slice2DSizeBytes / samples;
+    const uint64_t sample_base = v.base + static_cast<uint64_t>(sample) * sample_stride;
     const uint32_t w = v.ml->WidthElements;
     const uint32_t h = v.ml->HeightElements;
     std::vector<uint64_t> xoff(w);
     for (uint32_t x = 0; x < w; ++x) xoff[x] = XOffset(v, x);
     for (uint32_t y = 0; y < h; ++y) {
-        const uint64_t row = v.base + YOffset(v, y);
+        const uint64_t row = sample_base + YOffset(v, y);
         for (uint32_t x = 0; x < w; ++x) fn(x, y, row + xoff[x]);
     }
     return true;
+}
+
+template <typename Fn>
+bool ForEachElement(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice, Fn&& fn) {
+    return ForEachElementSample(layout, mip, slice, 0u, std::forward<Fn>(fn));
 }
 
 }  // namespace
@@ -234,9 +244,17 @@ bool IsAddressable(const XG_RESOURCE_LAYOUT& layout) {
 
 bool TexelElementOffset(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice,
                         uint32_t x, uint32_t y, uint64_t* offset) {
+    return TexelElementOffsetSample(layout, mip, slice, x, y, 0u, offset);
+}
+
+bool TexelElementOffsetSample(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t slice,
+                              uint32_t x, uint32_t y, uint32_t sample, uint64_t* offset) {
     MipView v;
     if (!offset || !ViewMip(layout, mip, slice, &v)) return false;
-    *offset = v.base + XOffset(v, x) + YOffset(v, y);
+    const uint32_t samples = std::max<uint32_t>(1u, v.ml->SampleCount);
+    if (sample >= samples) return false;
+    const uint64_t sample_stride = v.ml->Slice2DSizeBytes / samples;
+    *offset = v.base + static_cast<uint64_t>(sample) * sample_stride + XOffset(v, x) + YOffset(v, y);
     return true;
 }
 
@@ -260,26 +278,36 @@ bool SubresourceRange(const XG_RESOURCE_LAYOUT& layout, uint32_t mip, uint32_t s
     return true;
 }
 
-bool CopyIntoSubresource(const XG_RESOURCE_LAYOUT& layout, void* resource_base, uint32_t mip,
-                         uint32_t slice, const void* src, uint32_t src_row_pitch) {
+bool CopyIntoMsaaSample(const XG_RESOURCE_LAYOUT& layout, void* resource_base, uint32_t mip,
+                        uint32_t slice, uint32_t sample, const void* src, uint32_t src_row_pitch) {
     if (!resource_base || !src) return false;
     const uint32_t bpe = layout.Plane[0].BytesPerElement;
     auto* dst_bytes = static_cast<uint8_t*>(resource_base);
     const auto* src_bytes = static_cast<const uint8_t*>(src);
-    return ForEachElement(layout, mip, slice, [&](uint32_t x, uint32_t y, uint64_t off) {
+    return ForEachElementSample(layout, mip, slice, sample, [&](uint32_t x, uint32_t y, uint64_t off) {
         std::memcpy(dst_bytes + off, src_bytes + static_cast<uint64_t>(y) * src_row_pitch + x * bpe, bpe);
+    });
+}
+
+bool CopyIntoSubresource(const XG_RESOURCE_LAYOUT& layout, void* resource_base, uint32_t mip,
+                         uint32_t slice, const void* src, uint32_t src_row_pitch) {
+    return CopyIntoMsaaSample(layout, resource_base, mip, slice, 0u, src, src_row_pitch);
+}
+
+bool CopyFromMsaaSample(const XG_RESOURCE_LAYOUT& layout, const void* resource_base, uint32_t mip,
+                        uint32_t slice, uint32_t sample, void* dst, uint32_t dst_row_pitch) {
+    if (!resource_base || !dst) return false;
+    const uint32_t bpe = layout.Plane[0].BytesPerElement;
+    const auto* src_bytes = static_cast<const uint8_t*>(resource_base);
+    auto* dst_bytes = static_cast<uint8_t*>(dst);
+    return ForEachElementSample(layout, mip, slice, sample, [&](uint32_t x, uint32_t y, uint64_t off) {
+        std::memcpy(dst_bytes + static_cast<uint64_t>(y) * dst_row_pitch + x * bpe, src_bytes + off, bpe);
     });
 }
 
 bool CopyFromSubresource(const XG_RESOURCE_LAYOUT& layout, const void* resource_base, uint32_t mip,
                          uint32_t slice, void* dst, uint32_t dst_row_pitch) {
-    if (!resource_base || !dst) return false;
-    const uint32_t bpe = layout.Plane[0].BytesPerElement;
-    const auto* src_bytes = static_cast<const uint8_t*>(resource_base);
-    auto* dst_bytes = static_cast<uint8_t*>(dst);
-    return ForEachElement(layout, mip, slice, [&](uint32_t x, uint32_t y, uint64_t off) {
-        std::memcpy(dst_bytes + static_cast<uint64_t>(y) * dst_row_pitch + x * bpe, src_bytes + off, bpe);
-    });
+    return CopyFromMsaaSample(layout, resource_base, mip, slice, 0u, dst, dst_row_pitch);
 }
 
 void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* out_ptr) {
@@ -289,7 +317,12 @@ void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* o
     const uint32_t width = std::max<uint32_t>(1, desc.Width);
     const uint32_t height = std::max<uint32_t>(1, desc.Height);
     const uint32_t array_size = std::max<uint32_t>(1, desc.ArraySize);
-    const uint32_t mips = std::clamp<uint32_t>(desc.MipLevels == 0 ? 1u : desc.MipLevels, 1u, kMaxMips);
+    const uint32_t samples = (desc.SampleDesc.Count >= 8u) ? 8u
+                           : (desc.SampleDesc.Count >= 4u) ? 4u
+                           : (desc.SampleDesc.Count >= 2u) ? 2u
+                                                           : 1u;
+    const uint32_t mips = (samples > 1u) ? 1u
+                                         : std::clamp<uint32_t>(desc.MipLevels == 0 ? 1u : desc.MipLevels, 1u, kMaxMips);
     const uint32_t bpe = FormatBytesPerElement(desc.Format);
     const bool bc = IsBlockCompressed(desc.Format);
     const BlockEquation* eq = FindEquation(bpe);
@@ -335,15 +368,16 @@ void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* o
         ml.ReservedHeight = mh;
         ml.DepthOrArraySize = array_size;
         ml.PaddedDepthOrArraySize = array_size;
-        ml.SampleCount = std::max<uint32_t>(1, desc.SampleDesc.Count);
+        ml.SampleCount = samples;
         ml.Reserved60 = 1;
-        // Mips that fit in half a micro-tile share one tail block (mipped textures only).
+        // Mips that fit in half a micro-tile share one tail block (single-sampled mipped textures only).
         // Applies to both 4KB_S (4 KB tail block) and RDNA2 64KB_S/D/Z_X/R_X (64 KB tail block).
         const uint32_t micro_w = eq ? (1u << AxisBits(*eq, 'x', 12)) : block_w;
         const uint32_t micro_h = eq ? (1u << AxisBits(*eq, 'y', 12)) : block_h;
         const uint32_t tw = std::max<uint32_t>(1, (1u << Log2(we[0])) >> m);
         const uint32_t th = std::max<uint32_t>(1, (1u << Log2(he[0])) >> m);
-        if ((swizzled || is_64k) && mips > 1 && first_tail == mips && tw <= micro_w / 2 && th <= micro_h) {
+        if ((swizzled || is_64k) && samples == 1u && mips > 1 && first_tail == mips &&
+            tw <= micro_w / 2 && th <= micro_h) {
             first_tail = m;
         }
     }
@@ -358,7 +392,9 @@ void ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT* o
         ml.PitchBytes = ml.PaddedWidthElements * bpe;
         ml.AlignmentBytes = block_bytes;
         ml.SwizzleMode = desc.SwizzleMode;
-        ml.SizeBytes = static_cast<uint64_t>(ml.PaddedWidthElements) * ml.PaddedHeightElements * bpe;
+        const uint64_t sample_plane_bytes =
+            static_cast<uint64_t>(ml.PaddedWidthElements) * ml.PaddedHeightElements * bpe;
+        ml.SizeBytes = sample_plane_bytes * samples;
         ml.Slice2DSizeBytes = ml.SizeBytes;
         ml.OffsetBytes = offset;
         offset += ml.SizeBytes;

@@ -496,6 +496,79 @@ SCARLETTX_D3D12_API int32_t D3D12XboxGetGpuStabilityReport(
     uint64_t device_handle,
     D3D12XBOX_GPU_STABILITY_REPORT* out_report);
 
+// ---------------------------------------------------------------------------
+// D3D12.2 Ultimate: Variable Rate Shading, Tiled/Sampler Feedback,
+// ExecuteIndirect GPU Count Buffers, & GPU Producer->Consumer Work Graphs
+// ---------------------------------------------------------------------------
+typedef struct D3D12XBOX_VRS_CAPABILITIES {
+    uint32_t VariableShadingRateTier;           // 0 = NotSupported, 1 = Tier1, 2 = Tier2
+    uint32_t AdditionalShadingRatesSupported;
+    uint32_t PerPrimitiveShadingRateSupported;
+    uint32_t ShadingRateImageTileSize;          // Typically 8 or 16
+} D3D12XBOX_VRS_CAPABILITIES;
+
+typedef struct D3D12XBOX_WORK_GRAPH_DESC {
+    D3D12XBOX_SHADER_BYTECODE ProducerCS;       // Writes dispatch args (u0[0..2]) + node records (u1)
+    D3D12XBOX_SHADER_BYTECODE ConsumerCS;       // Reads node records (u1) and writes final output (u2)
+    uint32_t MaxNodeRecords;
+    uint32_t RecordStrideBytes;
+} D3D12XBOX_WORK_GRAPH_DESC;
+
+SCARLETTX_D3D12_API int32_t D3D12XboxQueryVrsCapabilities(
+    uint64_t device_handle,
+    D3D12XBOX_VRS_CAPABILITIES* out_caps);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxSetShadingRate(
+    uint64_t device_handle,
+    uint32_t base_shading_rate,
+    const uint32_t* combiners_pair);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxCreateReservedResource(
+    uint64_t device_handle,
+    uint64_t byte_size_aligned_64kb,
+    uint64_t* out_reserved_handle);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxUpdateTileMappings(
+    uint64_t device_handle,
+    uint64_t reserved_handle,
+    uint32_t start_tile_index,
+    uint32_t num_tiles_64kb,
+    const void* optional_upload_data,
+    uint64_t upload_byte_size,
+    void* optional_readback_data,
+    uint64_t readback_byte_size);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxDestroyReservedResource(
+    uint64_t device_handle,
+    uint64_t reserved_handle);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxExecuteIndirectWithCount(
+    uint64_t device_handle,
+    uint64_t compute_pso_handle,
+    uint32_t max_command_count,
+    const uint32_t* dispatch_triplets_xyz,
+    uint32_t gpu_count_buffer_value,
+    void* inout_uav_data,
+    uint32_t uav_byte_size);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxCreateWorkGraph(
+    uint64_t device_handle,
+    const D3D12XBOX_WORK_GRAPH_DESC* desc,
+    uint64_t* out_work_graph_handle);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxDispatchWorkGraph(
+    uint64_t device_handle,
+    uint64_t work_graph_handle,
+    uint32_t producer_groups_x,
+    const uint32_t* root_constants,
+    uint32_t root_constant_count,
+    void* out_uav_data,
+    uint32_t uav_byte_size);
+
+SCARLETTX_D3D12_API int32_t D3D12XboxDestroyWorkGraph(
+    uint64_t device_handle,
+    uint64_t work_graph_handle);
+
 // xgameruntime.dll exports are declared in scarlettx/gdk/xgameruntime_abi.h.
 
 // ---------------------------------------------------------------------------

@@ -8,10 +8,13 @@
 // Structure layouts follow the public GDK reference for dstorage_xs.h and
 // match what a title builds. A vtable slot has a name here only if a title's
 // call confirmed it; the others report themselves when called.
+#include "scarlettx/gpu/xg_layout.h"
 #include "scarlettx/media/codecs_abi.h"
 #include "scarlettx/io/deflate_rfc1951.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -50,7 +53,7 @@ constexpr uint64_t kOptDestinationPhysical = 1ull << 21;
 constexpr uint64_t kOptSourceMemory = 1ull << 22;
 constexpr uint64_t kOptSourcePhysical = 1ull << 23;
 constexpr uint64_t kOptUnsupported =
-    kOptSwizzle | kOptDestinationPhysical | kOptSourcePhysical;
+    kOptDestinationPhysical | kOptSourcePhysical;
 
 bool TraceEnabled() {
     static const bool on = [] {
@@ -276,15 +279,25 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
     if (r.source_size == 0) return kOk;
     const bool is_zlib = (r.options & kOptZlib) != 0;
     const uint32_t bcpack_fmt = static_cast<uint32_t>((r.options & kOptBcpack) >> 1);
+    const uint32_t swizzle_opt = static_cast<uint32_t>((r.options & kOptSwizzle) >> 5);
     const bool compressed = is_zlib || (bcpack_fmt != 0);
-    if (!r.destination || !r.source || (!compressed && r.destination_size < r.source_size)) {
+    if (!r.destination || !r.source || (!compressed && swizzle_opt == 0 && r.destination_size < r.source_size)) {
         return kInvalidArg;
     }
 
     uint8_t* dst_ptr = static_cast<uint8_t*>(r.destination) + r.destination_page_offset;
     std::vector<uint8_t> raw_buf;
-    uint8_t* io_target = compressed ? nullptr : dst_ptr;
-    if (compressed) {
+    std::vector<uint8_t> swizzle_linear_buf;
+    uint8_t* decode_dst = dst_ptr;
+    uint32_t decode_cap = r.destination_size;
+    if (swizzle_opt != 0) {
+        decode_cap = std::max<uint32_t>(r.destination_size, r.source_size);
+        swizzle_linear_buf.assign(decode_cap, 0u);
+        decode_dst = swizzle_linear_buf.data();
+    }
+
+    uint8_t* io_target = (compressed || swizzle_opt != 0) ? nullptr : dst_ptr;
+    if (compressed || swizzle_opt != 0) {
         raw_buf.resize(r.source_size);
         io_target = raw_buf.data();
     }
@@ -316,31 +329,76 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
         if (read != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
     }
 
+    size_t decoded_bytes = r.source_size;
     if (is_zlib) {
         // Dispatch tile-framed GDeflate streams (0x04 0xFB) and spec-compliant RFC 1950 Zlib streams;
         // return E_NOTIMPL for unrecognized/unframed payloads without overwriting destination memory.
         if (raw_buf.size() >= 8 && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu) {
             size_t written = 0;
-            return XboxCodecGDeflateDecompress(
-                raw_buf.data(), raw_buf.size(), dst_ptr, r.destination_size, &written);
-        }
-        if (scarlettx::io::LooksLikeRfc1950ZlibHeader(raw_buf.data(), raw_buf.size())) {
-            std::vector<uint8_t> staged(r.destination_size, 0u);
+            const int32_t gd_hr = XboxCodecGDeflateDecompress(
+                raw_buf.data(), raw_buf.size(), decode_dst, decode_cap, &written);
+            if (gd_hr < 0) return gd_hr;
+            decoded_bytes = written;
+        } else if (scarlettx::io::LooksLikeRfc1950ZlibHeader(raw_buf.data(), raw_buf.size())) {
+            std::vector<uint8_t> staged(decode_cap, 0u);
             size_t written = 0;
-            if (scarlettx::io::InflateZlibRfc1950(
+            if (!scarlettx::io::InflateZlibRfc1950(
                     raw_buf.data(), raw_buf.size(), staged.data(), staged.size(), written)) {
-                std::memcpy(dst_ptr, staged.data(), std::min<size_t>(written, r.destination_size));
-                return kOk;
+                return kNotImpl;
             }
+            decoded_bytes = std::min<size_t>(written, decode_cap);
+            std::memcpy(decode_dst, staged.data(), decoded_bytes);
+        } else {
+            return kNotImpl;
         }
-        return kNotImpl;
-    }
-    if (bcpack_fmt != 0) {
+    } else if (bcpack_fmt != 0) {
         if (raw_buf.size() >= 8 && std::memcmp(raw_buf.data(), "BCPK", 4) == 0) {
-            return XboxCodecBcPackDecompress(
-                raw_buf.data(), raw_buf.size(), dst_ptr, r.destination_size, bcpack_fmt);
+            const int32_t bc_hr = XboxCodecBcPackDecompress(
+                raw_buf.data(), raw_buf.size(), decode_dst, decode_cap, bcpack_fmt);
+            if (bc_hr < 0) return bc_hr;
+            decoded_bytes = decode_cap;
+        } else {
+            return kNotImpl;
         }
-        return kNotImpl;
+    } else if (swizzle_opt != 0) {
+        std::memcpy(decode_dst, raw_buf.data(), std::min<size_t>(raw_buf.size(), decode_cap));
+    }
+
+    if (swizzle_opt != 0) {
+        const uint32_t mode = swizzle_opt & 0xFFu;
+        const uint32_t dxgi_fmt = (bcpack_fmt != 0) ? bcpack_fmt : 28u;  // default RGBA8_UNORM
+        const uint32_t bpe = scarlettx::gpu::xg::FormatBytesPerElement(dxgi_fmt);
+        const bool is_bc = scarlettx::gpu::xg::IsBlockCompressed(dxgi_fmt);
+
+        uint32_t tex_w = static_cast<uint32_t>(r.reserved & 0xFFFFu);
+        uint32_t tex_h = static_cast<uint32_t>(r.reserved >> 16u);
+        if (tex_w == 0 || tex_h == 0) {
+            const uint32_t elem_count = std::max<uint32_t>(1u, static_cast<uint32_t>(decoded_bytes / std::max<uint32_t>(1u, bpe)));
+            const auto side_elems = std::max<uint32_t>(1u, static_cast<uint32_t>(std::sqrt(static_cast<double>(elem_count)) + 0.5));
+            tex_w = side_elems * (is_bc ? 4u : 1u);
+            tex_h = tex_w;
+        }
+
+        XG_TEXTURE2D_DESC td{};
+        td.Width = tex_w;
+        td.Height = tex_h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = dxgi_fmt;
+        td.SampleDesc.Count = 1;
+        td.SwizzleMode = mode;
+
+        XG_RESOURCE_LAYOUT layout{};
+        scarlettx::gpu::xg::ComputeTexture2DLayout(td, &layout);
+        if (scarlettx::gpu::xg::IsAddressable(layout) && layout.SizeBytes <= r.destination_size) {
+            const uint32_t row_pitch = layout.Plane[0].MipLayout[0].WidthElements * bpe;
+            if (!scarlettx::gpu::xg::CopyIntoSubresource(layout, dst_ptr, 0u, 0u, decode_dst, row_pitch)) {
+                return kInvalidArg;
+            }
+            return kOk;
+        }
+        if (r.destination_size < decoded_bytes) return kInvalidArg;
+        std::memcpy(dst_ptr, decode_dst, decoded_bytes);
     }
     return kOk;
 }
