@@ -10,7 +10,7 @@
     .r-count { font-size: 13px; fill: #9198a1; font-variant-numeric: tabular-nums; }
     .r-pct { font-size: 13px; font-weight: 600; fill: #e6edf3; font-variant-numeric: tabular-nums; }
     .callout-txt { font-size: 13px; fill: #d1d7e0; }
-    .callout-lead { font-size: 13px; font-weight: 600; fill: #d29922; }
+    .callout-lead { font-size: 13px; font-weight: 600; fill: #39d353; }
   </style>
   <rect width="900" height="546" fill="#0d1117"/>
 
@@ -38,7 +38,7 @@
     <rect x="430" y="82" width="65" height="20" fill="#555555"/>
     <rect x="495" y="82" width="97" height="20" fill="#26a641"/>
     <text class="badge-txt" x="462.5" y="96" text-anchor="middle">CI tests</text>
-    <text class="badge-txt" x="543.5" y="96" text-anchor="middle">33/33 passing</text>
+    <text class="badge-txt" x="543.5" y="96" text-anchor="middle">36/36 passing</text>
   </g>
   <clipPath id="bclip3"><rect x="598" y="82" width="245" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip3)">
@@ -180,9 +180,9 @@
   <text class="r-pct" x="860.0" y="445" text-anchor="end">100%</text>
   <line x1="470.0" y1="456" x2="860.0" y2="456" stroke="#21262d" stroke-width="1"/>
 
-  <!-- 5. Warning callout -->
-  <rect x="36" y="472" width="4" height="44" fill="#d29922"/>
-  <g transform="translate(56,482)"><path d="M8 1.5 15 14H1z" fill="none" stroke="#d29922" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="#d29922" stroke-width="1.5" stroke-linecap="round"/></g>
+  <!-- 5. Status callout -->
+  <rect x="36" y="472" width="4" height="44" fill="#39d353"/>
+  <g transform="translate(56,482)"><circle cx="8" cy="8" r="6.5" fill="none" stroke="#39d353" stroke-width="1.5"/><path d="M5.2 8.2 7.1 10.1 11 6.1" fill="none" stroke="#39d353" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
   <text class="callout-txt" x="82" y="491"><tspan class="callout-lead">Scope note:</tspan> All 72/72 (100.0%) clean-room silicon, Vulkan KHR RT, GPU GDeflate, MSAA/DCC/HTILE &amp; D3D12.2 milestones are active.</text>
   <text class="callout-txt" x="82" y="508">Passing synthetic &amp; UE5/Open-World vertical-slice suites do not guarantee compatibility with untested commercial retail games.</text>
 </svg>

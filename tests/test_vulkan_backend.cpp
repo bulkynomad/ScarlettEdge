@@ -118,7 +118,7 @@ int main() {
             };
         };
         const auto rgen_spv = make_rt_spirv(5313u);  // RayGenerationKHR
-        const auto miss_spv = make_rt_spirv(5315u);  // MissKHR
+        const auto miss_spv = make_rt_spirv(5317u);  // MissKHR
         const auto chit_spv = make_rt_spirv(5316u);  // ClosestHitKHR
 
         VULKAN_XS_RT_PIPELINE_DESC khr_desc{};
@@ -142,6 +142,10 @@ int main() {
         std::cout << "[test_vulkan_backend] KHR RT SBT built (hardwareBacked=" << khr_sbt.hardwareBacked
                   << ", handleSize=" << khr_sbt.handleSize << ", baseAlign=" << khr_sbt.baseAlignment
                   << ", blasVA=0x" << std::hex << blas_va << ", tlasVA=0x" << tlas_va << std::dec << ")\n";
+        if (caps.hardwareRaytracingSupported != 0 &&
+            std::strstr(caps.deviceName, "ScarlettEdge Vulkan (") != nullptr) {
+            SX_CHECK(khr_sbt.hardwareBacked == 1u);
+        }
 
         VULKAN_XS_TRACE_RAYS_DESC khr_trace{};
         khr_trace.width = 64;

@@ -403,6 +403,11 @@ int32_t WINAPI SourceSubmitBuffer(VoiceProxy* v, const void* buffer, const void*
             uint32_t loop_count;
             void* context;
         };
+        struct HostVoiceStateRaw {
+            void* current_context;
+            uint32_t buffers_queued;
+            uint64_t samples_played;
+        };
         #pragma pack(pop)
         const auto* in_buf = static_cast<const XAudio2BufRaw*>(buffer);
         if (!in_buf->audio_data || in_buf->audio_bytes == 0) return kInvalidArg;
@@ -415,22 +420,47 @@ int32_t WINAPI SourceSubmitBuffer(VoiceProxy* v, const void* buffer, const void*
                     v->xma2_channels, v->xma2_rate);
             }
             if (!v->xma2_decoder->DecodeBlock(
-                    in_buf->audio_data, in_buf->audio_bytes, decoded_f32, in_buf->play_length)) {
+                    in_buf->audio_data, in_buf->audio_bytes, decoded_f32, 0u)) {
                 return kInvalidArg;
             }
+            const uint32_t ch = std::max<uint32_t>(1u, v->xma2_channels);
+            const uint32_t decoded_frames = static_cast<uint32_t>(decoded_f32.size() / ch);
+            if (decoded_frames == 0u) return kInvalidArg;
+
             std::vector<int16_t> pcm16(decoded_f32.size());
             for (size_t i = 0; i < decoded_f32.size(); ++i) {
                 const float clamped = std::clamp(decoded_f32[i], -1.0f, 1.0f);
                 pcm16[i] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
             }
-            while (v->xma2_pcm_ring.size() >= 64u) {
+
+            // Query host GetState(XAUDIO2_VOICE_NOSAMPLESPLAYED = 0x0100) before retiring ring entries
+            // so buffers still queued/playing on the realtime audio thread are NEVER freed early!
+            HostVoiceStateRaw host_state{};
+            VCall<void, void*, uint32_t>(v->host, 25, &host_state, 0x0100u);
+            const size_t min_keep = static_cast<size_t>(host_state.buffers_queued) + 1u;
+            while (v->xma2_pcm_ring.size() > min_keep && v->xma2_pcm_ring.size() >= 64u) {
                 v->xma2_pcm_ring.pop_front();
             }
             v->xma2_pcm_ring.push_back(std::move(pcm16));
+
             XAudio2BufRaw host_buf{};
             host_buf.flags = in_buf->flags;
             host_buf.audio_bytes = static_cast<uint32_t>(v->xma2_pcm_ring.back().size() * sizeof(int16_t));
             host_buf.audio_data = reinterpret_cast<const uint8_t*>(v->xma2_pcm_ring.back().data());
+            host_buf.play_begin = (in_buf->play_begin < decoded_frames) ? in_buf->play_begin : 0u;
+            const uint32_t avail_frames = decoded_frames - host_buf.play_begin;
+            host_buf.play_length = (in_buf->play_length > 0u)
+                                       ? std::min<uint32_t>(in_buf->play_length, avail_frames)
+                                       : 0u;
+            const uint32_t play_end =
+                host_buf.play_begin + (host_buf.play_length > 0u ? host_buf.play_length : avail_frames);
+            if (in_buf->loop_count > 0u && play_end > host_buf.play_begin) {
+                host_buf.loop_count = std::min<uint32_t>(in_buf->loop_count, 255u);
+                host_buf.loop_begin = std::clamp<uint32_t>(in_buf->loop_begin, host_buf.play_begin, play_end - 1u);
+                host_buf.loop_length = (in_buf->loop_length > 0u)
+                                           ? std::min<uint32_t>(in_buf->loop_length, play_end - host_buf.loop_begin)
+                                           : 0u;
+            }
             host_buf.context = in_buf->context;
             return VCall<int32_t, const void*, const void*>(v->host, 21, &host_buf, nullptr);
         }
@@ -444,6 +474,29 @@ int32_t WINAPI SourceSubmitBuffer(VoiceProxy* v, const void* buffer, const void*
         std::memcpy(&loops, static_cast<const uint8_t*>(buffer) + 32, 4);
         XA2_TRACE(8, "source voice %p SubmitSourceBuffer(flags=0x%x, bytes=%u, loops=%u, wma=%p) -> 0x%08x",
                   static_cast<void*>(v), flags, bytes, loops, buffer_wma, static_cast<uint32_t>(hr));
+    }
+    return hr;
+}
+
+int32_t WINAPI SourceFlushBuffers(VoiceProxy* v) {
+    const int32_t hr = VCall<int32_t>(v->host, 22);
+    if (v->is_xma2_voice) {
+        std::lock_guard<std::mutex> lk(v->xma2_mu);
+        if (v->xma2_decoder) {
+            v->xma2_decoder->Reset();
+        }
+        #pragma pack(push, 1)
+        struct HostVoiceStateRaw {
+            void* current_context;
+            uint32_t buffers_queued;
+            uint64_t samples_played;
+        };
+        #pragma pack(pop)
+        HostVoiceStateRaw host_state{};
+        VCall<void, void*, uint32_t>(v->host, 25, &host_state, 0x0100u);
+        while (v->xma2_pcm_ring.size() > static_cast<size_t>(host_state.buffers_queued)) {
+            v->xma2_pcm_ring.pop_front();
+        }
     }
     return hr;
 }
@@ -488,7 +541,7 @@ void* const kSourceVoiceVtbl[29] = {
     reinterpret_cast<void*>(&SourceStart),
     XA2_FWD(20, int32_t, uint32_t, uint32_t),       // Stop
     reinterpret_cast<void*>(&SourceSubmitBuffer),
-    XA2_FWD(22, int32_t),                           // FlushSourceBuffers
+    reinterpret_cast<void*>(&SourceFlushBuffers),   // FlushSourceBuffers
     XA2_FWD(23, int32_t),                           // Discontinuity
     XA2_FWD(24, int32_t, uint32_t),                 // ExitLoop
     reinterpret_cast<void*>(&SourceGetState),

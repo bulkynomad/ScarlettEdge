@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -18,7 +19,6 @@ namespace {
 constexpr int32_t kS_OK = 0;
 constexpr int32_t kE_INVALIDARG = static_cast<int32_t>(0x80070057u);
 constexpr int32_t kE_OUTOFMEMORY = static_cast<int32_t>(0x8007000Eu);
-constexpr int32_t kE_POINTER = static_cast<int32_t>(0x80004003u);
 
 bool TraceEnabled() {
     const char* v = std::getenv("SCARLETTX_TRACE");
@@ -37,6 +37,7 @@ struct ApuState {
     std::mutex mu;
     uint32_t next_pa = 0x10000000u;
     uint32_t heap_capacity = 64u * 1024u * 1024u;
+    bool heap_configured = false;
     uint32_t bytes_allocated = 0;
     ACP_SHAPE_CONTEXT_COUNTS shape_contexts{};
     std::unordered_map<uintptr_t, ApuAllocation> by_va;
@@ -48,14 +49,95 @@ ApuState& State() {
     return s;
 }
 
-// IAcpHal vtable layout observed from real Scarlett target disassembly
-// (non-IUnknown interface):
-//   +0x00: Connect(uint32_t cmdQueueLen, uint32_t msgQueueLen) -> HRESULT
-//   +0x08: Disconnect() -> HRESULT
-//   +0x10: SubmitCommand(uint32_t type, uint32_t id, uint32_t flags, const void* data, uint32_t extra) -> HRESULT
-//   +0x18: PopMessage(void* msg) -> bool (uint8_t; 0 = empty, 1 = popped; Disconnect expects msg[0] == 0x80)
-//   +0x20: StubSlot4() -> HRESULT
-//   +0x28: Release() -> uint32_t
+int32_t ApuAllocLocked(
+    ApuState& st,
+    void** virtualAddress,
+    uint32_t* physicalAddress,
+    uint32_t sizeInBytes,
+    uint32_t alignmentInBytes,
+    uint32_t flags) {
+    if (!virtualAddress || sizeInBytes == 0) return kE_INVALIDARG;
+    if (alignmentInBytes > 0x40000000u) return kE_INVALIDARG;
+
+    // Validate & normalize alignment to a power-of-2 >= 64 so _aligned_malloc never aborts
+    const uint32_t align = std::bit_ceil(std::max<uint32_t>(64u, alignmentInBytes));
+
+    if (st.heap_configured &&
+        static_cast<uint64_t>(st.bytes_allocated) + static_cast<uint64_t>(sizeInBytes) > st.heap_capacity) {
+        return kE_OUTOFMEMORY;
+    }
+
+    const uint64_t aligned_pa64 =
+        (static_cast<uint64_t>(st.next_pa) + static_cast<uint64_t>(align) - 1ull) &
+        ~static_cast<uint64_t>(align - 1u);
+    if (aligned_pa64 + static_cast<uint64_t>(sizeInBytes) > 0xFFFFFFFFull) {
+        return kE_OUTOFMEMORY;
+    }
+
+#if defined(_WIN32)
+    void* mem = _aligned_malloc(sizeInBytes, align);
+#else
+    void* mem = nullptr;
+    if (posix_memalign(&mem, align, sizeInBytes) != 0) mem = nullptr;
+#endif
+    if (!mem) return kE_OUTOFMEMORY;
+    std::memset(mem, 0, sizeInBytes);
+
+    const uint32_t aligned_pa = static_cast<uint32_t>(aligned_pa64);
+    st.next_pa = aligned_pa + sizeInBytes;
+    st.bytes_allocated += sizeInBytes;
+
+    ApuAllocation rec{};
+    rec.va = mem;
+    rec.pa = aligned_pa;
+    rec.size = sizeInBytes;
+    rec.alignment = align;
+    rec.flags = flags;
+    st.by_va[reinterpret_cast<uintptr_t>(mem)] = rec;
+    st.by_pa[aligned_pa] = reinterpret_cast<uintptr_t>(mem);
+
+    *virtualAddress = mem;
+    if (physicalAddress) *physicalAddress = aligned_pa;
+    if (TraceEnabled()) {
+        std::cerr << "[ScarlettX][AcpHal] ApuAlloc(size=" << sizeInBytes << ", align=" << align
+                  << ") -> va=" << mem << ", pa=0x" << std::hex << aligned_pa << std::dec << "\n";
+    }
+    return kS_OK;
+}
+
+int32_t ApuFreeLocked(ApuState& st, void* virtualAddress) {
+    if (!virtualAddress) return kS_OK;
+    auto it = st.by_va.find(reinterpret_cast<uintptr_t>(virtualAddress));
+    if (it == st.by_va.end()) {
+        return kE_INVALIDARG;
+    }
+    st.bytes_allocated = st.bytes_allocated >= it->second.size ? (st.bytes_allocated - it->second.size) : 0u;
+    st.by_pa.erase(it->second.pa);
+    st.by_va.erase(it);
+#if defined(_WIN32)
+    _aligned_free(virtualAddress);
+#else
+    std::free(virtualAddress);
+#endif
+    return kS_OK;
+}
+
+void ReleaseShapeContextsLocked(ApuState& st) {
+    auto release_one = [&](void*& p) {
+        if (p) {
+            (void)ApuFreeLocked(st, p);
+            p = nullptr;
+        }
+    };
+    release_one(st.shape_contexts.srcContexts);
+    release_one(st.shape_contexts.eqCompContexts);
+    release_one(st.shape_contexts.filtVolContexts);
+    release_one(st.shape_contexts.dmaContexts);
+    release_one(st.shape_contexts.xmaContexts);
+    release_one(st.shape_contexts.pcmContexts);
+    std::memset(&st.shape_contexts, 0, sizeof(st.shape_contexts));
+}
+
 struct IAcpHalVtbl {
     int32_t (SCARLETTX_ACP_CALL* Connect)(void* self, uint32_t cmdQueueLen, uint32_t msgQueueLen);
     int32_t (SCARLETTX_ACP_CALL* Disconnect)(void* self);
@@ -142,45 +224,43 @@ extern "C" {
 
 int32_t SCARLETTX_ACP_CALL AcpHalAllocateShapeContexts(ACP_SHAPE_CONTEXT_COUNTS* ctx) {
     if (!ctx) return kE_INVALIDARG;
-    auto alloc_ctx_buf = [](uint32_t count, size_t elem_bytes) -> void* {
-        if (count == 0) return nullptr;
-        const size_t bytes = static_cast<size_t>(count) * elem_bytes;
-#if defined(_WIN32)
-        void* p = _aligned_malloc(bytes, 64);
-#else
-        void* p = nullptr;
-        if (posix_memalign(&p, 64, bytes) != 0) p = nullptr;
-#endif
-        if (p) std::memset(p, 0, bytes);
-        return p;
-    };
-    auto free_ctx_buf = [](void*& p) {
-        if (!p) return;
-#if defined(_WIN32)
-        _aligned_free(p);
-#else
-        std::free(p);
-#endif
-        p = nullptr;
-    };
 
     std::lock_guard<std::mutex> lk(State().mu);
-    free_ctx_buf(State().shape_contexts.srcContexts);
-    free_ctx_buf(State().shape_contexts.eqCompContexts);
-    free_ctx_buf(State().shape_contexts.filtVolContexts);
-    free_ctx_buf(State().shape_contexts.dmaContexts);
-    free_ctx_buf(State().shape_contexts.xmaContexts);
-    free_ctx_buf(State().shape_contexts.pcmContexts);
+    ReleaseShapeContextsLocked(State());
 
-    // Observed strides from ConceptDestruction.exe:
-    // +0x00/+0x18: src (32B), +0x0c/+0x30: dma (16B), +0x10/+0x38: xma (64B).
-    ctx->srcContexts = alloc_ctx_buf(ctx->numSrcContexts, 32);
-    ctx->eqCompContexts = alloc_ctx_buf(ctx->numEqCompContexts, 64);
-    ctx->filtVolContexts = alloc_ctx_buf(ctx->numFiltVolContexts, 64);
-    ctx->dmaContexts = alloc_ctx_buf(ctx->numDmaContexts, 16);
-    ctx->xmaContexts = alloc_ctx_buf(ctx->numXmaContexts, 64);
-    ctx->pcmContexts = alloc_ctx_buf(ctx->numPcmContexts, 64);
-    State().shape_contexts = *ctx;
+    ACP_SHAPE_CONTEXT_COUNTS allocated{};
+    allocated.numSrcContexts = ctx->numSrcContexts;
+    allocated.numEqCompContexts = ctx->numEqCompContexts;
+    allocated.numFiltVolContexts = ctx->numFiltVolContexts;
+    allocated.numDmaContexts = ctx->numDmaContexts;
+    allocated.numXmaContexts = ctx->numXmaContexts;
+    allocated.numPcmContexts = ctx->numPcmContexts;
+
+    // Allocate SHAPE contexts through ApuAlloc so ApuMapVirtualAddress, ApuMapApuAddress,
+    // and ApuIsVirtualAddressValid succeed on every SHAPE context array!
+    auto alloc_ctx_buf = [&](uint32_t count, size_t elem_bytes, void** out_ptr) -> int32_t {
+        *out_ptr = nullptr;
+        if (count == 0u) return kS_OK;
+        const uint64_t total_bytes = static_cast<uint64_t>(count) * elem_bytes;
+        if (total_bytes > 0x7FFFFFFFull) return kE_OUTOFMEMORY;
+        return ApuAllocLocked(State(), out_ptr, nullptr, static_cast<uint32_t>(total_bytes), 64u, 0u);
+    };
+
+    int32_t hr = alloc_ctx_buf(ctx->numSrcContexts, 32u, &allocated.srcContexts);
+    if (hr == kS_OK) hr = alloc_ctx_buf(ctx->numEqCompContexts, 64u, &allocated.eqCompContexts);
+    if (hr == kS_OK) hr = alloc_ctx_buf(ctx->numFiltVolContexts, 64u, &allocated.filtVolContexts);
+    if (hr == kS_OK) hr = alloc_ctx_buf(ctx->numDmaContexts, 16u, &allocated.dmaContexts);
+    if (hr == kS_OK) hr = alloc_ctx_buf(ctx->numXmaContexts, 64u, &allocated.xmaContexts);
+    if (hr == kS_OK) hr = alloc_ctx_buf(ctx->numPcmContexts, 64u, &allocated.pcmContexts);
+
+    if (hr != kS_OK) {
+        State().shape_contexts = allocated;
+        ReleaseShapeContextsLocked(State());
+        return hr;
+    }
+
+    *ctx = allocated;
+    State().shape_contexts = allocated;
 
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][AcpHal] AcpHalAllocateShapeContexts(src=" << ctx->numSrcContexts
@@ -206,31 +286,17 @@ int32_t SCARLETTX_ACP_CALL AcpHalCreate(void** acpHal) {
 }
 
 int32_t SCARLETTX_ACP_CALL AcpHalReleaseShapeContexts(void) {
-    auto free_ctx_buf = [](void*& p) {
-        if (!p) return;
-#if defined(_WIN32)
-        _aligned_free(p);
-#else
-        std::free(p);
-#endif
-        p = nullptr;
-    };
     std::lock_guard<std::mutex> lk(State().mu);
-    free_ctx_buf(State().shape_contexts.srcContexts);
-    free_ctx_buf(State().shape_contexts.eqCompContexts);
-    free_ctx_buf(State().shape_contexts.filtVolContexts);
-    free_ctx_buf(State().shape_contexts.dmaContexts);
-    free_ctx_buf(State().shape_contexts.xmaContexts);
-    free_ctx_buf(State().shape_contexts.pcmContexts);
-    std::memset(&State().shape_contexts, 0, sizeof(State().shape_contexts));
+    ReleaseShapeContextsLocked(State());
     return kS_OK;
 }
 
 int32_t SCARLETTX_ACP_CALL ApuCreateHeap(uint32_t cachedSizeInBytes, uint32_t nonCachedSizeInBytes) {
     std::lock_guard<std::mutex> lk(State().mu);
-    const uint64_t total = static_cast<uint64_t>(cachedSizeInBytes) + nonCachedSizeInBytes;
-    if (total > 0) {
-        State().heap_capacity = static_cast<uint32_t>(std::min<uint64_t>(total, 0x7FFFFFFFu));
+    const uint64_t total = static_cast<uint64_t>(cachedSizeInBytes) + static_cast<uint64_t>(nonCachedSizeInBytes);
+    if (total > 0ull) {
+        State().heap_capacity = static_cast<uint32_t>(std::min<uint64_t>(total, 0xFFFFFFFFull));
+        State().heap_configured = true;
     }
     return kS_OK;
 }
@@ -241,57 +307,13 @@ int32_t SCARLETTX_ACP_CALL ApuAlloc(
     uint32_t sizeInBytes,
     uint32_t alignmentInBytes,
     uint32_t flags) {
-    if (!virtualAddress || sizeInBytes == 0) return kE_INVALIDARG;
-    const uint32_t align = std::max<uint32_t>(64u, alignmentInBytes);
-#if defined(_WIN32)
-    void* mem = _aligned_malloc(sizeInBytes, align);
-#else
-    void* mem = nullptr;
-    if (posix_memalign(&mem, align, sizeInBytes) != 0) mem = nullptr;
-#endif
-    if (!mem) return kE_OUTOFMEMORY;
-    std::memset(mem, 0, sizeInBytes);
-
     std::lock_guard<std::mutex> lk(State().mu);
-    const uint32_t aligned_pa = (State().next_pa + align - 1u) & ~(align - 1u);
-    State().next_pa = aligned_pa + sizeInBytes;
-    State().bytes_allocated += sizeInBytes;
-
-    ApuAllocation rec{};
-    rec.va = mem;
-    rec.pa = aligned_pa;
-    rec.size = sizeInBytes;
-    rec.alignment = align;
-    rec.flags = flags;
-    State().by_va[reinterpret_cast<uintptr_t>(mem)] = rec;
-    State().by_pa[aligned_pa] = reinterpret_cast<uintptr_t>(mem);
-
-    *virtualAddress = mem;
-    if (physicalAddress) *physicalAddress = aligned_pa;
-    if (TraceEnabled()) {
-        std::cerr << "[ScarlettX][AcpHal] ApuAlloc(size=" << sizeInBytes << ", align=" << align
-                  << ") -> va=" << mem << ", pa=0x" << std::hex << aligned_pa << std::dec << "\n";
-    }
-    return kS_OK;
+    return ApuAllocLocked(State(), virtualAddress, physicalAddress, sizeInBytes, alignmentInBytes, flags);
 }
 
 int32_t SCARLETTX_ACP_CALL ApuFree(void* virtualAddress) {
-    if (!virtualAddress) return kS_OK;
     std::lock_guard<std::mutex> lk(State().mu);
-    auto it = State().by_va.find(reinterpret_cast<uintptr_t>(virtualAddress));
-    if (it == State().by_va.end()) {
-        return kE_INVALIDARG;
-    }
-    State().bytes_allocated =
-        State().bytes_allocated >= it->second.size ? (State().bytes_allocated - it->second.size) : 0;
-    State().by_pa.erase(it->second.pa);
-    State().by_va.erase(it);
-#if defined(_WIN32)
-    _aligned_free(virtualAddress);
-#else
-    std::free(virtualAddress);
-#endif
-    return kS_OK;
+    return ApuFreeLocked(State(), virtualAddress);
 }
 
 int32_t SCARLETTX_ACP_CALL ApuHeapGetState(APU_HEAP_STATE* apuHeapState, uint32_t /*flags*/) {
@@ -300,7 +322,7 @@ int32_t SCARLETTX_ACP_CALL ApuHeapGetState(APU_HEAP_STATE* apuHeapState, uint32_
     std::memset(apuHeapState, 0, sizeof(*apuHeapState));
     apuHeapState->bytesAllocated = State().bytes_allocated;
     apuHeapState->bytesFree =
-        State().heap_capacity > State().bytes_allocated ? (State().heap_capacity - State().bytes_allocated) : 0;
+        State().heap_capacity > State().bytes_allocated ? (State().heap_capacity - State().bytes_allocated) : 0u;
     apuHeapState->maximumBlockSizeAvailable = apuHeapState->bytesFree;
     apuHeapState->allocationCount = static_cast<uint32_t>(State().by_va.size());
     return kS_OK;
@@ -312,8 +334,10 @@ int32_t SCARLETTX_ACP_CALL ApuIsVirtualAddressValid(const void* virtualAddress, 
     std::lock_guard<std::mutex> lk(State().mu);
     for (const auto& kv : State().by_va) {
         const uintptr_t base = kv.first;
-        const uintptr_t end = base + kv.second.size;
-        if (addr >= base && addr + sizeInBytes <= end) {
+        const uintptr_t alloc_sz = static_cast<uintptr_t>(kv.second.size);
+        // Overflow-safe bounds check (never computes addr + sizeInBytes!)
+        if (addr >= base && (addr - base) <= alloc_sz &&
+            static_cast<uintptr_t>(sizeInBytes) <= (alloc_sz - (addr - base))) {
             return 1;
         }
     }
@@ -324,7 +348,7 @@ void* SCARLETTX_ACP_CALL ApuMapApuAddress(uint32_t apuPhysicalAddress) {
     std::lock_guard<std::mutex> lk(State().mu);
     for (const auto& kv : State().by_va) {
         const auto& rec = kv.second;
-        if (apuPhysicalAddress >= rec.pa && apuPhysicalAddress < rec.pa + rec.size) {
+        if (apuPhysicalAddress >= rec.pa && (apuPhysicalAddress - rec.pa) < rec.size) {
             return static_cast<uint8_t*>(rec.va) + (apuPhysicalAddress - rec.pa);
         }
     }
@@ -337,8 +361,8 @@ uint32_t SCARLETTX_ACP_CALL ApuMapVirtualAddress(const void* virtualAddress) {
     std::lock_guard<std::mutex> lk(State().mu);
     for (const auto& kv : State().by_va) {
         const uintptr_t base = kv.first;
-        const uintptr_t end = base + kv.second.size;
-        if (addr >= base && addr < end) {
+        const uintptr_t alloc_sz = static_cast<uintptr_t>(kv.second.size);
+        if (addr >= base && (addr - base) < alloc_sz) {
             return kv.second.pa + static_cast<uint32_t>(addr - base);
         }
     }

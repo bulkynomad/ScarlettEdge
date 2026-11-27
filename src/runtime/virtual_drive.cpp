@@ -24,6 +24,22 @@ std::atomic<bool> g_mapped{false};
 std::atomic<bool> g_handlers_installed{false};
 LPTOP_LEVEL_EXCEPTION_FILTER g_previous_filter = nullptr;
 
+void NormalizeDosPath(const char* src, char* dst, size_t dst_cap) {
+    if (!dst || dst_cap == 0) {
+        return;
+    }
+    size_t i = 0;
+    if (src) {
+        for (; src[i] != '\0' && src[i] != '\r' && src[i] != '\n' && i + 1 < dst_cap; ++i) {
+            dst[i] = (src[i] == '/') ? '\\' : src[i];
+        }
+    }
+    while (i > 3 && dst[i - 1] == '\\') {
+        --i;
+    }
+    dst[i] = '\0';
+}
+
 bool MarkerPath(char letter, char* out, size_t out_size) {
     char temp[MAX_PATH + 1] = {};
     const DWORD len = GetTempPathA(MAX_PATH, temp);
@@ -34,7 +50,11 @@ bool MarkerPath(char letter, char* out, size_t out_size) {
 }
 
 bool SamePath(const char* a, const char* b) {
-    return _stricmp(a, b) == 0;
+    char norm_a[MAX_PATH + 16] = {};
+    char norm_b[MAX_PATH + 16] = {};
+    NormalizeDosPath(a, norm_a, sizeof(norm_a));
+    NormalizeDosPath(b, norm_b, sizeof(norm_b));
+    return _stricmp(norm_a, norm_b) == 0;
 }
 
 // QueryDosDevice reports "<4-character NT prefix>C:<path>".
@@ -103,9 +123,9 @@ bool RecoverStaleDrive(char letter) {
         return false;
     }
     unsigned long pid = 0;
-    char target[MAX_PATH + 1] = {};
+    char raw_target[MAX_PATH + 1] = {};
     const bool parsed = std::fscanf(file, "%lu", &pid) == 1 && std::fgetc(file) == 10 &&
-                        std::fgets(target, sizeof(target), file) != nullptr;
+                        std::fgets(raw_target, sizeof(raw_target), file) != nullptr;
     std::fclose(file);
     if (!parsed) {
         DeleteFileA(marker);
@@ -121,13 +141,27 @@ bool RecoverStaleDrive(char letter) {
             return false;  // another instance owns the mapping
         }
     }
+
+    char norm_target[MAX_PATH + 1] = {};
+    NormalizeDosPath(raw_target, norm_target, sizeof(norm_target));
+    if (norm_target[0] == '\0') {
+        DeleteFileA(marker);
+        return false;
+    }
+
     const char device[3] = {letter, ':', 0};
     bool removed = false;
-    if (DriveTargets(device, target)) {
+    if (DriveTargets(device, norm_target)) {
         removed = DefineDosDeviceA(DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE, device,
-                                   target) != 0;
+                                   norm_target) != 0;
+        if (!removed && std::strcmp(norm_target, raw_target) != 0) {
+            removed = DefineDosDeviceA(DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE, device,
+                                       raw_target) != 0;
+        }
     }
-    DeleteFileA(marker);
+    if (removed || !DriveTargets(device, norm_target)) {
+        DeleteFileA(marker);
+    }
     return removed;
 }
 
@@ -136,17 +170,23 @@ bool MapPackageDrive(char letter, const std::string& target) {
         letter > 'Z') {
         return false;
     }
+    char norm_target[MAX_PATH + 1] = {};
+    NormalizeDosPath(target.c_str(), norm_target, sizeof(norm_target));
+    if (norm_target[0] == '\0') {
+        return false;
+    }
+
     DriveLock lock(letter);
     RecoverStaleDrive(letter);
     if (GetLogicalDrives() & (1u << (letter - 'A'))) {
         return false;
     }
     const char device[3] = {letter, ':', 0};
-    if (!DefineDosDeviceA(0, device, target.c_str())) {
+    if (!DefineDosDeviceA(0, device, norm_target)) {
         return false;
     }
     g_device[0] = letter;
-    std::memcpy(g_target, target.c_str(), target.size() + 1);
+    std::memcpy(g_target, norm_target, std::strlen(norm_target) + 1);
     g_marker[0] = 0;
     if (MarkerPath(letter, g_marker, sizeof(g_marker))) {
         if (std::FILE* file = std::fopen(g_marker, "wb")) {

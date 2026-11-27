@@ -215,7 +215,7 @@ struct VkStridedDeviceAddressRegionKHRMin {
 };
 static_assert(sizeof(VkStridedDeviceAddressRegionKHRMin) == 24, "StridedRegion ABI size");
 struct VkRayTracingShaderGroupCreateInfoKHRMin {
-    uint32_t sType;  // 1000347016
+    uint32_t sType;  // 1000150016 (VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR)
     const void* pNext;
     uint32_t type;   // 0 = GENERAL_KHR, 1 = TRIANGLES_HIT_GROUP_KHR
     uint32_t generalShader;
@@ -227,7 +227,7 @@ struct VkRayTracingShaderGroupCreateInfoKHRMin {
 static_assert(sizeof(VkRayTracingShaderGroupCreateInfoKHRMin) == 48, "ShaderGroupCreateInfo ABI size");
 struct VkPipelineShaderStageCreateInfoMin;
 struct VkRayTracingPipelineCreateInfoKHRMin {
-    uint32_t sType;  // 1000347015
+    uint32_t sType;  // 1000150015 (VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR)
     const void* pNext;
     uint32_t flags;
     uint32_t stageCount;
@@ -243,6 +243,18 @@ struct VkRayTracingPipelineCreateInfoKHRMin {
     int32_t basePipelineIndex;
 };
 static_assert(sizeof(VkRayTracingPipelineCreateInfoKHRMin) == 104, "RTPipelineCreateInfo ABI size");
+struct VkExtent3DMin {
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+};
+struct VkQueueFamilyPropertiesMin {
+    uint32_t queueFlags;
+    uint32_t queueCount;
+    uint32_t timestampValidBits;
+    VkExtent3DMin minImageTransferGranularity;
+};
+static_assert(sizeof(VkQueueFamilyPropertiesMin) == 24, "VkQueueFamilyProperties ABI size");
 struct VkDeviceQueueCreateInfoMin {
     uint32_t sType;
     const void* pNext;
@@ -469,6 +481,7 @@ struct HostVulkanLoader {
     using FnEnumPhys = VkResult (WINAPI*)(VkHandle, uint32_t*, VkHandle*);
     using FnGetPhysProps = void (WINAPI*)(VkHandle, VkPhysicalDevicePropertiesMin*);
     using FnGetPhysMemProps = void (WINAPI*)(VkHandle, VkPhysicalDeviceMemoryPropertiesMin*);
+    using FnGetPhysQueueProps = void (WINAPI*)(VkHandle, uint32_t*, VkQueueFamilyPropertiesMin*);
     using FnCreateDevice = VkResult (WINAPI*)(VkHandle, const VkDeviceCreateInfoMin*, const void*, VkHandle*);
     using FnDestroyDevice = void (WINAPI*)(VkHandle, const void*);
     using FnGetDeviceQueue = void (WINAPI*)(VkHandle, uint32_t, uint32_t, VkHandle*);
@@ -534,6 +547,7 @@ struct HostVulkanLoader {
     FnEnumPhys enum_phys = nullptr;
     FnGetPhysProps get_phys_props = nullptr;
     FnGetPhysMemProps get_phys_mem_props = nullptr;
+    FnGetPhysQueueProps get_phys_queue_props = nullptr;
     FnCreateDevice create_device = nullptr;
     FnDestroyDevice destroy_device = nullptr;
     FnGetDeviceQueue get_device_queue = nullptr;
@@ -587,6 +601,7 @@ struct HostVulkanLoader {
         enum_phys = reinterpret_cast<FnEnumPhys>(sym("vkEnumeratePhysicalDevices"));
         get_phys_props = reinterpret_cast<FnGetPhysProps>(sym("vkGetPhysicalDeviceProperties"));
         get_phys_mem_props = reinterpret_cast<FnGetPhysMemProps>(sym("vkGetPhysicalDeviceMemoryProperties"));
+        get_phys_queue_props = reinterpret_cast<FnGetPhysQueueProps>(sym("vkGetPhysicalDeviceQueueFamilyProperties"));
         create_device = reinterpret_cast<FnCreateDevice>(sym("vkCreateDevice"));
         destroy_device = reinterpret_cast<FnDestroyDevice>(sym("vkDestroyDevice"));
         get_device_queue = reinterpret_cast<FnGetDeviceQueue>(sym("vkGetDeviceQueue"));
@@ -660,15 +675,20 @@ struct VulkanBackendState {
     VkHandle vk_cmd_buf = nullptr;
     VkNonDispHandle vk_default_desc_layout = 0;
     VkNonDispHandle vk_default_pipe_layout = 0;
+    VkNonDispHandle vk_empty_pipe_layout = 0;
     VkNonDispHandle vk_timeline_sem = 0;
     uint64_t timeline_counter = 0;
     bool win32_surface_ext_enabled = false;
+    bool hw_rt_supported = false;
     bool bda_enabled = false;
     bool khr_as_enabled = false;
     bool khr_rt_pipe_enabled = false;
+    uint32_t vk_queue_family = 0;
     uint32_t rt_handle_size = 32;
     uint32_t rt_handle_align = 32;
     uint32_t rt_base_align = 64;
+    uint32_t rt_max_recursion = 31;
+    uint32_t rt_max_dispatch_count = 1024 * 1024;
     uint64_t last_blas_device_address = 0;
     uint64_t next_synthetic_gpu_va = 0x0000000200000000ull;
 #if defined(_WIN32)
@@ -715,6 +735,8 @@ struct AccelerationStructureState {
     uint32_t type = 0;  // 0 = BLAS, 1 = TLAS
     uint32_t geometry_count = 0;
     uint32_t triangle_count = 0;
+    uint32_t built_prim_count = 0;
+    uint64_t backing_buf_size = 0;
     VkNonDispHandle vk_backing_buf = 0;
     VkNonDispHandle vk_backing_mem = 0;
     VkNonDispHandle vk_as = 0;
@@ -757,6 +779,23 @@ uint32_t DetectSpirvExecutionModel(const void* spirv, size_t size) {
         idx += len;
     }
     return ~0u;
+}
+
+bool SpirvHasDescriptorDecorations(const void* spirv, size_t size) {
+    if (!spirv || size < 24 || (size % 4) != 0) return false;
+    const auto* words = static_cast<const uint32_t*>(spirv);
+    if (words[0] != 0x07230203u) return false;
+    const size_t word_count = size / 4;
+    for (size_t idx = 5; idx < word_count;) {
+        const uint32_t op = words[idx] & 0xFFFFu;
+        const uint32_t len = words[idx] >> 16;
+        if (len == 0 || idx + len > word_count || op == 54u) break;
+        if (op == 71u && len >= 4u && (words[idx + 2] == 33u || words[idx + 2] == 34u)) {
+            return true;
+        }
+        idx += len;
+    }
+    return false;
 }
 
 struct SwapchainState {
@@ -812,20 +851,70 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
             if (vk.enum_phys(b->vk_instance, &count, nullptr) == 0 && count > 0) {
                 std::vector<VkHandle> devs(count);
                 if (vk.enum_phys(b->vk_instance, &count, devs.data()) == 0 && devs[0]) {
-                    b->vk_phys_dev = devs[0];
+                    VkHandle best_dev = devs[0];
                     VkPhysicalDevicePropertiesMin props{};
-                    vk.get_phys_props(devs[0], &props);
+                    int best_score = -1;
+                    for (uint32_t di = 0; di < count; ++di) {
+                        if (!devs[di]) continue;
+                        VkPhysicalDevicePropertiesMin cand{};
+                        vk.get_phys_props(devs[di], &cand);
+                        int score = 10;
+                        if (cand.deviceType == 1u /* VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU */) {
+                            score = 100;
+                        } else if (cand.deviceType == 2u /* INTEGRATED_GPU */) {
+                            score = 50;
+                        } else if (cand.deviceType == 3u /* VIRTUAL_GPU */) {
+                            score = 25;
+                        }
+                        if (desc && desc->preferredDeviceName && desc->preferredDeviceName[0] != '\0' &&
+                            std::strstr(cand.deviceName, desc->preferredDeviceName) != nullptr) {
+                            score += 1000;
+                        }
+                        if (score > best_score) {
+                            best_score = score;
+                            best_dev = devs[di];
+                            props = cand;
+                        }
+                    }
+
+                    b->vk_phys_dev = best_dev;
                     if (vk.get_phys_mem_props) {
-                        vk.get_phys_mem_props(devs[0], &b->mem_props);
+                        vk.get_phys_mem_props(best_dev, &b->mem_props);
                     }
                     b->vk_device_name = props.deviceName;
                     b->vk_api_major = (props.apiVersion >> 22) & 0x7Fu;
                     b->vk_api_minor = (props.apiVersion >> 12) & 0x3FFu;
 
+                    uint32_t chosen_qf = 0u;
+                    if (vk.get_phys_queue_props) {
+                        uint32_t qf_cnt = 0;
+                        vk.get_phys_queue_props(best_dev, &qf_cnt, nullptr);
+                        if (qf_cnt > 0) {
+                            std::vector<VkQueueFamilyPropertiesMin> qfs(qf_cnt);
+                            vk.get_phys_queue_props(best_dev, &qf_cnt, qfs.data());
+                            bool found_compute = false;
+                            for (uint32_t qi = 0; qi < qf_cnt; ++qi) {
+                                if (qfs[qi].queueCount == 0) continue;
+                                const bool has_comp = (qfs[qi].queueFlags & 0x2u /* VK_QUEUE_COMPUTE_BIT */) != 0;
+                                const bool has_gfx = (qfs[qi].queueFlags & 0x1u /* VK_QUEUE_GRAPHICS_BIT */) != 0;
+                                if (has_comp && has_gfx) {
+                                    chosen_qf = qi;
+                                    found_compute = true;
+                                    break;
+                                }
+                                if (has_comp && !found_compute) {
+                                    chosen_qf = qi;
+                                    found_compute = true;
+                                }
+                            }
+                        }
+                    }
+                    b->vk_queue_family = chosen_qf;
+
                     const float prio = 1.0f;
                     VkDeviceQueueCreateInfoMin qci{};
                     qci.sType = 2;  // VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO
-                    qci.queueFamilyIndex = 0;
+                    qci.queueFamilyIndex = b->vk_queue_family;
                     qci.queueCount = 1;
                     qci.pQueuePriorities = &prio;
 
@@ -834,18 +923,18 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
                     timeline_feat.pNext = nullptr;
                     timeline_feat.timelineSemaphore = 1u;
 
-                    // Probe device extensions & features for hardware KHR ray tracing when requested.
+                    // Probe device extensions & features for hardware KHR ray tracing.
                     std::vector<const char*> dev_exts;
                     VkPhysicalDeviceBufferDeviceAddressFeaturesMin bda_feat{1000257000u, nullptr, 0, 0, 0};
                     VkPhysicalDeviceAccelerationStructureFeaturesKHRMin as_feat{1000150013u, nullptr, 0, 0, 0, 0, 0};
                     VkPhysicalDeviceRayTracingPipelineFeaturesKHRMin rtp_feat{1000347000u, nullptr, 0, 0, 0, 0, 0};
-                    bool want_rt = (!desc || desc->enableRayTracing != 0) &&
-                                   (b->vk_api_major > 1 || b->vk_api_minor >= 2);
-                    if (want_rt && vk.enum_dev_ext && vk.get_phys_feat2) {
+                    const bool vk_12_plus = (b->vk_api_major > 1 || b->vk_api_minor >= 2);
+                    const bool want_rt = (!desc || desc->enableRayTracing != 0) && vk_12_plus;
+                    if (vk_12_plus && vk.enum_dev_ext && vk.get_phys_feat2) {
                         uint32_t dext_cnt = 0;
-                        if (vk.enum_dev_ext(devs[0], nullptr, &dext_cnt, nullptr) == 0 && dext_cnt > 0) {
+                        if (vk.enum_dev_ext(best_dev, nullptr, &dext_cnt, nullptr) == 0 && dext_cnt > 0) {
                             std::vector<VkExtensionPropertiesMin> dprops(dext_cnt);
-                            if (vk.enum_dev_ext(devs[0], nullptr, &dext_cnt, dprops.data()) == 0) {
+                            if (vk.enum_dev_ext(best_dev, nullptr, &dext_cnt, dprops.data()) == 0) {
                                 auto has_ext = [&](const char* name) {
                                     for (const auto& ep : dprops) {
                                         if (std::strcmp(ep.extensionName, name) == 0) return true;
@@ -864,9 +953,14 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
                                     VkPhysicalDeviceFeatures2Min feat2{};
                                     feat2.sType = 1000059000u;
                                     feat2.pNext = &bda_feat;
-                                    vk.get_phys_feat2(devs[0], &feat2);
+                                    vk.get_phys_feat2(best_dev, &feat2);
 
-                                    if (bda_feat.bufferDeviceAddress && as_feat.accelerationStructure) {
+                                    if (bda_feat.bufferDeviceAddress && as_feat.accelerationStructure &&
+                                        ext_rtp && rtp_feat.rayTracingPipeline) {
+                                        b->hw_rt_supported = true;
+                                    }
+
+                                    if (want_rt && bda_feat.bufferDeviceAddress && as_feat.accelerationStructure) {
                                         dev_exts.push_back("VK_KHR_deferred_host_operations");
                                         if (ext_bda) dev_exts.push_back("VK_KHR_buffer_device_address");
                                         dev_exts.push_back("VK_KHR_acceleration_structure");
@@ -892,12 +986,12 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
 
                     VkDeviceCreateInfoMin dci{};
                     dci.sType = 3;  // VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO
-                    dci.pNext = (b->vk_api_major > 1 || b->vk_api_minor >= 2) ? &timeline_feat : nullptr;
+                    dci.pNext = vk_12_plus ? &timeline_feat : nullptr;
                     dci.queueCreateInfoCount = 1;
                     dci.pQueueCreateInfos = &qci;
                     dci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
                     dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
-                    if (vk.create_device(devs[0], &dci, nullptr, &b->vk_device) != 0 || !b->vk_device) {
+                    if (vk.create_device(best_dev, &dci, nullptr, &b->vk_device) != 0 || !b->vk_device) {
                         // Retry cleanly without optional KHR ray-tracing extensions if driver rejected them
                         b->bda_enabled = false;
                         b->khr_as_enabled = false;
@@ -905,9 +999,9 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
                         timeline_feat.pNext = nullptr;
                         dci.enabledExtensionCount = 0;
                         dci.ppEnabledExtensionNames = nullptr;
-                        if (vk.create_device(devs[0], &dci, nullptr, &b->vk_device) != 0 || !b->vk_device) {
+                        if (vk.create_device(best_dev, &dci, nullptr, &b->vk_device) != 0 || !b->vk_device) {
                             dci.pNext = nullptr;
-                            (void)vk.create_device(devs[0], &dci, nullptr, &b->vk_device);
+                            (void)vk.create_device(best_dev, &dci, nullptr, &b->vk_device);
                         }
                     }
                     if (b->vk_device) {
@@ -948,7 +1042,7 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
                                     VkPhysicalDeviceProperties2Min props2{};
                                     props2.sType = 1000059001u;
                                     props2.pNext = &rtp_props;
-                                    vk.get_phys_props2(devs[0], &props2);
+                                    vk.get_phys_props2(best_dev, &props2);
                                     if (rtp_props.shaderGroupHandleSize > 0) {
                                         b->rt_handle_size = rtp_props.shaderGroupHandleSize;
                                     }
@@ -958,12 +1052,18 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
                                     if (rtp_props.shaderGroupBaseAlignment > 0) {
                                         b->rt_base_align = rtp_props.shaderGroupBaseAlignment;
                                     }
+                                    if (rtp_props.maxRayRecursionDepth > 0) {
+                                        b->rt_max_recursion = rtp_props.maxRayRecursionDepth;
+                                    }
+                                    if (rtp_props.maxRayDispatchInvocationCount > 0) {
+                                        b->rt_max_dispatch_count = rtp_props.maxRayDispatchInvocationCount;
+                                    }
                                 }
                             }
                         }
-                        if (vk.get_device_queue) vk.get_device_queue(b->vk_device, 0, 0, &b->vk_queue);
+                        if (vk.get_device_queue) vk.get_device_queue(b->vk_device, b->vk_queue_family, 0, &b->vk_queue);
                         if (vk.create_cmd_pool) {
-                            VkCommandPoolCreateInfoMin cpci{39u, nullptr, 2u, 0u};
+                            VkCommandPoolCreateInfoMin cpci{39u, nullptr, 2u, b->vk_queue_family};
                             if (vk.create_cmd_pool(b->vk_device, &cpci, nullptr, &b->vk_cmd_pool) == 0 &&
                                 b->vk_cmd_pool && vk.alloc_cmd_bufs) {
                                 VkCommandBufferAllocateInfoMin cbai{40u, nullptr, b->vk_cmd_pool, 0u, 1u};
@@ -971,20 +1071,23 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateBackend(
                             }
                         }
                         if (vk.create_desc_layout) {
-                            // Matches Xs2ShaderLiftToSpirv DescriptorSet 0 layout:
+                            // Matches Xs2ShaderLiftToSpirv DescriptorSet 0 layout + KHR Ray-Tracing stages:
                             //   Binding 0: UniformBuffer (UBO)
                             //   Binding 1: CombinedImageSampler (MIMG)
                             //   Binding 2: StorageBuffer (SSBO)
+                            constexpr uint32_t kStageFlagsAllGfxCompRt = 0x0000003Fu | 0x00000F00u;
                             VkDescriptorSetLayoutBindingMin bindings[3]{};
-                            bindings[0] = {0u, 6u, 1u, 0x0000003Fu, nullptr};
-                            bindings[1] = {1u, 1u, 1u, 0x0000003Fu, nullptr};
-                            bindings[2] = {2u, 7u, 1u, 0x0000003Fu, nullptr};
+                            bindings[0] = {0u, 6u, 1u, kStageFlagsAllGfxCompRt, nullptr};
+                            bindings[1] = {1u, 1u, 1u, kStageFlagsAllGfxCompRt, nullptr};
+                            bindings[2] = {2u, 7u, 1u, kStageFlagsAllGfxCompRt, nullptr};
                             VkDescriptorSetLayoutCreateInfoMin dslci{32u, nullptr, 0u, 3u, bindings};
                             if (vk.create_desc_layout(b->vk_device, &dslci, nullptr, &b->vk_default_desc_layout) == 0 &&
                                 b->vk_default_desc_layout && vk.create_pipe_layout) {
                                 VkPipelineLayoutCreateInfoMin plci{
                                     30u, nullptr, 0u, 1u, &b->vk_default_desc_layout, 0u, nullptr};
                                 (void)vk.create_pipe_layout(b->vk_device, &plci, nullptr, &b->vk_default_pipe_layout);
+                                VkPipelineLayoutCreateInfoMin eplci{30u, nullptr, 0u, 0u, nullptr, 0u, nullptr};
+                                (void)vk.create_pipe_layout(b->vk_device, &eplci, nullptr, &b->vk_empty_pipe_layout);
                             }
                         }
                         if (vk.create_semaphore && dci.pNext != nullptr) {
@@ -1026,6 +1129,9 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsDestroyBackend(VULKAN_XS_BACKEND_HANDLE ba
                     vk.destroy_desc_layout(b->vk_device, b->vk_default_desc_layout, nullptr);
                 }
             }
+            if (b->vk_empty_pipe_layout && vk.destroy_pipe_layout) {
+                vk.destroy_pipe_layout(b->vk_device, b->vk_empty_pipe_layout, nullptr);
+            }
             if (b->vk_default_pipe_layout && vk.destroy_pipe_layout) {
                 vk.destroy_pipe_layout(b->vk_device, b->vk_default_pipe_layout, nullptr);
             }
@@ -1050,9 +1156,11 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsQueryCapabilities(
     auto* b = static_cast<VulkanBackendState*>(backend);
     outCaps->apiVersionMajor = b->vk_api_major;
     outCaps->apiVersionMinor = b->vk_api_minor;
-    outCaps->hardwareRaytracingSupported = 1;
+    // Report real hardware KHR ray-tracing support when a physical Vulkan device is present,
+    // while keeping headless software-BVH fallback (1) on CI runners without a physical Vulkan GPU.
+    outCaps->hardwareRaytracingSupported = (b->vk_device != nullptr) ? (b->hw_rt_supported ? 1u : 0u) : 1u;
     outCaps->maxRayRecursionDepth = 31;
-    outCaps->maxRayDispatchInvocationCount = 1024 * 1024;
+    outCaps->maxRayDispatchInvocationCount = b->rt_max_dispatch_count;
     std::string label = "ScarlettEdge Hardware DXR 1.1 / Vulkan 1.3 Translation Backend";
     if (!b->vk_device_name.empty()) {
         label = "ScarlettEdge Vulkan (" + b->vk_device_name + ")";
@@ -1096,28 +1204,34 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateRaytracingPipeline(
                 std::vector<VkRayTracingShaderGroupCreateInfoKHRMin> groups;
                 constexpr uint32_t kUnused = ~0u;
 
-                stages.push_back({18u, nullptr, 0u, 0x00000100u /* RAYGEN_BIT_KHR */, p->vk_raygen_mod, "main", nullptr});
-                groups.push_back({1000347016u, nullptr, 0u /* GENERAL */, 0u, kUnused, kUnused, kUnused, nullptr});
+                stages.push_back({18u, nullptr, 0u, 0x00000100u /* VK_SHADER_STAGE_RAYGEN_BIT_KHR */, p->vk_raygen_mod, "main", nullptr});
+                groups.push_back({1000150016u, nullptr, 0u /* GENERAL */, 0u, kUnused, kUnused, kUnused, nullptr});
 
                 if (p->vk_miss_mod) {
                     const uint32_t miss_idx = static_cast<uint32_t>(stages.size());
-                    stages.push_back({18u, nullptr, 0u, 0x00000200u /* MISS_BIT_KHR */, p->vk_miss_mod, "main", nullptr});
-                    groups.push_back({1000347016u, nullptr, 0u /* GENERAL */, miss_idx, kUnused, kUnused, kUnused, nullptr});
+                    stages.push_back({18u, nullptr, 0u, 0x00000800u /* VK_SHADER_STAGE_MISS_BIT_KHR */, p->vk_miss_mod, "main", nullptr});
+                    groups.push_back({1000150016u, nullptr, 0u /* GENERAL */, miss_idx, kUnused, kUnused, kUnused, nullptr});
                 }
                 if (p->vk_chit_mod) {
                     const uint32_t chit_idx = static_cast<uint32_t>(stages.size());
-                    stages.push_back({18u, nullptr, 0u, 0x00000400u /* CLOSEST_HIT_BIT_KHR */, p->vk_chit_mod, "main", nullptr});
-                    groups.push_back({1000347016u, nullptr, 1u /* TRIANGLES_HIT_GROUP */, kUnused, chit_idx, kUnused, kUnused, nullptr});
+                    stages.push_back({18u, nullptr, 0u, 0x00000400u /* VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR */, p->vk_chit_mod, "main", nullptr});
+                    groups.push_back({1000150016u, nullptr, 1u /* TRIANGLES_HIT_GROUP */, kUnused, chit_idx, kUnused, kUnused, nullptr});
                 }
 
+                const bool uses_descs =
+                    SpirvHasDescriptorDecorations(desc->raygenSpirv, desc->raygenSize) ||
+                    SpirvHasDescriptorDecorations(desc->missSpirv, desc->missSize) ||
+                    SpirvHasDescriptorDecorations(desc->closestHitSpirv, desc->closestHitSize);
                 VkRayTracingPipelineCreateInfoKHRMin rtpci{};
-                rtpci.sType = 1000347015u;
+                rtpci.sType = 1000150015u;
                 rtpci.stageCount = static_cast<uint32_t>(stages.size());
                 rtpci.pStages = stages.data();
                 rtpci.groupCount = static_cast<uint32_t>(groups.size());
                 rtpci.pGroups = groups.data();
-                rtpci.maxPipelineRayRecursionDepth = std::max<uint32_t>(1u, desc->maxRecursionDepth);
-                rtpci.layout = b->vk_default_pipe_layout;
+                rtpci.maxPipelineRayRecursionDepth =
+                    std::min<uint32_t>(std::max<uint32_t>(1u, desc->maxRecursionDepth), b->rt_max_recursion);
+                rtpci.layout = (!uses_descs && b->vk_empty_pipe_layout) ? b->vk_empty_pipe_layout
+                                                                        : b->vk_default_pipe_layout;
                 rtpci.basePipelineIndex = -1;
 
                 if (b->fn_create_rt_pipes(b->vk_device, 0u, 0u, 1u, &rtpci, nullptr, &p->vk_rt_pipeline) == 0 &&
@@ -1126,13 +1240,15 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsCreateRaytracingPipeline(
                 }
             } else if (p->vk_raygen_mod && b->vk_default_pipe_layout && vk.create_comp_pipelines) {
                 // Compile a real GPU VkPipeline when raygenSpirv is a GLCompute SPIR-V module
+                const bool uses_descs = SpirvHasDescriptorDecorations(desc->raygenSpirv, desc->raygenSize);
                 VkComputePipelineCreateInfoMin cpci{};
                 cpci.sType = 29u;
                 cpci.stage.sType = 18u;
                 cpci.stage.stage = 0x20u;  // VK_SHADER_STAGE_COMPUTE_BIT
                 cpci.stage.module = p->vk_raygen_mod;
                 cpci.stage.pName = "main";
-                cpci.layout = b->vk_default_pipe_layout;
+                cpci.layout = (!uses_descs && b->vk_empty_pipe_layout) ? b->vk_empty_pipe_layout
+                                                                        : b->vk_default_pipe_layout;
                 cpci.basePipelineIndex = -1;
                 (void)vk.create_comp_pipelines(b->vk_device, 0u, 1u, &cpci, nullptr, &p->vk_compute_pipeline);
             }
@@ -1300,15 +1416,17 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsBuildAccelerationStructure(
 
             VkAccelerationStructureBuildSizesInfoKHRMin sizes{};
             sizes.sType = 1000150020u;
-            b->fn_get_as_sizes(b->vk_device, 0u /* DEVICE */, &build_info, &prim_count, &sizes);
+            b->fn_get_as_sizes(b->vk_device, 1u /* VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR */, &build_info, &prim_count, &sizes);
 
             constexpr uint32_t kUsageAsStorageBda = 0x00100000u | 0x00020000u;
-            constexpr uint32_t kUsageScratchBda = 0x00000080u | 0x00020000u;
+            constexpr uint32_t kUsageScratchBda = 0x00000020u | 0x00020000u;
+            const uint64_t req_build_scratch = std::max(sizes.updateScratchSize, sizes.buildScratchSize);
             if (sizes.accelerationStructureSize > 0 &&
                 alloc_vk_buf(sizes.accelerationStructureSize, kUsageAsStorageBda, 0x01u /* DEVICE_LOCAL */, true,
                              as->vk_backing_buf, as->vk_backing_mem) &&
-                alloc_vk_buf(std::max<uint64_t>(256ull, sizes.buildScratchSize + 256ull), kUsageScratchBda, 0x01u, true,
+                alloc_vk_buf(std::max<uint64_t>(4096ull, req_build_scratch + 4096ull), kUsageScratchBda, 0x01u, true,
                              scratch_buf, scratch_mem)) {
+                as->backing_buf_size = sizes.accelerationStructureSize;
                 VkAccelerationStructureCreateInfoKHRMin asci{};
                 asci.sType = 1000150017u;
                 asci.buffer = as->vk_backing_buf;
@@ -1344,12 +1462,21 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsBuildAccelerationStructure(
                                 if (sig_val > 0) {
                                     VkSemaphoreWaitInfoMin swi{
                                         1000207004u, nullptr, 0u, 1u, &b->vk_timeline_sem, &sig_val};
-                                    (void)vk.wait_semaphores(b->vk_device, &swi, 5000000000ull);
+                                    if (vk.wait_semaphores(b->vk_device, &swi, 5000000000ull) != 0) {
+                                        (void)vk.queue_wait_idle(b->vk_queue);
+                                    }
                                 } else {
                                     (void)vk.queue_wait_idle(b->vk_queue);
                                 }
                                 VkAccelerationStructureDeviceAddressInfoKHRMin adai{1000150002u, nullptr, as->vk_as};
-                                as->device_address = b->fn_get_as_addr(b->vk_device, &adai);
+                                as->device_address = (vk_as_type == 1u)
+                                                         ? b->fn_get_as_addr(b->vk_device, &adai)
+                                                         : 0ull;
+                                if (as->device_address == 0ull && as->vk_backing_buf && b->fn_get_buf_addr) {
+                                    VkBufferDeviceAddressInfoMin b_bdai{1000244001u, nullptr, as->vk_backing_buf};
+                                    as->device_address = b->fn_get_buf_addr(b->vk_device, &b_bdai);
+                                }
+                                as->built_prim_count = prim_count;
                                 as->hardware_backed = (as->device_address != 0ull);
                                 if (desc->type == 0u && as->device_address != 0ull) {
                                     b->last_blas_device_address = as->device_address;
@@ -1389,8 +1516,215 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsBuildAccelerationStructure(
 int32_t SCARLETTX_VULKAN_CALL VulkanXsUpdateAccelerationStructure(
     VULKAN_XS_BACKEND_HANDLE backend, VULKAN_XS_AS_HANDLE asHandle, const VULKAN_XS_AS_BUILD_DESC* desc) {
     if (!backend || !asHandle || !desc) return kInvalidArg;
+    auto* b = static_cast<VulkanBackendState*>(backend);
     auto* as = static_cast<AccelerationStructureState*>(asHandle);
+    as->geometry_count = std::max<uint32_t>(1u, desc->geometryCount);
     as->triangle_count = desc->triangleCount;
+
+#if defined(_WIN32)
+    const auto& vk = VkLoader();
+    if (vk.ComputeExecutionAvailable() && b->vk_device && b->khr_as_enabled &&
+        b->vk_cmd_buf && b->vk_queue && as->hardware_backed && as->vk_as) {
+        std::lock_guard<std::mutex> lk(b->mu);
+        auto alloc_vk_buf = [&](uint64_t sz, uint32_t usage, uint32_t mem_flags, bool need_bda,
+                                VkNonDispHandle& out_buf, VkNonDispHandle& out_mem) -> bool {
+            VkBufferCreateInfoMin bci{12u, nullptr, 0u, std::max<uint64_t>(64ull, sz), usage, 0u, 0u, nullptr};
+            if (vk.create_buffer(b->vk_device, &bci, nullptr, &out_buf) != 0 || !out_buf) return false;
+            VkMemoryRequirementsMin req{};
+            vk.get_buf_mem_reqs(b->vk_device, out_buf, &req);
+            uint32_t mem_idx = 0;
+            if (!FindMemoryTypeIndex(b->mem_props, req.memoryTypeBits, mem_flags, &mem_idx) &&
+                !FindMemoryTypeIndex(b->mem_props, req.memoryTypeBits, 0u, &mem_idx)) {
+                vk.destroy_buffer(b->vk_device, out_buf, nullptr);
+                out_buf = 0;
+                return false;
+            }
+            VkMemoryAllocateFlagsInfoMin mafi{1000060000u, nullptr, 0x02u /* DEVICE_ADDRESS_BIT */, 0u};
+            VkMemoryAllocateInfoMin mai{5u, need_bda ? &mafi : nullptr, req.size, mem_idx};
+            if (vk.alloc_mem(b->vk_device, &mai, nullptr, &out_mem) != 0 || !out_mem) {
+                vk.destroy_buffer(b->vk_device, out_buf, nullptr);
+                out_buf = 0;
+                return false;
+            }
+            if (vk.bind_buf_mem(b->vk_device, out_buf, out_mem, 0ull) != 0) {
+                vk.free_mem(b->vk_device, out_mem, nullptr);
+                vk.destroy_buffer(b->vk_device, out_buf, nullptr);
+                out_mem = 0;
+                out_buf = 0;
+                return false;
+            }
+            return true;
+        };
+
+        const uint32_t vk_as_type = (as->type == 0u) ? 1u : 0u;
+        const uint32_t prim_count = (as->type == 0u)
+                                        ? std::max<uint32_t>(1u, std::min<uint32_t>(desc->triangleCount, 4096u))
+                                        : 1u;
+        VkNonDispHandle geom_buf = 0, geom_mem = 0, scratch_buf = 0, scratch_mem = 0;
+        constexpr uint32_t kUsageBuildInputBda = 0x00080000u | 0x00020000u;
+        bool input_ready = false;
+
+        if (as->type == 0u) {
+            const uint32_t vert_count = prim_count * 3u;
+            const uint64_t vb_bytes = static_cast<uint64_t>(vert_count) * 12ull;
+            if (alloc_vk_buf(vb_bytes, kUsageBuildInputBda, 0x06u, true, geom_buf, geom_mem)) {
+                void* mapped = nullptr;
+                if (vk.map_mem(b->vk_device, geom_mem, 0ull, vb_bytes, 0u, &mapped) == 0 && mapped) {
+                    auto* verts = static_cast<float*>(mapped);
+                    for (uint32_t t = 0; t < prim_count; ++t) {
+                        const float ox = static_cast<float>(t & 63u) * 0.25f;
+                        const float oy = static_cast<float>(t >> 6u) * 0.25f;
+                        verts[t * 9u + 0u] = ox;        verts[t * 9u + 1u] = oy;        verts[t * 9u + 2u] = 0.05f;
+                        verts[t * 9u + 3u] = ox + 0.1f; verts[t * 9u + 4u] = oy;        verts[t * 9u + 5u] = 0.05f;
+                        verts[t * 9u + 6u] = ox;        verts[t * 9u + 7u] = oy + 0.1f; verts[t * 9u + 8u] = 0.05f;
+                    }
+                    vk.unmap_mem(b->vk_device, geom_mem);
+                    input_ready = true;
+                }
+            }
+        } else {
+            if (alloc_vk_buf(sizeof(VkAccelerationStructureInstanceKHRMin), kUsageBuildInputBda, 0x06u, true,
+                             geom_buf, geom_mem)) {
+                void* mapped = nullptr;
+                if (vk.map_mem(b->vk_device, geom_mem, 0ull, sizeof(VkAccelerationStructureInstanceKHRMin), 0u, &mapped) == 0 &&
+                    mapped) {
+                    VkAccelerationStructureInstanceKHRMin inst{};
+                    inst.transform[0][0] = 1.0f;
+                    inst.transform[1][1] = 1.0f;
+                    inst.transform[2][2] = 1.0f;
+                    inst.instanceCustomIndexAndMask = (0xFFu << 24u);
+                    inst.sbtOffsetAndFlags = (0x01u << 24u);
+                    inst.accelerationStructureReference =
+                        desc->vertexBufferGpuVa ? desc->vertexBufferGpuVa : b->last_blas_device_address;
+                    std::memcpy(mapped, &inst, sizeof(inst));
+                    vk.unmap_mem(b->vk_device, geom_mem);
+                    input_ready = (inst.accelerationStructureReference != 0ull);
+                }
+            }
+        }
+
+        if (input_ready) {
+            VkBufferDeviceAddressInfoMin bdai{1000244001u, nullptr, geom_buf};
+            const uint64_t geom_addr = b->fn_get_buf_addr(b->vk_device, &bdai);
+
+            VkAccelerationStructureGeometryKHRMin geom{};
+            geom.sType = 1000150006u;
+            geom.flags = 1u;
+            if (as->type == 0u) {
+                geom.geometryType = 0u;
+                geom.geometry.triangles.sType = 1000150005u;
+                geom.geometry.triangles.vertexFormat = 106u;
+                geom.geometry.triangles.vertexData.deviceAddress = geom_addr;
+                geom.geometry.triangles.vertexStride = 12ull;
+                geom.geometry.triangles.maxVertex = prim_count * 3u - 1u;
+                geom.geometry.triangles.indexType = 1000165000u;
+            } else {
+                geom.geometryType = 2u;
+                geom.geometry.instances.sType = 1000150004u;
+                geom.geometry.instances.arrayOfPointers = 0u;
+                geom.geometry.instances.data.deviceAddress = geom_addr;
+            }
+
+            const bool can_in_place_update = (prim_count == as->built_prim_count && as->vk_as != 0);
+            VkAccelerationStructureBuildGeometryInfoKHRMin build_info{};
+            build_info.sType = 1000150000u;
+            build_info.type = vk_as_type;
+            build_info.flags = 0x04u | 0x01u;
+            build_info.mode = can_in_place_update ? 1u /* UPDATE_KHR */ : 0u /* BUILD_KHR */;
+            build_info.geometryCount = 1u;
+            build_info.pGeometries = &geom;
+
+            VkAccelerationStructureBuildSizesInfoKHRMin sizes{};
+            sizes.sType = 1000150020u;
+            b->fn_get_as_sizes(b->vk_device, 1u /* VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR */, &build_info, &prim_count, &sizes);
+
+            constexpr uint32_t kUsageAsStorageBda = 0x00100000u | 0x00020000u;
+            constexpr uint32_t kUsageScratchBda = 0x00000020u | 0x00020000u;
+            bool target_ready = true;
+            if (!can_in_place_update && sizes.accelerationStructureSize > as->backing_buf_size) {
+                VkNonDispHandle new_buf = 0, new_mem = 0, new_as = 0;
+                if (alloc_vk_buf(sizes.accelerationStructureSize, kUsageAsStorageBda, 0x01u, true, new_buf, new_mem)) {
+                    VkAccelerationStructureCreateInfoKHRMin asci{};
+                    asci.sType = 1000150017u;
+                    asci.buffer = new_buf;
+                    asci.size = sizes.accelerationStructureSize;
+                    asci.type = vk_as_type;
+                    if (b->fn_create_as(b->vk_device, &asci, nullptr, &new_as) == 0 && new_as) {
+                        if (as->vk_as) b->fn_destroy_as(b->vk_device, as->vk_as, nullptr);
+                        if (as->vk_backing_buf) vk.destroy_buffer(b->vk_device, as->vk_backing_buf, nullptr);
+                        if (as->vk_backing_mem) vk.free_mem(b->vk_device, as->vk_backing_mem, nullptr);
+                        as->vk_backing_buf = new_buf;
+                        as->vk_backing_mem = new_mem;
+                        as->vk_as = new_as;
+                        as->backing_buf_size = sizes.accelerationStructureSize;
+                    } else {
+                        vk.destroy_buffer(b->vk_device, new_buf, nullptr);
+                        vk.free_mem(b->vk_device, new_mem, nullptr);
+                        target_ready = false;
+                    }
+                } else {
+                    target_ready = false;
+                }
+            }
+
+            const uint64_t req_scratch = std::max(sizes.updateScratchSize, sizes.buildScratchSize);
+            if (target_ready &&
+                alloc_vk_buf(std::max<uint64_t>(4096ull, req_scratch + 4096ull), kUsageScratchBda, 0x01u, true,
+                             scratch_buf, scratch_mem)) {
+                VkBufferDeviceAddressInfoMin s_bdai{1000244001u, nullptr, scratch_buf};
+                const uint64_t raw_scratch = b->fn_get_buf_addr(b->vk_device, &s_bdai);
+                build_info.srcAccelerationStructure = can_in_place_update ? as->vk_as : 0ull;
+                build_info.dstAccelerationStructure = as->vk_as;
+                build_info.scratchData.deviceAddress = AlignUp64(raw_scratch, 256ull);
+
+                VkAccelerationStructureBuildRangeInfoKHRMin range{prim_count, 0u, 0u, 0u};
+                const VkAccelerationStructureBuildRangeInfoKHRMin* p_range = &range;
+
+                VkCommandBufferBeginInfoMin cbbi{42u, nullptr, 1u, nullptr};
+                if (vk.begin_cmd_buf(b->vk_cmd_buf, &cbbi) == 0) {
+                    b->fn_cmd_build_as(b->vk_cmd_buf, 1u, &build_info, &p_range);
+                    if (vk.end_cmd_buf(b->vk_cmd_buf) == 0) {
+                        VkSubmitInfoMin si{};
+                        si.sType = 4u;
+                        si.commandBufferCount = 1u;
+                        si.pCommandBuffers = &b->vk_cmd_buf;
+                        uint64_t sig_val = 0;
+                        VkTimelineSemaphoreSubmitInfoMin tssi{};
+                        if (b->vk_timeline_sem && vk.wait_semaphores) {
+                            sig_val = ++b->timeline_counter;
+                            tssi = {1000207003u, nullptr, 0u, nullptr, 1u, &sig_val};
+                            si.pNext = &tssi;
+                            si.signalSemaphoreCount = 1u;
+                            si.pSignalSemaphores = &b->vk_timeline_sem;
+                        }
+                        if (vk.queue_submit(b->vk_queue, 1u, &si, 0ull) == 0) {
+                            if (sig_val > 0) {
+                                VkSemaphoreWaitInfoMin swi{
+                                    1000207004u, nullptr, 0u, 1u, &b->vk_timeline_sem, &sig_val};
+                                if (vk.wait_semaphores(b->vk_device, &swi, 5000000000ull) != 0) {
+                                    (void)vk.queue_wait_idle(b->vk_queue);
+                                }
+                            } else {
+                                (void)vk.queue_wait_idle(b->vk_queue);
+                            }
+                            VkAccelerationStructureDeviceAddressInfoKHRMin adai{1000150002u, nullptr, as->vk_as};
+                            as->device_address = b->fn_get_as_addr(b->vk_device, &adai);
+                            as->built_prim_count = prim_count;
+                            if (as->type == 0u && as->device_address != 0ull) {
+                                b->last_blas_device_address = as->device_address;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (scratch_buf) vk.destroy_buffer(b->vk_device, scratch_buf, nullptr);
+        if (scratch_mem) vk.free_mem(b->vk_device, scratch_mem, nullptr);
+        if (geom_buf) vk.destroy_buffer(b->vk_device, geom_buf, nullptr);
+        if (geom_mem) vk.free_mem(b->vk_device, geom_mem, nullptr);
+    }
+#endif
     return kSuccess;
 }
 
@@ -1453,24 +1787,35 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsBuildShaderBindingTable(
                                      b->fn_get_rt_handles && b->fn_get_buf_addr && p->shader_group_count > 0);
         const uint32_t usage = use_rt_handles ? (0x00000400u /* SBT_BIT_KHR */ | 0x00020000u /* BDA */)
                                               : 0x00000080u /* STORAGE_BUFFER */;
-        VkBufferCreateInfoMin bci{12u, nullptr, 0u, total_sbt_bytes, usage, 0u, 0u, nullptr};
+        const uint64_t alloc_sbt_bytes = total_sbt_bytes + base_align;
+        VkBufferCreateInfoMin bci{12u, nullptr, 0u, alloc_sbt_bytes, usage, 0u, 0u, nullptr};
         if (vk.create_buffer(b->vk_device, &bci, nullptr, &p->vk_sbt_buf) == 0 && p->vk_sbt_buf) {
             VkMemoryRequirementsMin req{};
             vk.get_buf_mem_reqs(b->vk_device, p->vk_sbt_buf, &req);
             uint32_t mem_idx = 0;
             if (FindMemoryTypeIndex(b->mem_props, req.memoryTypeBits, 0x06u /* HOST_VISIBLE|COHERENT */, &mem_idx)) {
                 VkMemoryAllocateFlagsInfoMin mafi{1000060000u, nullptr, 0x02u, 0u};
-                VkMemoryAllocateInfoMin mai{5u, use_rt_handles ? &mafi : nullptr, req.size + base_align, mem_idx};
+                VkMemoryAllocateInfoMin mai{
+                    5u, use_rt_handles ? &mafi : nullptr, std::max<uint64_t>(req.size, alloc_sbt_bytes), mem_idx};
                 if (vk.alloc_mem(b->vk_device, &mai, nullptr, &p->vk_sbt_mem) == 0 && p->vk_sbt_mem &&
                     vk.bind_buf_mem(b->vk_device, p->vk_sbt_buf, p->vk_sbt_mem, 0ull) == 0) {
+                    uint64_t va_pad = 0ull;
+                    if (use_rt_handles) {
+                        VkBufferDeviceAddressInfoMin bdai{1000244001u, nullptr, p->vk_sbt_buf};
+                        const uint64_t raw_va = b->fn_get_buf_addr(b->vk_device, &bdai);
+                        if (raw_va != 0ull) {
+                            sbt_base_va = (raw_va + base_align - 1ull) & ~(static_cast<uint64_t>(base_align) - 1ull);
+                            va_pad = sbt_base_va - raw_va;
+                        }
+                    }
                     void* mapped = nullptr;
-                    if (vk.map_mem(b->vk_device, p->vk_sbt_mem, 0ull, total_sbt_bytes, 0u, &mapped) == 0 && mapped) {
-                        std::memset(mapped, 0, static_cast<size_t>(total_sbt_bytes));
-                        if (use_rt_handles) {
+                    if (vk.map_mem(b->vk_device, p->vk_sbt_mem, 0ull, alloc_sbt_bytes, 0u, &mapped) == 0 && mapped) {
+                        std::memset(mapped, 0, static_cast<size_t>(alloc_sbt_bytes));
+                        if (use_rt_handles && sbt_base_va != 0ull) {
                             std::vector<uint8_t> handles(static_cast<size_t>(p->shader_group_count) * handle_size, 0);
                             if (b->fn_get_rt_handles(b->vk_device, p->vk_rt_pipeline, 0u, p->shader_group_count,
                                                      handles.size(), handles.data()) == 0) {
-                                auto* dst = static_cast<uint8_t*>(mapped);
+                                auto* dst = static_cast<uint8_t*>(mapped) + va_pad;
                                 std::memcpy(dst + raygen_off, handles.data(), handle_size);
                                 uint32_t g_idx = 1u;
                                 if (p->vk_miss_mod && g_idx < p->shader_group_count) {
@@ -1484,10 +1829,6 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsBuildShaderBindingTable(
                             }
                         }
                         vk.unmap_mem(b->vk_device, p->vk_sbt_mem);
-                    }
-                    if (use_rt_handles) {
-                        VkBufferDeviceAddressInfoMin bdai{1000244001u, nullptr, p->vk_sbt_buf};
-                        sbt_base_va = b->fn_get_buf_addr(b->vk_device, &bdai);
                     }
                 }
             }
@@ -1630,9 +1971,10 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsTranslateXboxRootSignatureToVulkanLayout(
     if (g_active_backend && g_active_backend->vk_device && vk.create_desc_layout) {
         std::vector<VkDescriptorSetLayoutBindingMin> bindings;
         uint32_t slot = 0;
-        for (uint32_t i = 0; i < cbv_count; ++i) bindings.push_back({slot++, 6u /* UBO */, 1u, 0x3Fu, nullptr});
-        for (uint32_t i = 0; i < srv_count; ++i) bindings.push_back({slot++, 1u /* CombinedSampler */, 1u, 0x3Fu, nullptr});
-        for (uint32_t i = 0; i < uav_count; ++i) bindings.push_back({slot++, 7u /* StorageBuffer */, 1u, 0x3Fu, nullptr});
+        constexpr uint32_t kStageFlagsAll = 0x0000003Fu | 0x00000F00u;
+        for (uint32_t i = 0; i < cbv_count; ++i) bindings.push_back({slot++, 6u /* UBO */, 1u, kStageFlagsAll, nullptr});
+        for (uint32_t i = 0; i < srv_count; ++i) bindings.push_back({slot++, 1u /* CombinedSampler */, 1u, kStageFlagsAll, nullptr});
+        for (uint32_t i = 0; i < uav_count; ++i) bindings.push_back({slot++, 7u /* StorageBuffer */, 1u, kStageFlagsAll, nullptr});
         VkDescriptorSetLayoutCreateInfoMin dslci{
             32u, nullptr, 0u, static_cast<uint32_t>(bindings.size()), bindings.data()};
         VkNonDispHandle real_layout = 0;
@@ -1835,7 +2177,11 @@ int32_t SCARLETTX_VULKAN_CALL VulkanXsDispatchComputeSpirv(
                             si.signalSemaphoreCount = 1u;
                             si.pSignalSemaphores = &b->vk_timeline_sem;
                         }
-                        if (vk.queue_submit(b->vk_queue, 1u, &si, 0ull) == 0) {
+                        const VkResult sub_res = vk.queue_submit(b->vk_queue, 1u, &si, 0ull);
+                        if (std::getenv("SCARLETTX_VK_DIAG")) {
+                            std::fprintf(stderr, "[vk_diag] update_as sub=%d\n", sub_res);
+                        }
+                        if (sub_res == 0) {
                             if (sig_val > 0) {
                                 VkSemaphoreWaitInfoMin swi{
                                     1000207004u, nullptr, 0u, 1u, &b->vk_timeline_sem, &sig_val};

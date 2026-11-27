@@ -17,9 +17,11 @@
 #include "scarlettx/gpu/xg_layout.h"
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "scarlettx/core/flight_recorder.h"
 #include "scarlettx/gpu/d3d12_backend.h"
 #include "scarlettx/gpu/rt_bvh.h"
 #include "scarlettx/gpu/shader_ir.h"
@@ -118,6 +120,18 @@ HRESULT CallSystemD3D12CreateVersionedRootSignatureDeserializer(
     auto fn = reinterpret_cast<Fn>(GetProcAddress(m, "D3D12CreateVersionedRootSignatureDeserializer"));
     return fn ? fn(src, size, riid, ppv) : E_FAIL;
 }
+
+HRESULT CallSystemD3D12EnableExperimentalFeatures(
+    UINT numFeatures,
+    const IID* pIIDs,
+    void* pConfigurationStructs,
+    UINT* pConfigurationStructSizes) {
+    HMODULE m = GetSystemD3D12Module();
+    if (!m) return E_FAIL;
+    using Fn = HRESULT(WINAPI*)(UINT, const IID*, void*, UINT*);
+    auto fn = reinterpret_cast<Fn>(GetProcAddress(m, "D3D12EnableExperimentalFeatures"));
+    return fn ? fn(numFeatures, pIIDs, pConfigurationStructs, pConfigurationStructSizes) : E_NOINTERFACE;
+}
 #endif
 
 uint32_t IntervalToHz(uint32_t interval) {
@@ -174,7 +188,9 @@ struct PipelineStateEntry {
     uint32_t max_recursion_depth = 0;
 #if defined(_WIN32)
     ID3D12PipelineState* native = nullptr;
+    ID3D12StateObject* rt_state_object = nullptr;
     ~PipelineStateEntry() {
+        if (rt_state_object) rt_state_object->Release();
         if (native) native->Release();
     }
 #endif
@@ -238,7 +254,12 @@ struct D3D12XsDeviceState {
     uint64_t pso_cache_misses = 0;
 #if defined(_WIN32)
     std::unordered_map<uint64_t, ID3D12PipelineState*> pso_cache;
+    std::unordered_map<uint64_t, ID3D12StateObject*> rt_pso_cache;
     ~D3D12XsDeviceState() {
+        for (auto& kv : rt_pso_cache) {
+            if (kv.second) kv.second->Release();
+        }
+        rt_pso_cache.clear();
         for (auto& kv : pso_cache) {
             if (kv.second) kv.second->Release();
         }
@@ -282,6 +303,7 @@ struct GpuStabilityProfiler {
         }
         breadcrumbs[static_cast<size_t>(total_breadcrumbs % kBreadcrumbCap)] = entry;
         ++total_breadcrumbs;
+        scarlettx::FlightRecorder::Instance().RecordGpuBreadcrumb(cmd_list_id, marker_value, tag);
     }
 
     void RecordDurationUs(uint64_t us) {
@@ -341,6 +363,42 @@ struct GpuStabilityProfiler {
 
 GpuStabilityProfiler g_gpu_profiler;
 
+#if defined(_WIN32)
+void MaybeRecordDeviceRemoved(ID3D12Device* pc_dev, HRESULT triggering_hr, const char* site) {
+    if (!scarlettx::FlightRecorder::IsEnabled() || !pc_dev) return;
+    const HRESULT reason = pc_dev->GetDeviceRemovedReason();
+    if (reason != S_OK ||
+        triggering_hr == DXGI_ERROR_DEVICE_REMOVED ||
+        triggering_hr == DXGI_ERROR_DEVICE_HUNG ||
+        triggering_hr == DXGI_ERROR_DEVICE_RESET) {
+        std::vector<scarlettx::FlightGpuBreadcrumb> bcs;
+        {
+            std::lock_guard<std::mutex> lock(g_gpu_profiler.mu);
+            const size_t n = static_cast<size_t>(
+                std::min<uint64_t>(g_gpu_profiler.total_breadcrumbs, GpuStabilityProfiler::kBreadcrumbCap));
+            bcs.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                const uint64_t idx = (g_gpu_profiler.total_breadcrumbs > GpuStabilityProfiler::kBreadcrumbCap)
+                    ? (g_gpu_profiler.total_breadcrumbs - n + i)
+                    : i;
+                const auto& src = g_gpu_profiler.breadcrumbs[static_cast<size_t>(idx % GpuStabilityProfiler::kBreadcrumbCap)];
+                scarlettx::FlightGpuBreadcrumb dst{};
+                dst.command_list_id = src.CommandListId;
+                dst.marker_value = src.MarkerValue;
+                std::memcpy(dst.tag, src.Tag, sizeof(dst.tag));
+                bcs.push_back(dst);
+            }
+        }
+        scarlettx::FlightRecorder::Instance().RecordGpuDeviceRemoved(
+            pc_dev,
+            static_cast<int32_t>(reason != S_OK ? reason : triggering_hr),
+            site,
+            bcs.data(),
+            bcs.size());
+    }
+}
+#endif
+
 bool TraceEnabled() {
     static const bool enabled = []() {
         const char* v = std::getenv("SCARLETTX_TRACE");
@@ -379,19 +437,186 @@ struct ProxyGuid {
     uint8_t d4[8];
 };
 
-bool ProxyGuidEquals(uintptr_t riid, const ProxyGuid& g) {
-    return riid != 0 && std::memcmp(reinterpret_cast<const void*>(riid), &g, sizeof(ProxyGuid)) == 0;
+bool IsReadableMemory(const void* ptr, size_t bytes) {
+    if (!ptr || bytes == 0) return false;
+#if defined(_WIN32)
+    const auto addr = reinterpret_cast<uintptr_t>(ptr);
+    if (addr < 0x10000u || addr + bytes < addr) return false;
+    uintptr_t cur = addr;
+    const uintptr_t end = addr + bytes;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cur), &mbi, sizeof(mbi)) == 0) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+        const DWORD kReadableMask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & kReadableMask) == 0) return false;
+        const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= cur) return false;
+        cur = region_end;
+    }
+    return true;
+#else
+    return true;
+#endif
 }
+
+bool IsWritableMemory(void* ptr, size_t bytes) {
+    if (!ptr || bytes == 0) return false;
+#if defined(_WIN32)
+    const auto addr = reinterpret_cast<uintptr_t>(ptr);
+    if (addr < 0x10000u || addr + bytes < addr) return false;
+    uintptr_t cur = addr;
+    const uintptr_t end = addr + bytes;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cur), &mbi, sizeof(mbi)) == 0) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+        const DWORD kWritableMask = PAGE_READWRITE | PAGE_WRITECOPY |
+                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if ((mbi.Protect & kWritableMask) == 0) return false;
+        const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= cur) return false;
+        cur = region_end;
+    }
+    return true;
+#else
+    return true;
+#endif
+}
+
+bool ProxyGuidEquals(uintptr_t riid, const ProxyGuid& g) {
+    return riid != 0 && IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) &&
+           std::memcmp(reinterpret_cast<const void*>(riid), &g, sizeof(ProxyGuid)) == 0;
+}
+
+constexpr ProxyGuid kIidIUnknown = {
+    0x00000000u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+constexpr ProxyGuid kIidIDXGIObject = {
+    0xAEC22FB8u, 0x76F3u, 0x4639u, {0x9B, 0xE0, 0x28, 0xEB, 0x43, 0xA6, 0x7A, 0x2E}};
 
 // Standard DXGI / D3D12 IIDs verified from target disassembly
 constexpr ProxyGuid kIidIDXGIDevice = {
     0x54EC77FAu, 0x1377u, 0x44E6u, {0x8C, 0x32, 0x88, 0xFD, 0x5F, 0x44, 0xC8, 0x4C}};
+constexpr ProxyGuid kIidIDXGIDevice1 = {
+    0x77DB970Fu, 0x6276u, 0x48BAu, {0xBA, 0x28, 0x07, 0x01, 0x43, 0xB4, 0x39, 0x2C}};
+constexpr ProxyGuid kIidIDXGIDevice2 = {
+    0x05008617u, 0xFBFDu, 0x4051u, {0xA7, 0x90, 0x14, 0x48, 0x84, 0xB4, 0xF6, 0xA9}};
+constexpr ProxyGuid kIidIDXGIDevice3 = {
+    0x6007896Cu, 0x3244u, 0x4AFDu, {0xBF, 0x18, 0xA6, 0xD3, 0xBE, 0xDA, 0x50, 0x23}};
+constexpr ProxyGuid kIidIDXGIDevice4 = {
+    0x95B4F95Fu, 0xD8DAu, 0x4CA4u, {0x9E, 0xE6, 0x3B, 0x76, 0xD5, 0x96, 0x8A, 0x10}};
 constexpr ProxyGuid kIidIDXGIAdapter = {
     0x2411E7E1u, 0x12ACu, 0x4CCFu, {0xBD, 0x14, 0x97, 0x98, 0xE8, 0x53, 0x4D, 0xC0}};
 constexpr ProxyGuid kIidIDXGIAdapter1 = {
     0x29038F61u, 0x3839u, 0x4626u, {0x91, 0xFD, 0x08, 0x68, 0x79, 0x01, 0x1A, 0x05}};
-constexpr ProxyGuid kIidIDXGIDevice1 = {
-    0x77DB970Fu, 0x6276u, 0x48BAu, {0xBA, 0x28, 0x07, 0x01, 0x43, 0xB4, 0x39, 0x2C}};
+constexpr ProxyGuid kIidIDXGIAdapter2 = {
+    0x0AA1AE0Au, 0xFA0Eu, 0x4B84u, {0x86, 0x44, 0xE0, 0x5F, 0xF8, 0xE5, 0xAC, 0xB5}};
+constexpr ProxyGuid kIidIDXGIAdapter3 = {
+    0x645967A4u, 0x1392u, 0x4310u, {0xA7, 0x98, 0x80, 0x53, 0xCE, 0x3E, 0x93, 0xFD}};
+constexpr ProxyGuid kIidIDXGIAdapter4 = {
+    0x3C8D99D1u, 0x4FBFu, 0x4181u, {0xA8, 0x2C, 0xAF, 0x66, 0xBF, 0x7B, 0xD2, 0x4E}};
+constexpr ProxyGuid kIidID3D12StateObject = {
+    0x47016943u, 0xFCA8u, 0x4594u, {0x93, 0xEA, 0xAF, 0x25, 0x8B, 0x55, 0x34, 0x6D}};
+constexpr ProxyGuid kIidID3D12StateObjectProperties = {
+    0xDE5FA827u, 0x9BF9u, 0x4F26u, {0x89, 0xFF, 0xD7, 0xF5, 0x6F, 0xDE, 0x38, 0x60}};
+constexpr ProxyGuid kIidID3D12Object = {
+    0xC4FEC28Fu, 0x7966u, 0x4E95u, {0x9F, 0x94, 0xF4, 0x31, 0xCB, 0x56, 0xC3, 0xB8}};
+constexpr ProxyGuid kIidID3D12DeviceChild = {
+    0x905DB94Bu, 0xA00Cu, 0x4140u, {0x9D, 0xFB, 0x2B, 0x63, 0xFA, 0x76, 0xAA, 0xE4}};
+
+bool IsDxgiDeviceIid(uintptr_t riid) {
+    return ProxyGuidEquals(riid, kIidIDXGIDevice) ||
+           ProxyGuidEquals(riid, kIidIDXGIDevice1) ||
+           ProxyGuidEquals(riid, kIidIDXGIDevice2) ||
+           ProxyGuidEquals(riid, kIidIDXGIDevice3) ||
+           ProxyGuidEquals(riid, kIidIDXGIDevice4);
+}
+
+bool IsDxgiAdapterIid(uintptr_t riid) {
+    return ProxyGuidEquals(riid, kIidIDXGIAdapter) ||
+           ProxyGuidEquals(riid, kIidIDXGIAdapter1) ||
+           ProxyGuidEquals(riid, kIidIDXGIAdapter2) ||
+           ProxyGuidEquals(riid, kIidIDXGIAdapter3) ||
+           ProxyGuidEquals(riid, kIidIDXGIAdapter4);
+}
+
+bool IsD3D12DeviceIid(uintptr_t riid) {
+    static constexpr ProxyGuid kDeviceIids[] = {
+        {0x189819F1u, 0x1DB6u, 0x4B57u, {0xBE, 0x54, 0x18, 0x21, 0x33, 0x9B, 0x85, 0xF7}}, // ID3D12Device
+        {0x77ACCE80u, 0x638Eu, 0x4E65u, {0x88, 0x95, 0xC1, 0xF2, 0x33, 0x86, 0x86, 0x3E}}, // ID3D12Device1
+        {0x30BAA41Eu, 0xB15Bu, 0x475Cu, {0xA0, 0xBB, 0x1A, 0xF5, 0xC5, 0xB6, 0x43, 0x28}}, // ID3D12Device2
+        {0x81DADC15u, 0x2BADu, 0x4392u, {0x93, 0xC5, 0x10, 0x13, 0x45, 0xC4, 0xAA, 0x98}}, // ID3D12Device3
+        {0xE865DF17u, 0xA9EEu, 0x46F9u, {0xA4, 0x63, 0x30, 0x98, 0x31, 0x5A, 0xA2, 0xE5}}, // ID3D12Device4
+        {0x8B4F173Bu, 0x2FEAu, 0x4B80u, {0x8F, 0x58, 0x43, 0x07, 0x19, 0x1A, 0xB9, 0x5D}}, // ID3D12Device5
+        {0xC70B221Bu, 0x40E4u, 0x4A17u, {0x89, 0xAF, 0x02, 0x5A, 0x07, 0x27, 0xA6, 0xDC}}, // ID3D12Device6
+        {0x5C014B53u, 0x68A1u, 0x4B9Bu, {0x8B, 0xD1, 0xDD, 0x60, 0x46, 0xB9, 0x35, 0x8B}}, // ID3D12Device7
+        {0x9218E6BBu, 0xF944u, 0x4F7Eu, {0xA7, 0x5C, 0xB1, 0xB2, 0xC7, 0xB7, 0x01, 0xF3}}, // ID3D12Device8
+        {0x4C80E962u, 0xF032u, 0x4F60u, {0xBC, 0x9E, 0xEB, 0xC2, 0xCF, 0xA1, 0xD8, 0x3C}}, // ID3D12Device9
+        {0x517F8718u, 0xAA66u, 0x49F9u, {0xB0, 0x2B, 0xA7, 0xAB, 0x89, 0xC0, 0x60, 0x31}}, // ID3D12Device10
+        {0x5405C344u, 0xD457u, 0x444Eu, {0xB4, 0xDD, 0x23, 0x66, 0xE4, 0x5A, 0xEE, 0x39}}, // ID3D12Device11
+        {0x5AF5C532u, 0x4C91u, 0x4CD0u, {0xB3, 0x41, 0xF5, 0xA4, 0x05, 0xE6, 0x55, 0x3F}}, // ID3D12Device12
+        {0x14EECFFCu, 0x4DF8u, 0x40F7u, {0xA1, 0x18, 0x5C, 0x81, 0xF0, 0x62, 0xC2, 0x9E}}, // ID3D12Device13
+        {0x5FF3E912u, 0xFE16u, 0x4EF9u, {0x9B, 0x99, 0xB1, 0x59, 0x0E, 0x43, 0xC6, 0x5F}}, // ID3D12Device14
+    };
+    for (const auto& g : kDeviceIids) {
+        if (ProxyGuidEquals(riid, g)) return true;
+    }
+    return false;
+}
+
+bool IsBlockedDiagnosticsOrComIid(uintptr_t riid) {
+    static constexpr ProxyGuid kBlockedIids[] = {
+        // COM marshaling / WinRT / weak references
+        {0x00000003u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, // IMarshal
+        {0x000001CFu, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, // IMarshal2
+        {0xECC8691Bu, 0xC1DBu, 0x4DC0u, {0x85, 0x5E, 0x65, 0xF6, 0xC5, 0x51, 0xAF, 0x49}}, // INoMarshal
+        {0x94EA2B94u, 0xE9CCu, 0x49E0u, {0xC0, 0xFF, 0xEE, 0x64, 0xCA, 0x8F, 0x5B, 0x90}}, // IAgileObject
+        {0x00000040u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, // IFastRundown
+        {0x00000018u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, // IStdMarshalInfo
+        {0x00000019u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, // IExternalConnection
+        {0x1C733A30u, 0x2A1Cu, 0x11CEu, {0xAD, 0xE5, 0x00, 0xAA, 0x00, 0x44, 0x77, 0x3D}}, // ICallFactory
+        {0xAF86E2E0u, 0xB12Du, 0x4C6Au, {0x9C, 0x5A, 0xD7, 0xAA, 0x65, 0x10, 0x1E, 0x90}}, // IInspectable
+        {0x00000037u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, // IWeakReference
+        {0x00000038u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}}, // IWeakReferenceSource
+        // D3D12 InfoQueue / Debug / DRED / Diagnostics
+        {0x0742A90Bu, 0xC387u, 0x483Fu, {0xB9, 0x46, 0x30, 0xA7, 0xE4, 0xE6, 0x14, 0x58}}, // ID3D12InfoQueue
+        {0x2852DD88u, 0xB484u, 0x4C0Cu, {0xB6, 0xB1, 0x67, 0x16, 0x85, 0x00, 0xE6, 0x00}}, // ID3D12InfoQueue1
+        {0x344488B7u, 0x6846u, 0x474Bu, {0xB9, 0x89, 0xF0, 0x27, 0x44, 0x82, 0x45, 0xE0}}, // ID3D12Debug
+        {0xAFFAA4CAu, 0x63FEu, 0x4D8Eu, {0xB8, 0xAD, 0x15, 0x90, 0x00, 0xAF, 0x43, 0x04}}, // ID3D12Debug1
+        {0x93A665C4u, 0xA3B2u, 0x4E5Du, {0xB6, 0x92, 0xA2, 0x6A, 0xE1, 0x4E, 0x33, 0x74}}, // ID3D12Debug2
+        {0x5CF4E58Fu, 0xF671u, 0x4FF1u, {0xA5, 0x42, 0x36, 0x86, 0xE3, 0xD1, 0x53, 0xD1}}, // ID3D12Debug3
+        {0x014B816Eu, 0x9EC5u, 0x472Fu, {0xA8, 0x45, 0xFF, 0xBE, 0x44, 0x1C, 0xE1, 0x3A}}, // ID3D12Debug4
+        {0x548D6B12u, 0x09FAu, 0x40E0u, {0x90, 0x69, 0x5D, 0xCD, 0x58, 0x9A, 0x52, 0xC9}}, // ID3D12Debug5
+        {0x82A816D6u, 0x5D01u, 0x4157u, {0x97, 0xD0, 0x49, 0x75, 0x46, 0x3F, 0xD1, 0xED}}, // ID3D12Debug6
+        {0x3FEBD6DDu, 0x4973u, 0x4787u, {0x81, 0x94, 0xE4, 0x5F, 0x9E, 0x28, 0x92, 0x3E}}, // ID3D12DebugDevice
+        {0xA9B71770u, 0xD099u, 0x4A65u, {0xA6, 0x98, 0x3D, 0xEE, 0x10, 0x02, 0x0F, 0x88}}, // ID3D12DebugDevice1
+        {0x60ECCBC1u, 0x378Du, 0x4DF1u, {0x89, 0x4C, 0xF8, 0xAC, 0x5C, 0xE4, 0xD7, 0xDD}}, // ID3D12DebugDevice2
+        {0x09E0BF36u, 0x54ACu, 0x484Fu, {0x88, 0x47, 0x4B, 0xAE, 0xEA, 0xB6, 0x05, 0x3A}}, // ID3D12DebugCommandQueue
+        {0x16BE35A2u, 0xBFD6u, 0x49F2u, {0xBC, 0xAE, 0xEA, 0xAE, 0x4A, 0xFF, 0x86, 0x2D}}, // ID3D12DebugCommandQueue1
+        {0x09E0BF36u, 0x54ACu, 0x484Fu, {0x88, 0x47, 0x4B, 0xAE, 0xEA, 0xB6, 0x05, 0x3F}}, // ID3D12DebugCommandList
+        {0x102CA951u, 0x311Bu, 0x4B01u, {0xB1, 0x1F, 0xEC, 0xB8, 0x3E, 0x06, 0x1B, 0x37}}, // ID3D12DebugCommandList1
+        {0xAEB575CFu, 0x4E06u, 0x48BEu, {0xBA, 0x3B, 0xC4, 0x50, 0xFC, 0x96, 0x65, 0x2E}}, // ID3D12DebugCommandList2
+        {0x197D5E15u, 0x4D37u, 0x4D34u, {0xAF, 0x78, 0x72, 0x4C, 0xD7, 0x0F, 0xDB, 0x1F}}, // ID3D12DebugCommandList3
+        {0x0ADF7D52u, 0x929Cu, 0x4E61u, {0xAD, 0xDB, 0xFF, 0xED, 0x30, 0xDE, 0x66, 0xEF}}, // ID3D12SharingContract
+        {0x86CA3B85u, 0x49ADu, 0x4B6Eu, {0xAE, 0xD5, 0xED, 0xDB, 0x18, 0x54, 0x0F, 0x41}}, // ID3D12ManualWriteTrackingResource
+        {0x82BC481Cu, 0x6B9Bu, 0x4030u, {0xAE, 0xDB, 0x7E, 0xE3, 0xD1, 0xDF, 0x1E, 0x63}}, // ID3D12DeviceRemovedExtendedDataSettings
+        {0xDBD5AE51u, 0x3317u, 0x4F0Au, {0xAD, 0xF9, 0x1D, 0x7C, 0xED, 0xCA, 0xAE, 0x0B}}, // ID3D12DeviceRemovedExtendedDataSettings1
+        {0x61552388u, 0x01ABu, 0x4008u, {0xA4, 0x36, 0x83, 0xDB, 0x18, 0x95, 0x66, 0xEA}}, // ID3D12DeviceRemovedExtendedDataSettings2
+        {0x98931D33u, 0x5AE8u, 0x4791u, {0xAA, 0x3C, 0x1A, 0x73, 0xA2, 0x93, 0x4E, 0x71}}, // ID3D12DeviceRemovedExtendedData
+        {0x9727A022u, 0xCF1Du, 0x4DDAu, {0x9E, 0xBA, 0xEF, 0xFA, 0x65, 0x3F, 0xC5, 0x06}}, // ID3D12DeviceRemovedExtendedData1
+        {0x67FC5816u, 0xE4CAu, 0x4915u, {0xBF, 0x18, 0x42, 0x54, 0x12, 0x72, 0xDA, 0x54}}, // ID3D12DeviceRemovedExtendedData2
+        {0x119E7452u, 0xDE9Eu, 0x40FEu, {0x88, 0x06, 0x88, 0xF9, 0x0C, 0x12, 0xB4, 0x41}}, // IDXGIDebug
+        {0xC5A05F0Cu, 0x16F2u, 0x4ADFu, {0x9F, 0x4D, 0xA8, 0xC4, 0xD5, 0x8A, 0xC5, 0x50}}, // IDXGIDebug1
+        {0xD67441C7u, 0x672Au, 0x476Fu, {0x9E, 0x82, 0xCD, 0x55, 0xB4, 0x49, 0x49, 0xCE}}, // IDXGIInfoQueue
+    };
+    for (const auto& g : kBlockedIids) {
+        if (ProxyGuidEquals(riid, g)) return true;
+    }
+    return false;
+}
 
 // A title gets its output from IDXGIAdapter::EnumOutputs only to hand it to
 // SetFrameIntervalX, so the output is an identity with a reference count.
@@ -400,9 +625,15 @@ struct XboxDXGIOutputProxy {
     std::atomic<uint32_t> ref_count{1};
 };
 
-intptr_t SCARLETTX_GDK_CALLBACK OutputProxyQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
+intptr_t SCARLETTX_GDK_CALLBACK OutputProxyQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) ||
+        IsBlockedDiagnosticsOrComIid(riid) || IsD3D12DeviceIid(riid) || IsDxgiDeviceIid(riid) ||
+        IsDxgiAdapterIid(riid)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
     static_cast<XboxDXGIOutputProxy*>(self)->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
     return 0;
@@ -454,10 +685,19 @@ intptr_t SCARLETTX_GDK_CALLBACK AdapterProxyQueryInterface(void* self, uintptr_t
     auto* obj = static_cast<XboxDXGIAdapterProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
-    if (TraceEnabled() && riid) {
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid))) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
+    if (TraceEnabled()) {
         const auto* g = reinterpret_cast<const uint32_t*>(riid);
         std::cerr << "[ScarlettX][d3d12_xs] XboxIDXGIAdapter::QueryInterface("
                   << std::hex << g[0] << "-" << g[1] << "-" << g[2] << "-" << g[3] << std::dec << ")\n";
+    }
+    if (!ProxyGuidEquals(riid, kIidIUnknown) &&
+        !ProxyGuidEquals(riid, kIidIDXGIObject) &&
+        !IsDxgiAdapterIid(riid)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
     }
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
@@ -554,10 +794,18 @@ struct XboxD3D12DescriptorHeapProxy {
 #endif
 };
 
+extern const std::array<ComVtableFn, 16> kXboxD3D12DescriptorHeapProxyVtbl;
+
 intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12DescriptorHeapProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) ||
+        IsBlockedDiagnosticsOrComIid(riid) || IsD3D12DeviceIid(riid) || IsDxgiDeviceIid(riid) ||
+        IsDxgiAdapterIid(riid) || ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
     return 0;
@@ -590,28 +838,105 @@ intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxySetName(void* self, uintptr_t name_
     return 0;
 }
 
-intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyGetCPUStart(void* self, uintptr_t, uintptr_t, uintptr_t) {
+intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyGetDesc(void* arg0, uintptr_t arg1, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
-    auto* obj = static_cast<XboxD3D12DescriptorHeapProxy*>(self);
+    XboxD3D12DescriptorHeapProxy* obj = nullptr;
+    uintptr_t sret_ptr = 0;
+    if (IsReadableMemory(arg0, sizeof(void*)) &&
+        *reinterpret_cast<const void* const*>(arg0) == kXboxD3D12DescriptorHeapProxyVtbl.data()) {
+        obj = static_cast<XboxD3D12DescriptorHeapProxy*>(arg0);
+        sret_ptr = arg1;
+    } else if (IsReadableMemory(reinterpret_cast<const void*>(arg1), sizeof(void*)) &&
+               *reinterpret_cast<const void* const*>(arg1) == kXboxD3D12DescriptorHeapProxyVtbl.data()) {
+        obj = reinterpret_cast<XboxD3D12DescriptorHeapProxy*>(arg1);
+        sret_ptr = reinterpret_cast<uintptr_t>(arg0);
+    }
+    if (obj && IsWritableMemory(reinterpret_cast<void*>(sret_ptr), sizeof(D3D12_DESCRIPTOR_HEAP_DESC))) {
+        *reinterpret_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(sret_ptr) = obj->orig_desc;
+    }
+    return static_cast<intptr_t>(sret_ptr);
+#else
+    (void)arg0;
+    return static_cast<intptr_t>(arg1);
+#endif
+}
+
+bool IsLikelyDescriptorHandleSretPtr(uintptr_t sret_ptr, const void* self_ptr) {
+#if defined(_WIN32)
+    if (sret_ptr == 0 || (sret_ptr & 7u) != 0 || reinterpret_cast<const void*>(sret_ptr) == self_ptr) {
+        return false;
+    }
+    if (!IsWritableMemory(reinterpret_cast<void*>(sret_ptr), sizeof(uint64_t))) {
+        return false;
+    }
+    const void* maybe_vtbl = *reinterpret_cast<const void* const*>(sret_ptr);
+    if (maybe_vtbl == kXboxD3D12DescriptorHeapProxyVtbl.data()) {
+        return false;
+    }
+    return true;
+#else
+    (void)sret_ptr;
+    (void)self_ptr;
+    return false;
+#endif
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyGetCPUStart(void* arg0, uintptr_t arg1, uintptr_t, uintptr_t) {
+#if defined(_WIN32)
+    XboxD3D12DescriptorHeapProxy* obj = nullptr;
+    uintptr_t sret_ptr = 0;
+    if (IsReadableMemory(arg0, sizeof(void*)) &&
+        *reinterpret_cast<const void* const*>(arg0) == kXboxD3D12DescriptorHeapProxyVtbl.data()) {
+        obj = static_cast<XboxD3D12DescriptorHeapProxy*>(arg0);
+        sret_ptr = arg1;
+    } else if (IsReadableMemory(reinterpret_cast<const void*>(arg1), sizeof(void*)) &&
+               *reinterpret_cast<const void* const*>(arg1) == kXboxD3D12DescriptorHeapProxyVtbl.data()) {
+        obj = reinterpret_cast<XboxD3D12DescriptorHeapProxy*>(arg1);
+        sret_ptr = reinterpret_cast<uintptr_t>(arg0);
+    }
     if (obj && obj->pc_heap) {
         const D3D12_CPU_DESCRIPTOR_HANDLE h = obj->pc_heap->GetCPUDescriptorHandleForHeapStart();
+        if (IsLikelyDescriptorHandleSretPtr(sret_ptr, obj)) {
+            *reinterpret_cast<D3D12_CPU_DESCRIPTOR_HANDLE*>(sret_ptr) = h;
+            return static_cast<intptr_t>(sret_ptr);
+        }
         return static_cast<intptr_t>(h.ptr);
     }
+#else
+    (void)arg0;
+    (void)arg1;
 #endif
     return 0;
 }
 
-intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyGetGPUStart(void* self, uintptr_t a1, uintptr_t, uintptr_t) {
+intptr_t SCARLETTX_GDK_CALLBACK DescHeapProxyGetGPUStart(void* arg0, uintptr_t arg1, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
-    auto* obj = static_cast<XboxD3D12DescriptorHeapProxy*>(self);
+    XboxD3D12DescriptorHeapProxy* obj = nullptr;
+    uintptr_t sret_ptr = 0;
+    if (IsReadableMemory(arg0, sizeof(void*)) &&
+        *reinterpret_cast<const void* const*>(arg0) == kXboxD3D12DescriptorHeapProxyVtbl.data()) {
+        obj = static_cast<XboxD3D12DescriptorHeapProxy*>(arg0);
+        sret_ptr = arg1;
+    } else if (IsReadableMemory(reinterpret_cast<const void*>(arg1), sizeof(void*)) &&
+               *reinterpret_cast<const void* const*>(arg1) == kXboxD3D12DescriptorHeapProxyVtbl.data()) {
+        obj = reinterpret_cast<XboxD3D12DescriptorHeapProxy*>(arg1);
+        sret_ptr = reinterpret_cast<uintptr_t>(arg0);
+    }
     if (obj && obj->pc_heap) {
         const D3D12_GPU_DESCRIPTOR_HANDLE h = obj->pc_heap->GetGPUDescriptorHandleForHeapStart();
         if (TraceEnabled()) {
-            std::cerr << "[ScarlettX][d3d12_xs] DescHeap::GetGPUStart(self=" << self
-                      << ", a1=0x" << std::hex << a1 << ", h=0x" << h.ptr << std::dec << ")\n";
+            std::cerr << "[ScarlettX][d3d12_xs] DescHeap::GetGPUStart(self=" << obj
+                      << ", sret=0x" << std::hex << sret_ptr << ", h=0x" << h.ptr << std::dec << ")\n";
+        }
+        if (IsLikelyDescriptorHandleSretPtr(sret_ptr, obj)) {
+            *reinterpret_cast<D3D12_GPU_DESCRIPTOR_HANDLE*>(sret_ptr) = h;
+            return static_cast<intptr_t>(sret_ptr);
         }
         return static_cast<intptr_t>(h.ptr);
     }
+#else
+    (void)arg0;
+    (void)arg1;
 #endif
     return 0;
 }
@@ -639,12 +964,13 @@ constexpr std::array<ComVtableFn, sizeof...(Is) + 3> MakeDescHeapProxyVtable(std
 std::array<ComVtableFn, 16> BuildDescHeapProxyVtable() {
     auto vtbl = MakeDescHeapProxyVtable(std::make_index_sequence<13>{});
     vtbl[6] = &DescHeapProxySetName;      // +0x30
-    vtbl[9] = &DescHeapProxyGetCPUStart;  // +0x48 (verified in ConceptDestruction.exe: returns SIZE_T in RAX)
-    vtbl[10] = &DescHeapProxyGetGPUStart; // +0x50
+    vtbl[8] = &DescHeapProxyGetDesc;      // +0x40
+    vtbl[9] = &DescHeapProxyGetCPUStart;  // +0x48 (supports both MSVC sret and Xbox register return)
+    vtbl[10] = &DescHeapProxyGetGPUStart; // +0x50 (supports both MSVC sret and Xbox register return)
     return vtbl;
 }
 
-const auto kXboxD3D12DescriptorHeapProxyVtbl = BuildDescHeapProxyVtable();
+const std::array<ComVtableFn, 16> kXboxD3D12DescriptorHeapProxyVtbl = BuildDescHeapProxyVtable();
 
 struct XboxD3D12FenceProxy {
     const ComVtableFn* lpVtbl;
@@ -654,10 +980,16 @@ struct XboxD3D12FenceProxy {
 #endif
 };
 
-intptr_t SCARLETTX_GDK_CALLBACK FenceProxyQueryInterface(void* self, uintptr_t /*riid*/, uintptr_t ppv, uintptr_t) {
+intptr_t SCARLETTX_GDK_CALLBACK FenceProxyQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12FenceProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) ||
+        IsBlockedDiagnosticsOrComIid(riid) || IsD3D12DeviceIid(riid) || IsDxgiDeviceIid(riid) ||
+        IsDxgiAdapterIid(riid) || ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
     return 0;
@@ -728,6 +1060,17 @@ std::array<ComVtableFn, 16> BuildFenceProxyVtable() {
 }
 const auto kXboxFenceProxyVtbl = BuildFenceProxyVtable();
 
+#if defined(_WIN32)
+std::mutex g_alloc_epoch_mu;
+std::unordered_map<ID3D12CommandAllocator*, uint64_t> g_alloc_epochs;
+
+uint64_t GetAllocatorEpoch(ID3D12CommandAllocator* alloc) {
+    if (!alloc) return 0;
+    std::lock_guard<std::mutex> lk(g_alloc_epoch_mu);
+    return g_alloc_epochs[alloc];
+}
+#endif
+
 struct XboxD3D12CommandAllocatorProxy {
     const ComVtableFn* lpVtbl;
     std::atomic<uint32_t> ref_count{1};
@@ -735,10 +1078,16 @@ struct XboxD3D12CommandAllocatorProxy {
     ID3D12CommandAllocator* pc_alloc = nullptr;
 #endif
 };
-intptr_t SCARLETTX_GDK_CALLBACK AllocProxyQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
+intptr_t SCARLETTX_GDK_CALLBACK AllocProxyQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12CommandAllocatorProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) ||
+        IsBlockedDiagnosticsOrComIid(riid) || IsD3D12DeviceIid(riid) || IsDxgiDeviceIid(riid) ||
+        IsDxgiAdapterIid(riid) || ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
     return 0;
@@ -752,7 +1101,13 @@ intptr_t SCARLETTX_GDK_CALLBACK AllocProxyRelease(void* self, uintptr_t, uintptr
     const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (rem == 0) {
 #if defined(_WIN32)
-        if (obj->pc_alloc) obj->pc_alloc->Release();
+        if (obj->pc_alloc) {
+            {
+                std::lock_guard<std::mutex> lk(g_alloc_epoch_mu);
+                g_alloc_epochs.erase(obj->pc_alloc);
+            }
+            obj->pc_alloc->Release();
+        }
 #endif
         delete obj;
     }
@@ -768,7 +1123,14 @@ intptr_t SCARLETTX_GDK_CALLBACK AllocProxySetName(void* self, uintptr_t name_ptr
 intptr_t SCARLETTX_GDK_CALLBACK AllocProxyReset(void* self, uintptr_t, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12CommandAllocatorProxy*>(self);
-    if (obj->pc_alloc) return static_cast<intptr_t>(obj->pc_alloc->Reset());
+    if (obj->pc_alloc) {
+        const HRESULT hr = obj->pc_alloc->Reset();
+        if (SUCCEEDED(hr)) {
+            std::lock_guard<std::mutex> lk(g_alloc_epoch_mu);
+            ++g_alloc_epochs[obj->pc_alloc];
+        }
+        return static_cast<intptr_t>(hr);
+    }
 #endif
     return 0;
 }
@@ -805,10 +1167,152 @@ struct XboxD3D12SimpleObjectProxy {
 #endif
     const char* kind = "Object";
 };
-intptr_t SCARLETTX_GDK_CALLBACK SimpleObjQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
+
+intptr_t SCARLETTX_GDK_CALLBACK SimpleObjRelease(void* self, uintptr_t, uintptr_t, uintptr_t);
+
+struct XboxD3D12StateObjectPropertiesProxy {
+    const ComVtableFn* lpVtbl;
+    std::atomic<uint32_t> ref_count{1};
+    XboxD3D12SimpleObjectProxy* parent_so = nullptr;
+#if defined(_WIN32)
+    ID3D12StateObjectProperties* pc_props = nullptr;
+#endif
+};
+
+intptr_t SCARLETTX_GDK_CALLBACK StateObjPropsQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
+    auto* obj = static_cast<XboxD3D12StateObjectPropertiesProxy*>(self);
+    auto** out = reinterpret_cast<void**>(ppv);
+    if (!out) return static_cast<intptr_t>(0x80004003u);
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) ||
+        IsBlockedDiagnosticsOrComIid(riid)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
+    if (ProxyGuidEquals(riid, kIidIUnknown) || ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        obj->ref_count.fetch_add(1, std::memory_order_relaxed);
+        *out = self;
+        return 0;
+    }
+    if ((ProxyGuidEquals(riid, kIidID3D12StateObject) ||
+         ProxyGuidEquals(riid, kIidID3D12Object) ||
+         ProxyGuidEquals(riid, kIidID3D12DeviceChild)) &&
+        obj->parent_so) {
+        obj->parent_so->ref_count.fetch_add(1, std::memory_order_relaxed);
+        *out = obj->parent_so;
+        return 0;
+    }
+    return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK StateObjPropsAddRef(void* self, uintptr_t, uintptr_t, uintptr_t) {
+    return static_cast<intptr_t>(
+        static_cast<XboxD3D12StateObjectPropertiesProxy*>(self)->ref_count.fetch_add(1, std::memory_order_relaxed) + 1);
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK StateObjPropsRelease(void* self, uintptr_t, uintptr_t, uintptr_t) {
+    auto* obj = static_cast<XboxD3D12StateObjectPropertiesProxy*>(self);
+    const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (rem == 0) {
+#if defined(_WIN32)
+        if (obj->pc_props) obj->pc_props->Release();
+#endif
+        if (obj->parent_so) SimpleObjRelease(obj->parent_so, 0, 0, 0);
+        delete obj;
+    }
+    return static_cast<intptr_t>(rem);
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK StateObjPropsGetShaderIdentifier(void* self, uintptr_t pExportName, uintptr_t, uintptr_t) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12StateObjectPropertiesProxy*>(self);
+    if (obj && obj->pc_props && pExportName) {
+        return reinterpret_cast<intptr_t>(obj->pc_props->GetShaderIdentifier(reinterpret_cast<LPCWSTR>(pExportName)));
+    }
+#else
+    (void)self;
+    (void)pExportName;
+#endif
+    return 0;
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK StateObjPropsGetShaderStackSize(void* self, uintptr_t pExportName, uintptr_t, uintptr_t) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12StateObjectPropertiesProxy*>(self);
+    if (obj && obj->pc_props && pExportName) {
+        return static_cast<intptr_t>(obj->pc_props->GetShaderStackSize(reinterpret_cast<LPCWSTR>(pExportName)));
+    }
+#else
+    (void)self;
+    (void)pExportName;
+#endif
+    return 0;
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK StateObjPropsGetPipelineStackSize(void* self, uintptr_t, uintptr_t, uintptr_t) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12StateObjectPropertiesProxy*>(self);
+    if (obj && obj->pc_props) {
+        return static_cast<intptr_t>(obj->pc_props->GetPipelineStackSize());
+    }
+#else
+    (void)self;
+#endif
+    return 0;
+}
+
+intptr_t SCARLETTX_GDK_CALLBACK StateObjPropsSetPipelineStackSize(void* self, uintptr_t stackSizeBytes, uintptr_t, uintptr_t) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12StateObjectPropertiesProxy*>(self);
+    if (obj && obj->pc_props) {
+        obj->pc_props->SetPipelineStackSize(static_cast<UINT64>(stackSizeBytes));
+    }
+#else
+    (void)self;
+    (void)stackSizeBytes;
+#endif
+    return 0;
+}
+
+const std::array<ComVtableFn, 7> kXboxStateObjPropsProxyVtbl = {
+    &StateObjPropsQueryInterface,
+    &StateObjPropsAddRef,
+    &StateObjPropsRelease,
+    &StateObjPropsGetShaderIdentifier,
+    &StateObjPropsGetShaderStackSize,
+    &StateObjPropsGetPipelineStackSize,
+    &StateObjPropsSetPipelineStackSize,
+};
+
+intptr_t SCARLETTX_GDK_CALLBACK SimpleObjQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12SimpleObjectProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) ||
+        IsBlockedDiagnosticsOrComIid(riid) || IsD3D12DeviceIid(riid) || IsDxgiDeviceIid(riid) ||
+        IsDxgiAdapterIid(riid)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
+#if defined(_WIN32)
+    if (ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        if (!obj->pc_obj) {
+            return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+        }
+        ID3D12StateObjectProperties* pc_props = nullptr;
+        if (FAILED(obj->pc_obj->QueryInterface(__uuidof(ID3D12StateObjectProperties),
+                                               reinterpret_cast<void**>(&pc_props))) ||
+            !pc_props) {
+            return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+        }
+        auto* props_proxy = new XboxD3D12StateObjectPropertiesProxy();
+        props_proxy->lpVtbl = kXboxStateObjPropsProxyVtbl.data();
+        props_proxy->parent_so = obj;
+        obj->ref_count.fetch_add(1, std::memory_order_relaxed);
+        props_proxy->pc_props = pc_props;
+        *out = props_proxy;
+        return 0;
+    }
+#endif
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
     return 0;
@@ -921,13 +1425,29 @@ struct XboxD3D12ResourceProxy {
 #if defined(_WIN32)
     ID3D12Resource* pc_res = nullptr;
     std::atomic<uint32_t> tracked_state{0};
+    std::atomic<uint32_t> exec_state{0};
     DXGI_FORMAT guest_format = DXGI_FORMAT_UNKNOWN;
     bool promoted_typeless = false;
+    uint64_t external_buffer_gpu_va = 0;
     GuestTextureMemory* guest_memory = nullptr;
 #endif
     void* device = nullptr;  // the XboxD3D12DeviceProxy that created it, referenced
 };
 #if defined(_WIN32)
+std::mutex g_live_resources_mutex;
+std::unordered_set<XboxD3D12ResourceProxy*> g_live_resources;
+
+void RegisterLiveResourceProxy(XboxD3D12ResourceProxy* proxy) {
+    if (!proxy) return;
+    std::lock_guard<std::mutex> lk(g_live_resources_mutex);
+    g_live_resources.insert(proxy);
+}
+
+void UnregisterLiveResourceProxy(XboxD3D12ResourceProxy* proxy) {
+    if (!proxy) return;
+    std::lock_guard<std::mutex> lk(g_live_resources_mutex);
+    g_live_resources.erase(proxy);
+}
 // Textures the title fills through the address returned by
 // GetGPUVirtualAddress. On the console that address is the texture's own
 // memory, and titles copy cooked texel data (console layout) straight into it.
@@ -957,6 +1477,288 @@ uint64_t HashMemoryRegionFast(const uint8_t* ptr, size_t len) {
         h = (h ^ ptr[i]) * 1099511628211ull;
     }
     return h ? h : 1ull;
+}
+
+struct GuestPlacedBufferEntry {
+    XboxD3D12ResourceProxy* owner_proxy = nullptr;
+    uint8_t* external_cpu_va = nullptr;
+    uint64_t external_gpu_va = 0;
+    size_t size = 0;
+    ID3D12Device* pc_device = nullptr;
+    ID3D12Resource* pc_res = nullptr;
+    uint8_t* mapped_ptr = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS host_gpu_va = 0;
+    uint64_t last_hash = 0;
+};
+
+struct HostBufferVaRange {
+    XboxD3D12ResourceProxy* owner = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS start = 0;
+    uint64_t size = 0;
+};
+
+std::mutex g_guest_buffers_mutex;
+std::vector<GuestPlacedBufferEntry> g_guest_buffers;
+std::vector<HostBufferVaRange> g_host_buffer_vas;
+
+void RegisterHostBufferVaRange(XboxD3D12ResourceProxy* owner, ID3D12Resource* pc_res, uint64_t width) {
+    if (!owner || !pc_res || width == 0) return;
+    const D3D12_GPU_VIRTUAL_ADDRESS va = pc_res->GetGPUVirtualAddress();
+    if (va == 0) return;
+    std::lock_guard<std::mutex> lk(g_guest_buffers_mutex);
+    g_host_buffer_vas.push_back(HostBufferVaRange{owner, va, width});
+}
+
+void RegisterPlacedBufferAllocation(
+    XboxD3D12ResourceProxy* owner,
+    ID3D12Device* pc_device,
+    ID3D12Resource* pc_res,
+    void* external_cpu_va,
+    uint64_t external_gpu_va,
+    size_t size,
+    bool is_upload) {
+    if (!pc_res || size == 0) return;
+    GuestPlacedBufferEntry entry{};
+    entry.owner_proxy = owner;
+    entry.external_cpu_va = static_cast<uint8_t*>(external_cpu_va);
+    entry.external_gpu_va = external_gpu_va;
+    entry.size = size;
+    entry.pc_device = pc_device;
+    entry.pc_res = pc_res;
+    entry.pc_res->AddRef();
+    entry.host_gpu_va = pc_res->GetGPUVirtualAddress();
+    if (is_upload && entry.external_cpu_va && IsReadableMemory(entry.external_cpu_va, size)) {
+        void* mapped = nullptr;
+        if (SUCCEEDED(entry.pc_res->Map(0, nullptr, &mapped)) && mapped) {
+            entry.mapped_ptr = static_cast<uint8_t*>(mapped);
+            std::memcpy(entry.mapped_ptr, entry.external_cpu_va, size);
+            entry.last_hash = HashMemoryRegionFast(entry.external_cpu_va, size);
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_guest_buffers_mutex);
+    g_guest_buffers.push_back(entry);
+}
+
+void UnregisterResourceBufferTracking(XboxD3D12ResourceProxy* owner) {
+    if (!owner) return;
+    std::lock_guard<std::mutex> lk(g_guest_buffers_mutex);
+    g_host_buffer_vas.erase(
+        std::remove_if(g_host_buffer_vas.begin(), g_host_buffer_vas.end(),
+                       [owner](const HostBufferVaRange& r) { return r.owner == owner; }),
+        g_host_buffer_vas.end());
+    for (auto it = g_guest_buffers.begin(); it != g_guest_buffers.end();) {
+        if (it->owner_proxy == owner) {
+            if (it->mapped_ptr && it->pc_res) {
+                it->pc_res->Unmap(0, nullptr);
+            }
+            if (it->pc_res) {
+                it->pc_res->Release();
+            }
+            it = g_guest_buffers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ReleaseDeviceAutoGuestBuffers(ID3D12Device* pc_device) {
+    if (!pc_device) return;
+    std::lock_guard<std::mutex> lk(g_guest_buffers_mutex);
+    for (auto it = g_guest_buffers.begin(); it != g_guest_buffers.end();) {
+        if (it->owner_proxy == nullptr && it->pc_device == pc_device) {
+            if (it->mapped_ptr && it->pc_res) {
+                it->pc_res->Unmap(0, nullptr);
+            }
+            if (it->pc_res) {
+                it->pc_res->Release();
+            }
+            it = g_guest_buffers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool QueryKernelXUnifiedAddresses(
+    uint64_t candidate_va,
+    uint8_t** out_cpu_va,
+    uint64_t* out_gpu_va) {
+    if (out_cpu_va) *out_cpu_va = nullptr;
+    if (out_gpu_va) *out_gpu_va = 0;
+    HMODULE kx = GetModuleHandleW(L"kernelx.dll");
+    if (!kx) return false;
+    using MapGpuToVaFn = int32_t(__stdcall*)(uint64_t, void**);
+    using MapVaToGpuFn = int32_t(__stdcall*)(const void*, uint64_t*);
+    auto map_gpu_to_va = reinterpret_cast<MapGpuToVaFn>(
+        reinterpret_cast<void*>(GetProcAddress(kx, "KernelXMapGpuToVirtual")));
+    auto map_va_to_gpu = reinterpret_cast<MapVaToGpuFn>(
+        reinterpret_cast<void*>(GetProcAddress(kx, "KernelXMapVirtualToGpu")));
+
+    void* cpu_ptr = nullptr;
+    if (map_gpu_to_va && map_gpu_to_va(candidate_va, &cpu_ptr) == 0 && cpu_ptr) {
+        if (out_cpu_va) *out_cpu_va = static_cast<uint8_t*>(cpu_ptr);
+        if (out_gpu_va) *out_gpu_va = candidate_va;
+        return true;
+    }
+    uint64_t gpu_addr = 0;
+    if (map_va_to_gpu && map_va_to_gpu(reinterpret_cast<const void*>(candidate_va), &gpu_addr) == 0 &&
+        gpu_addr != 0) {
+        if (out_cpu_va) *out_cpu_va = reinterpret_cast<uint8_t*>(candidate_va);
+        if (out_gpu_va) *out_gpu_va = gpu_addr;
+        return true;
+    }
+    return false;
+}
+
+void SyncDirtyGuestBuffers() {
+    std::lock_guard<std::mutex> lk(g_guest_buffers_mutex);
+    for (GuestPlacedBufferEntry& e : g_guest_buffers) {
+        if (!e.mapped_ptr || !e.external_cpu_va || e.size == 0) continue;
+        if (!IsReadableMemory(e.external_cpu_va, e.size)) continue;
+        const uint64_t cur_hash = HashMemoryRegionFast(e.external_cpu_va, e.size);
+        if (cur_hash != e.last_hash) {
+            std::memcpy(e.mapped_ptr, e.external_cpu_va, e.size);
+            e.last_hash = cur_hash;
+            g_upload_bytes.fetch_add(e.size, std::memory_order_relaxed);
+        }
+    }
+}
+
+bool HasPendingGuestBufferWrites() {
+    std::lock_guard<std::mutex> lk(g_guest_buffers_mutex);
+    for (const GuestPlacedBufferEntry& e : g_guest_buffers) {
+        if (!e.mapped_ptr || !e.external_cpu_va || e.size == 0) continue;
+        if (!IsReadableMemory(e.external_cpu_va, e.size)) continue;
+        if (HashMemoryRegionFast(e.external_cpu_va, e.size) != e.last_hash) {
+            return true;
+        }
+    }
+    return false;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS TranslateGuestGpuVa(
+    ID3D12Device* pc_dev,
+    D3D12_GPU_VIRTUAL_ADDRESS va,
+    size_t size_hint) {
+    if (va == 0) return 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_guest_buffers_mutex);
+        for (GuestPlacedBufferEntry& e : g_guest_buffers) {
+            if (pc_dev && e.pc_device && e.pc_device != pc_dev) continue;
+            size_t offset = 0;
+            bool matched = false;
+            if (e.external_gpu_va != 0 && va >= e.external_gpu_va && va < e.external_gpu_va + e.size) {
+                offset = static_cast<size_t>(va - e.external_gpu_va);
+                matched = true;
+            } else if (e.external_cpu_va != nullptr) {
+                const uint64_t cpu_base = reinterpret_cast<uint64_t>(e.external_cpu_va);
+                if (va >= cpu_base && va < cpu_base + e.size) {
+                    offset = static_cast<size_t>(va - cpu_base);
+                    matched = true;
+                }
+            }
+            if (!matched && e.host_gpu_va != 0 && va >= e.host_gpu_va && va < e.host_gpu_va + e.size) {
+                offset = static_cast<size_t>(va - e.host_gpu_va);
+                matched = true;
+            }
+            if (matched) {
+                if (e.mapped_ptr && e.external_cpu_va && offset < e.size) {
+                    const size_t want = std::min<size_t>(e.size - offset, std::max<size_t>(size_hint, 4096u));
+                    if (IsReadableMemory(e.external_cpu_va + offset, want)) {
+                        std::memcpy(e.mapped_ptr + offset, e.external_cpu_va + offset, want);
+                    }
+                }
+                return e.host_gpu_va + offset;
+            }
+        }
+
+        for (const HostBufferVaRange& hb : g_host_buffer_vas) {
+            if (va >= hb.start && va < hb.start + hb.size) {
+                return va;
+            }
+        }
+    }
+
+    if (!pc_dev) return va;
+
+    uint8_t* cpu_ptr = nullptr;
+    uint64_t gpu_ptr = 0;
+    bool resolved = QueryKernelXUnifiedAddresses(va, &cpu_ptr, &gpu_ptr);
+    if (!resolved && RealTitleMode()) {
+        if (IsReadableMemory(reinterpret_cast<const void*>(va), std::max<size_t>(size_hint, 16u))) {
+            cpu_ptr = reinterpret_cast<uint8_t*>(va);
+            gpu_ptr = va;
+            resolved = true;
+        }
+    }
+    if (!resolved || !cpu_ptr) {
+        return va;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(cpu_ptr, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) {
+        return va;
+    }
+    auto* region_base = static_cast<uint8_t*>(mbi.BaseAddress);
+    const size_t region_size = mbi.RegionSize;
+    if (cpu_ptr < region_base || cpu_ptr >= region_base + region_size) {
+        return va;
+    }
+
+    const size_t off_in_region = static_cast<size_t>(cpu_ptr - region_base);
+    const size_t slab_off = off_in_region & ~static_cast<size_t>(0xFFFFu);
+    uint8_t* slab_cpu = region_base + slab_off;
+    const size_t delta_from_slab = static_cast<size_t>(cpu_ptr - slab_cpu);
+    const uint64_t slab_gpu = (gpu_ptr >= delta_from_slab) ? (gpu_ptr - delta_from_slab) : gpu_ptr;
+    const size_t max_avail = static_cast<size_t>((region_base + region_size) - slab_cpu);
+    const size_t req_bytes = static_cast<size_t>(
+        AlignUp(delta_from_slab + std::max<size_t>(size_hint, 4096u), 65536ull));
+    const size_t slab_size = std::min<size_t>(max_avail, std::max<size_t>(req_bytes, std::min<size_t>(max_avail, 65536u)));
+    if (slab_size == 0 || delta_from_slab >= slab_size || !IsReadableMemory(slab_cpu, slab_size)) {
+        return va;
+    }
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = AlignUp(slab_size, 256ull);
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* backing = nullptr;
+    if (FAILED(pc_dev->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&backing))) ||
+        !backing) {
+        return va;
+    }
+
+    void* mapped = nullptr;
+    if (FAILED(backing->Map(0, nullptr, &mapped)) || !mapped) {
+        backing->Release();
+        return va;
+    }
+    std::memcpy(mapped, slab_cpu, slab_size);
+
+    GuestPlacedBufferEntry entry{};
+    entry.owner_proxy = nullptr;
+    entry.external_cpu_va = slab_cpu;
+    entry.external_gpu_va = slab_gpu;
+    entry.size = slab_size;
+    entry.pc_device = pc_dev;
+    entry.pc_res = backing;
+    entry.mapped_ptr = static_cast<uint8_t*>(mapped);
+    entry.host_gpu_va = backing->GetGPUVirtualAddress();
+    entry.last_hash = HashMemoryRegionFast(slab_cpu, slab_size);
+
+    std::lock_guard<std::mutex> lk(g_guest_buffers_mutex);
+    g_guest_buffers.push_back(entry);
+    return entry.host_gpu_va + delta_from_slab;
 }
 
 // True when the guest layout describes the same rows as the host texture's
@@ -1112,9 +1914,8 @@ void UploadGuestTexture(ID3D12CommandQueue* queue, XboxD3D12ResourceProxy* tex, 
                                                     fps[s].Footprint.RowPitch);
         }
         upload->Unmap(0, nullptr);
-        // The state recorded by the title's latest barrier; these textures are
-        // created ready for sampling and are not transitioned by the title.
-        const auto state = static_cast<D3D12_RESOURCE_STATES>(tex->tracked_state.load(std::memory_order_relaxed));
+        // The state committed on the GPU queue from previously executed command lists.
+        const auto state = static_cast<D3D12_RESOURCE_STATES>(tex->exec_state.load(std::memory_order_relaxed));
         D3D12_RESOURCE_BARRIER b = {};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = tex->pc_res;
@@ -1227,7 +2028,7 @@ void UploadGuestTextureBatch(ID3D12CommandQueue* queue,
 
         for (const GuestTextureUpload& u : uploads) {
             const auto state =
-                static_cast<D3D12_RESOURCE_STATES>(u.tex->tracked_state.load(std::memory_order_relaxed));
+                static_cast<D3D12_RESOURCE_STATES>(u.tex->exec_state.load(std::memory_order_relaxed));
             D3D12_RESOURCE_BARRIER b = {};
             b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             b.Transition.pResource = u.tex->pc_res;
@@ -1266,10 +2067,11 @@ void UploadGuestTextureBatch(ID3D12CommandQueue* queue,
     device->Release();
 }
 
-// Uploads every guest-memory texture the title has written to since the last call.
+// Uploads every guest-memory texture and placed/unified buffer the title has written to since the last call.
 void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
+    SyncDirtyGuestBuffers();
     std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
-    if (g_guest_textures.empty() || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
+    if (!queue || g_guest_textures.empty() || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return;
     std::vector<GuestTextureUpload> uploads;
     std::vector<void*> pages;
     std::vector<UINT> dirty;
@@ -1335,8 +2137,9 @@ void FlushGuestTextureWrites(ID3D12CommandQueue* queue) {
     }
 }
 
-// Lightweight non-reset check for any mid-frame guest texture writes.
+// Lightweight non-reset check for any mid-frame guest texture or placed buffer writes.
 bool HasPendingGuestTextureWrites() {
+    if (HasPendingGuestBufferWrites()) return true;
     std::lock_guard<std::mutex> lock(g_guest_textures_mutex);
     if (g_guest_textures.empty()) return false;
     ULONG_PTR count = 1;
@@ -1367,10 +2170,18 @@ bool HasPendingGuestTextureWrites() {
     return false;
 }
 #endif
-intptr_t SCARLETTX_GDK_CALLBACK ResProxyQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
+extern const std::array<ComVtableFn, 24> kXboxResourceProxyVtbl;
+
+intptr_t SCARLETTX_GDK_CALLBACK ResProxyQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12ResourceProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) ||
+        IsBlockedDiagnosticsOrComIid(riid) || IsD3D12DeviceIid(riid) || IsDxgiDeviceIid(riid) ||
+        IsDxgiAdapterIid(riid) || ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
     return 0;
@@ -1384,6 +2195,8 @@ intptr_t SCARLETTX_GDK_CALLBACK ResProxyRelease(void* self, uintptr_t, uintptr_t
     const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (rem == 0) {
 #if defined(_WIN32)
+        UnregisterLiveResourceProxy(obj);
+        UnregisterResourceBufferTracking(obj);
         ReleaseGuestTextureMemory(obj);
         if (obj->pc_res) obj->pc_res->Release();
 #endif
@@ -1431,18 +2244,38 @@ intptr_t SCARLETTX_GDK_CALLBACK ResProxyUnmap(void* self, uintptr_t subres, uint
 #endif
     return 0;
 }
-intptr_t SCARLETTX_GDK_CALLBACK ResProxyGetDesc(void* self, uintptr_t sret_ptr, uintptr_t, uintptr_t) {
+intptr_t SCARLETTX_GDK_CALLBACK ResProxyGetDesc(void* arg0, uintptr_t arg1, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
-    auto* obj = static_cast<XboxD3D12ResourceProxy*>(self);
-    if (obj->pc_res && sret_ptr) {
-        *reinterpret_cast<D3D12_RESOURCE_DESC*>(sret_ptr) = obj->pc_res->GetDesc();
+    XboxD3D12ResourceProxy* obj = nullptr;
+    uintptr_t sret_ptr = 0;
+    if (IsReadableMemory(arg0, sizeof(void*)) &&
+        *reinterpret_cast<const void* const*>(arg0) == kXboxResourceProxyVtbl.data()) {
+        obj = static_cast<XboxD3D12ResourceProxy*>(arg0);
+        sret_ptr = arg1;
+    } else if (IsReadableMemory(reinterpret_cast<const void*>(arg1), sizeof(void*)) &&
+               *reinterpret_cast<const void* const*>(arg1) == kXboxResourceProxyVtbl.data()) {
+        obj = reinterpret_cast<XboxD3D12ResourceProxy*>(arg1);
+        sret_ptr = reinterpret_cast<uintptr_t>(arg0);
     }
-#endif
+    if (obj && obj->pc_res && IsWritableMemory(reinterpret_cast<void*>(sret_ptr), sizeof(D3D12_RESOURCE_DESC))) {
+        D3D12_RESOURCE_DESC desc = obj->pc_res->GetDesc();
+        if (obj->promoted_typeless && obj->guest_format != DXGI_FORMAT_UNKNOWN) {
+            desc.Format = obj->guest_format;
+        }
+        *reinterpret_cast<D3D12_RESOURCE_DESC*>(sret_ptr) = desc;
+    }
     return static_cast<intptr_t>(sret_ptr);
+#else
+    (void)arg0;
+    return static_cast<intptr_t>(arg1);
+#endif
 }
 intptr_t SCARLETTX_GDK_CALLBACK ResProxyGetGPUVirtualAddress(void* self, uintptr_t, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12ResourceProxy*>(self);
+    if (obj->external_buffer_gpu_va != 0) {
+        return static_cast<intptr_t>(obj->external_buffer_gpu_va);
+    }
     if (obj->guest_memory && obj->guest_memory->external_gpu_va != 0) {
         return static_cast<intptr_t>(obj->guest_memory->external_gpu_va);
     }
@@ -1478,7 +2311,15 @@ std::array<ComVtableFn, 24> BuildResProxyVtable() {
     vtbl[11] = &ResProxyGetGPUVirtualAddress;
     return vtbl;
 }
-const auto kXboxResourceProxyVtbl = BuildResProxyVtable();
+const std::array<ComVtableFn, 24> kXboxResourceProxyVtbl = BuildResProxyVtable();
+
+#if defined(_WIN32)
+struct RetiredScratchBuffer {
+    ID3D12CommandAllocator* pc_alloc = nullptr;
+    uint64_t epoch = 0;
+    ID3D12Resource* res = nullptr;
+};
+#endif
 
 struct XboxD3D12GraphicsCommandListProxy {
     const ComVtableFn* lpVtbl;
@@ -1492,9 +2333,13 @@ struct XboxD3D12GraphicsCommandListProxy {
 #if defined(_WIN32)
     ID3D12GraphicsCommandList* pc_list = nullptr;
     ID3D12Device* pc_device = nullptr;
+    ID3D12CommandAllocator* active_pc_alloc = nullptr;
+    uint64_t active_alloc_epoch = 0;
     ID3D12Resource* scratch_buf = nullptr;
     uint64_t scratch_size = 0;
-    std::vector<ID3D12Resource*> retired_scratch;
+    std::vector<RetiredScratchBuffer> retired_scratch;
+    std::mutex state_mu;
+    std::vector<std::pair<XboxD3D12ResourceProxy*, uint32_t>> pending_final_states;
 #endif
     XboxD3D12GraphicsCommandListProxy() {
         g_live_command_lists.fetch_add(1, std::memory_order_relaxed);
@@ -1503,10 +2348,16 @@ struct XboxD3D12GraphicsCommandListProxy {
         g_live_command_lists.fetch_sub(1, std::memory_order_relaxed);
     }
 };
-intptr_t SCARLETTX_GDK_CALLBACK CmdListQueryInterface(void* self, uintptr_t, uintptr_t ppv, uintptr_t) {
+intptr_t SCARLETTX_GDK_CALLBACK CmdListQueryInterface(void* self, uintptr_t riid, uintptr_t ppv, uintptr_t) {
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid)) ||
+        IsBlockedDiagnosticsOrComIid(riid) || IsD3D12DeviceIid(riid) || IsDxgiDeviceIid(riid) ||
+        IsDxgiAdapterIid(riid) || ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
     return 0;
@@ -1521,10 +2372,11 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListRelease(void* self, uintptr_t, uintptr_t,
     if (rem == 0) {
 #if defined(_WIN32)
         if (obj->scratch_buf) obj->scratch_buf->Release();
-        for (auto* r : obj->retired_scratch) {
-            if (r) r->Release();
+        for (auto& r : obj->retired_scratch) {
+            if (r.res) r.res->Release();
         }
         if (obj->pc_list) obj->pc_list->Release();
+        if (obj->pc_device) obj->pc_device->Release();
 #endif
         delete obj;
     }
@@ -1569,6 +2421,27 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListReset(void* self, uintptr_t pAlloc, uintp
         pc_pso = reinterpret_cast<ID3D12PipelineState*>(pso_proxy->pc_obj);
     }
     const HRESULT hr = obj->pc_list->Reset(alloc_proxy->pc_alloc, pc_pso);
+    if (SUCCEEDED(hr)) {
+        {
+            std::lock_guard<std::mutex> lk(obj->state_mu);
+            obj->pending_final_states.clear();
+        }
+        if (!obj->retired_scratch.empty()) {
+            std::lock_guard<std::mutex> lk(g_alloc_epoch_mu);
+            for (auto it = obj->retired_scratch.begin(); it != obj->retired_scratch.end();) {
+                auto ep_it = g_alloc_epochs.find(it->pc_alloc);
+                const bool alloc_gone_or_reset = (ep_it == g_alloc_epochs.end()) || (ep_it->second > it->epoch);
+                if (alloc_gone_or_reset) {
+                    if (it->res) it->res->Release();
+                    it = obj->retired_scratch.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        obj->active_pc_alloc = alloc_proxy->pc_alloc;
+        obj->active_alloc_epoch = GetAllocatorEpoch(alloc_proxy->pc_alloc);
+    }
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] CmdList::Reset(self=" << self << ", alloc=" << alloc_proxy
                   << ", pso=" << reinterpret_cast<void*>(pPso) << ") -> 0x"
@@ -1641,7 +2514,22 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListResourceBarrier(void* self, uintptr_t num
             const auto dim = pc_res->GetDesc().Dimension;
             b.Transition.StateBefore = SanitizePcResourceState(b.Transition.StateBefore, dim);
             b.Transition.StateAfter = SanitizePcResourceState(b.Transition.StateAfter, dim);
-            res_proxy->tracked_state.store(static_cast<uint32_t>(b.Transition.StateAfter), std::memory_order_relaxed);
+            const uint32_t after_u32 = static_cast<uint32_t>(b.Transition.StateAfter);
+            res_proxy->tracked_state.store(after_u32, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lk(obj->state_mu);
+                bool updated = false;
+                for (auto& kv : obj->pending_final_states) {
+                    if (kv.first == res_proxy) {
+                        kv.second = after_u32;
+                        updated = true;
+                        break;
+                    }
+                }
+                if (!updated) {
+                    obj->pending_final_states.emplace_back(res_proxy, after_u32);
+                }
+            }
             if (b.Transition.StateBefore == b.Transition.StateAfter) continue;
             translated.push_back(b);
         } else if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
@@ -1738,7 +2626,10 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListCopyTextureRegion(
                 if (SUCCEEDED(obj->pc_device->CreateCommittedResource(
                         &hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
                         nullptr, IID_PPV_ARGS(&new_buf))) && new_buf) {
-                    if (obj->scratch_buf) obj->retired_scratch.push_back(obj->scratch_buf);
+                    if (obj->scratch_buf) {
+                        obj->retired_scratch.push_back(
+                            RetiredScratchBuffer{obj->active_pc_alloc, obj->active_alloc_epoch, obj->scratch_buf});
+                    }
                     obj->scratch_buf = new_buf;
                     obj->scratch_size = alloc_size;
                 }
@@ -2120,42 +3011,60 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRoot32BitConstants(
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootCBV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootConstantBufferView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        const auto pc_loc = TranslateGuestGpuVa(obj->pc_device, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc), 4096u);
+        obj->pc_list->SetComputeRootConstantBufferView(static_cast<UINT>(idx), pc_loc);
+    }
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootCBV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootConstantBufferView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        const auto pc_loc = TranslateGuestGpuVa(obj->pc_device, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc), 4096u);
+        obj->pc_list->SetGraphicsRootConstantBufferView(static_cast<UINT>(idx), pc_loc);
+    }
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootSRV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootShaderResourceView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        const auto pc_loc = TranslateGuestGpuVa(obj->pc_device, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc), 4096u);
+        obj->pc_list->SetComputeRootShaderResourceView(static_cast<UINT>(idx), pc_loc);
+    }
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootSRV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootShaderResourceView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        const auto pc_loc = TranslateGuestGpuVa(obj->pc_device, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc), 4096u);
+        obj->pc_list->SetGraphicsRootShaderResourceView(static_cast<UINT>(idx), pc_loc);
+    }
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetComputeRootUAV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetComputeRootUnorderedAccessView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        const auto pc_loc = TranslateGuestGpuVa(obj->pc_device, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc), 4096u);
+        obj->pc_list->SetComputeRootUnorderedAccessView(static_cast<UINT>(idx), pc_loc);
+    }
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetGraphicsRootUAV(void* self, uintptr_t idx, uintptr_t loc, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
-    if (obj->pc_list) obj->pc_list->SetGraphicsRootUnorderedAccessView(static_cast<UINT>(idx), static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc));
+    if (obj->pc_list) {
+        const auto pc_loc = TranslateGuestGpuVa(obj->pc_device, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(loc), 4096u);
+        obj->pc_list->SetGraphicsRootUnorderedAccessView(static_cast<UINT>(idx), pc_loc);
+    }
 #endif
     return 0;
 }
@@ -2170,7 +3079,15 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListIASetIndexBuffer(void* self, uintptr_t pV
                   << ", size=" << ib->SizeInBytes << ", fmt=" << ib->Format << ")\n";
     }
     if (obj->pc_list) {
-        obj->pc_list->IASetIndexBuffer(reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(pView));
+        if (!pView) {
+            obj->pc_list->IASetIndexBuffer(nullptr);
+        } else {
+            D3D12_INDEX_BUFFER_VIEW ib = *reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(pView);
+            if (ib.BufferLocation != 0 && ib.SizeInBytes > 0) {
+                ib.BufferLocation = TranslateGuestGpuVa(obj->pc_device, ib.BufferLocation, ib.SizeInBytes);
+            }
+            obj->pc_list->IASetIndexBuffer(&ib);
+        }
     }
 #endif
     return 0;
@@ -2188,9 +3105,23 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListIASetVertexBuffers(
                   << ", size=" << vb[0].SizeInBytes << ", stride=" << vb[0].StrideInBytes << "))\n";
     }
     if (obj->pc_list) {
-        obj->pc_list->IASetVertexBuffers(
-            static_cast<UINT>(startSlot), static_cast<UINT>(numViews),
-            reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(pViews));
+        if (!pViews || numViews == 0 || numViews > 32u) {
+            obj->pc_list->IASetVertexBuffers(
+                static_cast<UINT>(startSlot), static_cast<UINT>(numViews),
+                reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(pViews));
+        } else {
+            D3D12_VERTEX_BUFFER_VIEW translated[32]{};
+            const auto* src_views = reinterpret_cast<const D3D12_VERTEX_BUFFER_VIEW*>(pViews);
+            for (size_t i = 0; i < static_cast<size_t>(numViews); ++i) {
+                translated[i] = src_views[i];
+                if (translated[i].BufferLocation != 0 && translated[i].SizeInBytes > 0) {
+                    translated[i].BufferLocation = TranslateGuestGpuVa(
+                        obj->pc_device, translated[i].BufferLocation, translated[i].SizeInBytes);
+                }
+            }
+            obj->pc_list->IASetVertexBuffers(
+                static_cast<UINT>(startSlot), static_cast<UINT>(numViews), translated);
+        }
     }
 #endif
     return 0;
@@ -2365,6 +3296,21 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListExecuteIndirect(
 #endif
     return 0;
 }
+#if defined(_WIN32)
+D3D12_GPU_VIRTUAL_ADDRESS UnwrapResourceProxyOrTranslateGpuVa(
+    ID3D12Device* pc_dev,
+    D3D12_GPU_VIRTUAL_ADDRESS addr,
+    size_t size_hint = 4096u) {
+    if (addr == 0) return 0;
+    const auto* cand = reinterpret_cast<const XboxD3D12ResourceProxy*>(addr);
+    if (IsReadableMemory(cand, sizeof(XboxD3D12ResourceProxy)) &&
+        cand->lpVtbl == kXboxResourceProxyVtbl.data()) {
+        return cand->pc_res ? cand->pc_res->GetGPUVirtualAddress() : 0;
+    }
+    return TranslateGuestGpuVa(pc_dev, addr, size_hint);
+}
+#endif
+
 intptr_t SCARLETTX_GDK_CALLBACK CmdListSetPipelineState1(
     void* self, uintptr_t pStateObject, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
@@ -2387,10 +3333,147 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListDispatchRays(
     if (obj && obj->pc_list && pDesc) {
         ID3D12GraphicsCommandList4* cl4 = nullptr;
         if (SUCCEEDED(obj->pc_list->QueryInterface(IID_PPV_ARGS(&cl4))) && cl4) {
-            cl4->DispatchRays(reinterpret_cast<const D3D12_DISPATCH_RAYS_DESC*>(pDesc));
+            D3D12_DISPATCH_RAYS_DESC d = *reinterpret_cast<const D3D12_DISPATCH_RAYS_DESC*>(pDesc);
+            if (d.RayGenerationShaderRecord.StartAddress != 0) {
+                d.RayGenerationShaderRecord.StartAddress = UnwrapResourceProxyOrTranslateGpuVa(
+                    obj->pc_device, d.RayGenerationShaderRecord.StartAddress,
+                    static_cast<size_t>(d.RayGenerationShaderRecord.SizeInBytes));
+            }
+            if (d.MissShaderTable.StartAddress != 0) {
+                d.MissShaderTable.StartAddress = UnwrapResourceProxyOrTranslateGpuVa(
+                    obj->pc_device, d.MissShaderTable.StartAddress,
+                    static_cast<size_t>(d.MissShaderTable.SizeInBytes));
+            }
+            if (d.HitGroupTable.StartAddress != 0) {
+                d.HitGroupTable.StartAddress = UnwrapResourceProxyOrTranslateGpuVa(
+                    obj->pc_device, d.HitGroupTable.StartAddress,
+                    static_cast<size_t>(d.HitGroupTable.SizeInBytes));
+            }
+            if (d.CallableShaderTable.StartAddress != 0) {
+                d.CallableShaderTable.StartAddress = UnwrapResourceProxyOrTranslateGpuVa(
+                    obj->pc_device, d.CallableShaderTable.StartAddress,
+                    static_cast<size_t>(d.CallableShaderTable.SizeInBytes));
+            }
+            cl4->DispatchRays(&d);
             cl4->Release();
         }
     }
+#endif
+    return 0;
+}
+intptr_t SCARLETTX_GDK_CALLBACK CmdListBuildRaytracingAccelerationStructure(
+    void* self, uintptr_t pDesc, uintptr_t numPostbuildInfoDescs, uintptr_t pPostbuildInfoDescs) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
+    if (obj && obj->pc_list && pDesc) {
+        ID3D12GraphicsCommandList4* cl4 = nullptr;
+        if (SUCCEEDED(obj->pc_list->QueryInterface(IID_PPV_ARGS(&cl4))) && cl4) {
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build_desc =
+                *reinterpret_cast<const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC*>(pDesc);
+            build_desc.DestAccelerationStructureData = UnwrapResourceProxyOrTranslateGpuVa(
+                obj->pc_device, build_desc.DestAccelerationStructureData);
+            build_desc.SourceAccelerationStructureData = UnwrapResourceProxyOrTranslateGpuVa(
+                obj->pc_device, build_desc.SourceAccelerationStructureData);
+            build_desc.ScratchAccelerationStructureData = UnwrapResourceProxyOrTranslateGpuVa(
+                obj->pc_device, build_desc.ScratchAccelerationStructureData);
+
+            std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geoms;
+            if (build_desc.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
+                if (build_desc.Inputs.InstanceDescs != 0) {
+                    build_desc.Inputs.InstanceDescs = UnwrapResourceProxyOrTranslateGpuVa(
+                        obj->pc_device, build_desc.Inputs.InstanceDescs,
+                        static_cast<size_t>(build_desc.Inputs.NumDescs) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+                }
+            } else if (build_desc.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL &&
+                       build_desc.Inputs.NumDescs > 0) {
+                geoms.resize(build_desc.Inputs.NumDescs);
+                for (UINT i = 0; i < build_desc.Inputs.NumDescs; ++i) {
+                    if (build_desc.Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS &&
+                        build_desc.Inputs.ppGeometryDescs && build_desc.Inputs.ppGeometryDescs[i]) {
+                        geoms[i] = *build_desc.Inputs.ppGeometryDescs[i];
+                    } else if (build_desc.Inputs.pGeometryDescs) {
+                        geoms[i] = build_desc.Inputs.pGeometryDescs[i];
+                    }
+                    if (geoms[i].Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) {
+                        if (geoms[i].Triangles.Transform3x4 != 0) {
+                            geoms[i].Triangles.Transform3x4 = UnwrapResourceProxyOrTranslateGpuVa(
+                                obj->pc_device, geoms[i].Triangles.Transform3x4, 48u);
+                        }
+                        if (geoms[i].Triangles.IndexBuffer != 0) {
+                            geoms[i].Triangles.IndexBuffer = UnwrapResourceProxyOrTranslateGpuVa(
+                                obj->pc_device, geoms[i].Triangles.IndexBuffer,
+                                static_cast<size_t>(geoms[i].Triangles.IndexCount) * 4u);
+                        }
+                        if (geoms[i].Triangles.VertexBuffer.StartAddress != 0) {
+                            const size_t vstride = geoms[i].Triangles.VertexBuffer.StrideInBytes
+                                                       ? static_cast<size_t>(geoms[i].Triangles.VertexBuffer.StrideInBytes)
+                                                       : 12u;
+                            geoms[i].Triangles.VertexBuffer.StartAddress = UnwrapResourceProxyOrTranslateGpuVa(
+                                obj->pc_device, geoms[i].Triangles.VertexBuffer.StartAddress,
+                                static_cast<size_t>(geoms[i].Triangles.VertexCount) * vstride);
+                        }
+                    } else if (geoms[i].Type == D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS) {
+                        if (geoms[i].AABBs.AABBs.StartAddress != 0) {
+                            const size_t astride = geoms[i].AABBs.AABBs.StrideInBytes
+                                                       ? static_cast<size_t>(geoms[i].AABBs.AABBs.StrideInBytes)
+                                                       : 24u;
+                            geoms[i].AABBs.AABBs.StartAddress = UnwrapResourceProxyOrTranslateGpuVa(
+                                obj->pc_device, geoms[i].AABBs.AABBs.StartAddress,
+                                static_cast<size_t>(geoms[i].AABBs.AABBCount) * astride);
+                        }
+                    }
+                }
+                build_desc.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+                build_desc.Inputs.pGeometryDescs = geoms.data();
+            }
+
+            std::vector<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC> post_descs;
+            const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* post_ptr = nullptr;
+            if (numPostbuildInfoDescs > 0 && pPostbuildInfoDescs) {
+                const auto* in_post =
+                    reinterpret_cast<const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC*>(
+                        pPostbuildInfoDescs);
+                post_descs.assign(in_post, in_post + numPostbuildInfoDescs);
+                for (auto& pd : post_descs) {
+                    pd.DestBuffer = UnwrapResourceProxyOrTranslateGpuVa(obj->pc_device, pd.DestBuffer, 256u);
+                }
+                post_ptr = post_descs.data();
+            }
+
+            cl4->BuildRaytracingAccelerationStructure(
+                &build_desc, static_cast<UINT>(post_descs.size()), post_ptr);
+            cl4->Release();
+        }
+    }
+#else
+    (void)self;
+    (void)pDesc;
+    (void)numPostbuildInfoDescs;
+    (void)pPostbuildInfoDescs;
+#endif
+    return 0;
+}
+intptr_t SCARLETTX_GDK_CALLBACK CmdListCopyRaytracingAccelerationStructure(
+    void* self, uintptr_t destData, uintptr_t srcData, uintptr_t mode) {
+#if defined(_WIN32)
+    auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
+    if (obj && obj->pc_list && destData != 0 && srcData != 0) {
+        ID3D12GraphicsCommandList4* cl4 = nullptr;
+        if (SUCCEEDED(obj->pc_list->QueryInterface(IID_PPV_ARGS(&cl4))) && cl4) {
+            const auto dst = UnwrapResourceProxyOrTranslateGpuVa(
+                obj->pc_device, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(destData));
+            const auto src = UnwrapResourceProxyOrTranslateGpuVa(
+                obj->pc_device, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(srcData));
+            cl4->CopyRaytracingAccelerationStructure(
+                dst, src, static_cast<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE>(mode));
+            cl4->Release();
+        }
+    }
+#else
+    (void)self;
+    (void)destData;
+    (void)srcData;
+    (void)mode;
 #endif
     return 0;
 }
@@ -2446,7 +3529,7 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListRSSetShadingRateImage(
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListDispatchMesh(
     void* self, uintptr_t x, uintptr_t y, uintptr_t z) {
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(__ID3D12GraphicsCommandList6_INTERFACE_DEFINED__)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (obj && obj->pc_list) {
         ID3D12GraphicsCommandList6* cl6 = nullptr;
@@ -2455,54 +3538,80 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListDispatchMesh(
             cl6->Release();
         }
     }
+#else
+    (void)self;
+    (void)x;
+    (void)y;
+    (void)z;
 #endif
     return 0;
 }
 intptr_t SCARLETTX_GDK_CALLBACK CmdListBarrier(
     void* self, uintptr_t numBarrierGroups, uintptr_t pBarrierGroups, uintptr_t) {
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(__ID3D12GraphicsCommandList7_INTERFACE_DEFINED__)
     auto* obj = static_cast<XboxD3D12GraphicsCommandListProxy*>(self);
     if (obj && obj->pc_list && numBarrierGroups > 0 && pBarrierGroups) {
         ID3D12GraphicsCommandList7* cl7 = nullptr;
         if (SUCCEEDED(obj->pc_list->QueryInterface(IID_PPV_ARGS(&cl7))) && cl7) {
             const auto* in_groups = reinterpret_cast<const D3D12_BARRIER_GROUP*>(pBarrierGroups);
-            std::vector<D3D12_BARRIER_GROUP> groups(in_groups, in_groups + numBarrierGroups);
+            std::vector<D3D12_BARRIER_GROUP> out_groups;
             std::vector<std::vector<D3D12_TEXTURE_BARRIER>> tex_storage;
             std::vector<std::vector<D3D12_BUFFER_BARRIER>> buf_storage;
+            out_groups.reserve(static_cast<size_t>(numBarrierGroups));
             tex_storage.reserve(static_cast<size_t>(numBarrierGroups));
             buf_storage.reserve(static_cast<size_t>(numBarrierGroups));
 
-            for (size_t g = 0; g < groups.size(); ++g) {
-                if (groups[g].Type == D3D12_BARRIER_TYPE_TEXTURE && groups[g].NumBarriers > 0 &&
-                    groups[g].pTextureBarriers) {
-                    tex_storage.emplace_back(
-                        groups[g].pTextureBarriers,
-                        groups[g].pTextureBarriers + groups[g].NumBarriers);
-                    for (auto& tb : tex_storage.back()) {
-                        if (tb.pResource) {
-                            auto* rp = reinterpret_cast<XboxD3D12ResourceProxy*>(tb.pResource);
-                            tb.pResource = rp->pc_res;
-                        }
+            for (size_t g = 0; g < static_cast<size_t>(numBarrierGroups); ++g) {
+                D3D12_BARRIER_GROUP grp = in_groups[g];
+                if (grp.Type == D3D12_BARRIER_TYPE_TEXTURE) {
+                    if (grp.NumBarriers == 0 || !grp.pTextureBarriers) continue;
+                    std::vector<D3D12_TEXTURE_BARRIER> tbs;
+                    tbs.reserve(grp.NumBarriers);
+                    for (UINT32 b = 0; b < grp.NumBarriers; ++b) {
+                        D3D12_TEXTURE_BARRIER tb = grp.pTextureBarriers[b];
+                        if (!tb.pResource) continue;
+                        auto* rp = reinterpret_cast<XboxD3D12ResourceProxy*>(tb.pResource);
+                        if (!IsReadableMemory(rp, sizeof(*rp)) || !rp->pc_res) continue;
+                        tb.pResource = rp->pc_res;
+                        tbs.push_back(tb);
                     }
-                    groups[g].pTextureBarriers = tex_storage.back().data();
-                } else if (groups[g].Type == D3D12_BARRIER_TYPE_BUFFER && groups[g].NumBarriers > 0 &&
-                           groups[g].pBufferBarriers) {
-                    buf_storage.emplace_back(
-                        groups[g].pBufferBarriers,
-                        groups[g].pBufferBarriers + groups[g].NumBarriers);
-                    for (auto& bb : buf_storage.back()) {
-                        if (bb.pResource) {
-                            auto* rp = reinterpret_cast<XboxD3D12ResourceProxy*>(bb.pResource);
-                            bb.pResource = rp->pc_res;
-                        }
+                    if (tbs.empty()) continue;
+                    tex_storage.push_back(std::move(tbs));
+                    grp.NumBarriers = static_cast<UINT32>(tex_storage.back().size());
+                    grp.pTextureBarriers = tex_storage.back().data();
+                    out_groups.push_back(grp);
+                } else if (grp.Type == D3D12_BARRIER_TYPE_BUFFER) {
+                    if (grp.NumBarriers == 0 || !grp.pBufferBarriers) continue;
+                    std::vector<D3D12_BUFFER_BARRIER> bbs;
+                    bbs.reserve(grp.NumBarriers);
+                    for (UINT32 b = 0; b < grp.NumBarriers; ++b) {
+                        D3D12_BUFFER_BARRIER bb = grp.pBufferBarriers[b];
+                        if (!bb.pResource) continue;
+                        auto* rp = reinterpret_cast<XboxD3D12ResourceProxy*>(bb.pResource);
+                        if (!IsReadableMemory(rp, sizeof(*rp)) || !rp->pc_res) continue;
+                        bb.pResource = rp->pc_res;
+                        bbs.push_back(bb);
                     }
-                    groups[g].pBufferBarriers = buf_storage.back().data();
+                    if (bbs.empty()) continue;
+                    buf_storage.push_back(std::move(bbs));
+                    grp.NumBarriers = static_cast<UINT32>(buf_storage.back().size());
+                    grp.pBufferBarriers = buf_storage.back().data();
+                    out_groups.push_back(grp);
+                } else if (grp.Type == D3D12_BARRIER_TYPE_GLOBAL) {
+                    if (grp.NumBarriers == 0 || !grp.pGlobalBarriers) continue;
+                    out_groups.push_back(grp);
                 }
             }
-            cl7->Barrier(static_cast<UINT32>(groups.size()), groups.data());
+            if (!out_groups.empty()) {
+                cl7->Barrier(static_cast<UINT32>(out_groups.size()), out_groups.data());
+            }
             cl7->Release();
         }
     }
+#else
+    (void)self;
+    (void)numBarrierGroups;
+    (void)pBarrierGroups;
 #endif
     return 0;
 }
@@ -2547,6 +3656,8 @@ intptr_t SCARLETTX_GDK_CALLBACK CmdListTracedSlot(void*, uintptr_t a1, uintptr_t
         line << "\n";
         std::cerr << line.str();
     }
+    scarlettx::FlightRecorder::Instance().RecordVtableSlotMiss(
+        "XboxID3D12GraphicsCommandList", Slot, static_cast<uint64_t>(a1), SCARLETTX_CALLER_RIP());
     return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
 }
 template <size_t... Is>
@@ -2611,6 +3722,8 @@ std::array<ComVtableFn, 128> BuildCmdListVtable() {
     vtbl[67] = &CmdListFlushPipelineX;
     vtbl[70] = &CmdListSetPipelineState1;
     vtbl[71] = &CmdListDispatchRays;
+    vtbl[72] = &CmdListBuildRaytracingAccelerationStructure;
+    vtbl[73] = &CmdListCopyRaytracingAccelerationStructure;
     vtbl[74] = &CmdListRSSetShadingRate;
     vtbl[75] = &CmdListRSSetShadingRateImage;
     vtbl[76] = &CmdListDispatchMesh;
@@ -2676,10 +3789,20 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyQueryInterface(void* self, uintptr_t r
     auto* obj = static_cast<XboxD3D12CommandQueueProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
-    if (TraceEnabled() && riid) {
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid))) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
+    if (TraceEnabled()) {
         const auto* g = reinterpret_cast<const uint32_t*>(riid);
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12CommandQueue::QueryInterface("
                   << std::hex << g[0] << "-" << g[1] << "-" << g[2] << "-" << g[3] << std::dec << ")\n";
+    }
+    if (IsBlockedDiagnosticsOrComIid(riid) || IsD3D12DeviceIid(riid) || IsDxgiDeviceIid(riid) ||
+        IsDxgiAdapterIid(riid) || ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        scarlettx::FlightRecorder::Instance().RecordComQiMiss(
+            "XboxID3D12CommandQueue", reinterpret_cast<const void*>(riid), SCARLETTX_CALLER_RIP());
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
     }
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     *out = self;
@@ -2727,6 +3850,8 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyTracedSlot(void* /*self*/, uintptr_t a
                   << "](a1=0x" << std::hex << a1 << ", a2=0x" << a2 << ", a3=0x" << a3
                   << std::dec << ") -> E_NOTIMPL\n";
     }
+    scarlettx::FlightRecorder::Instance().RecordVtableSlotMiss(
+        "XboxID3D12CommandQueue", Slot, static_cast<uint64_t>(a1), SCARLETTX_CALLER_RIP());
     return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));
 }
 
@@ -2865,6 +3990,21 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyExecuteCommandLists(
             }
         }
         obj->pc_queue->ExecuteCommandLists(static_cast<UINT>(pc_lists.size()), pc_lists.data());
+        scarlettx::FlightRecorder::Instance().BeatProgress("ExecuteCommandLists");
+        MaybeRecordDeviceRemoved(obj->pc_device, S_OK, "QueueProxyExecuteCommandLists");
+        {
+            std::lock_guard<std::mutex> live_lk(g_live_resources_mutex);
+            for (uintptr_t i = 0; i < num; ++i) {
+                auto* gl = guest_lists[i];
+                if (!gl) continue;
+                std::lock_guard<std::mutex> st_lk(gl->state_mu);
+                for (const auto& kv : gl->pending_final_states) {
+                    if (g_live_resources.count(kv.first) != 0) {
+                        kv.first->exec_state.store(kv.second, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
     }
 #endif
     return 0;
@@ -3105,8 +4245,19 @@ void DumpResourceToBmp(
         return;
     }
 
-    obj->present_alloc->Reset();
-    obj->present_list->Reset(obj->present_alloc, nullptr);
+    if (obj->present_fence && obj->present_fence->GetCompletedValue() < obj->present_fence_val) {
+        if (obj->present_event) {
+            obj->present_fence->SetEventOnCompletion(obj->present_fence_val, obj->present_event);
+            WaitForSingleObject(obj->present_event, 5000);
+        } else {
+            obj->present_fence->SetEventOnCompletion(obj->present_fence_val, nullptr);
+        }
+    }
+    if (FAILED(obj->present_alloc->Reset()) ||
+        FAILED(obj->present_list->Reset(obj->present_alloc, nullptr))) {
+        rb->Release();
+        return;
+    }
 
     if (cur_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
         D3D12_RESOURCE_BARRIER b = {};
@@ -3276,18 +4427,25 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
     const uint64_t n = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     g_frame_epoch.fetch_add(1, std::memory_order_relaxed);
     g_gpu_profiler.RecordQpcTick();
+    scarlettx::FlightRecorder::Instance().BeatProgress("PresentX");
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12CommandQueueProxy*>(self);
     XboxD3D12ResourceProxy* src_proxy = nullptr;
-    if (pPlaneParams && planeCount > 0) {
+    if (pPlaneParams && planeCount > 0 &&
+        IsReadableMemory(reinterpret_cast<const void*>(pPlaneParams), 24u)) {
         const auto* qwords = reinterpret_cast<const uint64_t*>(pPlaneParams);
         if (qwords[1] > 0 && qwords[2] != 0) {
-            auto* cand = reinterpret_cast<XboxD3D12ResourceProxy*>(qwords[2]);
-            if (cand->lpVtbl == kXboxResourceProxyVtbl.data()) {
-                src_proxy = cand;
-            } else {
-                auto* deref = *reinterpret_cast<XboxD3D12ResourceProxy* const*>(qwords[2]);
-                if (deref && deref->lpVtbl == kXboxResourceProxyVtbl.data()) {
+            const void* q2_ptr = reinterpret_cast<const void*>(qwords[2]);
+            if (IsReadableMemory(q2_ptr, sizeof(XboxD3D12ResourceProxy))) {
+                auto* cand = reinterpret_cast<XboxD3D12ResourceProxy*>(qwords[2]);
+                if (cand->lpVtbl == kXboxResourceProxyVtbl.data()) {
+                    src_proxy = cand;
+                }
+            }
+            if (!src_proxy && IsReadableMemory(q2_ptr, sizeof(void*))) {
+                auto* deref = *reinterpret_cast<XboxD3D12ResourceProxy* const*>(q2_ptr);
+                if (IsReadableMemory(deref, sizeof(XboxD3D12ResourceProxy)) &&
+                    deref->lpVtbl == kXboxResourceProxyVtbl.data()) {
                     src_proxy = deref;
                 }
             }
@@ -3299,7 +4457,7 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
         EnsurePresentSwapChain(obj, static_cast<UINT>(sdesc.Width), sdesc.Height, sdesc.Format);
 
         const auto cur_state = static_cast<D3D12_RESOURCE_STATES>(
-            src_proxy->tracked_state.load(std::memory_order_relaxed));
+            src_proxy->exec_state.load(std::memory_order_relaxed));
 
         if (obj->swapchain && obj->present_alloc && obj->present_list && obj->present_fence && obj->present_event) {
             const UINT bb_idx = obj->swapchain->GetCurrentBackBufferIndex();
@@ -3355,6 +4513,9 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
                     obj->pc_queue->ExecuteCommandLists(1, lists);
                     const UINT sync_interval = (std::getenv("SCARLETTX_VSYNC") || g_frame_interval_us.load(std::memory_order_relaxed) > 0) ? 1 : 0;
                     const HRESULT present_hr = obj->swapchain->Present(sync_interval, 0);
+                    if (FAILED(present_hr)) {
+                        MaybeRecordDeviceRemoved(obj->pc_device, present_hr, "QueueProxyPresentX");
+                    }
                     if (present_hr != S_OK) {
                         // The game keeps running when the output is lost, so say so.
                         static std::atomic<uint64_t> not_ok{0};
@@ -3457,6 +4618,8 @@ struct XboxD3D12DeviceProxy {
 #if defined(_WIN32)
     ID3D12Device* pc_device = nullptr;
     IDXGIAdapter1* pc_adapter = nullptr;
+    std::mutex pso_cache_mu;
+    std::unordered_map<uint64_t, ID3D12PipelineState*> pso_cache;
 #endif
 };
 
@@ -3470,14 +4633,34 @@ intptr_t SCARLETTX_GDK_CALLBACK DxgiDevProxyQueryInterface(void* self, uintptr_t
     auto* obj = static_cast<XboxDXGIDeviceProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);
-    if (TraceEnabled() && riid) {
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid))) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
+    if (TraceEnabled()) {
         const auto* g = reinterpret_cast<const uint32_t*>(riid);
         std::cerr << "[ScarlettX][d3d12_xs] XboxIDXGIDevice::QueryInterface("
                   << std::hex << g[0] << "-" << g[1] << "-" << g[2] << "-" << g[3] << std::dec << ")\n";
     }
-    obj->ref_count.fetch_add(1, std::memory_order_relaxed);
-    *out = self;
-    return 0;
+    if (IsBlockedDiagnosticsOrComIid(riid)) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
+    if (IsD3D12DeviceIid(riid)) {
+        if (!obj->parent_device) {
+            return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+        }
+        obj->parent_device->ref_count.fetch_add(1, std::memory_order_relaxed);
+        *out = obj->parent_device;
+        return 0;
+    }
+    if (ProxyGuidEquals(riid, kIidIUnknown) ||
+        ProxyGuidEquals(riid, kIidIDXGIObject) ||
+        IsDxgiDeviceIid(riid)) {
+        obj->ref_count.fetch_add(1, std::memory_order_relaxed);
+        *out = self;
+        return 0;
+    }
+    return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
 }
 
 intptr_t SCARLETTX_GDK_CALLBACK DxgiDevProxyAddRef(void* self, uintptr_t, uintptr_t, uintptr_t) {
@@ -3564,12 +4747,23 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyQueryInterface(void* self, uintptr_t riid, 
     auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppv);
     if (!out) return static_cast<intptr_t>(0x80004003u);  // E_POINTER
-    if (TraceEnabled() && riid) {
+    *out = nullptr;
+    if (!riid || !IsReadableMemory(reinterpret_cast<const void*>(riid), sizeof(ProxyGuid))) {
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
+    if (TraceEnabled()) {
         const auto* g = reinterpret_cast<const uint32_t*>(riid);
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::QueryInterface("
                   << std::hex << g[0] << "-" << g[1] << "-" << g[2] << "-" << g[3] << std::dec << ")\n";
     }
-    if (ProxyGuidEquals(riid, kIidIDXGIDevice) || ProxyGuidEquals(riid, kIidIDXGIDevice1)) {
+    if (IsBlockedDiagnosticsOrComIid(riid) ||
+        IsDxgiAdapterIid(riid) ||
+        ProxyGuidEquals(riid, kIidID3D12StateObjectProperties)) {
+        scarlettx::FlightRecorder::Instance().RecordComQiMiss(
+            "XboxID3D12Device", reinterpret_cast<const void*>(riid), SCARLETTX_CALLER_RIP());
+        return static_cast<intptr_t>(static_cast<int32_t>(0x80004002u));
+    }
+    if (IsDxgiDeviceIid(riid)) {
         auto* dxgi = new XboxDXGIDeviceProxy();
         dxgi->lpVtbl = kXboxDXGIDeviceProxyVtbl.data();
         dxgi->parent_device = obj;
@@ -3592,6 +4786,14 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyRelease(void* self, uintptr_t, uintptr_t, u
     const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (rem == 0) {
 #if defined(_WIN32)
+        {
+            std::lock_guard<std::mutex> lk(obj->pso_cache_mu);
+            for (auto& kv : obj->pso_cache) {
+                if (kv.second) kv.second->Release();
+            }
+            obj->pso_cache.clear();
+        }
+        ReleaseDeviceAutoGuestBuffers(obj->pc_device);
         if (obj->pc_device) obj->pc_device->Release();
         if (obj->pc_adapter) obj->pc_adapter->Release();
 #endif
@@ -3780,6 +4982,8 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyTracedSlot(void* /*self*/, uintptr_t a1, ui
                   << ", ret=0x" << norm_ret
                   << std::dec << ") -> E_NOTIMPL\n";
     }
+    scarlettx::FlightRecorder::Instance().RecordVtableSlotMiss(
+        "XboxID3D12Device", Slot, static_cast<uint64_t>(a1), SCARLETTX_CALLER_RIP());
     return static_cast<intptr_t>(static_cast<int32_t>(0x80004001u));  // E_NOTIMPL
 }
 
@@ -3845,6 +5049,69 @@ void TranslateGuestShaderStageIfNeeded(
         stage.BytecodeLength = out_owned.size();
     }
 }
+
+void FnvMixBytes(uint64_t& h, const void* data, size_t len) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; ++i) {
+        h = (h ^ p[i]) * 1099511628211ull;
+    }
+}
+
+void FnvMixShaderStage(uint64_t& h, const D3D12_SHADER_BYTECODE& s) {
+    const uint64_t len = s.BytecodeLength;
+    FnvMixBytes(h, &len, sizeof(len));
+    if (s.pShaderBytecode && s.BytecodeLength > 0) {
+        const uint64_t sh = HashMemoryRegionFast(static_cast<const uint8_t*>(s.pShaderBytecode), s.BytecodeLength);
+        FnvMixBytes(h, &sh, sizeof(sh));
+    }
+}
+
+uint64_t ComputeGraphicsPsoCacheKey(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) {
+    uint64_t h = 14695981039346656037ull;
+    FnvMixBytes(h, &d.pRootSignature, sizeof(d.pRootSignature));
+    FnvMixShaderStage(h, d.VS);
+    FnvMixShaderStage(h, d.PS);
+    FnvMixShaderStage(h, d.DS);
+    FnvMixShaderStage(h, d.HS);
+    FnvMixShaderStage(h, d.GS);
+    FnvMixBytes(h, &d.BlendState, sizeof(d.BlendState));
+    FnvMixBytes(h, &d.SampleMask, sizeof(d.SampleMask));
+    FnvMixBytes(h, &d.RasterizerState, sizeof(d.RasterizerState));
+    FnvMixBytes(h, &d.DepthStencilState, sizeof(d.DepthStencilState));
+    FnvMixBytes(h, &d.InputLayout.NumElements, sizeof(d.InputLayout.NumElements));
+    if (d.InputLayout.pInputElementDescs && d.InputLayout.NumElements > 0 && d.InputLayout.NumElements <= 64u) {
+        for (UINT i = 0; i < d.InputLayout.NumElements; ++i) {
+            const auto& el = d.InputLayout.pInputElementDescs[i];
+            if (el.SemanticName) {
+                FnvMixBytes(h, el.SemanticName, std::strlen(el.SemanticName) + 1u);
+            }
+            FnvMixBytes(h, &el.SemanticIndex, sizeof(el.SemanticIndex));
+            FnvMixBytes(h, &el.Format, sizeof(el.Format));
+            FnvMixBytes(h, &el.InputSlot, sizeof(el.InputSlot));
+            FnvMixBytes(h, &el.AlignedByteOffset, sizeof(el.AlignedByteOffset));
+            FnvMixBytes(h, &el.InputSlotClass, sizeof(el.InputSlotClass));
+            FnvMixBytes(h, &el.InstanceDataStepRate, sizeof(el.InstanceDataStepRate));
+        }
+    }
+    FnvMixBytes(h, &d.IBStripCutValue, sizeof(d.IBStripCutValue));
+    FnvMixBytes(h, &d.PrimitiveTopologyType, sizeof(d.PrimitiveTopologyType));
+    FnvMixBytes(h, &d.NumRenderTargets, sizeof(d.NumRenderTargets));
+    FnvMixBytes(h, d.RTVFormats, sizeof(d.RTVFormats));
+    FnvMixBytes(h, &d.DSVFormat, sizeof(d.DSVFormat));
+    FnvMixBytes(h, &d.SampleDesc, sizeof(d.SampleDesc));
+    FnvMixBytes(h, &d.NodeMask, sizeof(d.NodeMask));
+    FnvMixBytes(h, &d.Flags, sizeof(d.Flags));
+    return h ? h : 1ull;
+}
+
+uint64_t ComputeComputePsoCacheKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC& d) {
+    uint64_t h = 14695981039346656037ull ^ 0xC0DE0001ull;
+    FnvMixBytes(h, &d.pRootSignature, sizeof(d.pRootSignature));
+    FnvMixShaderStage(h, d.CS);
+    FnvMixBytes(h, &d.NodeMask, sizeof(d.NodeMask));
+    FnvMixBytes(h, &d.Flags, sizeof(d.Flags));
+    return h ? h : 1ull;
+}
 #endif
 
 intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
@@ -3854,7 +5121,8 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
     auto** out = reinterpret_cast<void**>(ppPso);
     if (!obj || !obj->pc_device || !pDesc || !out) return static_cast<intptr_t>(E_INVALIDARG);
     *out = nullptr;
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = *reinterpret_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(pDesc);
+    const auto& raw_desc = *reinterpret_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(pDesc);
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = raw_desc;
     if (desc.pRootSignature) {
         desc.pRootSignature = reinterpret_cast<ID3D12RootSignature*>(
             reinterpret_cast<XboxD3D12SimpleObjectProxy*>(desc.pRootSignature)->pc_obj);
@@ -3865,8 +5133,34 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
     TranslateGuestShaderStageIfNeeded(desc.DS, ds_owned);
     TranslateGuestShaderStageIfNeeded(desc.HS, hs_owned);
     TranslateGuestShaderStageIfNeeded(desc.GS, gs_owned);
+
+    const bool can_cache = (desc.StreamOutput.NumEntries == 0);
+    const uint64_t pso_key = can_cache ? ComputeGraphicsPsoCacheKey(desc) : 0ull;
     ID3D12PipelineState* pc_pso = nullptr;
-    const HRESULT hr = obj->pc_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pc_pso));
+    HRESULT hr = S_OK;
+    if (can_cache) {
+        std::lock_guard<std::mutex> lk(obj->pso_cache_mu);
+        auto it = obj->pso_cache.find(pso_key);
+        if (it != obj->pso_cache.end() && it->second) {
+            pc_pso = it->second;
+            pc_pso->AddRef();
+            g_proxy_pso_cache_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!pc_pso) {
+        hr = obj->pc_device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pc_pso));
+        if (SUCCEEDED(hr) && pc_pso) {
+            g_proxy_pso_cache_misses.fetch_add(1, std::memory_order_relaxed);
+            if (can_cache) {
+                std::lock_guard<std::mutex> lk(obj->pso_cache_mu);
+                auto& slot = obj->pso_cache[pso_key];
+                if (!slot) {
+                    pc_pso->AddRef();
+                    slot = pc_pso;
+                }
+            }
+        }
+    }
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateGraphicsPipelineState("
                   << "vs=" << desc.VS.BytecodeLength << ", ps=" << desc.PS.BytecodeLength
@@ -3878,7 +5172,23 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateGraphicsPipelineState(
                   << ") -> 0x"
                   << std::hex << static_cast<uint32_t>(hr) << std::dec << "\n";
     }
-    if (FAILED(hr) || !pc_pso) return static_cast<intptr_t>(hr);
+    if (FAILED(hr) || !pc_pso) {
+        const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
+        if (raw_desc.VS.pShaderBytecode && raw_desc.VS.BytecodeLength > 0) {
+            scarlettx::FlightRecorder::Instance().DumpFailingShaderArtifact(
+                "GraphicsPSO_VS", static_cast<int32_t>(hr),
+                raw_desc.VS.pShaderBytecode, raw_desc.VS.BytecodeLength,
+                vs_owned.empty() ? nullptr : vs_owned.data(), vs_owned.size(), caller_rip);
+        }
+        if (raw_desc.PS.pShaderBytecode && raw_desc.PS.BytecodeLength > 0) {
+            scarlettx::FlightRecorder::Instance().DumpFailingShaderArtifact(
+                "GraphicsPSO_PS", static_cast<int32_t>(hr),
+                raw_desc.PS.pShaderBytecode, raw_desc.PS.BytecodeLength,
+                ps_owned.empty() ? nullptr : ps_owned.data(), ps_owned.size(), caller_rip);
+        }
+        MaybeRecordDeviceRemoved(obj->pc_device, hr, "ProxyCreateGraphicsPipelineState");
+        return static_cast<intptr_t>(hr);
+    }
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
     proxy->pc_obj = pc_pso;
@@ -3897,20 +5207,52 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateComputePipelineState(
     auto** out = reinterpret_cast<void**>(ppPso);
     if (!obj || !obj->pc_device || !pDesc || !out) return static_cast<intptr_t>(E_INVALIDARG);
     *out = nullptr;
-    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = *reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(pDesc);
+    const auto& raw_desc = *reinterpret_cast<const D3D12_COMPUTE_PIPELINE_STATE_DESC*>(pDesc);
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = raw_desc;
     if (desc.pRootSignature) {
         desc.pRootSignature = reinterpret_cast<ID3D12RootSignature*>(
             reinterpret_cast<XboxD3D12SimpleObjectProxy*>(desc.pRootSignature)->pc_obj);
     }
     std::vector<uint8_t> cs_owned;
     TranslateGuestShaderStageIfNeeded(desc.CS, cs_owned);
+
+    const uint64_t pso_key = ComputeComputePsoCacheKey(desc);
     ID3D12PipelineState* pc_pso = nullptr;
-    const HRESULT hr = obj->pc_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pc_pso));
+    HRESULT hr = S_OK;
+    {
+        std::lock_guard<std::mutex> lk(obj->pso_cache_mu);
+        auto it = obj->pso_cache.find(pso_key);
+        if (it != obj->pso_cache.end() && it->second) {
+            pc_pso = it->second;
+            pc_pso->AddRef();
+            g_proxy_pso_cache_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!pc_pso) {
+        hr = obj->pc_device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pc_pso));
+        if (SUCCEEDED(hr) && pc_pso) {
+            g_proxy_pso_cache_misses.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lk(obj->pso_cache_mu);
+            auto& slot = obj->pso_cache[pso_key];
+            if (!slot) {
+                pc_pso->AddRef();
+                slot = pc_pso;
+            }
+        }
+    }
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateComputePipelineState() -> 0x"
                   << std::hex << static_cast<uint32_t>(hr) << std::dec << "\n";
     }
-    if (FAILED(hr) || !pc_pso) return static_cast<intptr_t>(hr);
+    if (FAILED(hr) || !pc_pso) {
+        scarlettx::FlightRecorder::Instance().DumpFailingShaderArtifact(
+            "ComputePSO_CS", static_cast<int32_t>(hr),
+            raw_desc.CS.pShaderBytecode, raw_desc.CS.BytecodeLength,
+            cs_owned.empty() ? nullptr : cs_owned.data(), cs_owned.size(),
+            SCARLETTX_CALLER_RIP());
+        MaybeRecordDeviceRemoved(obj->pc_device, hr, "ProxyCreateComputePipelineState");
+        return static_cast<intptr_t>(hr);
+    }
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
     proxy->pc_obj = pc_pso;
@@ -3956,6 +5298,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandList(
     proxy->lpVtbl = (obj->sdk_version >= 0x20004u ? kXboxCmdListProxyVtblV4 : kXboxCmdListProxyVtbl).data();
     proxy->pc_list = pc_list;
     proxy->pc_device = obj->pc_device;
+    if (proxy->pc_device) proxy->pc_device->AddRef();
+    proxy->active_pc_alloc = alloc_proxy->pc_alloc;
+    proxy->active_alloc_epoch = GetAllocatorEpoch(alloc_proxy->pc_alloc);
     *out = proxy;
     return 0;
 #else
@@ -3979,7 +5324,14 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateRootSignature(
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateRootSignature(len="
                   << blobLen << ") -> 0x" << std::hex << static_cast<uint32_t>(hr) << std::dec << "\n";
     }
-    if (FAILED(hr) || !pc_rs) return static_cast<intptr_t>(hr);
+    if (FAILED(hr) || !pc_rs) {
+        scarlettx::FlightRecorder::Instance().DumpFailingShaderArtifact(
+            "RootSignature", static_cast<int32_t>(hr),
+            reinterpret_cast<const void*>(pBlob), static_cast<size_t>(blobLen),
+            nullptr, 0, SCARLETTX_CALLER_RIP());
+        MaybeRecordDeviceRemoved(obj->pc_device, hr, "ProxyCreateRootSignature");
+        return static_cast<intptr_t>(hr);
+    }
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
     proxy->pc_obj = pc_rs;
@@ -3999,6 +5351,15 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateConstantBufferView(
     auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
     if (obj && obj->pc_device) {
         auto* d = reinterpret_cast<const D3D12_CONSTANT_BUFFER_VIEW_DESC*>(pDesc);
+        D3D12_CONSTANT_BUFFER_VIEW_DESC translated_cbv{};
+        if (d) {
+            translated_cbv = *d;
+            if (translated_cbv.BufferLocation != 0 && translated_cbv.SizeInBytes > 0) {
+                translated_cbv.BufferLocation = TranslateGuestGpuVa(
+                    obj->pc_device, translated_cbv.BufferLocation, translated_cbv.SizeInBytes);
+            }
+            d = &translated_cbv;
+        }
         if (TraceEnabled() && n <= 8) {
             std::cerr << "[ScarlettX][d3d12_xs] Device::CreateCBV(#" << n
                       << ", loc=0x" << std::hex << (d ? d->BufferLocation : 0) << std::dec
@@ -4012,6 +5373,17 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateConstantBufferView(
     return 0;
 }
 
+#if defined(_WIN32)
+DXGI_FORMAT StripSrgbForUav(DXGI_FORMAT fmt) {
+    switch (fmt) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8X8_UNORM;
+        default: return fmt;
+    }
+}
+#endif
+
 intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateShaderResourceView(
     void* self, uintptr_t pResource, uintptr_t pDesc, uintptr_t destDesc) {
     static std::atomic<uint64_t> srv_cnt{0};
@@ -4023,11 +5395,28 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateShaderResourceView(
         ID3D12Resource* pc_res = res_proxy ? res_proxy->pc_res : nullptr;
         auto* d = reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(pDesc);
         D3D12_SHADER_RESOURCE_VIEW_DESC synth_desc = {};
-        if (!d && res_proxy && res_proxy->promoted_typeless && res_proxy->guest_format != DXGI_FORMAT_UNKNOWN) {
+        if (!d && res_proxy && pc_res && res_proxy->promoted_typeless && res_proxy->guest_format != DXGI_FORMAT_UNKNOWN) {
+            const D3D12_RESOURCE_DESC rd = pc_res->GetDesc();
             synth_desc.Format = res_proxy->guest_format;
-            synth_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             synth_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            synth_desc.Texture2D.MipLevels = ~0u;
+            if (rd.SampleDesc.Count > 1) {
+                if (rd.DepthOrArraySize > 1) {
+                    synth_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    synth_desc.Texture2DMSArray.FirstArraySlice = 0;
+                    synth_desc.Texture2DMSArray.ArraySize = rd.DepthOrArraySize;
+                } else {
+                    synth_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                }
+            } else if (rd.DepthOrArraySize > 1) {
+                synth_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                synth_desc.Texture2DArray.MostDetailedMip = 0;
+                synth_desc.Texture2DArray.MipLevels = ~0u;
+                synth_desc.Texture2DArray.FirstArraySlice = 0;
+                synth_desc.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+            } else {
+                synth_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                synth_desc.Texture2D.MipLevels = ~0u;
+            }
             d = &synth_desc;
         }
         if (TraceEnabled() && n <= 8) {
@@ -4049,11 +5438,32 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateUnorderedAccessView(
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
     if (obj && obj->pc_device) {
-        ID3D12Resource* pc_res = pResource ? reinterpret_cast<XboxD3D12ResourceProxy*>(pResource)->pc_res : nullptr;
+        auto* res_proxy = pResource ? reinterpret_cast<XboxD3D12ResourceProxy*>(pResource) : nullptr;
+        ID3D12Resource* pc_res = res_proxy ? res_proxy->pc_res : nullptr;
         ID3D12Resource* pc_cnt = pCounter ? reinterpret_cast<XboxD3D12ResourceProxy*>(pCounter)->pc_res : nullptr;
+        auto* d = reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(pDesc);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC synth_uav = {};
+        if (!d && res_proxy && pc_res && res_proxy->promoted_typeless && res_proxy->guest_format != DXGI_FORMAT_UNKNOWN) {
+            const D3D12_RESOURCE_DESC rd = pc_res->GetDesc();
+            synth_uav.Format = StripSrgbForUav(res_proxy->guest_format);
+            if (rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                synth_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                synth_uav.Texture3D.MipSlice = 0;
+                synth_uav.Texture3D.FirstWSlice = 0;
+                synth_uav.Texture3D.WSize = rd.DepthOrArraySize;
+            } else if (rd.DepthOrArraySize > 1) {
+                synth_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                synth_uav.Texture2DArray.MipSlice = 0;
+                synth_uav.Texture2DArray.FirstArraySlice = 0;
+                synth_uav.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+            } else {
+                synth_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                synth_uav.Texture2D.MipSlice = 0;
+            }
+            d = &synth_uav;
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE h{destDesc};
-        obj->pc_device->CreateUnorderedAccessView(
-            pc_res, pc_cnt, reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(pDesc), h);
+        obj->pc_device->CreateUnorderedAccessView(pc_res, pc_cnt, d, h);
     }
 #endif
     return 0;
@@ -4070,9 +5480,25 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateRenderTargetView(
         ID3D12Resource* pc_res = res_proxy ? res_proxy->pc_res : nullptr;
         auto* d = reinterpret_cast<const D3D12_RENDER_TARGET_VIEW_DESC*>(pDesc);
         D3D12_RENDER_TARGET_VIEW_DESC synth_desc = {};
-        if (!d && res_proxy && res_proxy->promoted_typeless && res_proxy->guest_format != DXGI_FORMAT_UNKNOWN) {
+        if (!d && res_proxy && pc_res && res_proxy->promoted_typeless && res_proxy->guest_format != DXGI_FORMAT_UNKNOWN) {
+            const D3D12_RESOURCE_DESC rd = pc_res->GetDesc();
             synth_desc.Format = res_proxy->guest_format;
-            synth_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            if (rd.SampleDesc.Count > 1) {
+                if (rd.DepthOrArraySize > 1) {
+                    synth_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                    synth_desc.Texture2DMSArray.FirstArraySlice = 0;
+                    synth_desc.Texture2DMSArray.ArraySize = rd.DepthOrArraySize;
+                } else {
+                    synth_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+                }
+            } else if (rd.DepthOrArraySize > 1) {
+                synth_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                synth_desc.Texture2DArray.MipSlice = 0;
+                synth_desc.Texture2DArray.FirstArraySlice = 0;
+                synth_desc.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+            } else {
+                synth_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            }
             d = &synth_desc;
         }
         if (TraceEnabled() && n <= 12) {
@@ -4340,7 +5766,10 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommittedResource(
     const D3D12_CLEAR_VALUE* pc_clear_val = promoted_typeless
         ? nullptr
         : reinterpret_cast<const D3D12_CLEAR_VALUE*>(pClearVal);
-    const auto pc_heap_flags = static_cast<D3D12_HEAP_FLAGS>(heapFlags & 0x3FFFu);
+    // Strip D3D12_HEAP_FLAG_ALLOW_DISPLAY (0x80), which Xbox titles set on PresentX backbuffers
+    // (e.g. ATG DeviceResources.cpp) but PC D3D12 rejects under debug validation on CreateCommittedResource.
+    const auto pc_heap_flags = static_cast<D3D12_HEAP_FLAGS>(
+        (heapFlags & 0x3FFFu) & ~static_cast<uintptr_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY));
     ID3D12Resource* pc_res = nullptr;
     const HRESULT hr = obj->pc_device->CreateCommittedResource(
         &hp, pc_heap_flags, &desc, pc_state,
@@ -4367,8 +5796,13 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommittedResource(
     obj->ref_count.fetch_add(1, std::memory_order_relaxed);
     proxy->pc_res = pc_res;
     proxy->tracked_state.store(static_cast<uint32_t>(pc_state), std::memory_order_relaxed);
+    proxy->exec_state.store(static_cast<uint32_t>(pc_state), std::memory_order_relaxed);
     proxy->guest_format = orig_fmt;
     proxy->promoted_typeless = promoted_typeless;
+    RegisterLiveResourceProxy(proxy);
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        RegisterHostBufferVaRange(proxy, pc_res, desc.Width);
+    }
     *out = proxy;
     return 0;
 #else
@@ -4436,7 +5870,13 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateFence(
 intptr_t SCARLETTX_GDK_CALLBACK ProxyGetDeviceRemovedReason(void* self, uintptr_t, uintptr_t, uintptr_t) {
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
-    if (obj && obj->pc_device) return static_cast<intptr_t>(obj->pc_device->GetDeviceRemovedReason());
+    if (obj && obj->pc_device) {
+        const HRESULT rem = obj->pc_device->GetDeviceRemovedReason();
+        if (rem != S_OK) {
+            MaybeRecordDeviceRemoved(obj->pc_device, rem, "ProxyGetDeviceRemovedReason");
+        }
+        return static_cast<intptr_t>(rem);
+    }
 #endif
     return 0;
 }
@@ -4558,6 +5998,9 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateCommandListX(
                                       : (obj->sdk_version >= 0x20004u ? kXboxCmdListProxyVtblV4 : kXboxCmdListProxyVtbl).data();
     proxy->pc_list = pc_list;
     proxy->pc_device = obj->pc_device;
+    if (proxy->pc_device) proxy->pc_device->AddRef();
+    proxy->active_pc_alloc = alloc_proxy->pc_alloc;
+    proxy->active_alloc_epoch = GetAllocatorEpoch(alloc_proxy->pc_alloc);
     if (TraceEnabled()) {
         std::cerr << "[ScarlettX][d3d12_xs] XboxID3D12Device::CreateCommandListX(type="
                   << type_raw << ") -> 0x0 (proxy=" << proxy << ", alloc=" << alloc_proxy << ")\n";
@@ -4700,6 +6143,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyWaitFrameEventX(
     if (eventType == 0) {
         WaitForFrameOrigin();
         g_gpu_profiler.RecordQpcTick();
+        scarlettx::FlightRecorder::Instance().BeatProgress("WaitFrameEventX");
     }
     uint64_t tok = g_frame_pipeline_token.fetch_add(1, std::memory_order_relaxed);
     if (pToken) {
@@ -4771,12 +6215,27 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateStateObject(
     std::vector<D3D12_STATE_SUBOBJECT> subobjs;
     std::vector<D3D12_GLOBAL_ROOT_SIGNATURE> global_rs;
     std::vector<D3D12_LOCAL_ROOT_SIGNATURE> local_rs;
+    std::vector<D3D12_DXIL_LIBRARY_DESC> dxil_libs;
+    std::vector<std::vector<uint8_t>> dxil_blobs;
     if (in_desc->NumSubobjects > 0 && in_desc->pSubobjects) {
         subobjs.assign(in_desc->pSubobjects, in_desc->pSubobjects + in_desc->NumSubobjects);
         global_rs.reserve(subobjs.size());
         local_rs.reserve(subobjs.size());
+        dxil_libs.reserve(subobjs.size());
+        dxil_blobs.reserve(subobjs.size());
         for (size_t i = 0; i < subobjs.size(); ++i) {
-            if (subobjs[i].Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE && subobjs[i].pDesc) {
+            if (subobjs[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && subobjs[i].pDesc) {
+                auto lib = *static_cast<const D3D12_DXIL_LIBRARY_DESC*>(subobjs[i].pDesc);
+                std::vector<uint8_t> translated_dxil;
+                TranslateGuestShaderStageIfNeeded(lib.DXILLibrary, translated_dxil);
+                if (!translated_dxil.empty()) {
+                    dxil_blobs.push_back(std::move(translated_dxil));
+                    lib.DXILLibrary.pShaderBytecode = dxil_blobs.back().data();
+                    lib.DXILLibrary.BytecodeLength = dxil_blobs.back().size();
+                }
+                dxil_libs.push_back(lib);
+                subobjs[i].pDesc = &dxil_libs.back();
+            } else if (subobjs[i].Type == D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE && subobjs[i].pDesc) {
                 auto grs = *static_cast<const D3D12_GLOBAL_ROOT_SIGNATURE*>(subobjs[i].pDesc);
                 if (grs.pGlobalRootSignature) {
                     auto* rp = reinterpret_cast<XboxD3D12SimpleObjectProxy*>(grs.pGlobalRootSignature);
@@ -4819,7 +6278,29 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateStateObject(
         }
     }
     dev5->Release();
-    if (FAILED(hr) || !so) return static_cast<intptr_t>(hr);
+    if (FAILED(hr) || !so) {
+        const void* first_raw = nullptr;
+        size_t first_raw_sz = 0;
+        if (in_desc->NumSubobjects > 0 && in_desc->pSubobjects) {
+            for (UINT i = 0; i < in_desc->NumSubobjects; ++i) {
+                if (in_desc->pSubobjects[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY &&
+                    in_desc->pSubobjects[i].pDesc) {
+                    const auto* ld = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(in_desc->pSubobjects[i].pDesc);
+                    first_raw = ld->DXILLibrary.pShaderBytecode;
+                    first_raw_sz = ld->DXILLibrary.BytecodeLength;
+                    break;
+                }
+            }
+        }
+        scarlettx::FlightRecorder::Instance().DumpFailingShaderArtifact(
+            "StateObject_DXR", static_cast<int32_t>(hr),
+            first_raw, first_raw_sz,
+            dxil_blobs.empty() ? nullptr : dxil_blobs.front().data(),
+            dxil_blobs.empty() ? 0u : dxil_blobs.front().size(),
+            SCARLETTX_CALLER_RIP());
+        MaybeRecordDeviceRemoved(obj->pc_device, hr, "ProxyCreateStateObject");
+        return static_cast<intptr_t>(hr);
+    }
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
     proxy->pc_obj = so;
@@ -4947,7 +6428,16 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePipelineState(
     ID3D12PipelineState* pc_pso = nullptr;
     const HRESULT hr = dev2->CreatePipelineState(&mod_desc, IID_PPV_ARGS(&pc_pso));
     dev2->Release();
-    if (FAILED(hr) || !pc_pso) return static_cast<intptr_t>(hr);
+    if (FAILED(hr) || !pc_pso) {
+        scarlettx::FlightRecorder::Instance().DumpFailingShaderArtifact(
+            "PipelineStateStream", static_cast<int32_t>(hr),
+            in_stream->pPipelineStateSubobjectStream, in_stream->SizeInBytes,
+            translated_stages.empty() ? nullptr : translated_stages.front().data(),
+            translated_stages.empty() ? 0u : translated_stages.front().size(),
+            SCARLETTX_CALLER_RIP());
+        MaybeRecordDeviceRemoved(obj->pc_device, hr, "ProxyCreatePipelineState");
+        return static_cast<intptr_t>(hr);
+    }
 
     auto* proxy = new XboxD3D12SimpleObjectProxy();
     proxy->lpVtbl = kXboxSimpleObjProxyVtbl.data();
@@ -4967,26 +6457,20 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePlacedResourceX(
     void* self, uintptr_t baseAddress, uintptr_t pDesc, uintptr_t initialState,
     uintptr_t pClearVal, uintptr_t riid, uintptr_t ppvRes) {
 #if defined(_WIN32)
+    auto* dev_proxy = static_cast<XboxD3D12DeviceProxy*>(self);
     auto** out = reinterpret_cast<void**>(ppvRes);
     if (out) *out = nullptr;
-    if (!self || baseAddress == 0 || !pDesc || !out) {
+    if (!dev_proxy || baseAddress == 0 || !pDesc || !out) {
         return static_cast<intptr_t>(E_INVALIDARG);
     }
 
-    void* guest_cpu_va = nullptr;
-    if (HMODULE kx = GetModuleHandleA("kernelx.dll")) {
-        using MapGpuToVaFn = int32_t (__stdcall*)(uint64_t, void**);
-        auto fn = reinterpret_cast<MapGpuToVaFn>(
-            reinterpret_cast<void*>(GetProcAddress(kx, "KernelXMapGpuToVirtual")));
-        if (fn) {
-            (void)fn(static_cast<uint64_t>(baseAddress), &guest_cpu_va);
-        }
-    }
-    if (!guest_cpu_va) {
+    uint8_t* guest_cpu_va = nullptr;
+    uint64_t guest_gpu_va = static_cast<uint64_t>(baseAddress);
+    if (!QueryKernelXUnifiedAddresses(static_cast<uint64_t>(baseAddress), &guest_cpu_va, &guest_gpu_va)) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(reinterpret_cast<const void*>(baseAddress), &mbi, sizeof(mbi)) != 0 &&
             mbi.State == MEM_COMMIT) {
-            guest_cpu_va = reinterpret_cast<void*>(baseAddress);
+            guest_cpu_va = reinterpret_cast<uint8_t*>(baseAddress);
         }
     }
     if (!guest_cpu_va) {
@@ -5008,13 +6492,16 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreatePlacedResourceX(
     auto* res_proxy = static_cast<XboxD3D12ResourceProxy*>(*out);
     if (src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
         (void)BindExternalGuestTextureMemory(res_proxy, guest_cpu_va, static_cast<uint64_t>(baseAddress));
-    } else if (src_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && hp.Type == D3D12_HEAP_TYPE_UPLOAD &&
-               res_proxy->pc_res) {
-        void* mapped = nullptr;
-        if (SUCCEEDED(res_proxy->pc_res->Map(0, nullptr, &mapped)) && mapped) {
-            std::memcpy(mapped, guest_cpu_va, static_cast<size_t>(src_desc.Width));
-            res_proxy->pc_res->Unmap(0, nullptr);
-        }
+    } else if (src_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && res_proxy->pc_res) {
+        res_proxy->external_buffer_gpu_va = static_cast<uint64_t>(baseAddress);
+        RegisterPlacedBufferAllocation(
+            res_proxy,
+            dev_proxy->pc_device,
+            res_proxy->pc_res,
+            guest_cpu_va,
+            static_cast<uint64_t>(baseAddress),
+            static_cast<size_t>(src_desc.Width),
+            hp.Type == D3D12_HEAP_TYPE_UPLOAD);
     }
     return 0;
 #else
@@ -5050,7 +6537,12 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateReservedResource(
         obj->ref_count.fetch_add(1, std::memory_order_relaxed);
         proxy->pc_res = pc_res;
         proxy->tracked_state.store(static_cast<uint32_t>(pc_state), std::memory_order_relaxed);
+        proxy->exec_state.store(static_cast<uint32_t>(pc_state), std::memory_order_relaxed);
         proxy->guest_format = desc.Format;
+        RegisterLiveResourceProxy(proxy);
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            RegisterHostBufferVaRange(proxy, pc_res, desc.Width);
+        }
         *out = proxy;
         return 0;
     }
@@ -5072,7 +6564,7 @@ intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateReservedResource(
 
 intptr_t SCARLETTX_GDK_CALLBACK ProxyCreateSamplerFeedbackUAV(
     void* self, uintptr_t pTargetedResource, uintptr_t pFeedbackResource, uintptr_t destDescriptor) {
-#if defined(_WIN32)
+#if defined(_WIN32) && defined(__ID3D12Device8_INTERFACE_DEFINED__)
     auto* obj = static_cast<XboxD3D12DeviceProxy*>(self);
     if (obj && obj->pc_device && pFeedbackResource && destDescriptor) {
         D3D12_FEATURE_DATA_D3D12_OPTIONS7 opts7{};
@@ -5147,6 +6639,99 @@ std::array<ComVtableFn, 128> BuildXboxDeviceProxyVtable() {
 
 const std::array<ComVtableFn, 128> kXboxDeviceProxyVtbl = BuildXboxDeviceProxyVtable();
 
+#if defined(_WIN32)
+IUnknown* UnwrapGuestDxgiAdapter(void* pAdapter) {
+    if (!pAdapter) return nullptr;
+    if (IsReadableMemory(pAdapter, sizeof(XboxDXGIAdapterProxy))) {
+        const auto* cand = static_cast<const XboxDXGIAdapterProxy*>(pAdapter);
+        if (cand->lpVtbl == kXboxDXGIAdapterProxyVtbl.data()) {
+            return cand->pc_adapter;
+        }
+    }
+    return static_cast<IUnknown*>(pAdapter);
+}
+
+HRESULT CreatePcDeviceHelper(
+    void* pAdapter,
+    bool prefer_warp,
+    D3D_FEATURE_LEVEL min_fl,
+    IDXGIAdapter1** out_adapter,
+    REFIID riid,
+    void** ppvDevice) {
+    if (out_adapter) *out_adapter = nullptr;
+    IDXGIFactory4* factory = nullptr;
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory));
+    if (FAILED(hr) || !factory) {
+        return hr;
+    }
+
+    IDXGIAdapter1* adapter = nullptr;
+    if (prefer_warp) {
+        hr = factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&adapter));
+    } else {
+        if (pAdapter) {
+            IUnknown* raw_adapter = UnwrapGuestDxgiAdapter(pAdapter);
+            if (raw_adapter) {
+                raw_adapter->QueryInterface(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&adapter));
+            }
+            if (adapter) {
+                DXGI_ADAPTER_DESC1 requested{};
+                if (SUCCEEDED(adapter->GetDesc1(&requested)) &&
+                    (requested.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+                    adapter->Release();
+                    adapter = nullptr;
+                }
+            }
+        }
+        if (!adapter) {
+            IDXGIFactory6* factory6 = nullptr;
+            if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory6),
+                                                  reinterpret_cast<void**>(&factory6))) &&
+                factory6) {
+                factory6->EnumAdapterByGpuPreference(
+                    0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, __uuidof(IDXGIAdapter1),
+                    reinterpret_cast<void**>(&adapter));
+                factory6->Release();
+            }
+        }
+        if (!adapter) {
+            hr = factory->EnumAdapters1(0, &adapter);
+        }
+        if (FAILED(hr) || !adapter) {
+            hr = factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&adapter));
+        }
+    }
+
+    {
+        DXGI_ADAPTER_DESC1 chosen{};
+        if (adapter && SUCCEEDED(adapter->GetDesc1(&chosen))) {
+            std::fprintf(stderr, "[ScarlettX][d3d12] Adapter: %ls%s\n", chosen.Description,
+                         (chosen.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " (WARP/software)"
+                                                                     : " (hardware)");
+            std::fflush(stderr);
+        } else {
+            std::fprintf(stderr, "[ScarlettX][d3d12] Adapter: none\n");
+            std::fflush(stderr);
+        }
+    }
+
+    scarlettx::FlightRecorder::Instance().EnableD3D12DredIfConfigured();
+    const D3D_FEATURE_LEVEL primary_fl = (min_fl != 0) ? min_fl : D3D_FEATURE_LEVEL_12_0;
+    hr = CallSystemD3D12CreateDevice(adapter, primary_fl, riid, ppvDevice);
+    if (FAILED(hr) && primary_fl != D3D_FEATURE_LEVEL_11_0) {
+        hr = CallSystemD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, riid, ppvDevice);
+    }
+
+    factory->Release();
+    if (SUCCEEDED(hr) && out_adapter) {
+        *out_adapter = adapter;
+    } else if (adapter) {
+        adapter->Release();
+    }
+    return hr;
+}
+#endif
+
 }  // namespace
 
 extern "C" {
@@ -5202,89 +6787,38 @@ int32_t SCARLETTX_GDK_CALLBACK D3D12XboxCreateDevice(
         }
     }
 
-    IDXGIFactory4* factory = nullptr;
-    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory4), reinterpret_cast<void**>(&factory));
-    if (FAILED(hr) || !factory) {
-        return static_cast<int32_t>(hr);
-    }
-
-    IDXGIAdapter1* adapter = nullptr;
-    if (prefer_warp) {
-        hr = factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&adapter));
-    } else {
-        if (pAdapter) {
-            adapter = static_cast<IDXGIAdapter1*>(pAdapter);
-            adapter->AddRef();
-            DXGI_ADAPTER_DESC1 requested{};
-            if (SUCCEEDED(adapter->GetDesc1(&requested)) &&
-                (requested.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
-                adapter->Release();
-                adapter = nullptr;
-            }
-        }
-        if (!adapter) {
-            IDXGIFactory6* factory6 = nullptr;
-            if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory6),
-                                                  reinterpret_cast<void**>(&factory6))) &&
-                factory6) {
-                factory6->EnumAdapterByGpuPreference(
-                    0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, __uuidof(IDXGIAdapter1),
-                    reinterpret_cast<void**>(&adapter));
-                factory6->Release();
-            }
-        }
-        if (!adapter) {
-            hr = factory->EnumAdapters1(0, &adapter);
-        }
-        if (FAILED(hr) || !adapter) {
-            hr = factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), reinterpret_cast<void**>(&adapter));
-        }
-    }
-
-    {
-        DXGI_ADAPTER_DESC1 chosen{};
-        if (adapter && SUCCEEDED(adapter->GetDesc1(&chosen))) {
-            std::fprintf(stderr, "[ScarlettX][d3d12] Adapter: %ls%s\n", chosen.Description,
-                         (chosen.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " (WARP/software)"
-                                                                     : " (hardware)");
-            std::fflush(stderr);
-        } else {
-            std::fprintf(stderr, "[ScarlettX][d3d12] Adapter: none\n");
-            std::fflush(stderr);
-        }
-    }
-
     if (RealTitleMode()) {
+        if (IsBlockedDiagnosticsOrComIid(reinterpret_cast<uintptr_t>(riid))) {
+            return static_cast<int32_t>(E_NOINTERFACE);
+        }
         // Real Scarlett guest binary: NEVER hand back a raw PC ID3D12Device* vtable.
         ID3D12Device* pc_dev = nullptr;
-        hr = CallSystemD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
-                                         reinterpret_cast<void**>(&pc_dev));
-        if (FAILED(hr)) {
-            hr = CallSystemD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
-                                             reinterpret_cast<void**>(&pc_dev));
-        }
-        factory->Release();
+        IDXGIAdapter1* adapter = nullptr;
+        const HRESULT hr = CreatePcDeviceHelper(
+            pAdapter, prefer_warp, D3D_FEATURE_LEVEL_12_0, &adapter,
+            __uuidof(ID3D12Device), reinterpret_cast<void**>(&pc_dev));
         if (FAILED(hr) || !pc_dev) {
             if (adapter) adapter->Release();
-            return static_cast<intptr_t>(hr);
+            return static_cast<int32_t>(hr);
         }
         auto* proxy = new XboxD3D12DeviceProxy();
         proxy->lpVtbl = kXboxDeviceProxyVtbl.data();
         proxy->sdk_version = pParameters ? pParameters->Version : 0;
         proxy->pc_device = pc_dev;
         proxy->pc_adapter = adapter;  // transfers ownership
+        if (IsDxgiDeviceIid(reinterpret_cast<uintptr_t>(riid))) {
+            const intptr_t qi_hr = ProxyQueryInterface(
+                proxy, reinterpret_cast<uintptr_t>(riid), reinterpret_cast<uintptr_t>(ppvDevice), 0);
+            ProxyRelease(proxy, 0, 0, 0);
+            return static_cast<int32_t>(qi_hr);
+        }
         *ppvDevice = proxy;
         return S_OK;
     }
 
     const IID target_iid = *reinterpret_cast<const IID*>(riid);
-    hr = CallSystemD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, target_iid, ppvDevice);
-    if (FAILED(hr)) {
-        hr = CallSystemD3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, target_iid, ppvDevice);
-    }
-
-    if (adapter) adapter->Release();
-    factory->Release();
+    const HRESULT hr = CreatePcDeviceHelper(
+        pAdapter, prefer_warp, D3D_FEATURE_LEVEL_12_0, nullptr, target_iid, ppvDevice);
     return static_cast<int32_t>(hr);
 #else
     (void)pAdapter;
@@ -5304,9 +6838,44 @@ int32_t SCARLETTX_GDK_CALLBACK D3D12XsCreateDevice(
     if (!riid || !ppDevice) {
         return static_cast<int32_t>(E_INVALIDARG);
     }
+    *ppDevice = nullptr;
+    if (RealTitleMode()) {
+        if (IsBlockedDiagnosticsOrComIid(reinterpret_cast<uintptr_t>(riid))) {
+            return static_cast<int32_t>(E_NOINTERFACE);
+        }
+        const bool prefer_warp = PreferWarpFromEnv(false);
+        ID3D12Device* pc_dev = nullptr;
+        IDXGIAdapter1* adapter = nullptr;
+        const HRESULT hr = CreatePcDeviceHelper(
+            pAdapter,
+            prefer_warp,
+            static_cast<D3D_FEATURE_LEVEL>(minimumFeatureLevel),
+            &adapter,
+            __uuidof(ID3D12Device),
+            reinterpret_cast<void**>(&pc_dev));
+        if (FAILED(hr) || !pc_dev) {
+            if (adapter) adapter->Release();
+            return static_cast<int32_t>(hr);
+        }
+        auto* proxy = new XboxD3D12DeviceProxy();
+        proxy->lpVtbl = kXboxDeviceProxyVtbl.data();
+        proxy->sdk_version = 0;
+        proxy->pc_device = pc_dev;
+        proxy->pc_adapter = adapter;
+        if (IsDxgiDeviceIid(reinterpret_cast<uintptr_t>(riid))) {
+            const intptr_t qi_hr = ProxyQueryInterface(
+                proxy, reinterpret_cast<uintptr_t>(riid), reinterpret_cast<uintptr_t>(ppDevice), 0);
+            ProxyRelease(proxy, 0, 0, 0);
+            return static_cast<int32_t>(qi_hr);
+        }
+        *ppDevice = proxy;
+        return S_OK;
+    }
+    scarlettx::FlightRecorder::Instance().EnableD3D12DredIfConfigured();
     const IID target_iid = *reinterpret_cast<const IID*>(riid);
+    IUnknown* pc_adapter = UnwrapGuestDxgiAdapter(pAdapter);
     return static_cast<int32_t>(CallSystemD3D12CreateDevice(
-        static_cast<IUnknown*>(pAdapter),
+        pc_adapter,
         static_cast<D3D_FEATURE_LEVEL>(minimumFeatureLevel),
         target_iid,
         ppDevice));
@@ -5417,11 +6986,11 @@ int32_t SCARLETTX_GDK_CALLBACK D3D12XsEnableExperimentalFeatures(
     void* pConfigurationStructs,
     uint32_t* pConfigurationStructSizes) {
 #if defined(_WIN32)
-    HRESULT hr = D3D12EnableExperimentalFeatures(
+    HRESULT hr = CallSystemD3D12EnableExperimentalFeatures(
         numFeatures,
         static_cast<const IID*>(pIIDs),
         pConfigurationStructs,
-        pConfigurationStructSizes);
+        reinterpret_cast<UINT*>(pConfigurationStructSizes));
     // On headless WARP/CI without developer mode, swallow E_NOINTERFACE gracefully.
     if (hr == E_NOINTERFACE) {
         return S_OK;
@@ -5856,19 +7425,53 @@ int32_t D3D12XboxBuildRaytracingAccelerationStructure(
             return static_cast<int32_t>(st.code);
         }
     } else if (desc->Inputs.Type == D3D12XBOX_AS_TYPE_TOP_LEVEL) {
-        if (!desc->BlasHandles) {
+        if (!desc->BlasHandles && !desc->Instances) {
             return -1;
         }
         std::vector<scarlettx::RtTriangle> combined;
         for (uint32_t i = 0; i < desc->Inputs.NumDescs; ++i) {
-            auto bit = dev.accel_structs.find(desc->BlasHandles[i]);
+            const uint64_t blas_h = desc->Instances ? desc->Instances[i].BlasHandle : desc->BlasHandles[i];
+            auto bit = dev.accel_structs.find(blas_h);
             if (bit == dev.accel_structs.end() ||
                 bit->second->type != D3D12XBOX_AS_TYPE_BOTTOM_LEVEL) {
                 return -2;
             }
-            combined.insert(combined.end(),
-                            bit->second->triangles.begin(),
-                            bit->second->triangles.end());
+            if (desc->Instances) {
+                const auto& m = desc->Instances[i].Transform;
+                bool is_zero = true;
+                for (int r = 0; r < 3 && is_zero; ++r) {
+                    for (int c = 0; c < 4; ++c) {
+                        if (m[r][c] != 0.0f) {
+                            is_zero = false;
+                            break;
+                        }
+                    }
+                }
+                if (is_zero) {
+                    combined.insert(combined.end(),
+                                    bit->second->triangles.begin(),
+                                    bit->second->triangles.end());
+                } else {
+                    auto xform = [&](const scarlettx::Vec3& p) -> scarlettx::Vec3 {
+                        return {
+                            m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3],
+                            m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
+                            m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3],
+                        };
+                    };
+                    for (const auto& st_tri : bit->second->triangles) {
+                        scarlettx::RtTriangle wt = st_tri;
+                        wt.v0 = xform(st_tri.v0);
+                        wt.v1 = xform(st_tri.v1);
+                        wt.v2 = xform(st_tri.v2);
+                        combined.push_back(wt);
+                    }
+                }
+            } else {
+                combined.insert(combined.end(),
+                                bit->second->triangles.begin(),
+                                bit->second->triangles.end());
+            }
         }
         entry->triangles = combined;
         auto st = entry->bvh.Build(entry->triangles);
@@ -6658,8 +8261,60 @@ int32_t D3D12XboxCreateRaytracingPipelineState(
     entry->max_payload_bytes = desc->MaxPayloadSizeInBytes;
     entry->max_attribute_bytes = desc->MaxAttributeSizeInBytes;
     entry->max_recursion_depth = desc->MaxTraceRecursionDepth;
-    // Software DXR state object backing (native ID3D12StateObject requires hardware DXR Tier >= 1.0).
+#if defined(_WIN32)
+    auto rt_cache_it = dev.rt_pso_cache.find(entry->pso_key);
+    if (rt_cache_it != dev.rt_pso_cache.end() && rt_cache_it->second) {
+        ++dev.pso_cache_hits;
+        entry->rt_state_object = rt_cache_it->second;
+        entry->rt_state_object->AddRef();
+    } else {
+        ++dev.pso_cache_misses;
+        auto* dev5 = static_cast<ID3D12Device5*>(dev.backend->NativeDevice5());
+        if (dev5 && dev.backend->AdapterInfo().raytracing_tier >= 10 &&
+            translated.pc_bytecode.size() >= 32u) {
+            D3D12_DXIL_LIBRARY_DESC lib_desc{};
+            lib_desc.DXILLibrary.pShaderBytecode = translated.pc_bytecode.data();
+            lib_desc.DXILLibrary.BytecodeLength = translated.pc_bytecode.size();
+
+            D3D12_RAYTRACING_SHADER_CONFIG shader_cfg{};
+            shader_cfg.MaxPayloadSizeInBytes = std::max<UINT>(4u, desc->MaxPayloadSizeInBytes);
+            shader_cfg.MaxAttributeSizeInBytes =
+                desc->MaxAttributeSizeInBytes ? desc->MaxAttributeSizeInBytes : 8u;
+
+            D3D12_RAYTRACING_PIPELINE_CONFIG pipe_cfg{};
+            const UINT req_rec = desc->MaxTraceRecursionDepth ? desc->MaxTraceRecursionDepth : 1u;
+            pipe_cfg.MaxTraceRecursionDepth = std::min<UINT>(req_rec, 31u);
+
+            D3D12_GLOBAL_ROOT_SIGNATURE global_rs{};
+            std::vector<D3D12_STATE_SUBOBJECT> subobjs;
+            subobjs.reserve(4);
+            subobjs.push_back({D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &lib_desc});
+            subobjs.push_back({D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &shader_cfg});
+            subobjs.push_back({D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pipe_cfg});
+            if (desc->GlobalRootSignatureHandle != 0) {
+                auto rs_it = dev.root_signatures.find(desc->GlobalRootSignatureHandle);
+                if (rs_it != dev.root_signatures.end() && rs_it->second->native) {
+                    global_rs.pGlobalRootSignature = rs_it->second->native;
+                    subobjs.push_back({D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &global_rs});
+                }
+            }
+
+            D3D12_STATE_OBJECT_DESC so_desc{};
+            so_desc.Type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
+            so_desc.NumSubobjects = static_cast<UINT>(subobjs.size());
+            so_desc.pSubobjects = subobjs.data();
+
+            ID3D12StateObject* created_so = nullptr;
+            if (SUCCEEDED(dev5->CreateStateObject(&so_desc, IID_PPV_ARGS(&created_so))) && created_so) {
+                entry->rt_state_object = created_so;
+                entry->rt_state_object->AddRef();
+                dev.rt_pso_cache[entry->pso_key] = entry->rt_state_object;
+            }
+        }
+    }
+#else
     ++dev.pso_cache_misses;
+#endif
     const uint64_t h = dev.next_pso_handle++;
     dev.psos.emplace(h, std::move(entry));
     *out_pso_handle = h;

@@ -10,10 +10,31 @@
 
 #include "scarlettx/gpu/rt_bvh.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace {
 
 uint64_t AlignUp(uint64_t v, uint64_t align) {
     return (v + align - 1) & ~(align - 1);
+}
+
+bool IsZeroMatrix3x4(const float (&m)[3][4]) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (m[r][c] != 0.0f) return false;
+        }
+    }
+    return true;
+}
+
+scarlettx::Vec3 TransformPoint3x4(const float (&m)[3][4], scarlettx::Vec3 p) {
+    return {
+        m[0][0] * p.x + m[0][1] * p.y + m[0][2] * p.z + m[0][3],
+        m[1][0] * p.x + m[1][1] * p.y + m[1][2] * p.z + m[1][3],
+        m[2][0] * p.x + m[2][1] * p.y + m[2][2] * p.z + m[2][3],
+    };
 }
 
 struct BlasEntry {
@@ -105,11 +126,81 @@ int32_t XboxBvhUpdateBlas(uint64_t blas_handle, const SCARLETT_BVH_BUILD_DESC* d
     return 0;
 }
 
+int32_t XboxBvhBuildTlasInstances(const SCARLETT_BVH_INSTANCE_DESC* instances,
+                                  uint32_t instance_count,
+                                  uint64_t* out_tlas_handle) {
+    if (!instances || instance_count == 0 || !out_tlas_handle) {
+        return -1;
+    }
+
+    std::vector<scarlettx::RtTriangle> combined;
+    {
+        std::lock_guard<std::mutex> lock(g_bvh_mutex);
+        for (uint32_t i = 0; i < instance_count; ++i) {
+            const auto& inst = instances[i];
+            auto it = g_blas_map.find(inst.BlasHandle);
+            if (it == g_blas_map.end()) {
+                return -2;
+            }
+            const bool identity = IsZeroMatrix3x4(inst.Transform);
+            for (const auto& src_tri : it->second.triangles) {
+                if (identity) {
+                    combined.push_back(src_tri);
+                } else {
+                    scarlettx::RtTriangle wt = src_tri;
+                    wt.v0 = TransformPoint3x4(inst.Transform, src_tri.v0);
+                    wt.v1 = TransformPoint3x4(inst.Transform, src_tri.v1);
+                    wt.v2 = TransformPoint3x4(inst.Transform, src_tri.v2);
+                    combined.push_back(wt);
+                }
+            }
+        }
+    }
+
+    auto tlas = std::make_unique<TlasEntry>();
+    auto st = tlas->bvh.Build(combined);
+    if (!st.ok()) {
+        return static_cast<int32_t>(st.code);
+    }
+
+    std::lock_guard<std::mutex> lock(g_bvh_mutex);
+    const uint64_t handle = g_next_bvh_handle++;
+    g_tlas_map[handle] = std::move(tlas);
+    *out_tlas_handle = handle;
+    return 0;
+}
+
 int32_t XboxBvhBuildTlas(const uint64_t* blas_handles,
                          uint32_t blas_count,
                          uint64_t* out_tlas_handle) {
     if (!blas_handles || blas_count == 0 || !out_tlas_handle) {
         return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_bvh_mutex);
+        if (g_blas_map.find(blas_handles[0]) == g_blas_map.end()) {
+#if defined(_WIN32)
+            MEMORY_BASIC_INFORMATION mbi{};
+            const size_t inst_bytes = static_cast<size_t>(blas_count) * sizeof(SCARLETT_BVH_INSTANCE_DESC);
+            if (VirtualQuery(blas_handles, &mbi, sizeof(mbi)) != 0 && mbi.State == MEM_COMMIT &&
+                reinterpret_cast<uintptr_t>(blas_handles) + inst_bytes <=
+                    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize) {
+                const auto* as_inst = reinterpret_cast<const SCARLETT_BVH_INSTANCE_DESC*>(blas_handles);
+                if (g_blas_map.find(as_inst[0].BlasHandle) != g_blas_map.end()) {
+                    // Release lock before delegating
+                    goto build_from_instances;
+                }
+            }
+#endif
+            return -2;
+        }
+    }
+
+    if (false) {
+    build_from_instances:
+        return XboxBvhBuildTlasInstances(
+            reinterpret_cast<const SCARLETT_BVH_INSTANCE_DESC*>(blas_handles), blas_count, out_tlas_handle);
     }
 
     std::vector<scarlettx::RtTriangle> combined;
@@ -189,6 +280,8 @@ int32_t XboxBvhTraceSingleRay(uint64_t tlas_handle,
         out_hit->Hit = 1;
         out_hit->TriangleIndex = hit.triangle_index;
         out_hit->T = hit.t;
+        out_hit->U = hit.u;
+        out_hit->V = hit.v;
         out_hit->Normal[0] = hit.normal.x;
         out_hit->Normal[1] = hit.normal.y;
         out_hit->Normal[2] = hit.normal.z;

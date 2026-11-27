@@ -119,6 +119,9 @@ DllRedirectionTable::DllRedirectionTable() {
     RegisterRedirect("xvc_crypto.dll", "xvc_crypto.dll", true);
     RegisterRedirect("xbox_codecs.dll", "xbox_codecs.dll", true);
     RegisterRedirect("xsapi.dll", "xsapi.dll", true);
+    RegisterRedirect("microsoft.xbox.services.140.gdk.c.thunks.dll", "xsapi.dll", true);
+    RegisterRedirect("microsoft.xbox.services.141.gdk.c.thunks.dll", "xsapi.dll", true);
+    RegisterRedirect("microsoft.xbox.services.142.gdk.c.thunks.dll", "xsapi.dll", true);
     RegisterRedirect("xs2_lifting.dll", "xs2_lifting.dll", true);
     RegisterRedirect("vulkan_backend.dll", "vulkan_backend.dll", true);
     RegisterRedirect("pixevt.dll", "pixevt_stub.dll", true);

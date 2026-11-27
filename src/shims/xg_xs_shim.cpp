@@ -81,7 +81,8 @@ uint64_t SCARLETTX_XG_CALL XgGetResourceBaseAlignmentBytes(void* self) {
 uint64_t SCARLETTX_XG_CALL XgGetMipLevelOffsetBytes(void* self, uint32_t plane, uint32_t miplevel) {
     auto* obj = static_cast<XGTexture2DComputerImpl*>(self);
     if (!obj || plane >= obj->layout.Planes || miplevel >= obj->layout.MipLevels) return 0;
-    return obj->layout.Plane[plane].MipLayout[miplevel].OffsetBytes;
+    const auto& pl = obj->layout.Plane[plane];
+    return pl.BaseOffsetBytes + pl.MipLayout[miplevel].OffsetBytes;
 }
 
 uint64_t SCARLETTX_XG_CALL XgGetTexelElementOffsetBytes(
@@ -89,36 +90,72 @@ uint64_t SCARLETTX_XG_CALL XgGetTexelElementOffsetBytes(
     auto* obj = static_cast<XGTexture2DComputerImpl*>(self);
     if (!obj || plane >= obj->layout.Planes || miplevel >= obj->layout.MipLevels) return 0;
     uint64_t offset = 0;
-    if (scarlettx::gpu::xg::TexelElementOffsetSample(
+    if (plane == 0 && scarlettx::gpu::xg::TexelElementOffsetSample(
             obj->layout, miplevel, zOrSlice, static_cast<uint32_t>(x), y, sample, &offset)) {
         return offset;
     }
-    // Modes without texel addressing: rows inside the mip, slices one mip chain apart, samples per-plane.
+    // Modes without single-plane texel addressing: rows inside the mip, slices one mip chain (or 2D slice for 3D) apart.
     const auto& pl = obj->layout.Plane[plane];
     const auto& ml = pl.MipLayout[miplevel];
     const uint32_t samples = std::max<uint32_t>(1u, ml.SampleCount);
     const uint64_t sample_stride = ml.Slice2DSizeBytes / samples;
-    return ml.OffsetBytes + static_cast<uint64_t>(zOrSlice) * pl.Reserved10 +
+    const uint64_t slice_stride = (obj->layout.Dimension == 4u) ? ml.Slice2DSizeBytes : pl.Reserved10;
+    return pl.BaseOffsetBytes + ml.OffsetBytes + static_cast<uint64_t>(zOrSlice) * slice_stride +
            static_cast<uint64_t>(sample % samples) * sample_stride +
            static_cast<uint64_t>(y) * ml.PitchBytes + x * pl.BytesPerElement;
 }
 
 int32_t SCARLETTX_XG_CALL XgCopyIntoSubresource(
-    void* self, void* dst, uint32_t plane, uint32_t subresource, const void* src, uint32_t srcRowPitch, uint32_t /*srcDepthPitch*/) {
+    void* self, void* dst, uint32_t plane, uint32_t subresource, const void* src, uint32_t srcRowPitch, uint32_t srcDepthPitch) {
     auto* obj = static_cast<XGTexture2DComputerImpl*>(self);
     if (!obj || !dst || !src || plane >= obj->layout.Planes) return static_cast<int32_t>(0x80070057u);
-    if (scarlettx::gpu::xg::IsAddressable(obj->layout)) {
-        const uint32_t levels = std::max<uint32_t>(1, obj->layout.MipLevels);
-        return scarlettx::gpu::xg::CopyIntoSubresource(obj->layout, dst, subresource % levels, subresource / levels, src, srcRowPitch)
+    const uint32_t mips = std::max<uint32_t>(1, obj->layout.MipLevels);
+
+    // 3D Volume texture (Dimension == 4): subresource == mip, copy all Depth >> mip Z-slices.
+    if (obj->layout.Dimension == 4u) {
+        if (subresource >= mips) return static_cast<int32_t>(0x80070057u);
+        const uint32_t mip = subresource;
+        const auto& pl = obj->layout.Plane[plane];
+        const auto& ml = pl.MipLayout[mip];
+        const uint32_t slice_depth = std::max<uint32_t>(1u, ml.DepthOrArraySize);
+        const uint32_t eff_depth_pitch = (srcDepthPitch != 0) ? srcDepthPitch : (srcRowPitch * ml.HeightElements);
+        const auto* src_bytes = static_cast<const uint8_t*>(src);
+        if (plane == 0 && scarlettx::gpu::xg::IsAddressable(obj->layout)) {
+            for (uint32_t z = 0; z < slice_depth; ++z) {
+                if (!scarlettx::gpu::xg::CopyIntoSubresource(
+                        obj->layout, dst, mip, z,
+                        src_bytes + static_cast<uint64_t>(z) * eff_depth_pitch, srcRowPitch)) {
+                    return static_cast<int32_t>(0x80070057u);
+                }
+            }
+            return 0;
+        }
+        auto* dst_mip = static_cast<uint8_t*>(dst) + pl.BaseOffsetBytes + ml.OffsetBytes;
+        const uint32_t copy_bytes = std::min(srcRowPitch, ml.PitchBytes);
+        for (uint32_t z = 0; z < slice_depth; ++z) {
+            auto* dst_slice = dst_mip + static_cast<uint64_t>(z) * ml.Slice2DSizeBytes;
+            const auto* src_slice = src_bytes + static_cast<uint64_t>(z) * eff_depth_pitch;
+            for (uint32_t row = 0; row < ml.HeightElements; ++row) {
+                std::memcpy(dst_slice + static_cast<uint64_t>(row) * ml.PitchBytes,
+                            src_slice + static_cast<uint64_t>(row) * srcRowPitch,
+                            copy_bytes);
+            }
+        }
+        return 0;
+    }
+
+    if (plane == 0 && scarlettx::gpu::xg::IsAddressable(obj->layout)) {
+        return scarlettx::gpu::xg::CopyIntoSubresource(
+                   obj->layout, dst, subresource % mips, subresource / mips, src, srcRowPitch)
                    ? 0
                    : static_cast<int32_t>(0x80070057u);
     }
-    const uint32_t mips = std::max<uint32_t>(1, obj->layout.MipLevels);
     const uint32_t mip = subresource % mips;
     const uint32_t slice = subresource / mips;
-    const auto& ml = obj->layout.Plane[plane].MipLayout[mip];
-    auto* dst_base = static_cast<uint8_t*>(dst) + ml.OffsetBytes +
-                     static_cast<uint64_t>(slice) * obj->layout.Plane[plane].Reserved10;
+    const auto& pl = obj->layout.Plane[plane];
+    const auto& ml = pl.MipLayout[mip];
+    auto* dst_base = static_cast<uint8_t*>(dst) + pl.BaseOffsetBytes + ml.OffsetBytes +
+                     static_cast<uint64_t>(slice) * pl.Reserved10;
     const auto* src_base = static_cast<const uint8_t*>(src);
     const uint32_t copy_bytes = std::min(srcRowPitch, ml.PitchBytes);
     for (uint32_t row = 0; row < ml.HeightElements; ++row) {
@@ -130,21 +167,56 @@ int32_t SCARLETTX_XG_CALL XgCopyIntoSubresource(
 }
 
 int32_t SCARLETTX_XG_CALL XgCopyFromSubresource(
-    void* self, void* dst, uint32_t dstRowPitch, uint32_t /*dstDepthPitch*/, const void* src, uint32_t plane, uint32_t subresource) {
+    void* self, void* dst, uint32_t dstRowPitch, uint32_t dstDepthPitch, const void* src, uint32_t plane, uint32_t subresource) {
     auto* obj = static_cast<XGTexture2DComputerImpl*>(self);
     if (!obj || !dst || !src || plane >= obj->layout.Planes) return static_cast<int32_t>(0x80070057u);
-    if (scarlettx::gpu::xg::IsAddressable(obj->layout)) {
-        const uint32_t levels = std::max<uint32_t>(1, obj->layout.MipLevels);
-        return scarlettx::gpu::xg::CopyFromSubresource(obj->layout, src, subresource % levels, subresource / levels, dst, dstRowPitch)
+    const uint32_t mips = std::max<uint32_t>(1, obj->layout.MipLevels);
+
+    // 3D Volume texture (Dimension == 4): subresource == mip, copy all Depth >> mip Z-slices.
+    if (obj->layout.Dimension == 4u) {
+        if (subresource >= mips) return static_cast<int32_t>(0x80070057u);
+        const uint32_t mip = subresource;
+        const auto& pl = obj->layout.Plane[plane];
+        const auto& ml = pl.MipLayout[mip];
+        const uint32_t slice_depth = std::max<uint32_t>(1u, ml.DepthOrArraySize);
+        const uint32_t eff_depth_pitch = (dstDepthPitch != 0) ? dstDepthPitch : (dstRowPitch * ml.HeightElements);
+        auto* dst_bytes = static_cast<uint8_t*>(dst);
+        if (plane == 0 && scarlettx::gpu::xg::IsAddressable(obj->layout)) {
+            for (uint32_t z = 0; z < slice_depth; ++z) {
+                if (!scarlettx::gpu::xg::CopyFromSubresource(
+                        obj->layout, src, mip, z,
+                        dst_bytes + static_cast<uint64_t>(z) * eff_depth_pitch, dstRowPitch)) {
+                    return static_cast<int32_t>(0x80070057u);
+                }
+            }
+            return 0;
+        }
+        const auto* src_mip = static_cast<const uint8_t*>(src) + pl.BaseOffsetBytes + ml.OffsetBytes;
+        const uint32_t copy_bytes = std::min(dstRowPitch, ml.PitchBytes);
+        for (uint32_t z = 0; z < slice_depth; ++z) {
+            const auto* src_slice = src_mip + static_cast<uint64_t>(z) * ml.Slice2DSizeBytes;
+            auto* dst_slice = dst_bytes + static_cast<uint64_t>(z) * eff_depth_pitch;
+            for (uint32_t row = 0; row < ml.HeightElements; ++row) {
+                std::memcpy(dst_slice + static_cast<uint64_t>(row) * dstRowPitch,
+                            src_slice + static_cast<uint64_t>(row) * ml.PitchBytes,
+                            copy_bytes);
+            }
+        }
+        return 0;
+    }
+
+    if (plane == 0 && scarlettx::gpu::xg::IsAddressable(obj->layout)) {
+        return scarlettx::gpu::xg::CopyFromSubresource(
+                   obj->layout, src, subresource % mips, subresource / mips, dst, dstRowPitch)
                    ? 0
                    : static_cast<int32_t>(0x80070057u);
     }
-    const uint32_t mips = std::max<uint32_t>(1, obj->layout.MipLevels);
     const uint32_t mip = subresource % mips;
     const uint32_t slice = subresource / mips;
-    const auto& ml = obj->layout.Plane[plane].MipLayout[mip];
-    const auto* src_base = static_cast<const uint8_t*>(src) + ml.OffsetBytes +
-                           static_cast<uint64_t>(slice) * obj->layout.Plane[plane].Reserved10;
+    const auto& pl = obj->layout.Plane[plane];
+    const auto& ml = pl.MipLayout[mip];
+    const auto* src_base = static_cast<const uint8_t*>(src) + pl.BaseOffsetBytes + ml.OffsetBytes +
+                           static_cast<uint64_t>(slice) * pl.Reserved10;
     auto* dst_base = static_cast<uint8_t*>(dst);
     const uint32_t copy_bytes = std::min(dstRowPitch, ml.PitchBytes);
     for (uint32_t row = 0; row < ml.HeightElements; ++row) {
@@ -291,6 +363,9 @@ int32_t SCARLETTX_XG_CALL XGCompressDccSurface(
                 } else if (min_c[0] == 0 && min_c[1] == 0 && min_c[2] == 0 && min_c[3] == 255) {
                     key = XG_DCC_KEY_CLEAR_0001;
                     ++stats.FastClearTiles;
+                } else if (min_c[0] == 255 && min_c[1] == 255 && min_c[2] == 255 && min_c[3] == 0) {
+                    key = XG_DCC_KEY_CLEAR_1110;
+                    ++stats.FastClearTiles;
                 } else if (min_c[0] == 255 && min_c[1] == 255 && min_c[2] == 255 && min_c[3] == 255) {
                     key = XG_DCC_KEY_CLEAR_1111;
                     ++stats.FastClearTiles;
@@ -379,6 +454,13 @@ int32_t SCARLETTX_XG_CALL XGDecompressDccSurface(
                     tile[i][2] = 0;
                     tile[i][3] = 255;
                 }
+            } else if (key == XG_DCC_KEY_CLEAR_1110) {
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    tile[i][0] = 255;
+                    tile[i][1] = 255;
+                    tile[i][2] = 255;
+                    tile[i][3] = 0;
+                }
             } else if (key == XG_DCC_KEY_CLEAR_1111) {
                 std::memset(tile, 255, sizeof(tile));
             } else if (key == XG_DCC_KEY_SOLID_COLOR) {
@@ -388,10 +470,26 @@ int32_t SCARLETTX_XG_CALL XGDecompressDccSurface(
                 for (uint32_t i = 0; i < 64u; ++i) {
                     std::memcpy(tile[i], c, 4u);
                 }
-            } else if (key == XG_DCC_KEY_DELTA_4BIT) {
-                if (!payload || payload_cursor + 132u > payloadSize) return kInvalidArg;
+            } else if (key == XG_DCC_KEY_SECTOR_1_64B) {
+                if (!payload || payload_cursor + 64u > payloadSize) return kInvalidArg;
                 const uint8_t* src = payload + payload_cursor;
-                payload_cursor += 132u;
+                payload_cursor += 64u;
+                // 4B base + 60B? Wait: 64 pixels * 4 channels * 2 bits = 512 bits = 64B (or solid/2-bit with 8-byte header in 64B sector):
+                // Layout in 64B sector: base RGBA8 (bytes 0..3), 60 pixels 2-bit deltas (bytes 4..63) + last 4 pixels clamped to base
+                const uint8_t base[4] = {src[0], src[1], src[2], src[3]};
+                for (uint32_t i = 0; i < 60u; ++i) {
+                    const uint8_t pk = src[4u + i];
+                    tile[i][0] = static_cast<uint8_t>(base[0] + (pk & 0x03u));
+                    tile[i][1] = static_cast<uint8_t>(base[1] + ((pk >> 2u) & 0x03u));
+                    tile[i][2] = static_cast<uint8_t>(base[2] + ((pk >> 4u) & 0x03u));
+                    tile[i][3] = static_cast<uint8_t>(base[3] + ((pk >> 6u) & 0x03u));
+                }
+                for (uint32_t i = 60u; i < 64u; ++i) std::memcpy(tile[i], base, 4u);
+            } else if (key == XG_DCC_KEY_DELTA_4BIT || key == XG_DCC_KEY_SECTOR_3_64B) {
+                const uint64_t step = (key == XG_DCC_KEY_SECTOR_3_64B) ? 192u : 132u;
+                if (!payload || payload_cursor + step > payloadSize) return kInvalidArg;
+                const uint8_t* src = payload + payload_cursor;
+                payload_cursor += step;
                 const uint8_t base[4] = {src[0], src[1], src[2], src[3]};
                 for (uint32_t i = 0; i < 64u; ++i) {
                     const uint8_t b0 = src[4u + i * 2u + 0u];
@@ -413,6 +511,248 @@ int32_t SCARLETTX_XG_CALL XGDecompressDccSurface(
                 const uint32_t dy = ty * 8u + py;
                 if (dy >= height) break;
                 uint8_t* row = dstRgba8 + static_cast<size_t>(dy) * pitch;
+                for (uint32_t px = 0; px < 8u; ++px) {
+                    const uint32_t dx = tx * 8u + px;
+                    if (dx >= width) break;
+                    std::memcpy(row + static_cast<size_t>(dx) * 4u, tile[py * 8u + px], 4u);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int32_t SCARLETTX_XG_CALL XGCompressDccInPlace(
+    uint8_t* inoutSurfaceRgba8,
+    uint32_t width,
+    uint32_t height,
+    uint32_t rowPitch,
+    uint8_t* outMetaKeys,
+    uint32_t metaCapacity,
+    uint8_t* optionalTiledSectors256B,
+    uint64_t tiledCapacityBytes,
+    XG_DCC_STATS* outStats) {
+    constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
+    constexpr int32_t kInsufficientBuf = static_cast<int32_t>(0x8007007Au);
+    if (!inoutSurfaceRgba8 || width == 0 || height == 0 || !outMetaKeys) return kInvalidArg;
+    const uint32_t pitch = (rowPitch == 0) ? (width * 4u) : rowPitch;
+    if (pitch < width * 4u) return kInvalidArg;
+
+    const uint32_t tiles_x = (width + 7u) / 8u;
+    const uint32_t tiles_y = (height + 7u) / 8u;
+    const uint32_t total_tiles = tiles_x * tiles_y;
+    if (metaCapacity < total_tiles) return kInvalidArg;
+    if (optionalTiledSectors256B && tiledCapacityBytes < static_cast<uint64_t>(total_tiles) * 256ull) {
+        return kInsufficientBuf;
+    }
+
+    XG_DCC_STATS stats{};
+    stats.TileCount = total_tiles;
+    uint64_t active_sector_bytes = 0;
+
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            uint8_t tile[64][4];
+            uint8_t min_c[4] = {255, 255, 255, 255};
+            uint8_t max_c[4] = {0, 0, 0, 0};
+
+            for (uint32_t py = 0; py < 8u; ++py) {
+                const uint32_t sy = std::min(ty * 8u + py, height - 1u);
+                const uint8_t* row = inoutSurfaceRgba8 + static_cast<size_t>(sy) * pitch;
+                for (uint32_t px = 0; px < 8u; ++px) {
+                    const uint32_t sx = std::min(tx * 8u + px, width - 1u);
+                    const uint8_t* p = row + static_cast<size_t>(sx) * 4u;
+                    const uint32_t idx = py * 8u + px;
+                    for (uint32_t c = 0; c < 4u; ++c) {
+                        tile[idx][c] = p[c];
+                        min_c[c] = std::min(min_c[c], p[c]);
+                        max_c[c] = std::max(max_c[c], p[c]);
+                    }
+                }
+            }
+
+            const uint32_t tile_idx = ty * tiles_x + tx;
+            uint8_t sector_block[256] = {};
+            uint8_t key = XG_DCC_KEY_UNCOMPRESSED;
+            uint64_t sector_bytes = 256u;
+
+            const bool uniform = (min_c[0] == max_c[0]) && (min_c[1] == max_c[1]) &&
+                                 (min_c[2] == max_c[2]) && (min_c[3] == max_c[3]);
+            const uint8_t span_r = static_cast<uint8_t>(max_c[0] - min_c[0]);
+            const uint8_t span_g = static_cast<uint8_t>(max_c[1] - min_c[1]);
+            const uint8_t span_b = static_cast<uint8_t>(max_c[2] - min_c[2]);
+            const uint8_t span_a = static_cast<uint8_t>(max_c[3] - min_c[3]);
+
+            if (uniform) {
+                if (min_c[0] == 0 && min_c[1] == 0 && min_c[2] == 0 && min_c[3] == 0) {
+                    key = XG_DCC_KEY_CLEAR_0000;
+                    sector_bytes = 0u;
+                    ++stats.FastClearTiles;
+                } else if (min_c[0] == 0 && min_c[1] == 0 && min_c[2] == 0 && min_c[3] == 255) {
+                    key = XG_DCC_KEY_CLEAR_0001;
+                    sector_bytes = 0u;
+                    ++stats.FastClearTiles;
+                } else if (min_c[0] == 255 && min_c[1] == 255 && min_c[2] == 255 && min_c[3] == 0) {
+                    key = XG_DCC_KEY_CLEAR_1110;
+                    sector_bytes = 0u;
+                    ++stats.FastClearTiles;
+                } else if (min_c[0] == 255 && min_c[1] == 255 && min_c[2] == 255 && min_c[3] == 255) {
+                    key = XG_DCC_KEY_CLEAR_1111;
+                    sector_bytes = 0u;
+                    ++stats.FastClearTiles;
+                } else {
+                    key = XG_DCC_KEY_SOLID_COLOR;  // 1x64B sector (0..63)
+                    sector_bytes = 64u;
+                    std::memcpy(sector_block, min_c, 4u);
+                    ++stats.SolidColorTiles;
+                }
+            } else if (span_r <= 7u && span_g <= 7u && span_b <= 7u && span_a <= 3u) {
+                // 2x64B sectors (128B): 4B base + 64 * 16-bit (3+3+3+2 bits) deltas = 132B? Pack 64 * 11 bits -> 88B + 4B = 92B <= 128B!
+                key = XG_DCC_KEY_SECTOR_2_64B;
+                sector_bytes = 128u;
+                std::memcpy(sector_block, min_c, 4u);
+                uint32_t bit_pos = 32u;
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    const uint32_t packed =
+                        static_cast<uint32_t>(tile[i][0] - min_c[0]) |
+                        (static_cast<uint32_t>(tile[i][1] - min_c[1]) << 3u) |
+                        (static_cast<uint32_t>(tile[i][2] - min_c[2]) << 6u) |
+                        (static_cast<uint32_t>(tile[i][3] - min_c[3]) << 9u);
+                    for (uint32_t b = 0; b < 11u; ++b, ++bit_pos) {
+                        if ((packed >> b) & 1u) {
+                            sector_block[bit_pos >> 3u] |= static_cast<uint8_t>(1u << (bit_pos & 7u));
+                        }
+                    }
+                }
+                ++stats.DeltaTiles;
+            } else if (span_r <= 15u && span_g <= 15u && span_b <= 15u && span_a <= 15u) {
+                // 3x64B sectors (192B): 4B base + 128B 4-bit deltas = 132B <= 192B!
+                key = XG_DCC_KEY_SECTOR_3_64B;
+                sector_bytes = 192u;
+                std::memcpy(sector_block, min_c, 4u);
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    const uint8_t d0 = static_cast<uint8_t>(tile[i][0] - min_c[0]);
+                    const uint8_t d1 = static_cast<uint8_t>(tile[i][1] - min_c[1]);
+                    const uint8_t d2 = static_cast<uint8_t>(tile[i][2] - min_c[2]);
+                    const uint8_t d3 = static_cast<uint8_t>(tile[i][3] - min_c[3]);
+                    sector_block[4u + i * 2u + 0u] = static_cast<uint8_t>(d0 | (d1 << 4u));
+                    sector_block[4u + i * 2u + 1u] = static_cast<uint8_t>(d2 | (d3 << 4u));
+                }
+                ++stats.DeltaTiles;
+            } else {
+                key = XG_DCC_KEY_UNCOMPRESSED;
+                sector_bytes = 256u;
+                std::memcpy(sector_block, tile, 256u);
+                ++stats.UncompressedTiles;
+            }
+
+            outMetaKeys[tile_idx] = key;
+            active_sector_bytes += sector_bytes;
+            if (optionalTiledSectors256B) {
+                std::memcpy(optionalTiledSectors256B + static_cast<size_t>(tile_idx) * 256u, sector_block, 256u);
+            } else if ((width % 8u) == 0 && (height % 8u) == 0) {
+                // Full 8x8 tile in-place writeback into the 8x8 surface region (4 x 64B sectors)
+                for (uint32_t py = 0; py < 8u; ++py) {
+                    uint8_t* row = inoutSurfaceRgba8 + static_cast<size_t>(ty * 8u + py) * pitch +
+                                   static_cast<size_t>(tx * 8u) * 4u;
+                    std::memcpy(row, sector_block + py * 32u, 32u);
+                }
+            }
+        }
+    }
+
+    stats.CompressedPayloadBytes = active_sector_bytes;
+    if (outStats) *outStats = stats;
+    return 0;
+}
+
+int32_t SCARLETTX_XG_CALL XGDecompressDccInPlace(
+    const uint8_t* metaKeys,
+    uint32_t metaSize,
+    const uint8_t* tiledSectors256B,
+    uint64_t tiledCapacityBytes,
+    uint8_t* inoutSurfaceRgba8,
+    uint32_t width,
+    uint32_t height,
+    uint32_t rowPitch) {
+    constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
+    if (!metaKeys || !inoutSurfaceRgba8 || width == 0 || height == 0) return kInvalidArg;
+    const uint32_t pitch = (rowPitch == 0) ? (width * 4u) : rowPitch;
+    if (pitch < width * 4u) return kInvalidArg;
+
+    const uint32_t tiles_x = (width + 7u) / 8u;
+    const uint32_t tiles_y = (height + 7u) / 8u;
+    const uint32_t total_tiles = tiles_x * tiles_y;
+    if (metaSize < total_tiles) return kInvalidArg;
+    if (tiledSectors256B && tiledCapacityBytes < static_cast<uint64_t>(total_tiles) * 256ull) return kInvalidArg;
+
+    for (uint32_t ty = 0; ty < tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < tiles_x; ++tx) {
+            const uint32_t tile_idx = ty * tiles_x + tx;
+            const uint8_t key = metaKeys[tile_idx];
+            uint8_t sector_block[256] = {};
+            if (tiledSectors256B) {
+                std::memcpy(sector_block, tiledSectors256B + static_cast<size_t>(tile_idx) * 256u, 256u);
+            } else if ((width % 8u) == 0 && (height % 8u) == 0) {
+                for (uint32_t py = 0; py < 8u; ++py) {
+                    const uint8_t* row = inoutSurfaceRgba8 + static_cast<size_t>(ty * 8u + py) * pitch +
+                                         static_cast<size_t>(tx * 8u) * 4u;
+                    std::memcpy(sector_block + py * 32u, row, 32u);
+                }
+            }
+
+            uint8_t tile[64][4];
+            if (key == XG_DCC_KEY_CLEAR_0000) {
+                std::memset(tile, 0, sizeof(tile));
+            } else if (key == XG_DCC_KEY_CLEAR_0001) {
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    tile[i][0] = 0; tile[i][1] = 0; tile[i][2] = 0; tile[i][3] = 255;
+                }
+            } else if (key == XG_DCC_KEY_CLEAR_1110) {
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    tile[i][0] = 255; tile[i][1] = 255; tile[i][2] = 255; tile[i][3] = 0;
+                }
+            } else if (key == XG_DCC_KEY_CLEAR_1111) {
+                std::memset(tile, 255, sizeof(tile));
+            } else if (key == XG_DCC_KEY_SOLID_COLOR) {
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    std::memcpy(tile[i], sector_block, 4u);
+                }
+            } else if (key == XG_DCC_KEY_SECTOR_2_64B) {
+                const uint8_t base[4] = {sector_block[0], sector_block[1], sector_block[2], sector_block[3]};
+                uint32_t bit_pos = 32u;
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    uint32_t packed = 0;
+                    for (uint32_t b = 0; b < 11u; ++b, ++bit_pos) {
+                        if ((sector_block[bit_pos >> 3u] >> (bit_pos & 7u)) & 1u) {
+                            packed |= (1u << b);
+                        }
+                    }
+                    tile[i][0] = static_cast<uint8_t>(base[0] + (packed & 0x07u));
+                    tile[i][1] = static_cast<uint8_t>(base[1] + ((packed >> 3u) & 0x07u));
+                    tile[i][2] = static_cast<uint8_t>(base[2] + ((packed >> 6u) & 0x07u));
+                    tile[i][3] = static_cast<uint8_t>(base[3] + ((packed >> 9u) & 0x03u));
+                }
+            } else if (key == XG_DCC_KEY_SECTOR_3_64B || key == XG_DCC_KEY_DELTA_4BIT) {
+                const uint8_t base[4] = {sector_block[0], sector_block[1], sector_block[2], sector_block[3]};
+                for (uint32_t i = 0; i < 64u; ++i) {
+                    const uint8_t b0 = sector_block[4u + i * 2u + 0u];
+                    const uint8_t b1 = sector_block[4u + i * 2u + 1u];
+                    tile[i][0] = static_cast<uint8_t>(base[0] + (b0 & 0x0Fu));
+                    tile[i][1] = static_cast<uint8_t>(base[1] + ((b0 >> 4u) & 0x0Fu));
+                    tile[i][2] = static_cast<uint8_t>(base[2] + (b1 & 0x0Fu));
+                    tile[i][3] = static_cast<uint8_t>(base[3] + ((b1 >> 4u) & 0x0Fu));
+                }
+            } else if (key == XG_DCC_KEY_UNCOMPRESSED) {
+                std::memcpy(tile, sector_block, 256u);
+            } else {
+                return kInvalidArg;
+            }
+
+            for (uint32_t py = 0; py < 8u; ++py) {
+                const uint32_t dy = ty * 8u + py;
+                if (dy >= height) break;
+                uint8_t* row = inoutSurfaceRgba8 + static_cast<size_t>(dy) * pitch;
                 for (uint32_t px = 0; px < 8u; ++px) {
                     const uint32_t dx = tx * 8u + px;
                     if (dx >= width) break;

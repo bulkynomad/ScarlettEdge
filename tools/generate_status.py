@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Generate ScarlettX's Status dashboard (variant E: purple GitHub contribution graph).
+"""Generate ScarlettEdge's Status dashboards (SVGs, standalone HTML, and README status block).
 
 Inspects the actual C++ headers, shim exports, and CTest targets in the repo so
-the reported API counts and subsystem progress reflect real implemented code.
+the reported API counts and test results reflect real implemented code.
 Outputs:
-  - docs/status.svg   (fixed 900px GitHub-dark purple contribution graph SVG)
-  - docs/status.html  (responsive standalone HTML matching the same design DNA)
-  - README.md         (auto-updated status section between SCARLETTX_STATUS markers)
+  - docs/status.svg                      (ABI Coverage: Upstream Purple + Fork Green)
+  - docs/status_concept_destruction.svg  (Concept Destruction bring-up dashboard)
+  - docs/status_optimizations.svg        (Phase 1 Fork Foundations dashboard)
+  - docs/status_aaa_roadmap.svg          (Phase 2 Retail AAA Execution dashboard)
+  - docs/status.html                     (Responsive 4-section HTML dashboard)
+  - README.md                            (Auto-updated status section between SCARLETTX_STATUS markers)
 """
 
 from __future__ import annotations
@@ -220,6 +223,7 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
         + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "Xma2")
         + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "X3DAudio")
         + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "CreateFX")
+        + count_exported_symbols(xa_hdr, "SCARLETTX_XAUDIO2_API", "CreateAudio")
         + count_exported_symbols(acp_hdr, "SCARLETTX_ACP_API", "Apu")
         + count_exported_symbols(acp_hdr, "SCARLETTX_ACP_API", "AcpHal")
     )
@@ -229,13 +233,18 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
         ffx_hdr, "SCARLETTX_FFX_UPSCALER_API", "ffx"
     )
     hc_cnt = count_exported_symbols(hc_hdr, "SCARLETTX_HC_API", "HC")
-    curl_cnt = count_exported_symbols(curl_hdr, "SCARLETTX_XCURL_API", "curl_")
+    curl_cnt = count_exported_symbols(curl_hdr, "SCARLETTX_XCURL_API", "curl_") + count_exported_symbols(
+        curl_hdr, "SCARLETTX_XCURL_API", "xcurl_"
+    )
     kernelx_cnt = count_exported_symbols(kernelx_hdr, "SCARLETTX_KERNELX_API", "KernelX")
     xvc_crypto_cnt = count_exported_symbols(xvc_crypto_hdr, "SCARLETTX_XVC_CRYPTO_API", "XvcCrypto")
     codec_cnt = count_exported_symbols(codec_hdr, "SCARLETTX_CODEC_API", "XboxCodec")
     xsapi_cnt = count_exported_symbols(xsapi_hdr, "SCARLETTX_XSAPI_API", "Xbl")
     xs2_cnt = count_exported_symbols(xs2_hdr, "SCARLETTX_XS2_API", "Xs2Shader")
     vulkan_cnt = count_exported_symbols(vulkan_hdr, "SCARLETTX_VULKAN_API", "VulkanXs")
+    pix_cnt = count_exported_symbols(ROOT / "src/shims/pixevt_stub.cpp", "PIX_EXPORT", "PIX")
+    d3d_extra_cnt = count_exported_symbols(ROOT / "src/shims/d3d12_xs_exports.cpp", "SCARLETTX_D3D12_API", "D3D12")
+    xcrd_cnt = 1 if (ROOT / "src/shims/dstorage_guest.cpp").exists() else 0
 
     total_exports = (
         xruntime_cnt
@@ -246,8 +255,10 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
         + xgamesave_cnt
         + xmem_cnt
         + d3d_cnt
+        + d3d_extra_cnt
         + bvh_cnt
         + ds_cnt
+        + xcrd_cnt
         + xa_cnt
         + gi_cnt
         + bink_cnt
@@ -260,6 +271,7 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
         + xsapi_cnt
         + xs2_cnt
         + vulkan_cnt
+        + pix_cnt
     )
 
     loader_features = sum(
@@ -452,6 +464,11 @@ def collect_metrics() -> tuple[list[Subsystem], int, int]:
             notes=f"{xsapi_cnt} exports; WinRT RoActivateInstance IInspectable broker, persistent XblTitleStorage, profiles, achievements, sessions",
         ),
     ]
+
+    # Auto-scale target when new exports are added beyond baseline targets
+    for s in subsystems:
+        if s.implemented > s.target:
+            s.target = s.implemented
 
     return subsystems, total_exports, test_count
 
@@ -758,11 +775,28 @@ def render_svg(
     legend_h = 16
     graph_box_h = BOX_PAD_TOP + LABEL_H + LABEL_GAP + grid_h + legend_gap + legend_h + BOX_PAD_BOT
 
+    # Pre-layout badge rows with automatic wrapping at W - PAD_X so badges never clip at 900px
+    BADGE_H = 20
+    BADGE_ROW_GAP = 6
+    badge_placements: list[tuple[int, int, int, int, str, str, str, bool]] = []
+    bx_cur = PAD_X
+    b_row = 0
+    for k, v, v_bg, dark_v in badges:
+        kw = _badge_width(k)
+        vw = _badge_width(v)
+        bw = kw + vw
+        if bx_cur > PAD_X and bx_cur + bw > W - PAD_X:
+            b_row += 1
+            bx_cur = PAD_X
+        badge_placements.append((bx_cur, b_row, kw, vw, k, v, v_bg, dark_v))
+        bx_cur += bw + 6
+    badges_total_h = (b_row + 1) * BADGE_H + b_row * BADGE_ROW_GAP
+
     # Vertical flow (16px section spacing)
     y_heading_baseline = PAD_Y + 26
     y_heading_rule = y_heading_baseline + 10  # ~8px gap above 1px underline
     y_badges = y_heading_rule + 16
-    y_graph_box = y_badges + 20 + 16
+    y_graph_box = y_badges + badges_total_h + 16
     y_list = y_graph_box + graph_box_h + 16
 
     sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
@@ -771,6 +805,7 @@ def render_svg(
     list_h = list_rows_per_col * ROW_H
 
     has_callout = bool(callout_line1)
+    callout_accent = FORK_GREEN if overall_pct >= 99.9 else WARN
     callout_h = 44 if has_callout else 0
     y_callout = y_list + list_h + (16 if has_callout else 0)
     H = (y_callout + callout_h if has_callout else y_list + list_h) + PAD_Y
@@ -789,7 +824,7 @@ def render_svg(
         f"    .r-count {{ font-size: 13px; fill: {FG_MUTED}; font-variant-numeric: tabular-nums; }}",
         f"    .r-pct {{ font-size: 13px; font-weight: 600; fill: {FG}; font-variant-numeric: tabular-nums; }}",
         f"    .callout-txt {{ font-size: 13px; fill: {FG_SOFT}; }}",
-        f"    .callout-lead {{ font-size: 13px; font-weight: 600; fill: {WARN}; }}",
+        f"    .callout-lead {{ font-size: 13px; font-weight: 600; fill: {callout_accent}; }}",
         "  </style>",
         f'  <rect width="{W}" height="{H}" fill="{BG}"/>',
         "",
@@ -800,25 +835,22 @@ def render_svg(
         "  <!-- 2. Badge row -->",
     ]
 
-    bx = PAD_X
-    for idx, (k, v, v_bg, dark_v) in enumerate(badges):
-        kw = _badge_width(k)
-        vw = _badge_width(v)
+    for idx, (bx, row_idx, kw, vw, k, v, v_bg, dark_v) in enumerate(badge_placements):
         bw = kw + vw
+        by = y_badges + row_idx * (BADGE_H + BADGE_ROW_GAP)
         clip_id = f"bclip{idx}"
-        lines.append(f'  <clipPath id="{clip_id}"><rect x="{bx}" y="{y_badges}" width="{bw}" height="20" rx="3"/></clipPath>')
+        lines.append(f'  <clipPath id="{clip_id}"><rect x="{bx}" y="{by}" width="{bw}" height="{BADGE_H}" rx="3"/></clipPath>')
         lines.append(f'  <g clip-path="url(#{clip_id})">')
-        lines.append(f'    <rect x="{bx}" y="{y_badges}" width="{kw}" height="20" fill="{BADGE_LABEL}"/>')
-        lines.append(f'    <rect x="{bx + kw}" y="{y_badges}" width="{vw}" height="20" fill="{v_bg}"/>')
+        lines.append(f'    <rect x="{bx}" y="{by}" width="{kw}" height="{BADGE_H}" fill="{BADGE_LABEL}"/>')
+        lines.append(f'    <rect x="{bx + kw}" y="{by}" width="{vw}" height="{BADGE_H}" fill="{v_bg}"/>')
         lines.append(
-            f'    <text class="badge-txt" x="{bx + kw / 2:.1f}" y="{y_badges + 14}" text-anchor="middle">{html.escape(k)}</text>'
+            f'    <text class="badge-txt" x="{bx + kw / 2:.1f}" y="{by + 14}" text-anchor="middle">{html.escape(k)}</text>'
         )
         v_cls = "badge-txt-dark" if dark_v else "badge-txt"
         lines.append(
-            f'    <text class="{v_cls}" x="{bx + kw + vw / 2:.1f}" y="{y_badges + 14}" text-anchor="middle">{html.escape(v)}</text>'
+            f'    <text class="{v_cls}" x="{bx + kw + vw / 2:.1f}" y="{by + 14}" text-anchor="middle">{html.escape(v)}</text>'
         )
         lines.append("  </g>")
-        bx += bw + 6
 
     lines.append("")
     lines.append("  <!-- 3. Contribution graph box -->")
@@ -926,16 +958,24 @@ def render_svg(
 
     if has_callout:
         lines.append("")
-        lines.append("  <!-- 5. Warning callout -->")
-        lines.append(f'  <rect x="{PAD_X}" y="{y_callout}" width="4" height="{callout_h}" fill="{WARN}"/>')
+        lines.append("  <!-- 5. Status callout -->")
+        lines.append(f'  <rect x="{PAD_X}" y="{y_callout}" width="4" height="{callout_h}" fill="{callout_accent}"/>')
         ix = PAD_X + 20
         iy = y_callout + 10
-        lines.append(
-            f'  <g transform="translate({ix},{iy})">'
-            f'<path d="M8 1.5 15 14H1z" fill="none" stroke="{WARN}" stroke-width="1.5" stroke-linejoin="round"/>'
-            f'<path d="M8 6v3.5M8 11.6v.4" stroke="{WARN}" stroke-width="1.5" stroke-linecap="round"/>'
-            f"</g>"
-        )
+        if overall_pct >= 99.9:
+            lines.append(
+                f'  <g transform="translate({ix},{iy})">'
+                f'<circle cx="8" cy="8" r="6.5" fill="none" stroke="{callout_accent}" stroke-width="1.5"/>'
+                f'<path d="M5.2 8.2 7.1 10.1 11 6.1" fill="none" stroke="{callout_accent}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>'
+                f"</g>"
+            )
+        else:
+            lines.append(
+                f'  <g transform="translate({ix},{iy})">'
+                f'<path d="M8 1.5 15 14H1z" fill="none" stroke="{callout_accent}" stroke-width="1.5" stroke-linejoin="round"/>'
+                f'<path d="M8 6v3.5M8 11.6v.4" stroke="{callout_accent}" stroke-width="1.5" stroke-linecap="round"/>'
+                f"</g>"
+            )
         tx = ix + 26
         lines.append(
             f'  <text class="callout-txt" x="{tx}" y="{y_callout + 19}">'
@@ -952,24 +992,56 @@ def render_svg(
     return "\n".join(lines) + "\n"
 
 
-def render_html(subsystems: list[Subsystem], total_exports: int, tests_text: str, tests_ok: bool) -> str:
+def _serialize_js_subsystems(subs: list[Subsystem]) -> str:
+    rows = []
+    for s in subs:
+        up = -1 if s.upstream_implemented is None else min(s.implemented, s.upstream_implemented)
+        rows.append(f"      [{s.short_name!r}, {s.name!r}, {s.implemented}, {s.target}, {up}],")
+    return "\n".join(rows)
+
+
+def render_html(
+    subsystems: list[Subsystem],
+    total_exports: int,
+    tests_text: str,
+    tests_ok: bool,
+    cd_subsystems: list[Subsystem] | None = None,
+    opt_subsystems: list[Subsystem] | None = None,
+    aaa_subsystems: list[Subsystem] | None = None,
+) -> str:
+    cd_subs = cd_subsystems or []
+    opt_subs = opt_subsystems or []
+    aaa_subs = aaa_subsystems or []
+
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
     overall_pct = (total_impl / total_target * 100.0) if total_target else 0.0
+    up_impl = sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)
+    fork_impl = total_impl - up_impl
 
-    js_rows = []
-    for s in subsystems:
-        js_rows.append(
-            f"    [{s.short_name!r}, {s.name!r}, {s.implemented}, {s.target}],"
-        )
-    js_array = "\n".join(js_rows)
+    aaa_impl = sum(s.implemented for s in aaa_subs)
+    aaa_target = sum(s.target for s in aaa_subs)
+    aaa_pct = (aaa_impl / aaa_target * 100.0) if aaa_target else 0.0
+
+    opt_impl = sum(s.implemented for s in opt_subs)
+    opt_target = sum(s.target for s in opt_subs)
+    opt_pct = (opt_impl / opt_target * 100.0) if opt_target else 0.0
+
+    cd_impl = sum(s.implemented for s in cd_subs)
+    cd_target = sum(s.target for s in cd_subs)
+    cd_pct = (cd_impl / cd_target * 100.0) if cd_target else 0.0
+
+    js_abi = _serialize_js_subsystems(subsystems)
+    js_aaa = _serialize_js_subsystems(aaa_subs)
+    js_opt = _serialize_js_subsystems(opt_subs)
+    js_cd = _serialize_js_subsystems(cd_subs)
 
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ScarlettEdge — Status</title>
+<title>ScarlettEdge — Status Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@400;500;600;700&display=swap">
 <style>
@@ -987,12 +1059,14 @@ def render_html(subsystems: list[Subsystem], total_exports: int, tests_text: str
     --lv1: {LV1};
     --lv2: {LV2};
     --lv3: {LV3};
+    --upstream: {UPSTREAM_PURPLE};
+    --fork: {FORK_GREEN};
     --warn: {WARN};
     --badge-label: {BADGE_LABEL};
     --badge-exports: {BADGE_EXPORTS};
     --badge-tests: {BADGE_TESTS};
     --badge-target: {BADGE_TARGET};
-    --cell: 14px;
+    --cell: 13px;
     --cell-gap: 3px;
     --radius: 6px;
   }}
@@ -1003,18 +1077,19 @@ def render_html(subsystems: list[Subsystem], total_exports: int, tests_text: str
     color: var(--fg);
     font-family: 'Mona Sans', -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
   }}
-  .status {{
-    width: 900px;
+  .page {{
+    width: 920px;
     max-width: 100%;
     margin: 0 auto;
     padding: 30px 36px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 36px;
   }}
+  .panel {{ display: flex; flex-direction: column; gap: 16px; }}
   h2 {{
     margin: 0;
-    font-size: 26px;
+    font-size: 24px;
     font-weight: 600;
     line-height: 1.25;
     padding-bottom: 8px;
@@ -1022,12 +1097,13 @@ def render_html(subsystems: list[Subsystem], total_exports: int, tests_text: str
   }}
   .badges {{ display: flex; flex-wrap: wrap; gap: 6px; font-family: Verdana, 'DejaVu Sans', Geneva, sans-serif; font-size: 11px; line-height: 20px; }}
   .badge {{ display: flex; border-radius: 3px; overflow: hidden; }}
-  .badge span {{ padding: 0 6px; color: #fff; }}
+  .badge span {{ padding: 0 7px; color: #fff; }}
   .badge .k {{ background: var(--badge-label); }}
-  .badge .v-fn {{ background: var(--lv2); color: var(--bg); }}
+  .badge .v-up {{ background: var(--upstream); color: var(--bg); font-weight: 600; }}
+  .badge .v-fn {{ background: var(--fork); color: var(--bg); font-weight: 600; }}
   .badge .v-exports {{ background: var(--badge-exports); }}
   .badge .v-tests {{ background: var(--badge-tests); }}
-  .badge .v-tests-warn {{ background: var(--warn); }}
+  .badge .v-tests-warn {{ background: var(--warn); color: var(--bg); }}
   .badge .v-target {{ background: var(--badge-target); }}
   .graph-box {{
     border: 1px solid var(--border);
@@ -1038,9 +1114,9 @@ def render_html(subsystems: list[Subsystem], total_exports: int, tests_text: str
     gap: 14px;
     overflow-x: auto;
   }}
-  .graph {{ display: flex; gap: 10px; justify-content: center; }}
+  .graph {{ display: flex; gap: 8px; justify-content: center; }}
   .group {{ display: flex; flex-direction: column; gap: 6px; }}
-  .group-label {{ font-size: 11px; color: var(--fg-muted); white-space: nowrap; }}
+  .group-label {{ font-size: 10px; color: var(--fg-muted); white-space: nowrap; }}
   .cells {{
     display: grid;
     grid-template-rows: repeat(7, var(--cell));
@@ -1055,74 +1131,124 @@ def render_html(subsystems: list[Subsystem], total_exports: int, tests_text: str
   .lv1 {{ background: var(--lv1); }}
   .lv2 {{ background: var(--lv2); }}
   .lv3 {{ background: var(--lv3); }}
-  .legend {{ display: flex; justify-content: flex-end; align-items: center; gap: 4px; font-size: 12px; color: var(--fg-muted); }}
-  .sw {{ display: block; width: 11px; height: 11px; border-radius: 2px; }}
+  .upstream {{ background: var(--upstream); }}
+  .fork {{ background: var(--fork); }}
+  .dot.split {{ background: linear-gradient(90deg, var(--upstream) 50%, var(--fork) 50%); }}
+  .legend {{ display: flex; justify-content: flex-end; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-muted); }}
+  .sw {{ display: inline-block; width: 11px; height: 11px; border-radius: 2px; }}
   .list {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 40px; padding: 0 4px; }}
   .row {{ display: flex; align-items: center; gap: 10px; height: 30px; border-bottom: 1px solid var(--border-muted); font-size: 13px; }}
   .dot {{ width: 11px; height: 11px; border-radius: 2px; flex-shrink: 0; }}
   .row .name {{ flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
   .row .count {{ color: var(--fg-muted); font-variant-numeric: tabular-nums; }}
   .row .pct {{ width: 40px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }}
-  .callout {{ display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--warn); color: var(--fg-soft); font-size: 13px; }}
-  .callout svg {{ flex-shrink: 0; margin-top: 2px; }}
-  .callout strong {{ color: var(--warn); }}
+  .callout {{ display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--fork); color: var(--fg-soft); font-size: 13px; }}
+  .callout strong {{ color: var(--fork); }}
   @media (max-width: 640px) {{
-    .status {{ padding: 20px 16px; }}
+    .page {{ padding: 20px 16px; }}
     .graph {{ justify-content: flex-start; }}
     .list {{ grid-template-columns: minmax(0, 1fr); }}
   }}
 </style>
 </head>
 <body>
-<main class="status">
-  <h2>Status: {overall_pct:.1f}%</h2>
-  <div class="badges">
-    <span class="badge"><span class="k">functions</span><span class="v-fn">{total_impl}/{total_target}</span></span>
-    <span class="badge"><span class="k">exports</span><span class="v-exports">{total_exports}</span></span>
-    <span class="badge"><span class="k">tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
-    <span class="badge"><span class="k">target</span><span class="v-target">Xbox Series X|S (Gen9)</span></span>
-  </div>
-  <section class="graph-box" aria-label="Implemented functions per subsystem, one square per function">
-    <div class="graph" id="graph"></div>
-    <div class="legend">Not yet
-      <span class="sw empty"></span><span class="sw lv0"></span><span class="sw lv1"></span><span class="sw lv2"></span><span class="sw lv3"></span>
-    Done</div>
+<main class="page">
+  <section class="panel">
+    <h2>Phase 2: Retail AAA Execution Roadmap: {aaa_pct:.1f}%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">phase 2 AAA</span><span class="v-fn">{aaa_impl}/{aaa_target} ({aaa_pct:.1f}%)</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
+      <span class="badge"><span class="k">target</span><span class="v-target">Unmodified Retail AAA Titles</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-aaa"></div><div class="legend" id="leg-aaa"></div></div>
+    <div class="list" id="list-aaa"></div>
   </section>
-  <div class="list" id="list"></div>
-  <div class="callout">
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 15 14H1z" fill="none" stroke="{LV3}" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="{LV3}" stroke-width="1.5" stroke-linecap="round"/></svg>
-    <span><strong>Phase 1 ABI Parity (100%):</strong> Full clean-room ABI surface across all {len(subsystems)} subsystems ({total_impl}/{total_target} functions; {sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)} upstream ScarlettX + {total_impl - sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)} ScarlettEdge). See README for Phase 2 AAA Silicon Roadmap.</span>
-  </div>
+
+  <section class="panel">
+    <h2>ABI Coverage (Upstream Purple + Fork Green): {overall_pct:.1f}%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">{up_impl}/{total_target}</span></span>
+      <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+{fork_impl}</span></span>
+      <span class="badge"><span class="k">exports</span><span class="v-exports">{total_exports}</span></span>
+      <span class="badge"><span class="k">tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-abi"></div><div class="legend" id="leg-abi"></div></div>
+    <div class="list" id="list-abi"></div>
+    <div class="callout">
+      <span><strong>Unified Architecture:</strong> Shared <code>scarlettx_core.dll</code>, unified DirectStorage/COM bridges, retail XVD v3 + Merkle + NTFS, 32-lane GPU GDeflate, WMA-Pro XMA2, Vulkan KHR RT &amp; RDNA2 XS2 CFG/SM 6.6 lifting ({total_impl}/{total_target} functions: {up_impl} upstream + {fork_impl} ScarlettEdge).</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Phase 1: ScarlettEdge Runtime Optimization &amp; Fidelity: {opt_pct:.1f}%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">foundations</span><span class="v-fn">{opt_impl}/{opt_target} ({opt_pct:.1f}%)</span></span>
+      <span class="badge"><span class="k">frame pacing</span><span class="v-exports">0-tear VSync</span></span>
+      <span class="badge"><span class="k">textures</span><span class="v-tests">0-frame lag</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-opt"></div><div class="legend" id="leg-opt"></div></div>
+    <div class="list" id="list-opt"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Concept Destruction (Upstream Purple + Fork Green): {cd_pct:.1f}%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">milestones</span><span class="v-fn">{cd_impl}/{cd_target} ({cd_pct:.1f}%)</span></span>
+      <span class="badge"><span class="k">state</span><span class="v-target">Full speed on GPU, with sound</span></span>
+      <span class="badge"><span class="k">target</span><span class="v-exports">Concept Destruction (Gen9)</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-cd"></div><div class="legend" id="leg-cd"></div></div>
+    <div class="list" id="list-cd"></div>
+  </section>
 </main>
 <script>
-  const SUBSYSTEMS = [
-{js_array}
+  const PANELS = [
+    ['aaa', [\n{js_aaa}\n    ]],
+    ['abi', [\n{js_abi}\n    ]],
+    ['opt', [\n{js_opt}\n    ]],
+    ['cd',  [\n{js_cd}\n    ]],
   ];
   const level = p => p >= 0.8 ? 'lv3' : p >= 0.6 ? 'lv2' : p >= 0.4 ? 'lv1' : 'lv0';
   const el = (tag, cls, text) => {{ const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }};
-  const graph = document.getElementById('graph');
-  for (const [label, , done, total] of SUBSYSTEMS) {{
-    const g = el('div', 'group');
-    g.append(el('span', 'group-label', label));
-    const cells = el('div', 'cells');
-    const cols = Math.max(2, Math.ceil(total / 7));
-    const lv = level(done / total);
-    for (let i = 0; i < cols * 7; i++) {{
-      cells.append(el('span', 'cell ' + (i < done ? lv : i < total ? 'empty' : 'pad')));
+  for (const [id, subs] of PANELS) {{
+    const graph = document.getElementById('graph-' + id);
+    const leg = document.getElementById('leg-' + id);
+    const list = document.getElementById('list-' + id);
+    const hasSplit = subs.some(s => s[4] >= 0);
+    for (const [label, , done, total, up] of subs) {{
+      const g = el('div', 'group');
+      g.append(el('span', 'group-label', label));
+      const cells = el('div', 'cells');
+      const cols = Math.max(2, Math.ceil(total / 7));
+      const lv = level(done / total);
+      for (let i = 0; i < cols * 7; i++) {{
+        let cls = 'pad';
+        if (i < done) cls = hasSplit ? (i < up ? 'upstream' : 'fork') : lv;
+        else if (i < total) cls = 'empty';
+        cells.append(el('span', 'cell ' + cls));
+      }}
+      g.append(cells);
+      graph.append(g);
     }}
-    g.append(cells);
-    graph.append(g);
+    if (hasSplit) {{
+      leg.append(el('span', 'sw empty'), ' Not yet ', el('span', 'sw upstream'), ' ScarlettX (Upstream) ', el('span', 'sw fork'), ' ScarlettEdge (Fork)');
+    }} else {{
+      leg.append('Not yet ', el('span', 'sw empty'), el('span', 'sw lv0'), el('span', 'sw lv1'), el('span', 'sw lv2'), el('span', 'sw lv3'), ' Done');
+    }}
+    [...subs].sort((a, b) => b[2] / b[3] - a[2] / a[3]).forEach(([, name, done, total, up]) => {{
+      const p = done / total;
+      const row = el('div', 'row');
+      let dotCls = done === 0 ? 'empty' : level(p);
+      if (done > 0 && hasSplit && up >= 0) {{
+        dotCls = up === done ? 'upstream' : up === 0 ? 'fork' : 'split';
+      }}
+      row.append(el('span', 'dot ' + dotCls));
+      row.append(el('span', 'name', name));
+      row.append(el('span', 'count', `${{done}} of ${{total}}`));
+      row.append(el('span', 'pct', `${{Math.round(p * 100)}}%`));
+      list.append(row);
+    }});
   }}
-  const list = document.getElementById('list');
-  [...SUBSYSTEMS].sort((a, b) => b[2] / b[3] - a[2] / a[3]).forEach(([, name, done, total]) => {{
-    const p = done / total;
-    const row = el('div', 'row');
-    row.append(el('span', 'dot ' + (done === 0 ? 'empty' : level(p))));
-    row.append(el('span', 'name', name));
-    row.append(el('span', 'count', `${{done}} of ${{total}}`));
-    row.append(el('span', 'pct', `${{Math.round(p * 100)}}%`));
-    list.append(row);
-  }});
 </script>
 </body>
 </html>
@@ -1355,7 +1481,15 @@ def main() -> None:
         callout_line2="Passing synthetic & UE5/Open-World vertical-slice suites do not guarantee compatibility with untested commercial retail games.",
     )
 
-    html_doc = render_html(subsystems, total_exports, tests_text, tests_ok)
+    html_doc = render_html(
+        subsystems,
+        total_exports,
+        tests_text,
+        tests_ok,
+        cd_subsystems=cd_subsystems,
+        opt_subsystems=opt_subsystems,
+        aaa_subsystems=aaa_subsystems,
+    )
 
     out_svg = ROOT / "docs/status.svg"
     out_cd_svg = ROOT / "docs/status_concept_destruction.svg"

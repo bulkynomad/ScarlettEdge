@@ -38,6 +38,106 @@ struct XblMultiplayerSession {
 std::mutex g_mu;
 std::string g_scid;
 
+bool IsReadableMemoryRange(const void* ptr, size_t len, bool* out_writable = nullptr) {
+    if (!ptr || len == 0) return false;
+#if defined(_WIN32)
+    uintptr_t cur = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t end = cur + len;
+    if (end < cur) return false;
+    bool all_writable = true;
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+        if (mbi.State != MEM_COMMIT) {
+            return false;
+        }
+        const DWORD prot = mbi.Protect & 0xFFu;
+        if (prot == PAGE_NOACCESS || (mbi.Protect & PAGE_GUARD) != 0) {
+            return false;
+        }
+        const bool page_writable =
+            prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+            prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+        if (!page_writable) {
+            all_writable = false;
+        }
+        const uintptr_t region_end =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= cur) {
+            return false;
+        }
+        cur = region_end;
+    }
+    if (out_writable) {
+        *out_writable = all_writable;
+    }
+    return true;
+#else
+    if (out_writable) *out_writable = true;
+    return true;
+#endif
+}
+
+bool IsPrintableScidChar(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') || c == '-' || c == '_' || c == '.';
+}
+
+bool LooksLikeDirectScidString(const char* s, size_t* out_len = nullptr) {
+    if (!s || !IsReadableMemoryRange(s, 1)) return false;
+    size_t i = 0;
+    for (; i < 128; ++i) {
+        if (!IsReadableMemoryRange(s + i, 1)) return false;
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == '\0') break;
+        if (!IsPrintableScidChar(c)) return false;
+    }
+    if (i == 0 || i >= 128) return false;
+    if (out_len) *out_len = i;
+    return true;
+}
+
+bool LooksLikeUuidScid(const char* s) {
+    size_t len = 0;
+    if (!LooksLikeDirectScidString(s, &len) || len != 36) return false;
+    return s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-';
+}
+
+std::string ExtractScidFromInitializeArg(const char* scid_or_args) {
+    constexpr const char* kDefaultScid = "00000000-0000-0000-0000-000000000000";
+    if (!scid_or_args) {
+        return kDefaultScid;
+    }
+    // Check if caller passed a GDK XblInitArgs* ({ XTaskQueueHandle queue; const char* scid; }):
+    // 8-byte aligned struct whose +8 field points to a valid ASCII SCID string.
+    if ((reinterpret_cast<uintptr_t>(scid_or_args) & 0x7u) == 0) {
+        bool writable_struct = false;
+        if (IsReadableMemoryRange(scid_or_args, sizeof(XblInitArgs), &writable_struct)) {
+            XblInitArgs candidate{};
+            std::memcpy(&candidate, scid_or_args, sizeof(candidate));
+            const bool queue_plausible =
+                (candidate.queue == nullptr) || XSystemIsHandleValid(candidate.queue);
+            if (candidate.scid != nullptr && queue_plausible) {
+                if (candidate.queue != nullptr && XSystemIsHandleValid(candidate.queue) &&
+                    LooksLikeDirectScidString(candidate.scid)) {
+                    return candidate.scid;
+                }
+                if (!LooksLikeDirectScidString(scid_or_args) &&
+                    LooksLikeDirectScidString(candidate.scid) &&
+                    (writable_struct || LooksLikeUuidScid(candidate.scid))) {
+                    return candidate.scid;
+                }
+            }
+        }
+    }
+    if (LooksLikeDirectScidString(scid_or_args)) {
+        return scid_or_args;
+    }
+    return kDefaultScid;
+}
+
 XGameResult SCARLETTX_GDK_CALLBACK XsapiImmediateProvider(
     XAsyncOp op,
     const XAsyncProviderData* data) {
@@ -102,8 +202,9 @@ int32_t FinishXsapiAsync(void* asyncBlock) {
 extern "C" {
 
 int32_t SCARLETTX_XSAPI_CALL XblInitialize(const char* scid) {
+    const std::string resolved = ExtractScidFromInitializeArg(scid);
     std::lock_guard<std::mutex> lk(g_mu);
-    g_scid = scid ? scid : "00000000-0000-0000-0000-000000000000";
+    g_scid = resolved;
     return kSuccess;
 }
 
@@ -248,13 +349,20 @@ std::string SanitizeStorageToken(const char* raw) {
 
 fs::path ResolveTitleStoragePath(XblContext* ctx, uint32_t storageType, const char* blobPath) {
     const char* env_root = std::getenv("SCARLETTX_SAVE_ROOT");
-    fs::path base = (env_root && *env_root) ? fs::path(env_root)
-                                            : (fs::temp_directory_path() / "scarlettx_saves");
+    const char* env_ts = std::getenv("SCARLETTX_TITLE_STORAGE_DIR");
+    fs::path base;
+    if (env_root && *env_root) {
+        base = fs::path(env_root) / "title_storage";
+    } else if (env_ts && *env_ts) {
+        base = fs::path(env_ts);
+    } else {
+        base = fs::temp_directory_path() / "scarlettx_saves" / "title_storage";
+    }
     char xuid_hex[32]{};
     std::snprintf(xuid_hex, sizeof(xuid_hex), "%016llX",
                   static_cast<unsigned long long>(ctx ? ctx->xuid : 0ull));
     const std::string scid = SanitizeStorageToken(ctx ? ctx->scid.c_str() : "default_scid");
-    return base / "title_storage" / scid / std::to_string(storageType) /
+    return base / scid / std::to_string(storageType) /
            (storageType == XblTitleStorageType_GlobalStorage ? "global" : xuid_hex) /
            SanitizeStorageToken(blobPath);
 }
@@ -280,13 +388,51 @@ struct WinRtGuid {
 
 constexpr WinRtGuid kWinRtIUnknown = {0x00000000u, 0x0000u, 0x0000u, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
 constexpr WinRtGuid kWinRtIInspectable = {0xAF86E2E0u, 0xB12Du, 0x4C6Au, {0x9C, 0x5A, 0xD7, 0xAA, 0x65, 0x10, 0x1E, 0x90}};
+constexpr WinRtGuid kWinRtIAgileObject = {0x94EA2B94u, 0xE9CCu, 0x49E0u, {0xC0, 0xFF, 0xEE, 0x64, 0xCA, 0x8F, 0x5B, 0x90}};
 constexpr WinRtGuid kWinRtIActivationFactory = {0x00000035u, 0x0000u, 0x0000u, {0xC0, 0, 0, 0, 0, 0, 0, 0x46}};
+
+bool WinRtGuidEquals(const void* a, const WinRtGuid& b) {
+    return a && std::memcmp(a, &b, sizeof(WinRtGuid)) == 0;
+}
+
+bool IsZeroWinRtGuid(const WinRtGuid& g) {
+    static constexpr WinRtGuid kZero{};
+    return std::memcmp(&g, &kZero, sizeof(WinRtGuid)) == 0;
+}
+
+bool IsBaseWinRtIid(const WinRtGuid& g) {
+    return WinRtGuidEquals(&g, kWinRtIUnknown) ||
+           WinRtGuidEquals(&g, kWinRtIInspectable) ||
+           WinRtGuidEquals(&g, kWinRtIAgileObject) ||
+           WinRtGuidEquals(&g, kWinRtIActivationFactory);
+}
+
+WinRtGuid SynthesizeStaticsIidForClass(const wchar_t* cls) {
+    // Official IGameSaveProviderStatics IID for Windows.Gaming.XboxLive.Storage.GameSaveProvider
+    if (cls && std::wcscmp(cls, L"Windows.Gaming.XboxLive.Storage.GameSaveProvider") == 0) {
+        return {0xD0A60E5Bu, 0x3107u, 0x445Au, {0x8B, 0x5C, 0xC5, 0xE0, 0x5D, 0x58, 0xE6, 0xD8}};
+    }
+    uint64_t h1 = 0xCBF29CE484222325ull;
+    uint64_t h2 = 0x84222325CBF29CE4ull;
+    for (const wchar_t* p = cls; p && *p; ++p) {
+        h1 = (h1 ^ static_cast<uint64_t>(*p)) * 0x100000001B3ull;
+        h2 = (h2 ^ (static_cast<uint64_t>(*p) + 0x9E3779B97F4A7C15ull)) * 0x100000001B3ull;
+    }
+    WinRtGuid g{};
+    g.d1 = static_cast<uint32_t>(h1 & 0xFFFFFFFFu);
+    g.d2 = static_cast<uint16_t>((h1 >> 32) & 0xFFFFu);
+    g.d3 = static_cast<uint16_t>(((h1 >> 48) & 0x0FFFu) | 0x5000u);
+    std::memcpy(g.d4, &h2, 8);
+    g.d4[0] = static_cast<uint8_t>((g.d4[0] & 0x3Fu) | 0x80u);
+    return g;
+}
 
 bool IsXboxGameCoreRuntimeClass(const wchar_t* cls) {
     if (!cls || !*cls) return false;
+    // Note: "Windows.Gaming.Input." is intentionally NOT intercepted here so desktop
+    // Windows combase.dll handles Windows.Gaming.Input.* natively!
     static constexpr const wchar_t* kPrefixes[] = {
         L"Windows.Gaming.XboxLive.",
-        L"Windows.Gaming.Input.",
         L"Windows.ApplicationModel.Store.",
         L"Windows.Media.Protection.",
         L"Windows.System.XboxLive",
@@ -308,18 +454,24 @@ struct ShimWinRtObject {
     bool is_factory = false;
 };
 
-extern const void* const kShimWinRtVtbl[32];
+extern const void* const kShimWinRtFactoryVtbl[32];
+extern const void* const kShimWinRtInstanceVtbl[32];
 
 int32_t SCARLETTX_XSAPI_CALL WinRt_QueryInterface(void* self_ptr, const void* riid, void** ppv) {
     if (!ppv) return static_cast<int32_t>(0x80004003u);  // E_POINTER
     *ppv = nullptr;
     if (!self_ptr || !riid) return kInvalidArg;
     auto* self = static_cast<ShimWinRtObject*>(self_ptr);
-    // Answer IUnknown, IInspectable, IActivationFactory, and the Xbox interface IID requested by the title
-    self->custom_iid = *static_cast<const WinRtGuid*>(riid);
-    self->refs.fetch_add(1, std::memory_order_relaxed);
-    *ppv = self;
-    return kSuccess;
+    if (WinRtGuidEquals(riid, kWinRtIUnknown) ||
+        WinRtGuidEquals(riid, kWinRtIInspectable) ||
+        WinRtGuidEquals(riid, kWinRtIAgileObject) ||
+        (self->is_factory && WinRtGuidEquals(riid, kWinRtIActivationFactory)) ||
+        (!IsZeroWinRtGuid(self->custom_iid) && WinRtGuidEquals(riid, self->custom_iid))) {
+        self->refs.fetch_add(1, std::memory_order_relaxed);
+        *ppv = self;
+        return kSuccess;
+    }
+    return static_cast<int32_t>(0x80004002u);  // E_NOINTERFACE
 }
 
 uint32_t SCARLETTX_XSAPI_CALL WinRt_AddRef(void* self_ptr) {
@@ -341,15 +493,25 @@ int32_t SCARLETTX_XSAPI_CALL WinRt_GetIids(void* self_ptr, uint32_t* iidCount, v
     *iids = nullptr;
     if (!self_ptr) return kInvalidArg;
     auto* self = static_cast<ShimWinRtObject*>(self_ptr);
-    const uint32_t count = self->is_factory ? 2u : 1u;
+    // WinRT spec: exclude IUnknown, IInspectable, and IAgileObject from GetIids.
+    WinRtGuid list[2]{};
+    uint32_t count = 0;
+    if (self->is_factory) {
+        list[count++] = kWinRtIActivationFactory;
+    }
+    if (!IsZeroWinRtGuid(self->custom_iid) && !IsBaseWinRtIid(self->custom_iid)) {
+        list[count++] = self->custom_iid;
+    }
+    if (count == 0) {
+        return kSuccess;
+    }
 #if defined(_WIN32)
     auto* mem = static_cast<WinRtGuid*>(CoTaskMemAlloc(sizeof(WinRtGuid) * count));
 #else
     auto* mem = static_cast<WinRtGuid*>(std::malloc(sizeof(WinRtGuid) * count));
 #endif
     if (!mem) return static_cast<int32_t>(0x8007000Eu);
-    mem[0] = kWinRtIInspectable;
-    if (count > 1) mem[1] = kWinRtIActivationFactory;
+    std::memcpy(mem, list, sizeof(WinRtGuid) * count);
     *iidCount = count;
     *iids = mem;
     return kSuccess;
@@ -359,8 +521,11 @@ int32_t SCARLETTX_XSAPI_CALL WinRt_GetRuntimeClassName(void* self_ptr, void** ou
     if (!outHString) return static_cast<int32_t>(0x80004003u);
     *outHString = nullptr;
     if (!self_ptr) return kInvalidArg;
-#if defined(_WIN32)
     auto* self = static_cast<ShimWinRtObject*>(self_ptr);
+    if (self->is_factory) {
+        return static_cast<int32_t>(0x8000000Eu);  // E_ILLEGAL_METHOD_CALL per WinRT IActivationFactory spec
+    }
+#if defined(_WIN32)
     static HMODULE combase = LoadLibraryW(L"combase.dll");
     if (combase) {
         using FnCreateStr = int32_t(WINAPI*)(const wchar_t*, uint32_t, void**);
@@ -387,28 +552,52 @@ int32_t SCARLETTX_XSAPI_CALL WinRt_ActivateInstance(void* self_ptr, void** insta
     *instance = nullptr;
     if (!self_ptr) return kInvalidArg;
     auto* self = static_cast<ShimWinRtObject*>(self_ptr);
+    if (!self->is_factory) {
+        return static_cast<int32_t>(0x80004001u);  // E_NOTIMPL
+    }
     auto* inst = new (std::nothrow) ShimWinRtObject();
     if (!inst) return static_cast<int32_t>(0x8007000Eu);
-    inst->vtbl = kShimWinRtVtbl;
+    inst->vtbl = kShimWinRtInstanceVtbl;
     inst->class_name = self->class_name;
-    inst->custom_iid = kWinRtIInspectable;
+    inst->custom_iid = WinRtGuid{};
     inst->is_factory = false;
     *instance = inst;
     return kSuccess;
 }
 
-int32_t SCARLETTX_XSAPI_CALL WinRt_SafeStubMethod(void* /*self_ptr*/, void** maybeOut) {
-    // Many WinRT property getters take (this, T* outValue) -> zero the pointer/value safely and return S_OK.
-    if (maybeOut) {
-        // Avoid writing to small integer scalars cast as pointers (< 0x10000)
-        if (reinterpret_cast<uintptr_t>(maybeOut) >= 0x10000u) {
-            *maybeOut = nullptr;
-        }
-    }
-    return kSuccess;
+int32_t SCARLETTX_XSAPI_CALL WinRt_UnimplementedMethod(void* /*self_ptr*/) {
+    // Never write to rdx ([in] arg 1); fail cleanly with E_NOTIMPL.
+    return static_cast<int32_t>(0x80004001u);
 }
 
-const void* const kShimWinRtVtbl[32] = {
+#define SHIM_WINRT_STUB_SLOTS_7_TO_31 \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod), \
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod)
+
+const void* const kShimWinRtFactoryVtbl[32] = {
     reinterpret_cast<const void*>(&WinRt_QueryInterface),       // 0 IUnknown::QueryInterface
     reinterpret_cast<const void*>(&WinRt_AddRef),               // 1 IUnknown::AddRef
     reinterpret_cast<const void*>(&WinRt_Release),              // 2 IUnknown::Release
@@ -416,32 +605,21 @@ const void* const kShimWinRtVtbl[32] = {
     reinterpret_cast<const void*>(&WinRt_GetRuntimeClassName),  // 4 IInspectable::GetRuntimeClassName
     reinterpret_cast<const void*>(&WinRt_GetTrustLevel),        // 5 IInspectable::GetTrustLevel
     reinterpret_cast<const void*>(&WinRt_ActivateInstance),     // 6 IActivationFactory::ActivateInstance
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 7
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 8
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 9
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 10
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 11
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 12
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 13
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 14
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 15
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 16
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 17
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 18
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 19
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 20
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 21
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 22
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 23
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 24
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 25
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 26
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 27
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 28
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 29
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 30
-    reinterpret_cast<const void*>(&WinRt_SafeStubMethod),       // 31
+    SHIM_WINRT_STUB_SLOTS_7_TO_31,
 };
+
+const void* const kShimWinRtInstanceVtbl[32] = {
+    reinterpret_cast<const void*>(&WinRt_QueryInterface),       // 0 IUnknown::QueryInterface
+    reinterpret_cast<const void*>(&WinRt_AddRef),               // 1 IUnknown::AddRef
+    reinterpret_cast<const void*>(&WinRt_Release),              // 2 IUnknown::Release
+    reinterpret_cast<const void*>(&WinRt_GetIids),              // 3 IInspectable::GetIids
+    reinterpret_cast<const void*>(&WinRt_GetRuntimeClassName),  // 4 IInspectable::GetRuntimeClassName
+    reinterpret_cast<const void*>(&WinRt_GetTrustLevel),        // 5 IInspectable::GetTrustLevel
+    reinterpret_cast<const void*>(&WinRt_UnimplementedMethod),  // 6 Non-factory slot 6 -> E_NOTIMPL
+    SHIM_WINRT_STUB_SLOTS_7_TO_31,
+};
+
+#undef SHIM_WINRT_STUB_SLOTS_7_TO_31
 
 }  // namespace
 
@@ -550,15 +728,57 @@ int32_t SCARLETTX_XSAPI_CALL XblWinRtActivateClassByName(
     *outInspectable = nullptr;
     if (!runtimeClassName || !*runtimeClassName) return kInvalidArg;
     if (!IsXboxGameCoreRuntimeClass(runtimeClassName)) {
+#if defined(_WIN32)
+        // GuestRoActivateInstance passes (cls, nullptr, 0, out) and GuestRoGetActivationFactory
+        // passes (cls, iid, 1, out); both receive REGDB_E_CLASSNOTREG so combase.dll handles
+        // Windows.Gaming.Input.* natively. If a synthetic caller (e.g. ue5_slice) directly calls
+        // XblWinRtActivateClassByName(L"Windows.Gaming.Input.*", &IID_IInspectable, 0, out),
+        // forward directly to combase.dll's native RoGetActivationFactory!
+        if (isFactory == 0 && riid != nullptr &&
+            std::wcsncmp(runtimeClassName, L"Windows.Gaming.Input.", 21) == 0) {
+            static HMODULE combase = LoadLibraryW(L"combase.dll");
+            if (combase) {
+                using FnRoInit = int32_t(WINAPI*)(int32_t);
+                using FnCreateStr = int32_t(WINAPI*)(const wchar_t*, uint32_t, void**);
+                using FnDeleteStr = int32_t(WINAPI*)(void*);
+                using FnGetFac = int32_t(WINAPI*)(void*, const void*, void**);
+                auto ro_init = reinterpret_cast<FnRoInit>(reinterpret_cast<void*>(
+                    GetProcAddress(combase, "RoInitialize")));
+                auto create_str = reinterpret_cast<FnCreateStr>(reinterpret_cast<void*>(
+                    GetProcAddress(combase, "WindowsCreateString")));
+                auto delete_str = reinterpret_cast<FnDeleteStr>(reinterpret_cast<void*>(
+                    GetProcAddress(combase, "WindowsDeleteString")));
+                auto get_fac = reinterpret_cast<FnGetFac>(reinterpret_cast<void*>(
+                    GetProcAddress(combase, "RoGetActivationFactory")));
+                if (ro_init) (void)ro_init(1 /* RO_INIT_MULTITHREADED */);
+                if (create_str && delete_str && get_fac) {
+                    void* hstr = nullptr;
+                    if (create_str(runtimeClassName, static_cast<uint32_t>(std::wcslen(runtimeClassName)), &hstr) == 0 &&
+                        hstr) {
+                        const int32_t hr = get_fac(hstr, riid, outInspectable);
+                        delete_str(hstr);
+                        if (hr == 0 && *outInspectable) {
+                            return kSuccess;
+                        }
+                    }
+                }
+            }
+        }
+#endif
         return static_cast<int32_t>(0x80040154u);  // REGDB_E_CLASSNOTREG -> caller falls back to combase.dll
     }
     auto* obj = new (std::nothrow) ShimWinRtObject();
     if (!obj) return static_cast<int32_t>(0x8007000Eu);
-    obj->vtbl = kShimWinRtVtbl;
-    obj->class_name = runtimeClassName;
-    obj->custom_iid = riid ? *static_cast<const WinRtGuid*>(riid)
-                           : (isFactory ? kWinRtIActivationFactory : kWinRtIInspectable);
     obj->is_factory = (isFactory != 0);
+    obj->vtbl = obj->is_factory ? kShimWinRtFactoryVtbl : kShimWinRtInstanceVtbl;
+    obj->class_name = runtimeClassName;
+    if (riid && !IsBaseWinRtIid(*static_cast<const WinRtGuid*>(riid))) {
+        obj->custom_iid = *static_cast<const WinRtGuid*>(riid);
+    } else if (obj->is_factory) {
+        obj->custom_iid = SynthesizeStaticsIidForClass(runtimeClassName);
+    } else {
+        obj->custom_iid = WinRtGuid{};
+    }
     *outInspectable = obj;
     return kSuccess;
 }

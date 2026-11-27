@@ -1,11 +1,16 @@
 #include "scarlettx/runtime/emulator.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <vector>
 
+#include "scarlettx/core/flight_recorder.h"
 #include "scarlettx/loader/package_vfs.h"
 #include "scarlettx/loader/pe_mapper.h"
 #include "scarlettx/loader/xvd_container.h"
@@ -19,67 +24,245 @@ namespace scarlettx {
 
 namespace {
 
+constexpr uint64_t kStreamChunkBytes = 4ull * 1024ull * 1024ull;  // 4 MiB streaming buffer
+
+std::atomic<uint64_t> g_temp_seq{0};
+
+uint64_t CurrentProcessIdPortable() {
+#if defined(_WIN32)
+    return static_cast<uint64_t>(GetCurrentProcessId());
+#else
+    return 0;
+#endif
+}
+
+std::string ToLowerAscii(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+std::string NormalizeEmbeddedRelPath(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    size_t i = 0;
+    while (i < raw.size()) {
+        while (i < raw.size() && (raw[i] == '/' || raw[i] == '\\')) {
+            ++i;
+        }
+        const size_t start = i;
+        while (i < raw.size() && raw[i] != '/' && raw[i] != '\\') {
+            ++i;
+        }
+        if (i == start) {
+            break;
+        }
+        const std::string part = raw.substr(start, i - start);
+        if (part == ".") {
+            continue;
+        }
+        if (!out.empty()) {
+            out.push_back('/');
+        }
+        out += ToLowerAscii(part);
+    }
+    return out;
+}
+
+bool SplitSafeStagingParts(const std::string& raw, std::vector<std::string>& out_parts) {
+    out_parts.clear();
+    size_t i = 0;
+    while (i < raw.size()) {
+        while (i < raw.size() && (raw[i] == '/' || raw[i] == '\\')) {
+            ++i;
+        }
+        const size_t start = i;
+        while (i < raw.size() && raw[i] != '/' && raw[i] != '\\') {
+            ++i;
+        }
+        if (i == start) {
+            break;
+        }
+        const std::string part = raw.substr(start, i - start);
+        if (part == "." || part == "..") {
+            return false;
+        }
+        for (unsigned char ch : part) {
+            if (ch < 0x20u || ch == ':' || ch == '*' || ch == '?' || ch == '"' ||
+                ch == '<' || ch == '>' || ch == '|') {
+                return false;
+            }
+        }
+        out_parts.push_back(part);
+    }
+    return !out_parts.empty();
+}
+
 bool IsXvdContainerFile(const std::string& path_str) {
     std::error_code ec;
     const std::filesystem::path p(path_str);
     if (!std::filesystem::is_regular_file(p, ec)) return false;
-    std::string ext = p.extension().string();
-    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return ext == ".xvc" || ext == ".xvd";
+    const std::string ext = ToLowerAscii(p.extension().string());
+    return ext == ".xvc" || ext == ".xvd" || ext == ".msixvc";
 }
 
-Status StageXvdPackageIfNeeded(
-    const std::string& package_or_xvc,
-    const std::string& volume_key,
-    std::string& out_resolved_dir) {
+std::string ResolveEffectiveVolumeKey(const std::string& configured_key) {
+    if (!configured_key.empty()) {
+        return configured_key;
+    }
+    if (const char* env_key = std::getenv("SCARLETTX_VOLUME_KEY"); env_key && *env_key) {
+        return env_key;
+    }
+    return {};
+}
+
+Status OpenXvdWithVolumeKey(const std::string& container_path,
+                            const std::string& configured_key,
+                            XvdContainer& out_xvd) {
+    Status st = out_xvd.OpenFile(container_path);
+    if (!st.ok()) {
+        return st;
+    }
+    const std::string effective_key = ResolveEffectiveVolumeKey(configured_key);
+    if (!effective_key.empty()) {
+        std::error_code ec;
+        st = std::filesystem::exists(effective_key, ec)
+                 ? out_xvd.LoadVolumeKeyFile(effective_key)
+                 : out_xvd.SetVolumeKeyHex(effective_key);
+        if (!st.ok()) {
+            return st;
+        }
+    }
+    if (out_xvd.Header().is_encrypted && !out_xvd.HasVolumeKey()) {
+        return Status::Error(
+            StatusCode::NotImplemented,
+            "Encrypted XVC/XVD container requires --volume-key <hex|file>: " + container_path);
+    }
+    return Status::Ok();
+}
+
+Status StreamXvdEmbeddedToFile(const XvdContainer& xvd,
+                               const XvdEmbeddedFile& entry,
+                               const std::filesystem::path& dst_file) {
+    std::ofstream ofs(dst_file, std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+        return Status::Error(StatusCode::IoError,
+                             "Failed to open output file for XVD streaming: " + dst_file.string());
+    }
+    std::vector<uint8_t> chunk;
+    uint64_t remaining = entry.size_bytes;
+    uint64_t cur_offset = 0;
+    while (remaining > 0) {
+        const uint64_t to_read = std::min<uint64_t>(remaining, kStreamChunkBytes);
+        Status st = xvd.ReadEmbeddedFile(entry.relative_path, cur_offset, to_read, chunk);
+        if (!st.ok()) {
+            st = xvd.ReadUserData(entry.user_data_offset + cur_offset, to_read, chunk);
+            if (!st.ok()) return st;
+        }
+        ofs.write(reinterpret_cast<const char*>(chunk.data()),
+                  static_cast<std::streamsize>(chunk.size()));
+        if (!ofs) {
+            return Status::Error(StatusCode::IoError,
+                                 "Failed writing streamed XVD chunk to: " + dst_file.string());
+        }
+        cur_offset += to_read;
+        remaining -= to_read;
+    }
+    return Status::Ok();
+}
+
+struct ScopedTempFile {
+    std::filesystem::path path;
+    ~ScopedTempFile() {
+        if (!path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+};
+
+struct ScopedTempDir {
+    std::filesystem::path path;
+    ~ScopedTempDir() {
+        if (!path.empty()) {
+            PackageVfs::Global().Reset();
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    }
+};
+
+Status StageXvdPackageChunked(const std::string& package_or_xvc,
+                              const std::string& volume_key,
+                              ScopedTempDir& out_stage_guard,
+                              std::string& out_resolved_dir) {
     if (!IsXvdContainerFile(package_or_xvc)) {
         out_resolved_dir = package_or_xvc;
         return Status::Ok();
     }
 
     XvdContainer xvd;
-    Status st = xvd.OpenFile(package_or_xvc);
-    if (!st.ok()) return st;
+    Status st = OpenXvdWithVolumeKey(package_or_xvc, volume_key, xvd);
+    if (!st.ok()) {
+        return st;
+    }
 
-    std::string effective_key = volume_key;
-    if (effective_key.empty()) {
-        if (const char* env_key = std::getenv("SCARLETTX_VOLUME_KEY"); env_key && *env_key) {
-            effective_key = env_key;
-        }
-    }
-    if (!effective_key.empty()) {
-        st = std::filesystem::exists(effective_key)
-                 ? xvd.LoadVolumeKeyFile(effective_key)
-                 : xvd.SetVolumeKeyHex(effective_key);
-        if (!st.ok()) return st;
-    }
-    if (xvd.Header().is_encrypted && !xvd.HasVolumeKey()) {
-        return Status::Error(
-            StatusCode::NotImplemented,
-            "Encrypted XVC/XVD container requires --volume-key <hex|file>: " + package_or_xvc);
+    std::vector<XvdEmbeddedFile> entries;
+    st = xvd.ListEmbeddedFiles(entries);
+    if (!st.ok()) {
+        return st;
     }
 
     char cid_hex[33] = {};
     for (size_t i = 0; i < 16; ++i) {
         std::snprintf(cid_hex + i * 2, 3, "%02x", xvd.Header().content_id[i]);
     }
+    std::error_code ec;
     const std::filesystem::path stage_dir =
-        std::filesystem::temp_directory_path() /
-        ("scarlettx_xvc_" + std::filesystem::path(package_or_xvc).stem().string() + "_" + cid_hex);
+        std::filesystem::temp_directory_path(ec) /
+        ("scarlettx_stage_" + std::to_string(CurrentProcessIdPortable()) + "_" +
+         std::to_string(g_temp_seq.fetch_add(1)) + "_" + cid_hex);
 
-    st = xvd.ExtractEmbeddedFilesystem(stage_dir.string());
-    if (!st.ok()) {
-        return st;
+    std::filesystem::create_directories(stage_dir, ec);
+    if (ec) {
+        return Status::Error(StatusCode::IoError,
+                             "Failed to create scoped XVC staging directory: " + stage_dir.string());
     }
+    out_stage_guard.path = stage_dir;
+
+    for (const auto& entry : entries) {
+        std::vector<std::string> parts;
+        if (!SplitSafeStagingParts(entry.relative_path, parts)) {
+            return Status::Error(StatusCode::ParseError,
+                                 "Unsafe relative path in embedded XVC filesystem: " +
+                                     entry.relative_path);
+        }
+        std::filesystem::path full_path = stage_dir;
+        for (const auto& part : parts) {
+            full_path /= part;
+        }
+        if (entry.is_directory) {
+            std::filesystem::create_directories(full_path, ec);
+            continue;
+        }
+        std::filesystem::create_directories(full_path.parent_path(), ec);
+        st = StreamXvdEmbeddedToFile(xvd, entry, full_path);
+        if (!st.ok()) {
+            return st;
+        }
+    }
+
     out_resolved_dir = stage_dir.string();
     return Status::Ok();
 }
 
 std::string FindGameConfigInDir(const std::string& package_dir) {
     const std::filesystem::path dir(package_dir);
+    std::error_code ec;
     for (const char* candidate : {"MicrosoftGame.Config", "MicrosoftGame.config"}) {
         const auto p = dir / candidate;
-        if (std::filesystem::exists(p)) {
+        if (std::filesystem::exists(p, ec)) {
             return p.string();
         }
     }
@@ -93,15 +276,93 @@ Emulator::Emulator(EmulatorConfig config) : config_(std::move(config)) {}
 Status Emulator::InspectPackage(const std::string& package_dir,
                                 PackageInspectionReport& out_report) const {
     out_report = PackageInspectionReport{};
-    std::string resolved_dir;
-    Status stage_st = StageXvdPackageIfNeeded(package_dir, config_.volume_key, resolved_dir);
-    if (!stage_st.ok()) {
-        return stage_st;
+
+    if (IsXvdContainerFile(package_dir)) {
+        XvdContainer xvd;
+        Status st = OpenXvdWithVolumeKey(package_dir, config_.volume_key, xvd);
+        if (!st.ok()) {
+            return st;
+        }
+
+        std::vector<XvdEmbeddedFile> files;
+        st = xvd.ListEmbeddedFiles(files);
+        if (!st.ok()) {
+            return st;
+        }
+
+        const XvdEmbeddedFile* cfg_entry = nullptr;
+        for (const auto& entry : files) {
+            if (!entry.is_directory &&
+                NormalizeEmbeddedRelPath(entry.relative_path) == "microsoftgame.config") {
+                cfg_entry = &entry;
+                break;
+            }
+        }
+        if (!cfg_entry) {
+            return Status::Error(StatusCode::NotFound,
+                                 "MicrosoftGame.Config not found in XVC/XVD container: " +
+                                     package_dir);
+        }
+
+        if (cfg_entry->size_bytes > 16ull * 1024ull * 1024ull) {
+            return Status::Error(StatusCode::ParseError,
+                                 "MicrosoftGame.Config exceeds 16 MiB sanity limit");
+        }
+        std::vector<uint8_t> cfg_bytes;
+        st = xvd.ReadEmbeddedFile(cfg_entry->relative_path, cfg_bytes);
+        if (!st.ok()) {
+            st = xvd.ReadUserData(cfg_entry->user_data_offset, cfg_entry->size_bytes, cfg_bytes);
+            if (!st.ok()) return st;
+        }
+        const std::string xml_str(reinterpret_cast<const char*>(cfg_bytes.data()), cfg_bytes.size());
+        st = ParseGameConfigXml(xml_str, out_report.config);
+        if (!st.ok()) {
+            return st;
+        }
+        out_report.config.source_path = package_dir + ":" + cfg_entry->relative_path;
+
+        const GameExecutableEntry* exe = out_report.config.PrimaryExecutable();
+        if (!exe) {
+            return Status::Error(StatusCode::ParseError,
+                                 "No primary executable in MicrosoftGame.Config");
+        }
+
+        const std::string wanted_exe = NormalizeEmbeddedRelPath(exe->name);
+        const XvdEmbeddedFile* exe_entry = nullptr;
+        for (const auto& entry : files) {
+            if (!entry.is_directory && NormalizeEmbeddedRelPath(entry.relative_path) == wanted_exe) {
+                exe_entry = &entry;
+                break;
+            }
+        }
+        if (!exe_entry) {
+            return Status::Error(StatusCode::NotFound,
+                                 "Package executable missing in XVC/XVD container: " + exe->name);
+        }
+
+        std::error_code ec;
+        ScopedTempFile temp_exe{
+            std::filesystem::temp_directory_path(ec) /
+            ("scarlettx_inspect_exe_" + std::to_string(CurrentProcessIdPortable()) + "_" +
+             std::to_string(g_temp_seq.fetch_add(1)) + ".pe")};
+        st = StreamXvdEmbeddedToFile(xvd, *exe_entry, temp_exe.path);
+        if (!st.ok()) {
+            return st;
+        }
+
+        st = InspectPeFile(temp_exe.path.string(), redirects_, out_report.main_pe);
+        if (!st.ok()) {
+            return st;
+        }
+        out_report.executable_path = exe_entry->relative_path;
+        out_report.main_pe.file_path = out_report.executable_path;
+        return Status::Ok();
     }
-    const std::string cfg_path = FindGameConfigInDir(resolved_dir);
+
+    const std::string cfg_path = FindGameConfigInDir(package_dir);
     if (cfg_path.empty()) {
         return Status::Error(StatusCode::NotFound,
-                             "MicrosoftGame.Config not found in package directory: " + resolved_dir);
+                             "MicrosoftGame.Config not found in package directory: " + package_dir);
     }
 
     Status st = LoadGameConfigFile(cfg_path, out_report.config);
@@ -114,8 +375,9 @@ Status Emulator::InspectPackage(const std::string& package_dir,
         return Status::Error(StatusCode::ParseError, "No primary executable in MicrosoftGame.Config");
     }
 
-    const std::filesystem::path exe_path = std::filesystem::path(resolved_dir) / exe->name;
-    if (!std::filesystem::exists(exe_path)) {
+    const std::filesystem::path exe_path = std::filesystem::path(package_dir) / exe->name;
+    std::error_code ec;
+    if (!std::filesystem::exists(exe_path, ec)) {
         return Status::Error(StatusCode::NotFound, "Package executable missing: " + exe_path.string());
     }
     out_report.executable_path = exe_path.string();
@@ -124,8 +386,10 @@ Status Emulator::InspectPackage(const std::string& package_dir,
 }
 
 Status Emulator::BootPackage(const std::string& package_input) {
+    ScopedTempDir stage_guard;
     std::string package_dir;
-    Status stage_st = StageXvdPackageIfNeeded(package_input, config_.volume_key, package_dir);
+    Status stage_st =
+        StageXvdPackageChunked(package_input, config_.volume_key, stage_guard, package_dir);
     if (!stage_st.ok()) {
         return stage_st;
     }
@@ -171,27 +435,80 @@ Status Emulator::BootPackage(const std::string& package_input) {
     set_env("SCARLETTX_TRACE", config_.trace ? "1" : "0");
     set_env("SCARLETTX_STATS", config_.stats ? "1" : "0");
     set_env("SCARLETTX_FCAP", std::to_string(config_.fps_cap).c_str());
+    if (config_.lockhart_mode || config_.emulated_device == DeviceType::XboxScarlettLockhart) {
+        set_env("SCARLETTX_LOCKHART", "1");
+    }
+    if (config_.enable_debug_layer) {
+        set_env("SCARLETTX_DEBUG_LAYER", "1");
+    }
     if (!report.config.title_id.empty()) {
         set_env("SCARLETTX_TITLE_ID", report.config.title_id.c_str());
     }
     const std::string abs_pkg_dir = std::filesystem::absolute(package_dir).string();
     set_env("SCARLETTX_PACKAGE_ROOT", abs_pkg_dir.c_str());
 
-    if (!config_.volume_key.empty()) {
-        set_env("SCARLETTX_VOLUME_KEY", config_.volume_key.c_str());
+    const char* env_fr = std::getenv("SCARLETTX_FLIGHT_RECORDER");
+    const bool flight_active = config_.flight_recorder || (env_fr && env_fr[0] != '\0' && env_fr[0] != '0');
+    std::string abs_flight_dir;
+    uint32_t hang_timeout_ms = config_.hang_timeout_sec * 1000u;
+    if (flight_active) {
+        const char* env_fr_dir = std::getenv("SCARLETTX_FLIGHT_RECORDER_DIR");
+        const std::string raw_dir = !config_.flight_recorder_dir.empty()
+            ? config_.flight_recorder_dir
+            : ((env_fr_dir && *env_fr_dir) ? std::string(env_fr_dir) : std::string("flight_logs"));
+        abs_flight_dir = std::filesystem::absolute(raw_dir).string();
+        if (const char* env_hang_ms = std::getenv("SCARLETTX_HANG_TIMEOUT_MS"); env_hang_ms && *env_hang_ms) {
+            hang_timeout_ms = static_cast<uint32_t>(std::strtoul(env_hang_ms, nullptr, 10));
+        }
+        set_env("SCARLETTX_FLIGHT_RECORDER", "1");
+        set_env("SCARLETTX_FLIGHT_RECORDER_DIR", abs_flight_dir.c_str());
+        set_env("SCARLETTX_HANG_TIMEOUT_MS", std::to_string(hang_timeout_ms).c_str());
     }
 
-    // Mount package directory and any embedded .xvd / .xvc containers into VFS.
-    PackageVfs pkg_vfs;
+    struct FlightRecorderSessionGuard {
+        bool active = false;
+        void Flush() {
+            if (!active) return;
+            active = false;
+            FlightRecorder::Instance().BeatProgress("shutdown");
+            std::string json_out;
+            if (FlightRecorder::Instance().WriteSummaryReport(&json_out, nullptr)) {
+                std::cout << "[ScarlettX][FlightRecorder] Summary written to " << json_out << "\n";
+            }
+            FlightRecorder::Instance().Disable();
+        }
+        ~FlightRecorderSessionGuard() {
+            Flush();
+        }
+    } flight_guard;
+
+    if (flight_active && config_.in_process) {
+        FlightRecorderOptions fropts;
+        fropts.output_dir = abs_flight_dir;
+        fropts.hang_timeout_ms = hang_timeout_ms;
+        fropts.install_veh = true;
+        fropts.enable_dred = true;
+        fropts.dump_failing_shaders = true;
+        FlightRecorder::Instance().Enable(fropts);
+        flight_guard.active = true;
+    }
+
+    const std::string effective_key = ResolveEffectiveVolumeKey(config_.volume_key);
+    if (!effective_key.empty()) {
+        set_env("SCARLETTX_VOLUME_KEY", effective_key.c_str());
+    }
+
+    // Mount package directory and any embedded .xvd / .xvc containers into the process-wide VFS.
+    PackageVfs& pkg_vfs = PackageVfs::Global();
+    pkg_vfs.Reset();
     (void)pkg_vfs.MountDirectory("G:", abs_pkg_dir);
     std::error_code dir_ec;
     for (const auto& entry : std::filesystem::directory_iterator(abs_pkg_dir, dir_ec)) {
         if (!entry.is_regular_file(dir_ec)) continue;
-        std::string ext = entry.path().extension().string();
-        for (char& ch : ext) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        const std::string ext = ToLowerAscii(entry.path().extension().string());
         if (ext == ".xvd" || ext == ".xvc") {
             const std::string vpath = "G:\\" + entry.path().filename().string();
-            Status xvd_st = pkg_vfs.MountXvd(vpath, entry.path().string(), config_.volume_key);
+            Status xvd_st = pkg_vfs.MountXvd(vpath, entry.path().string(), effective_key);
             if (!xvd_st.ok()) {
                 return xvd_st;
             }
@@ -200,14 +517,21 @@ Status Emulator::BootPackage(const std::string& package_input) {
     }
 
     // Real Xbox Series X|S titles (e.g. Unity Game Core nativePlugins.txt) reference G:/.
-    // The mapping is skipped when G: is already assigned on the host.
+    // The mapping is skipped when G: is already assigned on the host; only unmap if we mapped it.
     struct VirtualDriveGuard {
-        ~VirtualDriveGuard() { vfs::UnmapPackageDrive(); }
+        bool mapped = false;
+        ~VirtualDriveGuard() {
+            if (mapped) {
+                vfs::UnmapPackageDrive();
+            }
+        }
     } g_drive_guard;
     const bool drive_mapped = vfs::MapPackageDrive('G', abs_pkg_dir);
+    g_drive_guard.mapped = drive_mapped;
     if (drive_mapped) {
         std::cout << "[ScarlettX][vfs] Mapped virtual G:\\ -> " << abs_pkg_dir << "\n";
     }
+    FlightRecorder::Instance().BeatProgress("vfs_mounted");
 
     if (config_.max_frames > 0) {
         set_env("SCARLETTX_MAX_FRAMES", std::to_string(config_.max_frames).c_str());
@@ -222,6 +546,27 @@ Status Emulator::BootPackage(const std::string& package_input) {
     }
 
     if (config_.in_process) {
+        struct CurrentDirectoryGuard {
+            std::wstring saved;
+            bool active = false;
+            void Capture() {
+                const DWORD needed = GetCurrentDirectoryW(0, nullptr);
+                if (needed > 1) {
+                    saved.assign(needed, L'\0');
+                    const DWORD got = GetCurrentDirectoryW(needed, saved.data());
+                    if (got > 0 && got < needed) {
+                        saved.resize(got);
+                        active = true;
+                    }
+                }
+            }
+            ~CurrentDirectoryGuard() {
+                if (active) {
+                    SetCurrentDirectoryW(saved.c_str());
+                }
+            }
+        } cwd_guard;
+
         MappedPeImage image;
         HleSymbolRegistry hle_registry;
         PeMapOptions map_opts;
@@ -233,6 +578,7 @@ Status Emulator::BootPackage(const std::string& package_input) {
         if (!map_st.ok()) {
             return map_st;
         }
+        FlightRecorder::Instance().BeatProgress("pe_mapped");
         std::cout << "[ScarlettX][loader] Mapped " << report.executable_path << " at 0x"
                   << std::hex << image.MappedBase() << std::dec
                   << " (relocated=" << (image.WasRelocated() ? "yes" : "no")
@@ -255,16 +601,21 @@ Status Emulator::BootPackage(const std::string& package_input) {
 
         int exit_code = 0;
         Status call_st = Status::Ok();
+        FlightRecorder::Instance().BeatProgress("entering_guest");
         if (image.GetExportAddress(config_.in_process_entry) != nullptr) {
             call_st = image.CallExportedEntry(config_.in_process_entry, exit_code);
         } else {
             set_env("SCARLETTX_REAL_TITLE", "1");
             // A title's relative paths start at its package root, as on the console.
+            cwd_guard.Capture();
             SetCurrentDirectoryA(drive_mapped ? "G:\\" : abs_pkg_dir.c_str());
             std::cout << "[ScarlettX][loader] Entering native PE entry point at "
                       << image.EntryPointAddress() << std::endl;
             call_st = image.CallEntryPoint(exit_code);
         }
+        FlightRecorder::Instance().BeatProgress("guest_exited");
+        // Flush summary BEFORE MappedPeImage::Unmap() runs so guest caller RVAs resolve cleanly!
+        flight_guard.Flush();
         if (!call_st.ok()) {
             return call_st;
         }
@@ -294,7 +645,8 @@ Status Emulator::BootPackage(const std::string& package_input) {
         const std::string new_path = shim_dir + ";" + original_path;
         SetEnvironmentVariableA("PATH", new_path.c_str());
     }
-    if (std::filesystem::exists(std::filesystem::path(work_dir) / "xgameruntime.dll")) {
+    std::error_code xgr_ec;
+    if (std::filesystem::exists(std::filesystem::path(work_dir) / "xgameruntime.dll", xgr_ec)) {
         std::cerr << "[ScarlettX][loader] Warning: Local xgameruntime.dll in title folder overrides SetDllDirectory/PATH in --separate-process mode; use default --in-process mode to force HLE shims.\n";
     }
     const BOOL created = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,

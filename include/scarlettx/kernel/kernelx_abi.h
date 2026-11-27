@@ -63,6 +63,15 @@ SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXMapVirtualToGpu(
 SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXMapGpuToVirtual(
     uint64_t gpuAddress, void** outVirtualAddress);
 
+// Registers or unregisters an externally-owned host virtual range (e.g. from
+// XMemVirtualAlloc or d3d12_xs) in the unified CPU/GPU VA directory without
+// transferring OS memory ownership to KernelXFreeMemory.
+SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXRegisterExternalAllocation(
+    void* virtualAddress, uint64_t size, uint64_t* outGpuAddress);
+
+SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXUnregisterExternalAllocation(
+    void* virtualAddress);
+
 // Creates a hardware-aliased virtual address view backed by the same physical
 // pages as an existing KernelX allocation (via VirtualAlloc2 + MapViewOfFile3).
 SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXCreateMemoryAlias(

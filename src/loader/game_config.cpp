@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <string_view>
@@ -29,6 +30,81 @@ std::string Trim(const std::string& s) {
         --end;
     }
     return s.substr(start, end - start);
+}
+
+void AppendUtf8CodePoint(std::string& out, uint32_t cp) {
+    if (cp <= 0x7Fu) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FFu) {
+        out.push_back(static_cast<char>(0xC0u | ((cp >> 6) & 0x1Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+        out.push_back(static_cast<char>(0xE0u | ((cp >> 12) & 0x0Fu)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0x10FFFFu) {
+        out.push_back(static_cast<char>(0xF0u | ((cp >> 18) & 0x07u)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+}
+
+std::string DecodeUtf16ToUtf8(const std::string& raw, size_t byte_offset, bool big_endian) {
+    std::string out;
+    out.reserve(raw.size() / 2);
+    size_t i = byte_offset;
+    auto read_u16 = [&](size_t off) -> uint16_t {
+        const uint8_t b0 = static_cast<uint8_t>(raw[off]);
+        const uint8_t b1 = static_cast<uint8_t>(raw[off + 1]);
+        return big_endian ? static_cast<uint16_t>((static_cast<uint16_t>(b0) << 8) | b1)
+                          : static_cast<uint16_t>(b0 | (static_cast<uint16_t>(b1) << 8));
+    };
+    while (i + 1 < raw.size()) {
+        const uint16_t w1 = read_u16(i);
+        i += 2;
+        if (w1 >= 0xD800u && w1 <= 0xDBFFu && i + 1 < raw.size()) {
+            const uint16_t w2 = read_u16(i);
+            if (w2 >= 0xDC00u && w2 <= 0xDFFFu) {
+                i += 2;
+                const uint32_t cp =
+                    0x10000u + ((static_cast<uint32_t>(w1 - 0xD800u) << 10) |
+                                static_cast<uint32_t>(w2 - 0xDC00u));
+                AppendUtf8CodePoint(out, cp);
+                continue;
+            }
+        }
+        AppendUtf8CodePoint(out, w1);
+    }
+    return out;
+}
+
+std::string PreprocessXml(const std::string& raw) {
+    std::string s;
+    if (raw.size() >= 2 && static_cast<uint8_t>(raw[0]) == 0xFFu &&
+        static_cast<uint8_t>(raw[1]) == 0xFEu) {
+        s = DecodeUtf16ToUtf8(raw, 2, false);
+    } else if (raw.size() >= 2 && static_cast<uint8_t>(raw[0]) == 0xFEu &&
+               static_cast<uint8_t>(raw[1]) == 0xFFu) {
+        s = DecodeUtf16ToUtf8(raw, 2, true);
+    } else if (raw.size() >= 3 && static_cast<uint8_t>(raw[0]) == 0xEFu &&
+               static_cast<uint8_t>(raw[1]) == 0xBBu &&
+               static_cast<uint8_t>(raw[2]) == 0xBFu) {
+        s = raw.substr(3);
+    } else {
+        s = raw;
+    }
+
+    size_t comment = 0;
+    while ((comment = s.find("<!--", comment)) != std::string::npos) {
+        const size_t close = s.find("-->", comment + 4);
+        if (close == std::string::npos) {
+            s.erase(comment);
+            break;
+        }
+        s.erase(comment, (close + 3) - comment);
+    }
+    return s;
 }
 
 constexpr std::string_view kXmlWhitespace = " \t\r\n";
@@ -87,25 +163,6 @@ bool ExtractAttribute(std::string_view tag, std::string_view attr_name, std::str
     return false;
 }
 
-bool ExtractElementText(const std::string& xml, const std::string& element, std::string& out_text) {
-    const std::string open_prefix = "<" + element;
-    size_t start = xml.find(open_prefix);
-    if (start == std::string::npos) {
-        return false;
-    }
-    size_t gt = xml.find('>', start);
-    if (gt == std::string::npos) {
-        return false;
-    }
-    const std::string close_tag = "</" + element + ">";
-    size_t close = xml.find(close_tag, gt + 1);
-    if (close == std::string::npos) {
-        return false;
-    }
-    out_text = Trim(xml.substr(gt + 1, close - (gt + 1)));
-    return true;
-}
-
 size_t FindTagEnd(const std::string& xml, size_t pos) {
     while ((pos = xml.find_first_of(">\"'", pos)) != std::string::npos) {
         if (xml[pos] == '>') {
@@ -120,12 +177,18 @@ size_t FindTagEnd(const std::string& xml, size_t pos) {
     return std::string::npos;
 }
 
-bool ExtractTagBlock(const std::string& xml, const std::string& element, std::string& out_tag, size_t search_from = 0, size_t* out_next = nullptr) {
+bool ExtractTagBlock(const std::string& xml,
+                     const std::string& element,
+                     std::string& out_tag,
+                     size_t search_from = 0,
+                     size_t* out_next = nullptr) {
     const std::string open_prefix = "<" + element;
     size_t pos = xml.find(open_prefix, search_from);
     while (pos != std::string::npos) {
         const size_t after = pos + open_prefix.size();
-        if (after < xml.size() && (std::isspace(static_cast<unsigned char>(xml[after])) || xml[after] == '>' || xml[after] == '/')) {
+        if (after < xml.size() &&
+            (std::isspace(static_cast<unsigned char>(xml[after])) ||
+             xml[after] == '>' || xml[after] == '/')) {
             const size_t gt = FindTagEnd(xml, after);
             if (gt == std::string::npos) {
                 return false;
@@ -141,12 +204,50 @@ bool ExtractTagBlock(const std::string& xml, const std::string& element, std::st
     return false;
 }
 
+bool ExtractElementText(const std::string& xml, const std::string& element, std::string& out_text) {
+    size_t cursor = 0;
+    std::string open_tag;
+    while (ExtractTagBlock(xml, element, open_tag, cursor, &cursor)) {
+        if (open_tag.size() >= 2 && open_tag[open_tag.size() - 2] == '/') {
+            out_text.clear();
+            return true;
+        }
+        const std::string close_prefix = "</" + element;
+        size_t close = xml.find(close_prefix, cursor);
+        while (close != std::string::npos) {
+            const size_t after = close + close_prefix.size();
+            if (after < xml.size() &&
+                (xml[after] == '>' || std::isspace(static_cast<unsigned char>(xml[after])))) {
+                out_text = DecodeAttributeValue(Trim(xml.substr(cursor, close - cursor)));
+                return true;
+            }
+            close = xml.find(close_prefix, after);
+        }
+        return false;
+    }
+    return false;
+}
+
 }  // namespace
 
 const GameExecutableEntry* GameConfig::PrimaryExecutable() const noexcept {
+    const GameExecutableEntry* dev_gen9 = nullptr;
     for (const auto& exe : executables) {
         const std::string tdf = ToLower(exe.target_device_family);
         if (tdf == "xboxgen9" || tdf == "scarlett") {
+            if (!exe.is_dev_only) {
+                return &exe;
+            }
+            if (!dev_gen9) {
+                dev_gen9 = &exe;
+            }
+        }
+    }
+    if (dev_gen9) {
+        return dev_gen9;
+    }
+    for (const auto& exe : executables) {
+        if (!exe.is_dev_only) {
             return &exe;
         }
     }
@@ -158,32 +259,32 @@ const GameExecutableEntry* GameConfig::PrimaryExecutable() const noexcept {
 
 Status ParseGameConfigXml(const std::string& xml_content, GameConfig& out_config) {
     out_config = GameConfig{};
-    if (xml_content.find("<Game") == std::string::npos) {
-        return Status::Error(StatusCode::ParseError, "Missing <Game> root element in MicrosoftGame.Config");
-    }
+    const std::string clean_xml = PreprocessXml(xml_content);
 
     std::string game_tag;
-    if (ExtractTagBlock(xml_content, "Game", game_tag)) {
-        ExtractAttribute(game_tag, "configVersion", out_config.config_version);
+    if (!ExtractTagBlock(clean_xml, "Game", game_tag)) {
+        return Status::Error(StatusCode::ParseError,
+                             "Missing <Game> root element in MicrosoftGame.Config");
     }
+    ExtractAttribute(game_tag, "configVersion", out_config.config_version);
 
     std::string identity_tag;
-    if (ExtractTagBlock(xml_content, "Identity", identity_tag)) {
+    if (ExtractTagBlock(clean_xml, "Identity", identity_tag)) {
         ExtractAttribute(identity_tag, "Name", out_config.identity_name);
         ExtractAttribute(identity_tag, "Publisher", out_config.publisher);
         ExtractAttribute(identity_tag, "Version", out_config.version);
     }
 
-    ExtractElementText(xml_content, "TitleId", out_config.title_id);
+    ExtractElementText(clean_xml, "TitleId", out_config.title_id);
 
     std::string shell_tag;
-    if (ExtractTagBlock(xml_content, "ShellVisuals", shell_tag)) {
+    if (ExtractTagBlock(clean_xml, "ShellVisuals", shell_tag)) {
         ExtractAttribute(shell_tag, "DefaultDisplayName", out_config.display_name);
     }
 
     size_t cursor = 0;
     std::string exe_tag;
-    while (ExtractTagBlock(xml_content, "Executable", exe_tag, cursor, &cursor)) {
+    while (ExtractTagBlock(clean_xml, "Executable", exe_tag, cursor, &cursor)) {
         GameExecutableEntry entry;
         ExtractAttribute(exe_tag, "Name", entry.name);
         ExtractAttribute(exe_tag, "Id", entry.id);
@@ -194,7 +295,8 @@ Status ParseGameConfigXml(const std::string& xml_content, GameConfig& out_config
         ExtractAttribute(exe_tag, "Alias", entry.alias);
         std::string dev_only;
         if (ExtractAttribute(exe_tag, "IsDevOnly", dev_only)) {
-            entry.is_dev_only = (ToLower(dev_only) == "true");
+            const std::string norm_dev = ToLower(Trim(dev_only));
+            entry.is_dev_only = (norm_dev == "true" || norm_dev == "1");
         }
         if (!entry.name.empty()) {
             out_config.executables.push_back(std::move(entry));
@@ -202,7 +304,7 @@ Status ParseGameConfigXml(const std::string& xml_content, GameConfig& out_config
     }
 
     // Determine ConsoleTarget from executable TargetDeviceFamily or package metadata.
-    const std::string lower_xml = ToLower(xml_content);
+    const std::string lower_xml = ToLower(clean_xml);
     bool has_gen9 = false;
     bool has_gen9_aware = false;
     bool has_xbox_one = false;
@@ -228,7 +330,8 @@ Status ParseGameConfigXml(const std::string& xml_content, GameConfig& out_config
     }
 
     if (out_config.executables.empty()) {
-        return Status::Error(StatusCode::ParseError, "MicrosoftGame.Config contains no <Executable> entries");
+        return Status::Error(StatusCode::ParseError,
+                             "MicrosoftGame.Config contains no <Executable> entries");
     }
 
     return Status::Ok();

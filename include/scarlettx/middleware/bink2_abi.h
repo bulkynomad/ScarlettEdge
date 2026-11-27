@@ -46,14 +46,40 @@ typedef struct BINKSUMMARY {
     uint32_t SkippedFrames;
 } BINKSUMMARY;
 
-// Surface pixel format & PTS lip-sync flags matching Bink2 conventions
+// Surface pixel format, memory-open & PTS lip-sync flags matching Bink2 conventions
 enum {
     BINKSURFACE32RGBA = 6,
     BINKSURFACE32BGRA = 3,
     BINKSURFACE24 = 1,
     BINKOPEN_PTS_SYNC = 0x00010000u,
-    BINKCOPYALL = 0x80000000u
+    BINKALPHA = 0x00100000u,
+    BINKFROMMEMORY = 0x04000000u,
+    BINKCOPYALL = 0x80000000u,
+    BINKMAXFRAMEBUFFERS = 2
 };
+
+typedef struct BINKPLANE {
+    int32_t Allocate;
+    void* Buffer;
+    uint32_t BufferPitch;
+} BINKPLANE;
+
+typedef struct BINKFRAMEPLANESET {
+    BINKPLANE YPlane;
+    BINKPLANE cRPlane;
+    BINKPLANE cBPlane;
+    BINKPLANE APlane;
+} BINKFRAMEPLANESET;
+
+typedef struct BINKFRAMEBUFFERS {
+    int32_t TotalFrames;
+    uint32_t YABufferWidth;
+    uint32_t YABufferHeight;
+    uint32_t cRcBBufferWidth;
+    uint32_t cRcBBufferHeight;
+    uint32_t FrameNum;
+    BINKFRAMEPLANESET Frames[BINKMAXFRAMEBUFFERS];
+} BINKFRAMEBUFFERS;
 
 typedef struct BINKREALTIME {
     uint32_t FrameNum;
@@ -81,6 +107,8 @@ SCARLETTX_BINK2_API int32_t BinkCopyToBuffer(
     uint32_t dest_x,
     uint32_t dest_y,
     uint32_t flags);
+SCARLETTX_BINK2_API void BinkGetFrameBuffersInfo(BINK* bnk, BINKFRAMEBUFFERS* fbset);
+SCARLETTX_BINK2_API void BinkRegisterFrameBuffers(BINK* bnk, BINKFRAMEBUFFERS* fbset);
 SCARLETTX_BINK2_API int32_t BinkPause(BINK* bnk, int32_t pause);
 SCARLETTX_BINK2_API void BinkGoto(BINK* bnk, uint32_t frame, int32_t flags);
 SCARLETTX_BINK2_API void BinkSetSoundOnOff(BINK* bnk, int32_t onoff);

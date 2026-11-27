@@ -16,6 +16,7 @@ struct EmulatorConfig {
     int32_t fps_cap = -1;  // --fcap: frames per second, 0 = no cap, -1 = the title's own rate
     bool in_process = false;
     bool force_relocate = false;
+    bool lockhart_mode = false;
     uint32_t render_width = 320;
     uint32_t render_height = 240;
     uint32_t max_frames = 0;  // 0 = unlimited / controlled by guest
@@ -26,6 +27,9 @@ struct EmulatorConfig {
     std::string rt_dump_path;
     std::string raster_dump_path;
     std::string volume_key;  // Hex key or path to key file for encrypted XVD streaming
+    bool flight_recorder = false;
+    uint32_t hang_timeout_sec = 15;  // --hang-timeout <sec> (0 = disable hang watchdog)
+    std::string flight_recorder_dir;
 };
 
 }  // namespace scarlettx

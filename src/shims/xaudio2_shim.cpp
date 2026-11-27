@@ -16,6 +16,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <objbase.h>
 #endif
 
 // xaudio2_guest.cpp
@@ -740,24 +741,80 @@ HMODULE LoadHostSystemXAudio2Dll() {
 }
 #endif
 
-// Clean-room IXAPO / IXAPOParameters COM fallback when host CreateFX is unavailable or custom CLSID is passed
+// Spec-compliant IXAPO + IXAPOParameters COM fallback when host CreateFX is unavailable or custom Xbox CLSID is passed
+#pragma pack(push, 1)
+struct XapoRegPropsRaw {
+    uint8_t clsid[16];
+    wchar_t friendly_name[256];
+    wchar_t copyright_info[256];
+    uint32_t major_version;
+    uint32_t minor_version;
+    uint32_t flags;
+    uint32_t min_input_buffers;
+    uint32_t max_input_buffers;
+    uint32_t min_output_buffers;
+    uint32_t max_output_buffers;
+};
+#pragma pack(pop)
+static_assert(sizeof(XapoRegPropsRaw) == 1068, "XAPO_REGISTRATION_PROPERTIES ABI size");
+
+struct XapoLockBufParamsRaw {
+    const void* pFormat;
+    uint32_t maxFrameCount;
+};
+
+struct XapoProcessBufParamsRaw {
+    void* pBuffer;
+    uint32_t bufferFlags;
+    uint32_t validFrameCount;
+};
+
 struct FallbackXapo {
     const void* const* vtbl;
+    struct ParamsSubobj {
+        const void* const* vtbl;
+        FallbackXapo* owner;
+    } params_sub;
     std::atomic<uint32_t> refs{1};
+    uint8_t clsid[16]{};
+    uint32_t frame_bytes = 8;
+    std::mutex mu;
     std::vector<uint8_t> params;
 };
+
+bool XapoGuidEq(const void* a, const uint8_t b[16]) {
+    return a && std::memcmp(a, b, 16) == 0;
+}
+
+static constexpr uint8_t kIidIUnknown[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46};
+static constexpr uint8_t kIidIXapo[16] = {
+    0x84, 0xB9, 0x10, 0xA4, 0x39, 0x98, 0x19, 0x48, 0xA0, 0xBE, 0x28, 0x56, 0xAE, 0x6B, 0x3A, 0xDB};
+static constexpr uint8_t kIidIXapo27[16] = {
+    0x01, 0xC0, 0x0B, 0xA9, 0x87, 0xE8, 0x8A, 0x48, 0xB5, 0x45, 0xE9, 0x08, 0x6A, 0xFD, 0x6E, 0x16};
+static constexpr uint8_t kIidIXapoParams[16] = {
+    0x66, 0x5C, 0xD9, 0x26, 0xF2, 0x80, 0x9A, 0x49, 0xAD, 0x54, 0x5A, 0xE7, 0xF0, 0x1C, 0x6D, 0x98};
 
 int32_t
 #if defined(_WIN32)
 WINAPI
 #endif
-FallbackXapo_QI(void* self_ptr, const void* /*riid*/, void** ppv) {
+FallbackXapo_QI(void* self_ptr, const void* riid, void** ppv) {
     if (!ppv) return static_cast<int32_t>(0x80004003u);
-    if (!self_ptr) { *ppv = nullptr; return kE_INVALIDARG; }
+    *ppv = nullptr;
+    if (!self_ptr || !riid) return kE_INVALIDARG;
     auto* self = static_cast<FallbackXapo*>(self_ptr);
-    self->refs.fetch_add(1, std::memory_order_relaxed);
-    *ppv = self;
-    return kS_OK;
+    if (XapoGuidEq(riid, kIidIUnknown) || XapoGuidEq(riid, kIidIXapo) || XapoGuidEq(riid, kIidIXapo27)) {
+        self->refs.fetch_add(1, std::memory_order_relaxed);
+        *ppv = self;
+        return kS_OK;
+    }
+    if (XapoGuidEq(riid, kIidIXapoParams)) {
+        self->refs.fetch_add(1, std::memory_order_relaxed);
+        *ppv = &self->params_sub;
+        return kS_OK;
+    }
+    return static_cast<int32_t>(0x80004002u);  // E_NOINTERFACE
 }
 
 uint32_t
@@ -784,7 +841,55 @@ int32_t
 #if defined(_WIN32)
 WINAPI
 #endif
-FallbackXapo_Ok(void*) { return kS_OK; }
+FallbackXapo_GetRegProps(void* self_ptr, XapoRegPropsRaw** out_props) {
+    if (!out_props) return kE_INVALIDARG;
+    *out_props = nullptr;
+    if (!self_ptr) return kE_INVALIDARG;
+    auto* self = static_cast<FallbackXapo*>(self_ptr);
+#if defined(_WIN32)
+    auto* p = static_cast<XapoRegPropsRaw*>(CoTaskMemAlloc(sizeof(XapoRegPropsRaw)));
+#else
+    auto* p = static_cast<XapoRegPropsRaw*>(std::malloc(sizeof(XapoRegPropsRaw)));
+#endif
+    if (!p) return static_cast<int32_t>(0x8007000Eu);
+    std::memset(p, 0, sizeof(*p));
+    std::memcpy(p->clsid, self->clsid, 16);
+    const wchar_t kName[] = L"ScarlettEdge Passthrough XAPO";
+    std::memcpy(p->friendly_name, kName, sizeof(kName));
+    p->major_version = 1;
+    p->minor_version = 0;
+    p->flags = 0x1Fu;  // XAPO_FLAG_DEFAULT (in-place + matching format)
+    p->min_input_buffers = 1;
+    p->max_input_buffers = 1;
+    p->min_output_buffers = 1;
+    p->max_output_buffers = 1;
+    *out_props = p;
+    return kS_OK;
+}
+
+int32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_FormatSupported(void*, const void*, const void*, void** ppSupported) {
+    if (ppSupported) *ppSupported = nullptr;
+    return kS_OK;
+}
+
+int32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_Initialize(void* self_ptr, const void* data, uint32_t bytes) {
+    if (!self_ptr) return kE_INVALIDARG;
+    auto* self = static_cast<FallbackXapo*>(self_ptr);
+    std::lock_guard<std::mutex> lk(self->mu);
+    if (data && bytes > 0) {
+        const auto* b = static_cast<const uint8_t*>(data);
+        self->params.assign(b, b + bytes);
+    }
+    return kS_OK;
+}
 
 void
 #if defined(_WIN32)
@@ -792,23 +897,126 @@ WINAPI
 #endif
 FallbackXapo_Void(void*) {}
 
-const void* const kFallbackXapoVtbl[16] = {
-    reinterpret_cast<const void*>(&FallbackXapo_QI),
-    reinterpret_cast<const void*>(&FallbackXapo_AddRef),
-    reinterpret_cast<const void*>(&FallbackXapo_Release),
-    reinterpret_cast<const void*>(&FallbackXapo_Ok),
-    reinterpret_cast<const void*>(&FallbackXapo_Ok),
-    reinterpret_cast<const void*>(&FallbackXapo_Ok),
-    reinterpret_cast<const void*>(&FallbackXapo_Void),
-    reinterpret_cast<const void*>(&FallbackXapo_Void),
-    reinterpret_cast<const void*>(&FallbackXapo_Void),
-    reinterpret_cast<const void*>(&FallbackXapo_Void),
-    reinterpret_cast<const void*>(&FallbackXapo_Void),
-    reinterpret_cast<const void*>(&FallbackXapo_Void),
-    reinterpret_cast<const void*>(&FallbackXapo_Ok),
-    reinterpret_cast<const void*>(&FallbackXapo_Ok),
-    reinterpret_cast<const void*>(&FallbackXapo_Void),
-    reinterpret_cast<const void*>(&FallbackXapo_Void),
+int32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_LockForProcess(void* self_ptr, uint32_t in_cnt, const XapoLockBufParamsRaw* in_params,
+                            uint32_t, const XapoLockBufParamsRaw*) {
+    if (self_ptr && in_cnt > 0 && in_params && in_params[0].pFormat) {
+        // WAVEFORMATEX: nChannels at +2 (uint16), nBlockAlign at +12 (uint16)
+        uint16_t block_align = 0;
+        std::memcpy(&block_align, static_cast<const uint8_t*>(in_params[0].pFormat) + 12, sizeof(uint16_t));
+        if (block_align > 0 && block_align <= 64) {
+            static_cast<FallbackXapo*>(self_ptr)->frame_bytes = block_align;
+        }
+    }
+    return kS_OK;
+}
+
+void
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_Process(void* self_ptr, uint32_t in_cnt, const XapoProcessBufParamsRaw* in_params,
+                     uint32_t out_cnt, XapoProcessBufParamsRaw* out_params, int32_t /*enabled*/) {
+    if (!self_ptr || in_cnt == 0 || out_cnt == 0 || !in_params || !out_params) return;
+    auto* self = static_cast<FallbackXapo*>(self_ptr);
+    out_params[0].bufferFlags = in_params[0].bufferFlags;
+    out_params[0].validFrameCount = in_params[0].validFrameCount;
+    if (out_params[0].pBuffer && in_params[0].pBuffer && out_params[0].pBuffer != in_params[0].pBuffer) {
+        const size_t bytes = static_cast<size_t>(in_params[0].validFrameCount) * self->frame_bytes;
+        if (in_params[0].bufferFlags == 1u /* XAPO_BUFFER_SILENT */) {
+            std::memset(out_params[0].pBuffer, 0, bytes);
+        } else {
+            std::memcpy(out_params[0].pBuffer, in_params[0].pBuffer, bytes);
+        }
+    }
+}
+
+uint32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapo_CalcFrames(void*, uint32_t frames) {
+    return frames;
+}
+
+int32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapoParams_QI(void* sub_ptr, const void* riid, void** ppv) {
+    auto* sub = static_cast<FallbackXapo::ParamsSubobj*>(sub_ptr);
+    return sub ? FallbackXapo_QI(sub->owner, riid, ppv) : kE_INVALIDARG;
+}
+
+uint32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapoParams_AddRef(void* sub_ptr) {
+    auto* sub = static_cast<FallbackXapo::ParamsSubobj*>(sub_ptr);
+    return sub ? FallbackXapo_AddRef(sub->owner) : 0u;
+}
+
+uint32_t
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapoParams_Release(void* sub_ptr) {
+    auto* sub = static_cast<FallbackXapo::ParamsSubobj*>(sub_ptr);
+    return sub ? FallbackXapo_Release(sub->owner) : 0u;
+}
+
+void
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapoParams_Set(void* sub_ptr, const void* data, uint32_t bytes) {
+    auto* sub = static_cast<FallbackXapo::ParamsSubobj*>(sub_ptr);
+    if (!sub || !sub->owner || !data || bytes == 0) return;
+    std::lock_guard<std::mutex> lk(sub->owner->mu);
+    const auto* b = static_cast<const uint8_t*>(data);
+    sub->owner->params.assign(b, b + bytes);
+}
+
+void
+#if defined(_WIN32)
+WINAPI
+#endif
+FallbackXapoParams_Get(void* sub_ptr, void* data, uint32_t bytes) {
+    if (!data || bytes == 0) return;
+    std::memset(data, 0, bytes);
+    auto* sub = static_cast<FallbackXapo::ParamsSubobj*>(sub_ptr);
+    if (!sub || !sub->owner) return;
+    std::lock_guard<std::mutex> lk(sub->owner->mu);
+    const size_t n = std::min<size_t>(bytes, sub->owner->params.size());
+    if (n > 0) std::memcpy(data, sub->owner->params.data(), n);
+}
+
+const void* const kFallbackXapoParamsVtbl[5] = {
+    reinterpret_cast<const void*>(&FallbackXapoParams_QI),
+    reinterpret_cast<const void*>(&FallbackXapoParams_AddRef),
+    reinterpret_cast<const void*>(&FallbackXapoParams_Release),
+    reinterpret_cast<const void*>(&FallbackXapoParams_Set),
+    reinterpret_cast<const void*>(&FallbackXapoParams_Get),
+};
+
+const void* const kFallbackXapoVtbl[13] = {
+    reinterpret_cast<const void*>(&FallbackXapo_QI),              // 0 QueryInterface
+    reinterpret_cast<const void*>(&FallbackXapo_AddRef),          // 1 AddRef
+    reinterpret_cast<const void*>(&FallbackXapo_Release),         // 2 Release
+    reinterpret_cast<const void*>(&FallbackXapo_GetRegProps),     // 3 GetRegistrationProperties
+    reinterpret_cast<const void*>(&FallbackXapo_FormatSupported), // 4 IsInputFormatSupported
+    reinterpret_cast<const void*>(&FallbackXapo_FormatSupported), // 5 IsOutputFormatSupported
+    reinterpret_cast<const void*>(&FallbackXapo_Initialize),      // 6 Initialize
+    reinterpret_cast<const void*>(&FallbackXapo_Void),            // 7 Reset
+    reinterpret_cast<const void*>(&FallbackXapo_LockForProcess),  // 8 LockForProcess
+    reinterpret_cast<const void*>(&FallbackXapo_Void),            // 9 UnlockForProcess
+    reinterpret_cast<const void*>(&FallbackXapo_Process),         // 10 Process
+    reinterpret_cast<const void*>(&FallbackXapo_CalcFrames),      // 11 CalcInputFrames
+    reinterpret_cast<const void*>(&FallbackXapo_CalcFrames),      // 12 CalcOutputFrames
 };
 
 }  // namespace
@@ -960,12 +1168,67 @@ int32_t CreateFX(
     auto* fx = new (std::nothrow) FallbackXapo();
     if (!fx) return static_cast<int32_t>(0x8007000Eu);
     fx->vtbl = kFallbackXapoVtbl;
+    fx->params_sub.vtbl = kFallbackXapoParamsVtbl;
+    fx->params_sub.owner = fx;
+    std::memcpy(fx->clsid, clsid, 16);
     if (init_data && init_data_bytes > 0) {
         const auto* p = static_cast<const uint8_t*>(init_data);
         fx->params.assign(p, p + init_data_bytes);
     }
     *out_effect = fx;
     return kS_OK;
+}
+
+SCARLETTX_XAUDIO2_API int32_t CreateAudioReverb(void** out_apo) {
+    if (!out_apo) return kE_INVALIDARG;
+    *out_apo = nullptr;
+#if defined(_WIN32)
+    if (HMODULE sys_xa2 = LoadHostSystemXAudio2Dll()) {
+        using Fn = int32_t(WINAPI*)(void**);
+        if (auto fn = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(sys_xa2, "CreateAudioReverb")))) {
+            const int32_t hr = fn(out_apo);
+            if (hr >= 0 && *out_apo) return hr;
+        }
+    }
+#endif
+    static constexpr uint8_t kClsidAudioReverb[16] = {
+        0x16, 0x3B, 0x63, 0xC2, 0x1B, 0x47, 0x98, 0x44, 0xB8, 0xC5, 0x4F, 0x09, 0x59, 0xE2, 0xEC, 0x09};
+    return CreateFX(kClsidAudioReverb, out_apo, nullptr, 0);
+}
+
+SCARLETTX_XAUDIO2_API int32_t CreateAudioReverbV2_8(void** out_apo) {
+    return CreateAudioReverb(out_apo);
+}
+
+SCARLETTX_XAUDIO2_API int32_t CreateAudioVolumeMeter(void** out_apo) {
+    if (!out_apo) return kE_INVALIDARG;
+    *out_apo = nullptr;
+#if defined(_WIN32)
+    if (HMODULE sys_xa2 = LoadHostSystemXAudio2Dll()) {
+        using Fn = int32_t(WINAPI*)(void**);
+        if (auto fn = reinterpret_cast<Fn>(reinterpret_cast<void*>(GetProcAddress(sys_xa2, "CreateAudioVolumeMeter")))) {
+            const int32_t hr = fn(out_apo);
+            if (hr >= 0 && *out_apo) return hr;
+        }
+    }
+#endif
+    static constexpr uint8_t kClsidVolumeMeter[16] = {
+        0x16, 0xB1, 0xC3, 0x4F, 0x2A, 0x97, 0xCF, 0x40, 0xBC, 0x37, 0x7D, 0xB0, 0x3D, 0xB2, 0xFB, 0xA3};
+    return CreateFX(kClsidVolumeMeter, out_apo, nullptr, 0);
+}
+
+SCARLETTX_XAUDIO2_API int32_t XAudio2CreateV2_9(void** ppXAudio2, uint32_t flags, uint32_t processor) {
+    return XAudio2Create(ppXAudio2, flags, processor);
+}
+
+SCARLETTX_XAUDIO2_API int32_t XAudio2CreateWithVersionInfo(
+    void** ppXAudio2, uint32_t flags, uint32_t processor, uint32_t /*ntddi_version*/) {
+    return XAudio2Create(ppXAudio2, flags, processor);
+}
+
+SCARLETTX_XAUDIO2_API int32_t XAudio2CreateWithSharedContexts(
+    void** ppXAudio2, uint32_t flags, uint32_t processor, void* /*shared_ctx*/) {
+    return XAudio2Create(ppXAudio2, flags, processor);
 }
 
 }  // extern "C"

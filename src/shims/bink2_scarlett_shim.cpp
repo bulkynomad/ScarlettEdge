@@ -1,5 +1,6 @@
 #define SCARLETTX_BUILDING_BINK2 1
 #include "scarlettx/middleware/bink2_abi.h"
+#include "scarlettx/loader/package_vfs.h"
 
 #include <algorithm>
 #include <chrono>
@@ -35,6 +36,29 @@ uint64_t QueryMicrosecondsNow() {
 #endif
 }
 
+#if defined(_WIN32)
+size_t QueryReadableCommittedBytes(const void* base_ptr, size_t max_needed) {
+    if (!base_ptr || max_needed == 0) return 0;
+    const auto* cur = static_cast<const uint8_t*>(base_ptr);
+    size_t total = 0;
+    while (total < max_needed) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(cur, &mbi, sizeof(mbi)) != sizeof(mbi)) break;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) break;
+        const DWORD prot = mbi.Protect & 0xFFu;
+        const bool readable = (prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+                               prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+                               prot == PAGE_EXECUTE_WRITECOPY);
+        if (!readable) break;
+        const auto* reg_end = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (reg_end <= cur) break;
+        total += static_cast<size_t>(reg_end - cur);
+        cur = reg_end;
+    }
+    return total;
+}
+#endif
+
 struct BinkStreamState {
     BINK pub{};
     std::string path;
@@ -43,6 +67,9 @@ struct BinkStreamState {
     uint64_t start_qpc_us = 0;
     uint64_t audio_pts_us = 0;
     bool has_explicit_audio_pts = false;
+    bool has_registered_fb = false;
+    BINKFRAMEBUFFERS registered_fb{};
+    BINKFRAMEBUFFERS* registered_fb_ptr = nullptr;
     std::vector<uint8_t> file_bytes;
     std::vector<uint32_t> frame_offsets;
     std::vector<uint8_t> frame_rgba;  // Width * Height * 4
@@ -52,6 +79,20 @@ std::mutex g_mutex;
 uint64_t g_next_id = 1;
 std::unordered_map<uint64_t, std::unique_ptr<BinkStreamState>> g_streams;
 std::string g_last_error;
+thread_local char t_last_error[256] = {};
+
+void SetBinkErrorLocked(const char* msg) {
+    g_last_error = msg ? msg : "";
+    std::memset(t_last_error, 0, sizeof(t_last_error));
+    if (msg) {
+        std::strncpy(t_last_error, msg, sizeof(t_last_error) - 1);
+    }
+}
+
+void ClearBinkErrorLocked() {
+    g_last_error.clear();
+    t_last_error[0] = '\0';
+}
 
 uint32_t ReadLe32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) |
@@ -65,21 +106,112 @@ uint64_t FrameIndexToPtsUs(const BINK& pub, uint32_t one_based_frame) {
     return (idx * 1000000ull * std::max(1u, pub.FrameRateDiv)) / std::max(1u, pub.FrameRate);
 }
 
-// Decodes embedded KB2/BIK YCbCr 4:2:0 / 8x8 DCT luma+chroma frame payload when present in file_bytes,
-// falling back to deterministic BT.709 color-bar synthesis for header-only / virtual streams.
+void ParseBinkContainerHeader(BinkStreamState& state) {
+    if (state.file_bytes.size() < 40u) return;
+    const uint8_t* hdr = state.file_bytes.data();
+    const bool is_bink1 = (hdr[0] == 'B' && hdr[1] == 'I' && hdr[2] == 'K');
+    const bool is_bink2 = (hdr[0] == 'K' && hdr[1] == 'B' && hdr[2] == '2');
+    if (!is_bink1 && !is_bink2) return;
+
+    const uint32_t frames = ReadLe32(hdr + 8);
+    const uint32_t width = ReadLe32(hdr + 20);
+    const uint32_t height = ReadLe32(hdr + 24);
+    const uint32_t fps = ReadLe32(hdr + 28);
+    const uint32_t fps_div = ReadLe32(hdr + 32);
+    if (width > 0 && width <= 7680 && height > 0 && height <= 4320) {
+        state.pub.Width = width;
+        state.pub.Height = height;
+    }
+    if (frames > 0 && frames <= 1000000) {
+        state.pub.Frames = frames;
+    }
+    if (fps > 0 && fps_div > 0) {
+        state.pub.FrameRate = fps;
+        state.pub.FrameRateDiv = fps_div;
+    }
+    const size_t tbl_off = 44u;
+    const size_t count = static_cast<size_t>(state.pub.Frames) + 1u;
+    if (state.file_bytes.size() >= tbl_off + count * 4u) {
+        state.frame_offsets.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            state.frame_offsets[i] = ReadLe32(state.file_bytes.data() + tbl_off + i * 4u);
+        }
+    }
+}
+
+void UpdateRegisteredYCrCbAPlanes(BinkStreamState& s) {
+    if (!s.has_registered_fb || s.frame_rgba.empty()) return;
+    const int32_t total = std::clamp<int32_t>(s.registered_fb.TotalFrames, 1, BINKMAXFRAMEBUFFERS);
+    const uint32_t slot = s.played_frames % static_cast<uint32_t>(total);
+    s.registered_fb.FrameNum = slot;
+    if (s.registered_fb_ptr) {
+        s.registered_fb_ptr->FrameNum = slot;
+    }
+
+    const BINKFRAMEPLANESET& ps = s.registered_fb.Frames[slot];
+    const uint32_t w = s.pub.Width;
+    const uint32_t h = s.pub.Height;
+
+    if (ps.YPlane.Buffer && ps.YPlane.BufferPitch >= w) {
+        auto* y_dst = static_cast<uint8_t*>(ps.YPlane.Buffer);
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                const uint8_t* px = s.frame_rgba.data() + (static_cast<size_t>(y) * w + x) * 4u;
+                const int32_t r = px[0], g = px[1], b = px[2];
+                const int32_t luma = std::clamp(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16, 16, 235);
+                y_dst[static_cast<size_t>(y) * ps.YPlane.BufferPitch + x] = static_cast<uint8_t>(luma);
+            }
+        }
+    }
+
+    if (ps.APlane.Buffer && ps.APlane.BufferPitch >= w) {
+        auto* a_dst = static_cast<uint8_t*>(ps.APlane.Buffer);
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                const uint8_t* px = s.frame_rgba.data() + (static_cast<size_t>(y) * w + x) * 4u;
+                a_dst[static_cast<size_t>(y) * ps.APlane.BufferPitch + x] = px[3];
+            }
+        }
+    }
+
+    const uint32_t cw = (w + 1u) / 2u;
+    const uint32_t ch = (h + 1u) / 2u;
+    if ((ps.cRPlane.Buffer && ps.cRPlane.BufferPitch >= cw) ||
+        (ps.cBPlane.Buffer && ps.cBPlane.BufferPitch >= cw)) {
+        auto* cr_dst = static_cast<uint8_t*>(ps.cRPlane.Buffer);
+        auto* cb_dst = static_cast<uint8_t*>(ps.cBPlane.Buffer);
+        for (uint32_t cy = 0; cy < ch; ++cy) {
+            const uint32_t sy = std::min<uint32_t>(cy * 2u, h - 1u);
+            for (uint32_t cx = 0; cx < cw; ++cx) {
+                const uint32_t sx = std::min<uint32_t>(cx * 2u, w - 1u);
+                const uint8_t* px = s.frame_rgba.data() + (static_cast<size_t>(sy) * w + sx) * 4u;
+                const int32_t r = px[0], g = px[1], b = px[2];
+                if (cr_dst && ps.cRPlane.BufferPitch >= cw) {
+                    const int32_t cr = std::clamp(((112 * r - 102 * g - 10 * b + 128) >> 8) + 128, 16, 240);
+                    cr_dst[static_cast<size_t>(cy) * ps.cRPlane.BufferPitch + cx] = static_cast<uint8_t>(cr);
+                }
+                if (cb_dst && ps.cBPlane.BufferPitch >= cw) {
+                    const int32_t cb = std::clamp(((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128, 16, 240);
+                    cb_dst[static_cast<size_t>(cy) * ps.cBPlane.BufferPitch + cx] = static_cast<uint8_t>(cb);
+                }
+            }
+        }
+    }
+}
+
 void DecodeOrSynthesizeFrame(BinkStreamState& s) {
     const uint32_t w = s.pub.Width;
     const uint32_t h = s.pub.Height;
     s.frame_rgba.resize(static_cast<size_t>(w) * h * 4ull);
     const uint32_t f_idx = s.pub.FrameNum > 0 ? (s.pub.FrameNum - 1u) : 0u;
 
+    bool decoded_from_payload = false;
     if (f_idx + 1u < s.frame_offsets.size()) {
-        const uint32_t off0 = s.frame_offsets[f_idx] & ~1u;  // bit 0 is keyframe flag in BIK/KB2
+        const uint32_t off0 = s.frame_offsets[f_idx] & ~1u;
         const uint32_t off1 = s.frame_offsets[f_idx + 1u] & ~1u;
         if (off1 > off0 && off1 <= s.file_bytes.size() && (off1 - off0) >= 8u) {
             const uint8_t* payload = s.file_bytes.data() + off0;
             const size_t plen = off1 - off0;
-            // Clean-room YCbCr -> BT.709 RGBA8 macroblock unpack from real frame payload bytes
             for (uint32_t y = 0; y < h; ++y) {
                 for (uint32_t x = 0; x < w; ++x) {
                     const size_t mb = ((y / 8u) * ((w + 7u) / 8u) + (x / 8u)) * 6u;
@@ -97,20 +229,24 @@ void DecodeOrSynthesizeFrame(BinkStreamState& s) {
                     s.frame_rgba[idx + 3] = 255u;
                 }
             }
-            return;
+            decoded_from_payload = true;
         }
     }
 
-    const uint32_t f = s.pub.FrameNum;
-    for (uint32_t y = 0; y < h; ++y) {
-        for (uint32_t x = 0; x < w; ++x) {
-            const size_t idx = (static_cast<size_t>(y) * w + x) * 4ull;
-            s.frame_rgba[idx + 0] = static_cast<uint8_t>((x * 4u + f * 17u) & 0xFFu);
-            s.frame_rgba[idx + 1] = static_cast<uint8_t>((y * 4u + f * 9u) & 0xFFu);
-            s.frame_rgba[idx + 2] = static_cast<uint8_t>(((x ^ y) + f * 23u) & 0xFFu);
-            s.frame_rgba[idx + 3] = 255u;
+    if (!decoded_from_payload) {
+        const uint32_t f = s.pub.FrameNum;
+        for (uint32_t y = 0; y < h; ++y) {
+            for (uint32_t x = 0; x < w; ++x) {
+                const size_t idx = (static_cast<size_t>(y) * w + x) * 4ull;
+                s.frame_rgba[idx + 0] = static_cast<uint8_t>((x * 4u + f * 17u) & 0xFFu);
+                s.frame_rgba[idx + 1] = static_cast<uint8_t>((y * 4u + f * 9u) & 0xFFu);
+                s.frame_rgba[idx + 2] = static_cast<uint8_t>(((x ^ y) + f * 23u) & 0xFFu);
+                s.frame_rgba[idx + 3] = 255u;
+            }
         }
     }
+
+    UpdateRegisteredYCrCbAPlanes(s);
 }
 
 }  // namespace
@@ -119,13 +255,13 @@ extern "C" {
 
 BINK* BinkOpen(const char* name, uint32_t flags) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!name || name[0] == '\0') {
-        g_last_error = "BinkOpen: empty filename";
+    const bool from_memory = (flags & BINKFROMMEMORY) != 0u;
+    if (!name || (!from_memory && name[0] == '\0')) {
+        SetBinkErrorLocked("BinkOpen: invalid or empty source");
         return nullptr;
     }
 
     auto state = std::make_unique<BinkStreamState>();
-    state->path = name;
     state->pub.Width = 320;
     state->pub.Height = 180;
     state->pub.Frames = 60;
@@ -138,52 +274,51 @@ BINK* BinkOpen(const char* name, uint32_t flags) {
     state->pub.SoundOn = 1;
     state->pub.Volume = 32768;
 
-    // Parse real BIK2 / KB2 / BIKi header + frame-offset table if a file exists on disk
-    std::ifstream file(name, std::ios::binary | std::ios::ate);
-    if (file.is_open()) {
-        const auto fsz = static_cast<size_t>(std::max<std::streamoff>(0, file.tellg()));
-        file.seekg(0, std::ios::beg);
-        if (fsz >= 44 && fsz <= 64ull * 1024ull * 1024ull) {
-            state->file_bytes.resize(fsz);
-            file.read(reinterpret_cast<char*>(state->file_bytes.data()), static_cast<std::streamsize>(fsz));
-        }
-        uint8_t hdr[44] = {};
-        if (state->file_bytes.size() >= 44) {
-            std::memcpy(hdr, state->file_bytes.data(), 44);
-        } else {
-            file.clear();
-            file.seekg(0, std::ios::beg);
-            file.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
-        }
-        if (state->file_bytes.size() >= 40 || file.gcount() >= 40) {
-            const bool is_bink1 = (hdr[0] == 'B' && hdr[1] == 'I' && hdr[2] == 'K');
-            const bool is_bink2 = (hdr[0] == 'K' && hdr[1] == 'B' && hdr[2] == '2');
-            if (is_bink1 || is_bink2) {
-                const uint32_t frames = ReadLe32(hdr + 8);
-                const uint32_t width = ReadLe32(hdr + 20);
-                const uint32_t height = ReadLe32(hdr + 24);
-                const uint32_t fps = ReadLe32(hdr + 28);
-                const uint32_t fps_div = ReadLe32(hdr + 32);
-                if (width > 0 && width <= 7680 && height > 0 && height <= 4320) {
-                    state->pub.Width = width;
-                    state->pub.Height = height;
-                }
-                if (frames > 0 && frames <= 1000000) {
-                    state->pub.Frames = frames;
-                }
-                if (fps > 0 && fps_div > 0) {
-                    state->pub.FrameRate = fps;
-                    state->pub.FrameRateDiv = fps_div;
-                }
-                // Parse BIK/KB2 frame offset table at +44 (Frames + 1 uint32_t entries)
-                const size_t tbl_off = 44u;
-                const size_t count = static_cast<size_t>(state->pub.Frames) + 1u;
-                if (state->file_bytes.size() >= tbl_off + count * 4u) {
-                    state->frame_offsets.resize(count);
-                    for (size_t i = 0; i < count; ++i) {
-                        state->frame_offsets[i] = ReadLe32(state->file_bytes.data() + tbl_off + i * 4u);
+    if (from_memory) {
+        state->path = "<BINKFROMMEMORY>";
+        const auto* mem = reinterpret_cast<const uint8_t*>(name);
+        size_t readable = 64ull * 1024ull * 1024ull;
+#if defined(_WIN32)
+        readable = QueryReadableCommittedBytes(mem, 64ull * 1024ull * 1024ull);
+#endif
+        if (readable >= 40u) {
+            const bool is_bink = (mem[0] == 'B' && mem[1] == 'I' && mem[2] == 'K') ||
+                                 (mem[0] == 'K' && mem[1] == 'B' && mem[2] == '2');
+            if (is_bink) {
+                const uint32_t sz_minus_8 = ReadLe32(mem + 4);
+                const uint32_t frames = ReadLe32(mem + 8);
+                size_t total_sz = 44u;
+                if (sz_minus_8 > 0u && static_cast<size_t>(sz_minus_8) + 8u <= 64ull * 1024ull * 1024ull) {
+                    total_sz = static_cast<size_t>(sz_minus_8) + 8u;
+                } else if (frames > 0u && frames <= 1000000u) {
+                    const size_t tbl_end = 44u + (static_cast<size_t>(frames) + 1u) * 4u;
+                    total_sz = tbl_end;
+                    if (readable >= tbl_end) {
+                        const uint32_t end_off = ReadLe32(mem + 44u + static_cast<size_t>(frames) * 4u) & ~1u;
+                        total_sz = std::max<size_t>(tbl_end, end_off);
                     }
                 }
+                const size_t safe_copy = std::min<size_t>(total_sz, readable);
+                state->file_bytes.assign(mem, mem + safe_copy);
+                ParseBinkContainerHeader(*state);
+            }
+        }
+    } else {
+        state->path = name;
+        std::ifstream file(name, std::ios::binary | std::ios::ate);
+        if (file.is_open()) {
+            const auto fsz = static_cast<size_t>(std::max<std::streamoff>(0, file.tellg()));
+            file.seekg(0, std::ios::beg);
+            if (fsz >= 40u && fsz <= 64ull * 1024ull * 1024ull) {
+                state->file_bytes.resize(fsz);
+                file.read(reinterpret_cast<char*>(state->file_bytes.data()), static_cast<std::streamsize>(fsz));
+                ParseBinkContainerHeader(*state);
+            }
+        } else if (scarlettx::PackageVfs::Global().Exists(name)) {
+            std::vector<uint8_t> vfs_bytes;
+            if (scarlettx::PackageVfs::Global().ReadFileBytes(name, vfs_bytes).ok() && vfs_bytes.size() >= 40u) {
+                state->file_bytes = std::move(vfs_bytes);
+                ParseBinkContainerHeader(*state);
             }
         }
     }
@@ -193,7 +328,7 @@ BINK* BinkOpen(const char* name, uint32_t flags) {
     DecodeOrSynthesizeFrame(*state);
     BINK* ret = &state->pub;
     g_streams[state->pub.InternalId] = std::move(state);
-    g_last_error.clear();
+    ClearBinkErrorLocked();
     return ret;
 }
 
@@ -270,7 +405,7 @@ int32_t BinkCopyToBuffer(
     uint32_t dest_x,
     uint32_t dest_y,
     uint32_t flags) {
-    if (!bnk || !dest || dest_pitch <= 0 || dest_height == 0) {
+    if (!bnk || !dest || dest_pitch <= 0 || dest_height == 0 || dest_y >= dest_height) {
         return -1;
     }
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -279,18 +414,37 @@ int32_t BinkCopyToBuffer(
     const auto& s = *it->second;
 
     const uint32_t fmt = flags & 0x0Fu;
+    const bool is_24bpp = (fmt == BINKSURFACE24);
     const bool is_bgra = (fmt == BINKSURFACE32BGRA);
-    const uint32_t copy_h = std::min(s.pub.Height, dest_height > dest_y ? dest_height - dest_y : 0u);
-    auto* dst_base = static_cast<uint8_t*>(dest);
+    const size_t bpp = is_24bpp ? 3u : 4u;
+    const size_t pitch_bytes = static_cast<size_t>(dest_pitch);
 
+    if (static_cast<size_t>(dest_x) * bpp >= pitch_bytes) {
+        return -1;
+    }
+    const uint32_t max_cols = static_cast<uint32_t>((pitch_bytes - static_cast<size_t>(dest_x) * bpp) / bpp);
+    const uint32_t copy_w = std::min<uint32_t>(s.pub.Width, max_cols);
+    const uint32_t copy_h = std::min<uint32_t>(s.pub.Height, dest_height - dest_y);
+    if (copy_w == 0u || copy_h == 0u ||
+        static_cast<size_t>(dest_x) * bpp + static_cast<size_t>(copy_w) * bpp > pitch_bytes) {
+        return -1;
+    }
+
+    auto* dst_base = static_cast<uint8_t*>(dest);
     for (uint32_t y = 0; y < copy_h; ++y) {
-        uint8_t* dst_row = dst_base + static_cast<size_t>(dest_y + y) * static_cast<size_t>(dest_pitch) +
-                           static_cast<size_t>(dest_x) * 4ull;
+        uint8_t* dst_row =
+            dst_base + static_cast<size_t>(dest_y + y) * pitch_bytes + static_cast<size_t>(dest_x) * bpp;
         const uint8_t* src_row = s.frame_rgba.data() + static_cast<size_t>(y) * s.pub.Width * 4ull;
-        if (!is_bgra) {
-            std::memcpy(dst_row, src_row, static_cast<size_t>(s.pub.Width) * 4ull);
+        if (is_24bpp) {
+            for (uint32_t x = 0; x < copy_w; ++x) {
+                dst_row[x * 3 + 0] = src_row[x * 4 + 2];
+                dst_row[x * 3 + 1] = src_row[x * 4 + 1];
+                dst_row[x * 3 + 2] = src_row[x * 4 + 0];
+            }
+        } else if (!is_bgra) {
+            std::memcpy(dst_row, src_row, static_cast<size_t>(copy_w) * 4ull);
         } else {
-            for (uint32_t x = 0; x < s.pub.Width; ++x) {
+            for (uint32_t x = 0; x < copy_w; ++x) {
                 dst_row[x * 4 + 0] = src_row[x * 4 + 2];
                 dst_row[x * 4 + 1] = src_row[x * 4 + 1];
                 dst_row[x * 4 + 2] = src_row[x * 4 + 0];
@@ -299,6 +453,56 @@ int32_t BinkCopyToBuffer(
         }
     }
     return 0;
+}
+
+void BinkGetFrameBuffersInfo(BINK* bnk, BINKFRAMEBUFFERS* fbset) {
+    if (!fbset) return;
+    std::memset(fbset, 0, sizeof(*fbset));
+    uint32_t w = 320, h = 180, open_flags = 0;
+    if (bnk) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        auto it = g_streams.find(bnk->InternalId);
+        if (it != g_streams.end()) {
+            w = it->second->pub.Width;
+            h = it->second->pub.Height;
+            open_flags = it->second->pub.OpenFlags;
+        } else {
+            w = bnk->Width ? bnk->Width : 320u;
+            h = bnk->Height ? bnk->Height : 180u;
+            open_flags = bnk->OpenFlags;
+        }
+    }
+    fbset->TotalFrames = BINKMAXFRAMEBUFFERS;
+    fbset->YABufferWidth = (w + 15u) & ~15u;
+    fbset->YABufferHeight = (h + 15u) & ~15u;
+    fbset->cRcBBufferWidth = fbset->YABufferWidth / 2u;
+    fbset->cRcBBufferHeight = fbset->YABufferHeight / 2u;
+    fbset->FrameNum = 0;
+    const int32_t need_alpha = (open_flags & BINKALPHA) ? 1 : 0;
+    for (int i = 0; i < BINKMAXFRAMEBUFFERS; ++i) {
+        fbset->Frames[i].YPlane = {1, nullptr, fbset->YABufferWidth};
+        fbset->Frames[i].cRPlane = {1, nullptr, fbset->cRcBBufferWidth};
+        fbset->Frames[i].cBPlane = {1, nullptr, fbset->cRcBBufferWidth};
+        fbset->Frames[i].APlane = {need_alpha, nullptr, fbset->YABufferWidth};
+    }
+}
+
+void BinkRegisterFrameBuffers(BINK* bnk, BINKFRAMEBUFFERS* fbset) {
+    if (!bnk) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_streams.find(bnk->InternalId);
+    if (it == g_streams.end()) return;
+    auto& s = *it->second;
+    if (!fbset) {
+        s.has_registered_fb = false;
+        s.registered_fb_ptr = nullptr;
+        std::memset(&s.registered_fb, 0, sizeof(s.registered_fb));
+        return;
+    }
+    s.registered_fb = *fbset;
+    s.registered_fb_ptr = fbset;
+    s.has_registered_fb = true;
+    UpdateRegisteredYCrCbAPlanes(s);
 }
 
 int32_t BinkPause(BINK* bnk, int32_t pause) {
@@ -362,8 +566,15 @@ void BinkGetSummary(BINK* bnk, BINKSUMMARY* sum) {
 }
 
 const char* BinkGetError(void) {
+    if (t_last_error[0] != '\0') {
+        return t_last_error;
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
-    return g_last_error.c_str();
+    std::memset(t_last_error, 0, sizeof(t_last_error));
+    if (!g_last_error.empty()) {
+        std::strncpy(t_last_error, g_last_error.c_str(), sizeof(t_last_error) - 1);
+    }
+    return t_last_error;
 }
 
 void BinkSetSoundTrack(BINK* /*bnk*/, uint32_t /*total_tracks*/) {}

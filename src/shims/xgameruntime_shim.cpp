@@ -23,9 +23,11 @@
 #include <vector>
 
 #if defined(_WIN32)
+#  include <malloc.h>
 #  include <windows.h>
 #endif
 
+#include "scarlettx/core/flight_recorder.h"
 #include "scarlettx/kernel/xruntime.h"
 #include "xgr_api_tables.h"
 #include "xgr_task_queue.h"
@@ -35,11 +37,15 @@ namespace fs = std::filesystem;
 namespace {
 
 bool TraceEnabled() {
-    static const bool enabled = []() {
+    static std::atomic<int> cached{0};  // 0 = uninitialized, 1 = off, 2 = on (constexpr: no PE TLS)
+    int s = cached.load(std::memory_order_relaxed);
+    if (s == 0) {
         const char* v = std::getenv("SCARLETTX_TRACE");
-        return v && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
+        const bool on = v && v[0] != '\0' && v[0] != '0';
+        s = on ? 2 : 1;
+        cached.store(s, std::memory_order_relaxed);
+    }
+    return s == 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,26 +136,41 @@ struct XUser {
 // XGameSave implementation (real persistent local-disk containers & blobs)
 // ---------------------------------------------------------------------------
 constexpr uint64_t kSaveQuotaBytes = 256ull * 1024ull * 1024ull;  // 256 MiB
+constexpr const char* kSaveMetaFileName = "_meta.txt";
 
-struct XGameSaveProvider {
-    std::atomic<int32_t> ref_count{1};
+struct XGameSaveProviderCore {
     std::string config_id;
     fs::path root_dir;
     uint64_t max_quota_bytes = kSaveQuotaBytes;
     std::mutex mutex;
 };
 
-struct XGameSaveContainer {
-    XGameSaveProvider* provider = nullptr;
+struct XGameSaveContainerCore {
+    std::shared_ptr<XGameSaveProviderCore> provider;
     std::string name;
     fs::path dir_path;
 };
 
-struct XGameSaveUpdate {
-    XGameSaveContainer* container = nullptr;
+struct XGameSaveUpdateCore {
+    std::mutex mutex;
+    std::shared_ptr<XGameSaveContainerCore> container;
     std::string display_name;
     std::map<std::string, std::vector<uint8_t>> pending_writes;
     std::vector<std::string> pending_deletes;
+};
+
+struct XGameSaveProvider {
+    std::atomic<int32_t> ref_count{1};
+    std::shared_ptr<XGameSaveProviderCore> core;
+};
+
+struct XGameSaveContainer {
+    XGameSaveProviderHandle provider_handle = nullptr;
+    std::shared_ptr<XGameSaveContainerCore> core;
+};
+
+struct XGameSaveUpdate {
+    std::shared_ptr<XGameSaveUpdateCore> core;
 };
 
 namespace {
@@ -165,12 +186,26 @@ std::string SanitizeSaveName(const std::string& raw) {
             out.push_back('_');
         }
     }
+    if (out == kSaveMetaFileName) {
+        out = "__meta.txt";
+    }
     return out.empty() ? "default" : out;
 }
 
 // A name of only dots resolves to the directory itself or its parent.
 bool IsValidSaveName(const char* name) {
     return name && name[std::strspn(name, ".")] != '\0';
+}
+
+uint64_t ConfiguredSaveQuotaBytes() {
+    if (const char* env_q = std::getenv("SCARLETTX_SAVE_QUOTA_BYTES"); env_q && *env_q) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(env_q, &end, 10);
+        if (end && end != env_q && parsed > 0) {
+            return static_cast<uint64_t>(parsed);
+        }
+    }
+    return kSaveQuotaBytes;
 }
 
 fs::path ResolveSaveRoot(const std::string& config_id) {
@@ -188,11 +223,24 @@ uint64_t ComputeDirectorySize(const fs::path& dir) {
     }
     uint64_t total = 0;
     for (const auto& entry : fs::recursive_directory_iterator(dir, ec)) {
-        if (entry.is_regular_file(ec)) {
+        if (entry.is_regular_file(ec) && entry.path().filename() != kSaveMetaFileName) {
             total += entry.file_size(ec);
         }
     }
     return total;
+}
+
+std::string ReadContainerDisplayName(const fs::path& container_dir, const std::string& fallback_name) {
+    std::ifstream ifs(container_dir / kSaveMetaFileName, std::ios::binary);
+    if (!ifs) {
+        return fallback_name;
+    }
+    std::string line;
+    std::getline(ifs, line);
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
+        line.pop_back();
+    }
+    return line.empty() ? fallback_name : line;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +329,7 @@ std::string MatchPackageLanguage(const std::string& locale, const std::vector<st
 }
 
 // ---------------------------------------------------------------------------
-// XMem hooks
+// XMem hooks & region tracking
 // ---------------------------------------------------------------------------
 std::mutex g_mem_hooks_mutex;
 XMemAllocFunction* g_mem_alloc_hook = nullptr;
@@ -289,10 +337,67 @@ XMemFreeFunction* g_mem_free_hook = nullptr;
 std::atomic<size_t> g_mem_total_allocated{0};
 std::atomic<size_t> g_mem_total_reserved{0};
 
+struct VMemRegion {
+    uintptr_t base = 0;
+    size_t reserved_size = 0;
+    size_t committed_bytes = 0;
+    bool registered_kernelx = false;
+};
+
+std::mutex g_vmem_mutex;
+std::map<uintptr_t, VMemRegion> g_vmem_regions;
+
 // ---------------------------------------------------------------------------
-// XThread TLS flag
+// XThread FLS state (zero implicit PE TLS in xgameruntime.dll)
 // ---------------------------------------------------------------------------
-thread_local bool g_thread_time_sensitive = false;
+std::mutex g_ts_mutex;
+std::unordered_map<uint32_t, bool> g_ts_by_tid;
+std::mutex g_missing_api_mutex;
+std::unordered_set<std::string> g_missing_apis;
+
+#if defined(_WIN32)
+INIT_ONCE g_ts_fls_once = INIT_ONCE_STATIC_INIT;
+DWORD g_ts_fls_index = FLS_OUT_OF_INDEXES;
+
+BOOL CALLBACK InitTsFlsOnce(PINIT_ONCE, PVOID, PVOID*) {
+    g_ts_fls_index = FlsAlloc(nullptr);
+    return TRUE;
+}
+
+bool GetCurrentThreadFlsTimeSensitive() {
+    InitOnceExecuteOnce(&g_ts_fls_once, &InitTsFlsOnce, nullptr, nullptr);
+    const uint32_t tid = GetCurrentThreadId();
+    {
+        std::lock_guard<std::mutex> lock(g_ts_mutex);
+        auto it = g_ts_by_tid.find(tid);
+        if (it != g_ts_by_tid.end()) {
+            const bool val = it->second;
+            if (g_ts_fls_index != FLS_OUT_OF_INDEXES) {
+                FlsSetValue(g_ts_fls_index, reinterpret_cast<PVOID>(static_cast<uintptr_t>(val ? 1 : 0)));
+            }
+            return val;
+        }
+    }
+    if (g_ts_fls_index == FLS_OUT_OF_INDEXES) {
+        return false;
+    }
+    return FlsGetValue(g_ts_fls_index) != nullptr;
+}
+
+void SetCurrentThreadFlsTimeSensitive(bool is_ts) {
+    InitOnceExecuteOnce(&g_ts_fls_once, &InitTsFlsOnce, nullptr, nullptr);
+    if (g_ts_fls_index != FLS_OUT_OF_INDEXES) {
+        FlsSetValue(g_ts_fls_index, reinterpret_cast<PVOID>(static_cast<uintptr_t>(is_ts ? 1 : 0)));
+    }
+    const uint32_t tid = GetCurrentThreadId();
+    std::lock_guard<std::mutex> lock(g_ts_mutex);
+    g_ts_by_tid[tid] = is_ts;
+}
+#else
+thread_local bool g_posix_time_sensitive = false;
+bool GetCurrentThreadFlsTimeSensitive() { return g_posix_time_sensitive; }
+void SetCurrentThreadFlsTimeSensitive(bool is_ts) { g_posix_time_sensitive = is_ts; }
+#endif
 
 }  // namespace
 
@@ -326,20 +431,8 @@ XGameResult XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature feature, bool* is
     if (!isAvailable) {
         return XGR_E_POINTER;
     }
-    switch (feature) {
-        case XGameRuntimeFeature_XTaskQueue:
-        case XGameRuntimeFeature_XAsync:
-        case XGameRuntimeFeature_XUser:
-        case XGameRuntimeFeature_XGameSave:
-        case XGameRuntimeFeature_XSystem:
-        case XGameRuntimeFeature_XMem:
-        case XGameRuntimeFeature_XThread:
-            *isAvailable = true;
-            return XGR_S_OK;
-        default:
-            *isAvailable = false;
-            return XGR_S_OK;
-    }
+    *isAvailable = static_cast<uint32_t>(feature) <= 21u;
+    return XGR_S_OK;
 }
 
 // ===========================================================================
@@ -386,11 +479,28 @@ XGameResult XSystemGetConsoleId(
     size_t consoleIdSize,
     char* consoleId,
     size_t* consoleIdUsed) {
-    return CopyStringToBuffer(
-        "SCARLETTX.CONSOLE.0001.0000",
-        consoleIdSize,
-        consoleId,
-        consoleIdUsed);
+    constexpr char kConsoleId[] = "SCARLETTX.CONSOLE.0001.000000000000000";
+    static_assert(sizeof(kConsoleId) == 39, "XSystemConsoleIdBytes must be 38 chars + NUL");
+    if (!consoleId || consoleIdSize == 0) {
+        if (consoleIdUsed) {
+            *consoleIdUsed = sizeof(kConsoleId);
+        }
+        return consoleId ? XGR_E_NOT_SUFFICIENT_BUFFER : XGR_E_POINTER;
+    }
+    if (consoleIdSize >= sizeof(kConsoleId)) {
+        std::memcpy(consoleId, kConsoleId, sizeof(kConsoleId));
+        if (consoleIdUsed) {
+            *consoleIdUsed = sizeof(kConsoleId);
+        }
+        return XGR_S_OK;
+    }
+    const size_t copy_chars = consoleIdSize - 1;
+    std::memcpy(consoleId, kConsoleId, copy_chars);
+    consoleId[copy_chars] = '\0';
+    if (consoleIdUsed) {
+        *consoleIdUsed = consoleIdSize;
+    }
+    return XGR_S_OK;
 }
 
 XGameResult XSystemGetXboxLiveSandboxId(
@@ -437,7 +547,11 @@ XGameResult XUserAddAsync(XUserAddOptions /*options*/, XAsyncBlock* async) {
             user->gamertag_classic = profile.gamertag;
         }
         RegisterValidHandle(user);
-        st->result_handle = user;
+        {
+            std::lock_guard<std::mutex> lk(st->mutex);
+            st->result_handle = user;
+            st->cleanup_result = [](void* h) { XUserCloseHandle(static_cast<XUserHandle>(h)); };
+        }
         CompleteAsyncState(st, XGR_S_OK, sizeof(XUserHandle));
     });
 }
@@ -452,11 +566,22 @@ XGameResult XUserAddResult(XAsyncBlock* async, XUserHandle* newUser) {
         return hr;
     }
     auto state = GetAsyncState(async);
-    if (!state || !state->result_handle) {
+    if (!state) {
         *newUser = nullptr;
         return XGR_E_FAIL;
     }
-    *newUser = static_cast<XUserHandle>(state->result_handle);
+    XUserHandle out_user = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(state->mutex);
+        out_user = static_cast<XUserHandle>(state->result_handle);
+        state->result_handle = nullptr;
+        state->cleanup_result = nullptr;
+    }
+    if (!out_user) {
+        *newUser = nullptr;
+        return XGR_E_FAIL;
+    }
+    *newUser = out_user;
     xgr::ReleaseHleAsyncResult(async);
     return XGR_S_OK;
 }
@@ -672,6 +797,152 @@ XGameResult XUserResolveIssueWithUiResult(XAsyncBlock* async) {
     return hr;
 }
 
+XGameResult XUserResolveIssueWithUiUtf16Async(
+    XUserHandle user,
+    const wchar_t* /*url*/,
+    XAsyncBlock* async) {
+    if (!user || !async) {
+        return XGR_E_INVALIDARG;
+    }
+    return BeginAsyncOperation(async, [](XAsyncState* st) {
+        CompleteAsyncState(st, XGR_S_OK, 0);
+    });
+}
+
+XGameResult XUserResolveIssueWithUiUtf16Result(XAsyncBlock* async) {
+    if (!async) {
+        return XGR_E_INVALIDARG;
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    xgr::ReleaseHleAsyncResult(async);
+    return hr;
+}
+
+}  // extern "C"
+
+namespace {
+
+uint32_t PngCrc32(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+void AppendPngChunk(std::vector<uint8_t>& out, const char type[4], const uint8_t* data, uint32_t len) {
+    auto push_be32 = [&](uint32_t v) {
+        out.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
+        out.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+        out.push_back(static_cast<uint8_t>(v & 0xFFu));
+    };
+    push_be32(len);
+    const size_t crc_start = out.size();
+    out.insert(out.end(), reinterpret_cast<const uint8_t*>(type), reinterpret_cast<const uint8_t*>(type) + 4);
+    if (data && len > 0) {
+        out.insert(out.end(), data, data + len);
+    }
+    push_be32(PngCrc32(out.data() + crc_start, 4u + len));
+}
+
+std::vector<uint8_t> BuildValidGamerPicturePng() {
+    static constexpr uint8_t kSig[8] = {0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au};
+    std::vector<uint8_t> png(kSig, kSig + sizeof(kSig));
+    // 1x1 8-bit RGBA IHDR
+    const uint8_t ihdr[13] = {0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0};
+    AppendPngChunk(png, "IHDR", ihdr, sizeof(ihdr));
+    // Uncompressed zlib stream containing 1 scanline: filter=0, RGBA=(0x10, 0x7C, 0x10, 0xFF)
+    const uint8_t raw_row[5] = {0x00u, 0x10u, 0x7Cu, 0x10u, 0xFFu};
+    uint32_t s1 = 1u, s2 = 0u;
+    for (uint8_t b : raw_row) {
+        s1 = (s1 + b) % 65521u;
+        s2 = (s2 + s1) % 65521u;
+    }
+    const uint32_t adler = (s2 << 16) | s1;
+    const uint8_t idat[16] = {
+        0x78u, 0x01u,                                // zlib header
+        0x01u, 0x05u, 0x00u, 0xFAu, 0xFFu,           // final stored deflate block (len=5)
+        raw_row[0], raw_row[1], raw_row[2], raw_row[3], raw_row[4],
+        static_cast<uint8_t>((adler >> 24) & 0xFFu),
+        static_cast<uint8_t>((adler >> 16) & 0xFFu),
+        static_cast<uint8_t>((adler >> 8) & 0xFFu),
+        static_cast<uint8_t>(adler & 0xFFu),
+    };
+    AppendPngChunk(png, "IDAT", idat, sizeof(idat));
+    AppendPngChunk(png, "IEND", nullptr, 0);
+    return png;
+}
+
+}  // namespace
+
+extern "C" {
+
+XGameResult XUserGetGamerPictureAsync(
+    XUserHandle user,
+    XUserGamerPictureSize pictureSize,
+    XAsyncBlock* async) {
+    if (!user || !async || static_cast<uint32_t>(pictureSize) > XUserGamerPictureSize_ExtraLarge) {
+        return XGR_E_INVALIDARG;
+    }
+    return BeginAsyncOperation(async, [](XAsyncState* st) {
+        std::vector<uint8_t> png = BuildValidGamerPicturePng();
+        const size_t sz = png.size();
+        st->result_payload = std::move(png);
+        CompleteAsyncState(st, XGR_S_OK, sz);
+    });
+}
+
+XGameResult XUserGetGamerPictureResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize) {
+    if (!async || !bufferSize) {
+        return XGR_E_INVALIDARG;
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr != XGR_S_OK) {
+        *bufferSize = 0;
+        return hr;
+    }
+    auto state = GetAsyncState(async);
+    if (!state) {
+        *bufferSize = 0;
+        return XGR_E_INVALIDARG;
+    }
+    *bufferSize = state->result_size;
+    return XGR_S_OK;
+}
+
+XGameResult XUserGetGamerPictureResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    size_t* bufferUsed) {
+    if (!async || !buffer) {
+        return XGR_E_INVALIDARG;
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr != XGR_S_OK) {
+        return hr;
+    }
+    auto state = GetAsyncState(async);
+    if (!state) {
+        return XGR_E_INVALIDARG;
+    }
+    if (bufferSize < state->result_size) {
+        return XGR_E_NOT_SUFFICIENT_BUFFER;
+    }
+    std::memcpy(buffer, state->result_payload.data(), state->result_size);
+    if (bufferUsed) {
+        *bufferUsed = state->result_size;
+    }
+    xgr::ReleaseHleAsyncResult(async);
+    return XGR_S_OK;
+}
+
 }  // extern "C"
 
 namespace {
@@ -710,7 +981,14 @@ void ComputeHmacSha256(const uint8_t* key, size_t key_len,
                        uint8_t out_mac[32]) {
     std::memset(out_mac, 0, 32);
 #if defined(_WIN32)
-    static HMODULE bcrypt_dll = LoadLibraryW(L"bcrypt.dll");
+    static std::atomic<HMODULE> bcrypt_dll_cached{nullptr};
+    static std::atomic<bool> bcrypt_probed{false};
+    if (!bcrypt_probed.load(std::memory_order_acquire)) {
+        HMODULE loaded = LoadLibraryW(L"bcrypt.dll");
+        bcrypt_dll_cached.store(loaded, std::memory_order_relaxed);
+        bcrypt_probed.store(true, std::memory_order_release);
+    }
+    HMODULE bcrypt_dll = bcrypt_dll_cached.load(std::memory_order_relaxed);
     if (bcrypt_dll) {
         using FnOpenAlg = long(WINAPI*)(void**, const wchar_t*, const wchar_t*, unsigned long);
         using FnHash = long(WINAPI*)(void*, uint8_t*, unsigned long, uint8_t*, unsigned long, uint8_t*, unsigned long);
@@ -1082,6 +1360,88 @@ XGameResult XUserGetTokenAndSignatureUtf16Result(
 // ===========================================================================
 // XGameSave.h
 // ===========================================================================
+}  // extern "C"
+
+namespace {
+
+XGameResult SubmitUpdateCore(const std::shared_ptr<XGameSaveUpdateCore>& ucore) {
+    if (!ucore || !ucore->container || !ucore->container->provider) {
+        return XGR_E_INVALIDARG;
+    }
+    std::lock_guard<std::mutex> ulock(ucore->mutex);
+    auto& ccore = ucore->container;
+    auto& pcore = ccore->provider;
+    std::lock_guard<std::mutex> plock(pcore->mutex);
+
+    std::error_code ec;
+    fs::create_directories(ccore->dir_path, ec);
+    if (ec) {
+        return XGR_E_FAIL;
+    }
+
+    // Enforce provider quota atomically before mutating blobs on disk.
+    const uint64_t current_used = ComputeDirectorySize(pcore->root_dir);
+    int64_t delta_bytes = 0;
+    std::unordered_set<std::string> accounted_existing;
+    for (const auto& del_name : ucore->pending_deletes) {
+        const std::string sanitized = SanitizeSaveName(del_name);
+        if (accounted_existing.insert(sanitized).second) {
+            const fs::path p = ccore->dir_path / sanitized;
+            if (fs::is_regular_file(p, ec)) {
+                delta_bytes -= static_cast<int64_t>(fs::file_size(p, ec));
+            }
+        }
+    }
+    for (const auto& [blob_name, bytes] : ucore->pending_writes) {
+        const std::string sanitized = SanitizeSaveName(blob_name);
+        if (accounted_existing.insert(sanitized).second) {
+            const fs::path p = ccore->dir_path / sanitized;
+            if (fs::is_regular_file(p, ec)) {
+                delta_bytes -= static_cast<int64_t>(fs::file_size(p, ec));
+            }
+        }
+        delta_bytes += static_cast<int64_t>(bytes.size());
+    }
+    const uint64_t projected_used =
+        (delta_bytes < 0 && static_cast<uint64_t>(-delta_bytes) > current_used)
+            ? 0ull
+            : static_cast<uint64_t>(static_cast<int64_t>(current_used) + delta_bytes);
+    if (projected_used > pcore->max_quota_bytes) {
+        return XGR_E_GS_QUOTA_EXCEEDED;
+    }
+
+    for (const auto& del_name : ucore->pending_deletes) {
+        fs::remove(ccore->dir_path / SanitizeSaveName(del_name), ec);
+    }
+    for (const auto& [blob_name, bytes] : ucore->pending_writes) {
+        fs::path file_path = ccore->dir_path / SanitizeSaveName(blob_name);
+        std::ofstream ofs(file_path, std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            return XGR_E_FAIL;
+        }
+        if (!bytes.empty()) {
+            ofs.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        if (!ofs.good()) {
+            return XGR_E_FAIL;
+        }
+    }
+    // Persist unsanitized container display name in _meta.txt
+    if (!ucore->display_name.empty()) {
+        std::ofstream meta_ofs(ccore->dir_path / kSaveMetaFileName, std::ios::binary | std::ios::trunc);
+        if (meta_ofs) {
+            meta_ofs.write(ucore->display_name.data(),
+                           static_cast<std::streamsize>(ucore->display_name.size()));
+        }
+    }
+    return XGR_S_OK;
+}
+
+}  // namespace
+
+extern "C" {
+
 XGameResult XGameSaveInitializeProvider(
     XUserHandle requestingUser,
     const char* configurationId,
@@ -1090,18 +1450,20 @@ XGameResult XGameSaveInitializeProvider(
     if (!requestingUser || !IsValidSaveName(configurationId) || !provider) {
         return XGR_E_INVALIDARG;
     }
+    auto pcore = std::make_shared<XGameSaveProviderCore>();
+    pcore->config_id = configurationId;
+    pcore->root_dir = ResolveSaveRoot(pcore->config_id);
+    pcore->max_quota_bytes = ConfiguredSaveQuotaBytes();
+    std::error_code ec;
+    fs::create_directories(pcore->root_dir, ec);
+    if (ec) {
+        return XGR_E_FAIL;
+    }
     auto* p = new (std::nothrow) XGameSaveProvider();
     if (!p) {
         return XGR_E_OUTOFMEMORY;
     }
-    p->config_id = configurationId;
-    p->root_dir = ResolveSaveRoot(p->config_id);
-    std::error_code ec;
-    fs::create_directories(p->root_dir, ec);
-    if (ec) {
-        delete p;
-        return XGR_E_FAIL;
-    }
+    p->core = std::move(pcore);
     RegisterValidHandle(p);
     *provider = p;
     return XGR_S_OK;
@@ -1115,14 +1477,32 @@ XGameResult XGameSaveInitializeProviderAsync(
     if (!requestingUser || !configurationId || !async) {
         return XGR_E_INVALIDARG;
     }
+    if (!IsValidSaveName(configurationId)) {
+        return XGR_E_INVALIDARG;
+    }
+    XUserHandle dup_user = nullptr;
+    if (XUserDuplicateHandle(requestingUser, &dup_user) != XGR_S_OK) {
+        return XGR_E_INVALIDARG;
+    }
     std::string cfg = configurationId;
-    return BeginAsyncOperation(async, [requestingUser, cfg, syncOnDemand](XAsyncState* st) {
+    XGameResult hr = BeginAsyncOperation(async, [dup_user, cfg, syncOnDemand](XAsyncState* st) {
         XGameSaveProviderHandle prov = nullptr;
-        XGameResult hr = XGameSaveInitializeProvider(
-            requestingUser, cfg.c_str(), syncOnDemand, &prov);
-        st->result_handle = prov;
-        CompleteAsyncState(st, hr, sizeof(XGameSaveProviderHandle));
+        XGameResult init_hr = XGameSaveInitializeProvider(
+            dup_user, cfg.c_str(), syncOnDemand, &prov);
+        XUserCloseHandle(dup_user);
+        if (init_hr == XGR_S_OK && prov) {
+            std::lock_guard<std::mutex> lk(st->mutex);
+            st->result_handle = prov;
+            st->cleanup_result = [](void* h) {
+                XGameSaveCloseProvider(static_cast<XGameSaveProviderHandle>(h));
+            };
+        }
+        CompleteAsyncState(st, init_hr, sizeof(XGameSaveProviderHandle));
     });
+    if (hr < 0) {
+        XUserCloseHandle(dup_user);
+    }
+    return hr;
 }
 
 XGameResult XGameSaveInitializeProviderResult(
@@ -1137,11 +1517,22 @@ XGameResult XGameSaveInitializeProviderResult(
         return hr;
     }
     auto state = GetAsyncState(async);
-    if (!state || !state->result_handle) {
+    if (!state) {
         *provider = nullptr;
         return XGR_E_FAIL;
     }
-    *provider = static_cast<XGameSaveProviderHandle>(state->result_handle);
+    XGameSaveProviderHandle out_prov = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(state->mutex);
+        out_prov = static_cast<XGameSaveProviderHandle>(state->result_handle);
+        state->result_handle = nullptr;
+        state->cleanup_result = nullptr;
+    }
+    if (!out_prov) {
+        *provider = nullptr;
+        return XGR_E_FAIL;
+    }
+    *provider = out_prov;
     xgr::ReleaseHleAsyncResult(async);
     return XGR_S_OK;
 }
@@ -1159,29 +1550,37 @@ void XGameSaveCloseProvider(XGameSaveProviderHandle provider) {
 XGameResult XGameSaveGetRemainingQuota(
     XGameSaveProviderHandle provider,
     int64_t* remainingQuota) {
-    if (!provider || !remainingQuota) {
+    if (!provider || !provider->core || !remainingQuota) {
         return XGR_E_INVALIDARG;
     }
-    std::lock_guard<std::mutex> lock(provider->mutex);
-    const uint64_t used = ComputeDirectorySize(provider->root_dir);
-    *remainingQuota = (used >= provider->max_quota_bytes)
+    auto pcore = provider->core;
+    std::lock_guard<std::mutex> lock(pcore->mutex);
+    const uint64_t used = ComputeDirectorySize(pcore->root_dir);
+    *remainingQuota = (used >= pcore->max_quota_bytes)
                           ? 0
-                          : static_cast<int64_t>(provider->max_quota_bytes - used);
+                          : static_cast<int64_t>(pcore->max_quota_bytes - used);
     return XGR_S_OK;
 }
 
 XGameResult XGameSaveGetRemainingQuotaAsync(
     XGameSaveProviderHandle provider,
     XAsyncBlock* async) {
-    if (!provider || !async) {
+    if (!provider || !provider->core || !async) {
         return XGR_E_INVALIDARG;
     }
-    return BeginAsyncOperation(async, [provider](XAsyncState* st) {
+    auto pcore = provider->core;
+    return BeginAsyncOperation(async, [pcore](XAsyncState* st) {
         int64_t remaining = 0;
-        XGameResult hr = XGameSaveGetRemainingQuota(provider, &remaining);
+        {
+            std::lock_guard<std::mutex> lock(pcore->mutex);
+            const uint64_t used = ComputeDirectorySize(pcore->root_dir);
+            remaining = (used >= pcore->max_quota_bytes)
+                            ? 0
+                            : static_cast<int64_t>(pcore->max_quota_bytes - used);
+        }
         st->result_payload.resize(sizeof(int64_t));
         std::memcpy(st->result_payload.data(), &remaining, sizeof(int64_t));
-        CompleteAsyncState(st, hr, sizeof(int64_t));
+        CompleteAsyncState(st, XGR_S_OK, sizeof(int64_t));
     });
 }
 
@@ -1210,19 +1609,25 @@ XGameResult XGameSaveCreateContainer(
     XGameSaveProviderHandle provider,
     const char* name,
     XGameSaveContainerHandle* containerContext) {
-    if (!provider || !IsValidSaveName(name) || !containerContext) {
+    if (!provider || !provider->core || !IsValidSaveName(name) || !containerContext) {
         return XGR_E_INVALIDARG;
+    }
+    auto ccore = std::make_shared<XGameSaveContainerCore>();
+    ccore->provider = provider->core;
+    ccore->name = name;
+    ccore->dir_path = provider->core->root_dir / SanitizeSaveName(name);
+    {
+        std::lock_guard<std::mutex> lock(provider->core->mutex);
+        std::error_code ec;
+        fs::create_directories(ccore->dir_path, ec);
     }
     auto* c = new (std::nothrow) XGameSaveContainer();
     if (!c) {
         return XGR_E_OUTOFMEMORY;
     }
     provider->ref_count.fetch_add(1, std::memory_order_relaxed);
-    c->provider = provider;
-    c->name = name;
-    c->dir_path = provider->root_dir / SanitizeSaveName(name);
-    std::error_code ec;
-    fs::create_directories(c->dir_path, ec);
+    c->provider_handle = provider;
+    c->core = std::move(ccore);
     RegisterValidHandle(c);
     *containerContext = c;
     return XGR_S_OK;
@@ -1232,7 +1637,7 @@ void XGameSaveCloseContainer(XGameSaveContainerHandle context) {
     if (!context) {
         return;
     }
-    XGameSaveProviderHandle prov = context->provider;
+    XGameSaveProviderHandle prov = context->provider_handle;
     UnregisterValidHandle(context);
     delete context;
     if (prov) {
@@ -1243,12 +1648,13 @@ void XGameSaveCloseContainer(XGameSaveContainerHandle context) {
 XGameResult XGameSaveDeleteContainer(
     XGameSaveProviderHandle provider,
     const char* name) {
-    if (!provider || !IsValidSaveName(name)) {
+    if (!provider || !provider->core || !IsValidSaveName(name)) {
         return XGR_E_INVALIDARG;
     }
-    std::lock_guard<std::mutex> lock(provider->mutex);
+    auto pcore = provider->core;
+    std::lock_guard<std::mutex> lock(pcore->mutex);
     std::error_code ec;
-    fs::remove_all(provider->root_dir / SanitizeSaveName(name), ec);
+    fs::remove_all(pcore->root_dir / SanitizeSaveName(name), ec);
     return ec ? XGR_E_FAIL : XGR_S_OK;
 }
 
@@ -1256,13 +1662,18 @@ XGameResult XGameSaveDeleteContainerAsync(
     XGameSaveProviderHandle provider,
     const char* name,
     XAsyncBlock* async) {
-    if (!provider || !name || !async) {
+    if (!provider || !provider->core || !IsValidSaveName(name) || !async) {
         return XGR_E_INVALIDARG;
     }
+    auto pcore = provider->core;
     std::string cname = name;
-    return BeginAsyncOperation(async, [provider, cname](XAsyncState* st) {
-        XGameResult hr = XGameSaveDeleteContainer(provider, cname.c_str());
-        CompleteAsyncState(st, hr, 0);
+    return BeginAsyncOperation(async, [pcore, cname](XAsyncState* st) {
+        std::error_code ec;
+        {
+            std::lock_guard<std::mutex> lock(pcore->mutex);
+            fs::remove_all(pcore->root_dir / SanitizeSaveName(cname), ec);
+        }
+        CompleteAsyncState(st, ec ? XGR_E_FAIL : XGR_S_OK, 0);
     });
 }
 
@@ -1279,21 +1690,23 @@ XGameResult XGameSaveEnumerateContainerInfo(
     XGameSaveProviderHandle provider,
     void* context,
     XGameSaveContainerInfoCallback* callback) {
-    if (!provider || !callback) {
+    if (!provider || !provider->core || !callback) {
         return XGR_E_INVALIDARG;
     }
     struct Entry {
         std::string name;
+        std::string display_name;
         uint32_t blob_count;
         uint64_t total_size;
     };
     std::vector<Entry> entries;
-    std::unique_lock<std::mutex> lock(provider->mutex);
+    auto pcore = provider->core;
+    std::unique_lock<std::mutex> lock(pcore->mutex);
     std::error_code ec;
-    if (!fs::exists(provider->root_dir, ec)) {
+    if (!fs::exists(pcore->root_dir, ec)) {
         return XGR_S_OK;
     }
-    for (const auto& entry : fs::directory_iterator(provider->root_dir, ec)) {
+    for (const auto& entry : fs::directory_iterator(pcore->root_dir, ec)) {
         if (!entry.is_directory(ec)) {
             continue;
         }
@@ -1301,18 +1714,18 @@ XGameResult XGameSaveEnumerateContainerInfo(
         uint32_t blob_count = 0;
         uint64_t total_size = 0;
         for (const auto& f : fs::directory_iterator(entry.path(), ec)) {
-            if (f.is_regular_file(ec)) {
+            if (f.is_regular_file(ec) && f.path().filename() != kSaveMetaFileName) {
                 ++blob_count;
                 total_size += f.file_size(ec);
             }
         }
-        entries.push_back({cname, blob_count, total_size});
+        entries.push_back({cname, ReadContainerDisplayName(entry.path(), cname), blob_count, total_size});
     }
     lock.unlock();
     for (const auto& entry : entries) {
         XGameSaveContainerInfo info{};
         info.name = entry.name.c_str();
-        info.displayName = entry.name.c_str();
+        info.displayName = entry.display_name.c_str();
         info.blobCount = entry.blob_count;
         info.totalSize = entry.total_size;
         info.lastModifiedTime = 0;
@@ -1329,22 +1742,25 @@ XGameResult XGameSaveEnumerateContainerInfoByName(
     const char* containerNamePrefix,
     void* context,
     XGameSaveContainerInfoCallback* callback) {
-    if (!provider || !callback) {
+    if (!provider || !provider->core || !callback) {
         return XGR_E_INVALIDARG;
     }
-    const std::string prefix = containerNamePrefix ? containerNamePrefix : "";
+    const std::string prefix =
+        (containerNamePrefix && *containerNamePrefix) ? SanitizeSaveName(containerNamePrefix) : "";
     struct Entry {
         std::string name;
+        std::string display_name;
         uint32_t blob_count;
         uint64_t total_size;
     };
     std::vector<Entry> entries;
-    std::unique_lock<std::mutex> lock(provider->mutex);
+    auto pcore = provider->core;
+    std::unique_lock<std::mutex> lock(pcore->mutex);
     std::error_code ec;
-    if (!fs::exists(provider->root_dir, ec)) {
+    if (!fs::exists(pcore->root_dir, ec)) {
         return XGR_S_OK;
     }
-    for (const auto& entry : fs::directory_iterator(provider->root_dir, ec)) {
+    for (const auto& entry : fs::directory_iterator(pcore->root_dir, ec)) {
         if (!entry.is_directory(ec)) {
             continue;
         }
@@ -1355,18 +1771,18 @@ XGameResult XGameSaveEnumerateContainerInfoByName(
         uint32_t blob_count = 0;
         uint64_t total_size = 0;
         for (const auto& f : fs::directory_iterator(entry.path(), ec)) {
-            if (f.is_regular_file(ec)) {
+            if (f.is_regular_file(ec) && f.path().filename() != kSaveMetaFileName) {
                 ++blob_count;
                 total_size += f.file_size(ec);
             }
         }
-        entries.push_back({cname, blob_count, total_size});
+        entries.push_back({cname, ReadContainerDisplayName(entry.path(), cname), blob_count, total_size});
     }
     lock.unlock();
     for (const auto& entry : entries) {
         XGameSaveContainerInfo info{};
         info.name = entry.name.c_str();
-        info.displayName = entry.name.c_str();
+        info.displayName = entry.display_name.c_str();
         info.blobCount = entry.blob_count;
         info.totalSize = entry.total_size;
         info.lastModifiedTime = 0;
@@ -1382,15 +1798,17 @@ XGameResult XGameSaveCreateUpdate(
     XGameSaveContainerHandle container,
     const char* displayName,
     XGameSaveUpdateHandle* updateContext) {
-    if (!container || !updateContext) {
+    if (!container || !container->core || !updateContext) {
         return XGR_E_INVALIDARG;
     }
+    auto ucore = std::make_shared<XGameSaveUpdateCore>();
+    ucore->container = container->core;
+    ucore->display_name = displayName ? displayName : container->core->name;
     auto* u = new (std::nothrow) XGameSaveUpdate();
     if (!u) {
         return XGR_E_OUTOFMEMORY;
     }
-    u->container = container;
-    u->display_name = displayName ? displayName : container->name;
+    u->core = std::move(ucore);
     RegisterValidHandle(u);
     *updateContext = u;
     return XGR_S_OK;
@@ -1409,66 +1827,47 @@ XGameResult XGameSaveSubmitBlobWrite(
     const char* blobName,
     const uint8_t* data,
     size_t byteCount) {
-    if (!updateContext || !IsValidSaveName(blobName) || (!data && byteCount > 0)) {
+    if (!updateContext || !updateContext->core || !IsValidSaveName(blobName) ||
+        (!data && byteCount > 0)) {
         return XGR_E_INVALIDARG;
     }
     std::vector<uint8_t> copy;
     if (byteCount > 0) {
         copy.assign(data, data + byteCount);
     }
-    updateContext->pending_writes[blobName] = std::move(copy);
+    std::lock_guard<std::mutex> lock(updateContext->core->mutex);
+    updateContext->core->pending_writes[blobName] = std::move(copy);
     return XGR_S_OK;
 }
 
 XGameResult XGameSaveSubmitBlobDelete(
     XGameSaveUpdateHandle updateContext,
     const char* blobName) {
-    if (!updateContext || !IsValidSaveName(blobName)) {
+    if (!updateContext || !updateContext->core || !IsValidSaveName(blobName)) {
         return XGR_E_INVALIDARG;
     }
-    updateContext->pending_writes.erase(blobName);
-    updateContext->pending_deletes.emplace_back(blobName);
+    std::lock_guard<std::mutex> lock(updateContext->core->mutex);
+    updateContext->core->pending_writes.erase(blobName);
+    updateContext->core->pending_deletes.emplace_back(blobName);
     return XGR_S_OK;
 }
 
 XGameResult XGameSaveSubmitUpdate(XGameSaveUpdateHandle updateContext) {
-    if (!updateContext || !updateContext->container || !updateContext->container->provider) {
+    if (!updateContext || !updateContext->core) {
         return XGR_E_INVALIDARG;
     }
-    auto* provider = updateContext->container->provider;
-    std::lock_guard<std::mutex> lock(provider->mutex);
-
-    std::error_code ec;
-    fs::create_directories(updateContext->container->dir_path, ec);
-
-    for (const auto& del_name : updateContext->pending_deletes) {
-        fs::remove(updateContext->container->dir_path / SanitizeSaveName(del_name), ec);
-    }
-    for (const auto& [blob_name, bytes] : updateContext->pending_writes) {
-        fs::path file_path = updateContext->container->dir_path / SanitizeSaveName(blob_name);
-        std::ofstream ofs(file_path, std::ios::binary | std::ios::trunc);
-        if (!ofs) {
-            return XGR_E_FAIL;
-        }
-        if (!bytes.empty()) {
-            ofs.write(reinterpret_cast<const char*>(bytes.data()),
-                      static_cast<std::streamsize>(bytes.size()));
-        }
-        if (!ofs.good()) {
-            return XGR_E_FAIL;
-        }
-    }
-    return XGR_S_OK;
+    return SubmitUpdateCore(updateContext->core);
 }
 
 XGameResult XGameSaveSubmitUpdateAsync(
     XGameSaveUpdateHandle updateContext,
     XAsyncBlock* async) {
-    if (!updateContext || !async) {
+    if (!updateContext || !updateContext->core || !async) {
         return XGR_E_INVALIDARG;
     }
-    return BeginAsyncOperation(async, [updateContext](XAsyncState* st) {
-        XGameResult hr = XGameSaveSubmitUpdate(updateContext);
+    auto ucore = updateContext->core;
+    return BeginAsyncOperation(async, [ucore](XAsyncState* st) {
+        XGameResult hr = SubmitUpdateCore(ucore);
         CompleteAsyncState(st, hr, 0);
     });
 }
@@ -1488,11 +1887,12 @@ XGameResult XGameSaveReadBlobData(
     uint32_t* countOfBlobs,
     size_t blobsSize,
     XGameSaveBlob* blobData) {
-    if (!container || !blobNames || !countOfBlobs || !blobData) {
+    if (!container || !container->core || !blobNames || !countOfBlobs || !blobData) {
         return XGR_E_INVALIDARG;
     }
-    auto* provider = container->provider;
-    std::lock_guard<std::mutex> lock(provider->mutex);
+    auto ccore = container->core;
+    auto pcore = ccore->provider;
+    std::lock_guard<std::mutex> lock(pcore->mutex);
 
     const uint32_t requested = *countOfBlobs;
     const size_t headers_bytes = sizeof(XGameSaveBlob) * requested;
@@ -1509,7 +1909,7 @@ XGameResult XGameSaveReadBlobData(
             return XGR_E_INVALIDARG;
         }
         const std::string name = blobNames[i];
-        fs::path file_path = container->dir_path / SanitizeSaveName(name);
+        fs::path file_path = ccore->dir_path / SanitizeSaveName(name);
         std::ifstream ifs(file_path, std::ios::binary | std::ios::ate);
         if (!ifs) {
             return XGR_E_GS_BLOB_NOT_FOUND;
@@ -1548,7 +1948,7 @@ XGameResult XGameSaveReadBlobDataAsync(
     const char** blobNames,
     uint32_t countOfBlobs,
     XAsyncBlock* async) {
-    if (!container || !blobNames || !async) {
+    if (!container || !container->core || !blobNames || !async) {
         return XGR_E_INVALIDARG;
     }
     std::vector<std::string> names;
@@ -1560,18 +1960,17 @@ XGameResult XGameSaveReadBlobDataAsync(
         names.emplace_back(blobNames[i]);
     }
 
-    return BeginAsyncOperation(async, [container, names = std::move(names)](XAsyncState* st) {
-        auto* provider = container->provider;
-        std::lock_guard<std::mutex> lock(provider->mutex);
+    auto ccore = container->core;
+    return BeginAsyncOperation(async, [ccore, names = std::move(names)](XAsyncState* st) {
+        auto pcore = ccore->provider;
+        std::lock_guard<std::mutex> lock(pcore->mutex);
 
-        // Compute packed payload size: [uint32_t count] + per-blob (name_len, data_len, name, data)
-        // Also compute GDK caller buffer requirement for XGameSaveReadBlobDataResult.
         size_t required_gdk_size = sizeof(XGameSaveBlob) * names.size();
         std::vector<std::pair<std::string, std::vector<uint8_t>>> blobs;
         blobs.reserve(names.size());
 
         for (const auto& name : names) {
-            fs::path file_path = container->dir_path / SanitizeSaveName(name);
+            fs::path file_path = ccore->dir_path / SanitizeSaveName(name);
             std::ifstream ifs(file_path, std::ios::binary | std::ios::ate);
             if (!ifs) {
                 CompleteAsyncState(st, XGR_E_GS_BLOB_NOT_FOUND, 0);
@@ -1587,7 +1986,6 @@ XGameResult XGameSaveReadBlobDataAsync(
             blobs.emplace_back(name, std::move(bytes));
         }
 
-        // Serialize into st->result_payload for XGameSaveReadBlobDataResult.
         std::vector<uint8_t> packed;
         auto append = [&](const void* src, size_t n) {
             const auto* p = static_cast<const uint8_t*>(src);
@@ -1675,18 +2073,19 @@ XGameResult XGameSaveEnumerateBlobInfo(
     XGameSaveContainerHandle container,
     void* context,
     XGameSaveBlobInfoCallback* callback) {
-    if (!container || !callback) {
+    if (!container || !container->core || !callback) {
         return XGR_E_INVALIDARG;
     }
-    auto* provider = container->provider;
+    auto ccore = container->core;
+    auto pcore = ccore->provider;
     std::vector<std::pair<std::string, uint32_t>> entries;
-    std::unique_lock<std::mutex> lock(provider->mutex);
+    std::unique_lock<std::mutex> lock(pcore->mutex);
     std::error_code ec;
-    if (!fs::exists(container->dir_path, ec)) {
+    if (!fs::exists(ccore->dir_path, ec)) {
         return XGR_S_OK;
     }
-    for (const auto& entry : fs::directory_iterator(container->dir_path, ec)) {
-        if (!entry.is_regular_file(ec)) {
+    for (const auto& entry : fs::directory_iterator(ccore->dir_path, ec)) {
+        if (!entry.is_regular_file(ec) || entry.path().filename() == kSaveMetaFileName) {
             continue;
         }
         entries.emplace_back(entry.path().filename().string(),
@@ -1767,8 +2166,9 @@ XGameResult XGameSaveFilesGetRemainingQuota(
     if (!userContext || !configurationId || !*configurationId) {
         return XGR_E_INVALIDARG;
     }
+    const uint64_t max_q = ConfiguredSaveQuotaBytes();
     const uint64_t used = ComputeDirectorySize(ResolveSaveRoot(configurationId));
-    *remainingQuota = used >= kSaveQuotaBytes ? 0 : static_cast<int64_t>(kSaveQuotaBytes - used);
+    *remainingQuota = used >= max_q ? 0 : static_cast<int64_t>(max_q - used);
     return XGR_S_OK;
 }
 
@@ -1779,14 +2179,23 @@ XGameResult XGameSaveFilesGetRemainingQuotaAsync(
     if (!userContext || !configurationId || !*configurationId || !async) {
         return XGR_E_INVALIDARG;
     }
+    XUserHandle dup_user = nullptr;
+    if (XUserDuplicateHandle(userContext, &dup_user) != XGR_S_OK) {
+        return XGR_E_INVALIDARG;
+    }
     std::string cfg = configurationId;
-    return BeginAsyncOperation(async, [userContext, cfg](XAsyncState* st) {
+    XGameResult hr = BeginAsyncOperation(async, [dup_user, cfg](XAsyncState* st) {
         int64_t remaining = 0;
-        XGameResult hr = XGameSaveFilesGetRemainingQuota(userContext, cfg.c_str(), &remaining);
+        XGameResult q_hr = XGameSaveFilesGetRemainingQuota(dup_user, cfg.c_str(), &remaining);
+        XUserCloseHandle(dup_user);
         st->result_payload.resize(sizeof(int64_t));
         std::memcpy(st->result_payload.data(), &remaining, sizeof(int64_t));
-        CompleteAsyncState(st, hr, sizeof(int64_t));
+        CompleteAsyncState(st, q_hr, sizeof(int64_t));
     });
+    if (hr < 0) {
+        XUserCloseHandle(dup_user);
+    }
+    return hr;
 }
 
 XGameResult XGameSaveFilesGetRemainingQuotaResult(
@@ -1903,11 +2312,31 @@ XGameResult XPackageEnumeratePackages(
     if (!callback) {
         return XGR_E_INVALIDARG;
     }
+    if (kind != XPackageKind_Game && kind != XPackageKind_Content) {
+        return XGR_E_INVALIDARG;
+    }
+    if (kind == XPackageKind_Game) {
+        std::string game_name = "ScarlettX Game";
+        if (const char* pkg_env = std::getenv("SCARLETTX_PACKAGE_ROOT"); pkg_env && *pkg_env) {
+            const std::string stem = fs::path(pkg_env).filename().string();
+            if (!stem.empty()) {
+                game_name = stem;
+            }
+        }
+        XPackageDetails game_det{};
+        game_det.packageIdentifier = "SCARLETTEDGE.GAME.MAIN";
+        game_det.version.major = 1;
+        game_det.kind = XPackageKind_Game;
+        game_det.displayName = game_name.c_str();
+        game_det.description = "ScarlettEdge Base Game Package";
+        game_det.publisher = "ScarlettEdge";
+        game_det.storeId = "9N5CA0000100";
+        game_det.installing = false;
+        (void)callback(context, &game_det);
+        return XGR_S_OK;
+    }
     const auto dlcs = DiscoverInstalledDlcPackages();
     for (const auto& dlc : dlcs) {
-        if (kind != XPackageKind_Content && kind != XPackageKind_Game) {
-            continue;
-        }
         XPackageDetails det{};
         det.packageIdentifier = dlc.package_id.c_str();
         det.version.major = 1;
@@ -1927,12 +2356,19 @@ XGameResult XPackageEnumeratePackages(
 XGameResult XPackageMountWithUiAsync(
     const char* packageIdentifier,
     XAsyncBlock* async) {
-    if (!packageIdentifier || !*packageIdentifier || !async) {
+    if (!packageIdentifier || !async) {
         return XGR_E_INVALIDARG;
     }
     std::string pkg_id = packageIdentifier;
-    return BeginAsyncOperation(async, [pkg_id = std::move(pkg_id)](XAsyncState* st) {
-        std::string resolved_path;
+    std::string resolved_path;
+    std::error_code ec;
+    if (pkg_id.empty() || pkg_id == "default" || pkg_id == "SCARLETTEDGE.GAME.MAIN") {
+        if (const char* root = std::getenv("SCARLETTX_PACKAGE_ROOT"); root && *root && fs::exists(root, ec)) {
+            resolved_path = fs::absolute(fs::path(root), ec).make_preferred().string();
+        } else {
+            resolved_path = fs::current_path(ec).make_preferred().string();
+        }
+    } else {
         const auto dlcs = DiscoverInstalledDlcPackages();
         for (const auto& dlc : dlcs) {
             if (dlc.package_id == pkg_id || dlc.display_name == pkg_id || dlc.store_id == pkg_id) {
@@ -1940,28 +2376,32 @@ XGameResult XPackageMountWithUiAsync(
                 break;
             }
         }
-        if (resolved_path.empty()) {
-            std::error_code ec;
-            if (fs::exists(pkg_id, ec)) {
-                resolved_path = fs::absolute(pkg_id, ec).make_preferred().string();
-            } else if (const char* root = std::getenv("SCARLETTX_PACKAGE_ROOT"); root && *root) {
-                resolved_path = fs::absolute(fs::path(root), ec).make_preferred().string();
-            } else {
-                resolved_path = fs::current_path(ec).make_preferred().string();
-            }
+        if (resolved_path.empty() && fs::exists(pkg_id, ec)) {
+            resolved_path = fs::absolute(pkg_id, ec).make_preferred().string();
         }
-        while (resolved_path.size() > 3 && (resolved_path.back() == '\\' || resolved_path.back() == '/')) {
-            resolved_path.pop_back();
-        }
+    }
+    if (resolved_path.empty()) {
+        return XGR_E_NOTFOUND;
+    }
+    while (resolved_path.size() > 3 && (resolved_path.back() == '\\' || resolved_path.back() == '/')) {
+        resolved_path.pop_back();
+    }
+    return BeginAsyncOperation(async, [pkg_id = std::move(pkg_id), resolved_path = std::move(resolved_path)](XAsyncState* st) {
         auto* mh = new (std::nothrow) XPackageMountObject();
         if (!mh) {
             CompleteAsyncState(st, XGR_E_OUTOFMEMORY, 0);
             return;
         }
         mh->package_id = pkg_id;
-        mh->host_path = std::move(resolved_path);
+        mh->host_path = resolved_path;
         RegisterValidHandle(mh);
-        st->result_handle = mh;
+        {
+            std::lock_guard<std::mutex> lk(st->mutex);
+            st->result_handle = mh;
+            st->cleanup_result = [](void* h) {
+                XPackageCloseMountHandle(static_cast<XPackageMountHandle>(h));
+            };
+        }
         CompleteAsyncState(st, XGR_S_OK, sizeof(XPackageMountHandle));
     });
 }
@@ -1976,11 +2416,22 @@ XGameResult XPackageMountWithUiResult(
         return hr;
     }
     auto state = GetAsyncState(async);
-    if (!state || !state->result_handle) {
+    if (!state) {
         *mountHandle = nullptr;
         return XGR_E_FAIL;
     }
-    *mountHandle = static_cast<XPackageMountHandle>(state->result_handle);
+    XPackageMountHandle out_mh = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(state->mutex);
+        out_mh = static_cast<XPackageMountHandle>(state->result_handle);
+        state->result_handle = nullptr;
+        state->cleanup_result = nullptr;
+    }
+    if (!out_mh) {
+        *mountHandle = nullptr;
+        return XGR_E_FAIL;
+    }
+    *mountHandle = out_mh;
     xgr::ReleaseHleAsyncResult(async);
     return XGR_S_OK;
 }
@@ -2075,7 +2526,13 @@ XGameResult XStoreQueryEntitledProductsAsync(
             q->items.push_back({dlc.store_id, dlc.display_name, "Entitled Add-On Content", 1u});
         }
         RegisterValidHandle(q);
-        st->result_handle = q;
+        {
+            std::lock_guard<std::mutex> lk(st->mutex);
+            st->result_handle = q;
+            st->cleanup_result = [](void* h) {
+                XStoreCloseProductsQueryHandle(static_cast<XStoreProductQueryHandle>(h));
+            };
+        }
         CompleteAsyncState(st, XGR_S_OK, sizeof(XStoreProductQueryHandle));
     });
 }
@@ -2090,11 +2547,22 @@ XGameResult XStoreQueryEntitledProductsResult(
         return hr;
     }
     auto state = GetAsyncState(async);
-    if (!state || !state->result_handle) {
+    if (!state) {
         *productQueryHandle = nullptr;
         return XGR_E_FAIL;
     }
-    *productQueryHandle = static_cast<XStoreProductQueryHandle>(state->result_handle);
+    XStoreProductQueryHandle out_q = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(state->mutex);
+        out_q = static_cast<XStoreProductQueryHandle>(state->result_handle);
+        state->result_handle = nullptr;
+        state->cleanup_result = nullptr;
+    }
+    if (!out_q) {
+        *productQueryHandle = nullptr;
+        return XGR_E_FAIL;
+    }
+    *productQueryHandle = out_q;
     xgr::ReleaseHleAsyncResult(async);
     return XGR_S_OK;
 }
@@ -2103,6 +2571,12 @@ XGameResult XStoreEnumerateProductsQuery(
     XStoreProductQueryHandle productQueryHandle,
     void* context,
     XStoreProductQueryCallback* callback) {
+    static_assert(offsetof(XStoreProduct, inAppOfferToken) == 0x20,
+                  "XStoreProduct::inAppOfferToken must be at +0x20");
+    static_assert(offsetof(XStoreProduct, linkUri) == 0x28,
+                  "XStoreProduct::linkUri must be at +0x28");
+    static_assert(offsetof(XStoreProduct, price) == 0x38,
+                  "XStoreProduct::price must be at +0x38");
     if (!productQueryHandle || !callback) return XGR_E_INVALIDARG;
     for (const auto& item : productQueryHandle->items) {
         XStoreProduct prod{};
@@ -2110,7 +2584,14 @@ XGameResult XStoreEnumerateProductsQuery(
         prod.title = item.title.c_str();
         prod.description = item.description.c_str();
         prod.language = "en-US";
+        prod.inAppOfferToken = "";
+        prod.linkUri = "";
         prod.productKind = item.kind;
+        prod.price.currencyCode = "USD";
+        std::strncpy(prod.price.formattedBasePrice, "$0.00", sizeof(prod.price.formattedBasePrice) - 1);
+        std::strncpy(prod.price.formattedPrice, "$0.00", sizeof(prod.price.formattedPrice) - 1);
+        std::strncpy(prod.price.formattedRecurrencePrice, "$0.00", sizeof(prod.price.formattedRecurrencePrice) - 1);
+        prod.hasDigitalDownload = true;
         prod.isInUserCollection = true;
         if (!callback(&prod, context)) break;
     }
@@ -2126,14 +2607,95 @@ void XStoreCloseProductsQueryHandle(XStoreProductQueryHandle productQueryHandle)
 // ===========================================================================
 // XMem.h
 // ===========================================================================
-void* XMemAllocDefault(size_t dwSize, uint64_t /*dwAttributes*/) {
-    const size_t sz = dwSize == 0 ? 16 : dwSize;
-    void* ptr = std::calloc(1, sz);
+}  // extern "C"
+
+namespace {
+
+size_t DecodeXMemAlignment(uint64_t attrs) {
+    // Honor XALLOC_ATTRIBUTES alignment code in bits 24..28 ((dwAttributes >> 24) & 0xF / 0x1F)
+    // as well as Xbox page-size modifiers if passed in dwAttributes.
+    const uint32_t align_code = static_cast<uint32_t>((attrs >> 24) & 0x1Fu);
+    if (align_code >= 4u && align_code <= 21u) {
+        return size_t{1} << align_code;
+    }
+    const uint32_t nibble = static_cast<uint32_t>((attrs >> 24) & 0xFu);
+    if (nibble >= 4u) {
+        return size_t{1} << nibble;
+    }
+    if ((attrs & 0x20400000ull) == 0x20400000ull) {
+        return 0x10000u;
+    }
+    if (attrs & 0x20000000ull) {
+        return 0x200000u;
+    }
+    const uint32_t page_type = static_cast<uint32_t>((attrs >> 29) & 0x3u);
+    if (page_type == 1u) return 0x1000u;
+    if (page_type == 2u) return 0x10000u;
+    if (page_type == 3u) return 0x200000u;
+    return 16u;
+}
+
+#if defined(_WIN32)
+bool RegisterWithKernelX(void* va, size_t size) {
+    if (!va || size == 0) return false;
+    HMODULE kx = GetModuleHandleW(L"kernelx.dll");
+    if (!kx) return false;
+    FARPROC proc = GetProcAddress(kx, "KernelXRegisterExternalAllocation");
+    if (!proc) return false;
+    using RegFn = int32_t(SCARLETTX_GDK_CALLBACK*)(void*, uint64_t, void*, void*);
+    auto fn = reinterpret_cast<RegFn>(reinterpret_cast<void*>(proc));
+    int32_t rc = fn(va, static_cast<uint64_t>(size), nullptr, nullptr);
+    if (rc == static_cast<int32_t>(0x80070057u)) {
+        uint64_t dummy_gpu_va = 0;
+        (void)fn(va, static_cast<uint64_t>(size), &dummy_gpu_va, &dummy_gpu_va);
+    }
+    return true;
+}
+
+void UnregisterWithKernelX(void* va, size_t size) {
+    if (!va) return;
+    HMODULE kx = GetModuleHandleW(L"kernelx.dll");
+    if (!kx) return;
+    FARPROC proc = GetProcAddress(kx, "KernelXUnregisterExternalAllocation");
+    if (!proc) return;
+    using UnregFn = int32_t(SCARLETTX_GDK_CALLBACK*)(void*, uint64_t);
+    auto fn = reinterpret_cast<UnregFn>(reinterpret_cast<void*>(proc));
+    (void)fn(va, static_cast<uint64_t>(size));
+}
+#endif
+
+}  // namespace
+
+extern "C" {
+
+void* XMemAllocDefault(size_t dwSize, uint64_t dwAttributes) {
+    const size_t align = DecodeXMemAlignment(dwAttributes);
+    const size_t sz = dwSize == 0 ? align : ((dwSize + align - 1) & ~(align - 1));
+#if defined(_WIN32)
+    void* ptr = _aligned_malloc(sz, align);
+    if (ptr) {
+        std::memset(ptr, 0, sz);
+    }
     return ptr;
+#else
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, align, sz) != 0) {
+        return nullptr;
+    }
+    std::memset(ptr, 0, sz);
+    return ptr;
+#endif
 }
 
 void XMemFreeDefault(void* lpAddress, uint64_t /*dwAttributes*/) {
+    if (!lpAddress) {
+        return;
+    }
+#if defined(_WIN32)
+    _aligned_free(lpAddress);
+#else
     std::free(lpAddress);
+#endif
 }
 
 void* XMemAlloc(size_t dwSize, uint64_t dwAttributes) {
@@ -2192,42 +2754,121 @@ void* XMemVirtualAlloc(
     uint64_t /*dwXMemFlags*/,
     uint32_t flProtect) {
 #if defined(_WIN32)
-    // On the console MEM_LARGE_PAGES selects 2 MB pages, and 64 KB pages when
-    // combined with 0x00400000. The host needs a privilege for large pages,
-    // so both get normal pages with that size rounding and alignment.
-    constexpr DWORD kPageSizeBits = 0x20400000u;
+    if (dwSize == 0) {
+        return nullptr;
+    }
+    // Console page-size selectors:
+    //   0x20400000 / 0x00400000 -> 64 KB pages
+    //   0x20000000 / 0x40000000 -> 2 MB large pages
+    // Strip Xbox-only MEM_GRAPHICS (0x04000000) and all console page/high bits before host VirtualAlloc.
+    constexpr uint32_t kPage64kMask = 0x20400000u;
     size_t page = 0x1000;
-    if ((flAllocationType & kPageSizeBits) == kPageSizeBits) {
+    if ((flAllocationType & kPage64kMask) == kPage64kMask || (flAllocationType & 0x00400000u) != 0) {
         page = 0x10000;
-    } else if (flAllocationType & 0x20000000u) {
+    } else if ((flAllocationType & 0x20000000u) != 0 || (flAllocationType & 0x40000000u) != 0) {
         page = 0x200000;
     }
-    DWORD flAlloc = static_cast<DWORD>(flAllocationType) & ~kPageSizeBits;
-    if (flAlloc == 0) flAlloc = MEM_RESERVE | MEM_COMMIT;
-    if (!lpAddress && (flAlloc & MEM_COMMIT)) flAlloc |= MEM_RESERVE;
-    const DWORD protect = flProtect ? static_cast<DWORD>(flProtect) : PAGE_READWRITE;
+    constexpr DWORD kValidWin32AllocFlags =
+        MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET_UNDO;
+    DWORD flAlloc = static_cast<DWORD>(flAllocationType) & kValidWin32AllocFlags;
+    if (flAlloc == 0) {
+        flAlloc = MEM_RESERVE | MEM_COMMIT;
+    }
+    if (!lpAddress && (flAlloc & MEM_COMMIT) != 0) {
+        flAlloc |= MEM_RESERVE;
+    }
+    DWORD protect = static_cast<DWORD>(flProtect) & 0x7FFu;
+    if ((protect & 0xFFu) == 0) {
+        protect = (flAlloc == MEM_RESERVE) ? PAGE_NOACCESS : PAGE_READWRITE;
+    }
     const size_t size = (dwSize + page - 1) & ~(page - 1);
     void* result = nullptr;
     if (lpAddress || page <= 0x10000) {
         result = VirtualAlloc(lpAddress, size, flAlloc, protect);
     } else {
-        // No address and more than the host's 64 KB granularity: find a free
-        // range, then claim its aligned part. Another thread can take it in
-        // between, hence the retries.
-        for (int attempt = 0; attempt < 8; ++attempt) {
-            void* probe = VirtualAlloc(nullptr, size + page, MEM_RESERVE, PAGE_NOACCESS);
-            if (!probe) break;
-            VirtualFree(probe, 0, MEM_RELEASE);
-            const uintptr_t aligned = (reinterpret_cast<uintptr_t>(probe) + page - 1) & ~(page - 1);
-            if (void* p = VirtualAlloc(reinterpret_cast<void*>(aligned), size, flAlloc, protect)) {
-                result = p;
-                break;
+        struct Win32AddrReq {
+            PVOID lowest;
+            PVOID highest;
+            SIZE_T alignment;
+        };
+        struct alignas(8) Win32ExtParam {
+            ULONG64 type;
+            PVOID ptr;
+        };
+        using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+        static std::atomic<VirtualAlloc2Fn> va2_cached{nullptr};
+        static std::atomic<bool> va2_probed{false};
+        if (!va2_probed.load(std::memory_order_acquire)) {
+            HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+            VirtualAlloc2Fn fn = kb ? reinterpret_cast<VirtualAlloc2Fn>(
+                                          reinterpret_cast<void*>(GetProcAddress(kb, "VirtualAlloc2")))
+                                    : nullptr;
+            va2_cached.store(fn, std::memory_order_relaxed);
+            va2_probed.store(true, std::memory_order_release);
+        }
+        if (VirtualAlloc2Fn va2 = va2_cached.load(std::memory_order_relaxed)) {
+            Win32AddrReq req{nullptr, nullptr, static_cast<SIZE_T>(page)};
+            Win32ExtParam ext{1ull /* MemExtendedParameterAddressRequirements */, &req};
+            result = va2(GetCurrentProcess(), nullptr, size, flAlloc, protect, &ext, 1u);
+        }
+        if (!result) {
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                void* probe = VirtualAlloc(nullptr, size + page, MEM_RESERVE, PAGE_NOACCESS);
+                if (!probe) break;
+                VirtualFree(probe, 0, MEM_RELEASE);
+                const uintptr_t aligned = (reinterpret_cast<uintptr_t>(probe) + page - 1) & ~(page - 1);
+                if (void* p = VirtualAlloc(reinterpret_cast<void*>(aligned), size, flAlloc, protect)) {
+                    result = p;
+                    break;
+                }
             }
         }
     }
-    if (result) {
-        g_mem_total_allocated.fetch_add(size, std::memory_order_relaxed);
-        g_mem_total_reserved.fetch_add(size, std::memory_order_relaxed);
+    if (!result) {
+        return nullptr;
+    }
+
+    const uintptr_t res_addr = reinterpret_cast<uintptr_t>(result);
+    const bool is_reserve = (flAlloc & MEM_RESERVE) != 0;
+    const bool is_commit = (flAlloc & MEM_COMMIT) != 0;
+    bool register_kx = false;
+    size_t register_kx_size = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_vmem_mutex);
+        if (is_reserve) {
+            VMemRegion reg{};
+            reg.base = res_addr;
+            reg.reserved_size = size;
+            reg.committed_bytes = is_commit ? size : 0;
+            reg.registered_kernelx = true;
+            g_vmem_regions[res_addr] = reg;
+            g_mem_total_reserved.fetch_add(size, std::memory_order_relaxed);
+            if (is_commit) {
+                g_mem_total_allocated.fetch_add(size, std::memory_order_relaxed);
+            }
+            register_kx = true;
+            register_kx_size = size;
+        } else if (is_commit) {
+            // Committing within an already-reserved region: do not double-count reserved bytes.
+            auto it = g_vmem_regions.upper_bound(res_addr);
+            if (it != g_vmem_regions.begin()) {
+                --it;
+                if (res_addr >= it->second.base &&
+                    res_addr < it->second.base + it->second.reserved_size) {
+                    const size_t avail = it->second.reserved_size - it->second.committed_bytes;
+                    const size_t added = std::min(size, avail);
+                    it->second.committed_bytes += added;
+                    g_mem_total_allocated.fetch_add(added, std::memory_order_relaxed);
+                } else {
+                    g_mem_total_allocated.fetch_add(size, std::memory_order_relaxed);
+                }
+            } else {
+                g_mem_total_allocated.fetch_add(size, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (register_kx) {
+        (void)RegisterWithKernelX(result, register_kx_size);
     }
     return result;
 #else
@@ -2237,6 +2878,9 @@ void* XMemVirtualAlloc(
     const size_t alloc_sz = dwSize == 0 ? 4096 : dwSize;
     void* ptr = std::calloc(1, alloc_sz);
     if (ptr) {
+        std::lock_guard<std::mutex> lock(g_vmem_mutex);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
+        g_vmem_regions[base] = VMemRegion{base, alloc_sz, alloc_sz, false};
         g_mem_total_allocated.fetch_add(alloc_sz, std::memory_order_relaxed);
         g_mem_total_reserved.fetch_add(alloc_sz, std::memory_order_relaxed);
     }
@@ -2252,16 +2896,62 @@ bool XMemVirtualFree(void* address, size_t size, uint32_t freeType) {
     DWORD flFree = freeType ? static_cast<DWORD>(freeType) : MEM_RELEASE;
     bool ok = VirtualFree(address, flFree == MEM_RELEASE ? 0 : size, flFree) != 0;
     if (ok) {
-        const size_t freed = size == 0 ? 4096 : size;
-        g_mem_total_allocated.fetch_sub(std::min(freed, g_mem_total_allocated.load(std::memory_order_relaxed)), std::memory_order_relaxed);
-        if (flFree == MEM_RELEASE) {
-            g_mem_total_reserved.fetch_sub(std::min(freed, g_mem_total_reserved.load(std::memory_order_relaxed)), std::memory_order_relaxed);
+        const uintptr_t addr_val = reinterpret_cast<uintptr_t>(address);
+        bool unregister_kx = false;
+        size_t unregister_kx_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_vmem_mutex);
+            if (flFree == MEM_RELEASE) {
+                auto it = g_vmem_regions.find(addr_val);
+                size_t rel_reserved = size == 0 ? 4096 : size;
+                size_t rel_committed = rel_reserved;
+                if (it != g_vmem_regions.end()) {
+                    rel_reserved = it->second.reserved_size;
+                    rel_committed = it->second.committed_bytes;
+                    unregister_kx = it->second.registered_kernelx;
+                    unregister_kx_size = rel_reserved;
+                    g_vmem_regions.erase(it);
+                }
+                const size_t cur_alloc = g_mem_total_allocated.load(std::memory_order_relaxed);
+                g_mem_total_allocated.fetch_sub(std::min(rel_committed, cur_alloc), std::memory_order_relaxed);
+                const size_t cur_res = g_mem_total_reserved.load(std::memory_order_relaxed);
+                g_mem_total_reserved.fetch_sub(std::min(rel_reserved, cur_res), std::memory_order_relaxed);
+            } else if ((flFree & MEM_DECOMMIT) != 0) {
+                const size_t decommit_sz = (size == 0 ? 4096 : ((size + 0xFFFu) & ~size_t{0xFFFu}));
+                size_t sub_committed = decommit_sz;
+                auto it = g_vmem_regions.upper_bound(addr_val);
+                if (it != g_vmem_regions.begin()) {
+                    --it;
+                    if (addr_val >= it->second.base &&
+                        addr_val < it->second.base + it->second.reserved_size) {
+                        sub_committed = std::min(decommit_sz, it->second.committed_bytes);
+                        it->second.committed_bytes -= sub_committed;
+                    }
+                }
+                const size_t cur_alloc = g_mem_total_allocated.load(std::memory_order_relaxed);
+                g_mem_total_allocated.fetch_sub(std::min(sub_committed, cur_alloc), std::memory_order_relaxed);
+            }
+        }
+        if (unregister_kx) {
+            UnregisterWithKernelX(address, unregister_kx_size);
         }
     }
     return ok;
 #else
     (void)size;
     (void)freeType;
+    const uintptr_t addr_val = reinterpret_cast<uintptr_t>(address);
+    {
+        std::lock_guard<std::mutex> lock(g_vmem_mutex);
+        auto it = g_vmem_regions.find(addr_val);
+        if (it != g_vmem_regions.end()) {
+            const size_t cur_alloc = g_mem_total_allocated.load(std::memory_order_relaxed);
+            g_mem_total_allocated.fetch_sub(std::min(it->second.committed_bytes, cur_alloc), std::memory_order_relaxed);
+            const size_t cur_res = g_mem_total_reserved.load(std::memory_order_relaxed);
+            g_mem_total_reserved.fetch_sub(std::min(it->second.reserved_size, cur_res), std::memory_order_relaxed);
+            g_vmem_regions.erase(it);
+        }
+    }
     std::free(address);
     return true;
 #endif
@@ -2285,11 +2975,11 @@ void XMemResetVirtualAllocStats() {
 // XThread.h & XGame.h
 // ===========================================================================
 bool XThreadIsTimeSensitive() {
-    return g_thread_time_sensitive;
+    return GetCurrentThreadFlsTimeSensitive();
 }
 
 XGameResult XThreadSetTimeSensitive(bool isTimeSensitive) {
-    g_thread_time_sensitive = isTimeSensitive;
+    SetCurrentThreadFlsTimeSensitive(isTimeSensitive);
     return XGR_S_OK;
 }
 
@@ -2305,35 +2995,44 @@ XGameResult XThreadGetTimeSensitive(bool* isTimeSensitive) {
     if (!isTimeSensitive) {
         return XGR_E_INVALIDARG;
     }
-    *isTimeSensitive = g_thread_time_sensitive;
+    *isTimeSensitive = GetCurrentThreadFlsTimeSensitive();
     return XGR_S_OK;
 }
 
 XGameResult XThreadSetTimeSensitiveThread(uint32_t threadId, bool isTimeSensitive) {
-    static std::mutex ts_mu;
-    static std::unordered_map<uint32_t, bool> ts_by_tid;
-    {
-        std::lock_guard<std::mutex> lock(ts_mu);
-        ts_by_tid[threadId] = isTimeSensitive;
-    }
 #if defined(_WIN32)
-    bool other_live_thread = false;
-    if (threadId != 0 && threadId != GetCurrentThreadId()) {
-        if (HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, threadId)) {
-            DWORD pid = GetProcessIdOfThread(h);
-            CloseHandle(h);
-            if (pid == GetCurrentProcessId()) {
-                other_live_thread = true;
-            }
+    const uint32_t self_tid = GetCurrentThreadId();
+    if (threadId == 0 || threadId == self_tid) {
+        SetCurrentThreadFlsTimeSensitive(isTimeSensitive);
+        return XGR_S_OK;
+    }
+    // Every real Win32 TID has ((tid & 3) == 0); check before OpenThread because
+    // NT's ExMapHandleToPointer masks the low 2 tag bits (1234 -> 1232) and could
+    // otherwise match an unrelated process's thread 1232!
+    if ((threadId & 3u) != 0u) {
+        SetCurrentThreadFlsTimeSensitive(isTimeSensitive);
+        return XGR_S_OK;
+    }
+    if (HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, threadId)) {
+        const DWORD pid = GetProcessIdOfThread(h);
+        CloseHandle(h);
+        if (pid != GetCurrentProcessId()) {
+            return XGR_E_INVALIDARG;
         }
+        std::lock_guard<std::mutex> lock(g_ts_mutex);
+        g_ts_by_tid[threadId] = isTimeSensitive;
+        return XGR_S_OK;
     }
-    if (!other_live_thread) {
-        g_thread_time_sensitive = isTimeSensitive;
+    {
+        std::lock_guard<std::mutex> lock(g_ts_mutex);
+        g_ts_by_tid[threadId] = isTimeSensitive;
     }
+    return XGR_E_INVALIDARG;
 #else
-    g_thread_time_sensitive = isTimeSensitive;
-#endif
+    (void)threadId;
+    SetCurrentThreadFlsTimeSensitive(isTimeSensitive);
     return XGR_S_OK;
+#endif
 }
 
 XGameResult XGameGetXboxTitleId(uint32_t* titleId) {
@@ -2368,6 +3067,16 @@ XGameResult InitializeApiImpl(uint32_t build, uint32_t revision) {
 XGameResult InitializeApiImplEx(uint32_t build, uint32_t revision, uint64_t flags) {
     std::fprintf(stderr, "[ScarlettX][xgameruntime] InitializeApiImplEx(build=%u, rev=%u, flags=0x%llX)\n",
                  build, revision, static_cast<unsigned long long>(flags));
+    std::fflush(stderr);
+    return XGameRuntimeInitialize();
+}
+
+XGameResult InitializeApiImplEx2(uint32_t build, uint32_t revision, uint64_t flags,
+                                 const XGameRuntimeOptions* options) {
+    std::fprintf(stderr,
+                 "[ScarlettX][xgameruntime] InitializeApiImplEx2(build=%u, rev=%u, flags=0x%llX, options=%p)\n",
+                 build, revision, static_cast<unsigned long long>(flags),
+                 static_cast<const void*>(options));
     std::fflush(stderr);
     return XGameRuntimeInitialize();
 }
@@ -2823,6 +3532,8 @@ XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_UnimplementedSlot(void* /*sel
                  SlotIndex * 8u,
                  SlotIndex);
     std::fflush(stderr);
+    scarlettx::FlightRecorder::Instance().RecordVtableSlotMiss(
+        "XgrApiImpl{37E56907}", static_cast<int32_t>(SlotIndex), 0ull, SCARLETTX_CALLER_RIP());
     return static_cast<XGameResult>(0x80004001u);  // E_NOTIMPL
 }
 
@@ -2915,12 +3626,10 @@ XGameResult QueryApiImpl(const void* api_id, const void* riid, void** out_impl) 
 
     // A title often waits forever on an API it cannot get, so the first
     // request for each missing table is reported even without --trace.
-    static std::mutex missing_mutex;
-    static std::unordered_set<std::string> missing;
     bool first = false;
     {
-        std::lock_guard<std::mutex> lock(missing_mutex);
-        first = missing.insert(std::string(api_str) + iid_str).second;
+        std::lock_guard<std::mutex> lock(g_missing_api_mutex);
+        first = g_missing_apis.insert(std::string(api_str) + iid_str).second;
     }
     if (first || TraceEnabled()) {
         std::fprintf(stderr,
@@ -2928,6 +3637,8 @@ XGameResult QueryApiImpl(const void* api_id, const void* riid, void** out_impl) 
                      api_str, iid_str);
         std::fflush(stderr);
     }
+    scarlettx::FlightRecorder::Instance().RecordComQiMiss(
+        "XGR::QueryApiImpl", riid, SCARLETTX_CALLER_RIP());
     return static_cast<XGameResult>(0x80004002u);
 }
 

@@ -18,13 +18,25 @@ namespace xgr {
 struct HleAsyncState {
     std::mutex mutex;
     XGameResult status = XGR_E_PENDING;
+    bool started = false;
     bool completed = false;
     bool canceled = false;
     size_t result_size = 0;
     std::vector<uint8_t> result_payload;
     void* result_handle = nullptr;
+    void (*cleanup_result)(void*) = nullptr;
     XAsyncBlock* block = nullptr;
     std::function<void(HleAsyncState*)> work_fn;
+
+    ~HleAsyncState() {
+        if (result_handle && cleanup_result) {
+            void* h = result_handle;
+            auto fn = cleanup_result;
+            result_handle = nullptr;
+            cleanup_result = nullptr;
+            fn(h);
+        }
+    }
 };
 
 // Starts `work_fn` on the work port of the block's queue. `work_fn` must call

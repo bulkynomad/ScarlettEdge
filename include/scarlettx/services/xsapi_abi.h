@@ -33,7 +33,13 @@ typedef struct XblUserProfile {
     char gameDisplayPictureResizeUri[256];
 } XblUserProfile;
 
-// Synthetic offline Xbox Live service initialization
+typedef struct XblInitArgs {
+    void* queue;
+    const char* scid;
+} XblInitArgs;
+
+// Synthetic offline Xbox Live service initialization (accepts either a direct ASCII
+// SCID string or a pointer to a GDK XblInitArgs struct).
 SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblInitialize(const char* scid);
 
 SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblCleanup(void);

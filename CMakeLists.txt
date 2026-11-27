@@ -7,6 +7,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 enable_testing()
 
+# Place shared libraries and executables in deterministic directories across both
+# single-config (Ninja) and multi-config (Visual Studio) CMake generators.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+foreach(_sx_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${_sx_cfg} "${CMAKE_BINARY_DIR}")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${_sx_cfg} "${CMAKE_BINARY_DIR}")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${_sx_cfg} "${CMAKE_BINARY_DIR}/lib")
+endforeach()
+
 if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_compile_options(/W4 /wd4100 /wd4201 /wd4324)
@@ -14,8 +25,9 @@ else()
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 endif()
 
-# Core emulator static library
-add_library(scarlettx_core STATIC
+# Core emulator shared library (single process-wide singleton state across scarlettx.exe and all 22 shim DLLs)
+add_library(scarlettx_core SHARED
+    src/core/flight_recorder.cpp
     src/core/status.cpp
     src/loader/game_config.cpp
     src/loader/pe_loader.cpp
@@ -33,6 +45,11 @@ add_library(scarlettx_core STATIC
     src/gpu/xg_layout.cpp
     src/runtime/emulator.cpp
     src/runtime/virtual_drive.cpp
+)
+set_target_properties(scarlettx_core PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "scarlettx_core"
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 
 target_include_directories(scarlettx_core PUBLIC
@@ -72,7 +89,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(d3d12_xs SHARED src/shims/d3d12_xs_shim.cpp src/shims/d3d12_xs_exports.cpp)
 set_target_properties(d3d12_xs PROPERTIES PREFIX "" OUTPUT_NAME "d3d12_xs")
-target_link_libraries(d3d12_xs PRIVATE scarlettx_core)
+target_link_libraries(d3d12_xs PRIVATE scarlettx_core $<$<BOOL:${WIN32}>:user32>)
 target_compile_definitions(d3d12_xs PRIVATE SCARLETTX_BUILDING_D3D12_XS=1)
 
 add_library(xg_xs SHARED src/shims/xg_xs_shim.cpp)
@@ -98,19 +115,18 @@ set_target_properties(XboxBvhBuilder PROPERTIES PREFIX "" OUTPUT_NAME "XboxBvhBu
 target_link_libraries(XboxBvhBuilder PRIVATE scarlettx_core)
 target_compile_definitions(XboxBvhBuilder PRIVATE SCARLETTX_BUILDING_XBOX_BVH=1)
 
+add_library(xcrdapi SHARED src/shims/dstorage_guest.cpp)
+set_target_properties(xcrdapi PROPERTIES PREFIX "" OUTPUT_NAME "xcrdapi")
+target_link_libraries(xcrdapi PRIVATE scarlettx_core xbox_codecs)
+
 add_library(dstorage SHARED src/shims/dstorage_shim.cpp)
 set_target_properties(dstorage PROPERTIES PREFIX "" OUTPUT_NAME "dstorage")
 target_link_libraries(dstorage PRIVATE scarlettx_core xbox_codecs)
 target_compile_definitions(dstorage PRIVATE SCARLETTX_BUILDING_DSTORAGE=1)
 
-add_library(dstorage_xs SHARED src/shims/dstorage_shim.cpp)
+add_library(dstorage_xs SHARED src/shims/dstorage_xs_forward.cpp src/shims/dstorage_xs.def)
 set_target_properties(dstorage_xs PROPERTIES PREFIX "" OUTPUT_NAME "dstorage_xs")
-target_link_libraries(dstorage_xs PRIVATE scarlettx_core xbox_codecs)
-target_compile_definitions(dstorage_xs PRIVATE SCARLETTX_BUILDING_DSTORAGE=1)
-
-add_library(xcrdapi SHARED src/shims/dstorage_guest.cpp)
-set_target_properties(xcrdapi PROPERTIES PREFIX "" OUTPUT_NAME "xcrdapi")
-target_link_libraries(xcrdapi PRIVATE scarlettx_core xbox_codecs)
+target_link_libraries(dstorage_xs PRIVATE scarlettx_core dstorage xcrdapi)
 
 add_library(xaudio2_9 SHARED src/shims/xaudio2_shim.cpp src/shims/xaudio2_guest.cpp src/shims/xaudio2_null_output.cpp src/shims/xaudio2_9.def)
 set_target_properties(xaudio2_9 PROPERTIES PREFIX "" OUTPUT_NAME "xaudio2_9")
@@ -119,7 +135,7 @@ target_compile_definitions(xaudio2_9 PRIVATE SCARLETTX_BUILDING_XAUDIO2=1)
 
 add_library(GameInput SHARED src/shims/gameinput_shim.cpp)
 set_target_properties(GameInput PROPERTIES PREFIX "" OUTPUT_NAME "GameInput")
-target_link_libraries(GameInput PRIVATE scarlettx_core)
+target_link_libraries(GameInput PRIVATE scarlettx_core $<$<BOOL:${WIN32}>:user32>)
 target_compile_definitions(GameInput PRIVATE SCARLETTX_BUILDING_GAMEINPUT=1)
 
 add_library(Bink2Scarlett SHARED src/shims/bink2_scarlett_shim.cpp)
@@ -213,12 +229,22 @@ add_dependencies(scarlettx
 # ---------------------------------------------------------------------------
 # Synthetic Scarlett GDK Test Games (compile as real x86-64 PEs linking HLE DLLs)
 # ---------------------------------------------------------------------------
+# Helper to keep synthetic package output directories identical under multi-config generators
+function(scarlettx_set_package_output target_name pkg_subdir)
+    set_target_properties(${target_name} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/${pkg_subdir}"
+    )
+    foreach(_sx_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+        set_target_properties(${target_name} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY_${_sx_cfg} "${CMAKE_BINARY_DIR}/packages/${pkg_subdir}"
+        )
+    endforeach()
+endfunction()
+
 add_executable(hello_scarlett tests/synthetic_games/hello_scarlett/main.cpp)
 target_link_libraries(hello_scarlett PRIVATE d3d12_xs xgameruntime XboxBvhBuilder)
 target_include_directories(hello_scarlett PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_target_properties(hello_scarlett PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/hello_scarlett"
-)
+scarlettx_set_package_output(hello_scarlett hello_scarlett)
 add_custom_command(TARGET hello_scarlett POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/hello_scarlett/MicrosoftGame.Config"
@@ -228,9 +254,7 @@ add_custom_command(TARGET hello_scarlett POST_BUILD
 add_executable(rt_showcase tests/synthetic_games/rt_showcase/main.cpp)
 target_link_libraries(rt_showcase PRIVATE d3d12_xs xgameruntime XboxBvhBuilder)
 target_include_directories(rt_showcase PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_target_properties(rt_showcase PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/rt_showcase"
-)
+scarlettx_set_package_output(rt_showcase rt_showcase)
 add_custom_command(TARGET rt_showcase POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/rt_showcase/MicrosoftGame.Config"
@@ -275,14 +299,12 @@ if(WIN32)
         xgameoverlay_missing
         xtelemetry_missing
     )
-    set_target_properties(iat_probe PROPERTIES
-        PREFIX ""
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/iat_probe"
-    )
+    set_target_properties(iat_probe PROPERTIES PREFIX "")
+    scarlettx_set_package_output(iat_probe iat_probe)
     add_custom_command(TARGET iat_probe POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/iat_probe/MicrosoftGame.Config"
-            "${CMAKE_BINARY_DIR}/packages/iat_probe/MicrosoftGame.Config"
+            "$<TARGET_FILE_DIR:iat_probe>/MicrosoftGame.Config"
     )
 endif()
 
@@ -300,21 +322,11 @@ target_include_directories(scarlett_arena PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/in
 if(MINGW)
     target_link_options(scarlett_arena PRIVATE -Wl,--dynamicbase)
 endif()
-set_target_properties(scarlett_arena PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/scarlett_arena"
-)
+scarlettx_set_package_output(scarlett_arena scarlett_arena)
 add_custom_command(TARGET scarlett_arena POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/scarlett_arena/MicrosoftGame.Config"
         "$<TARGET_FILE_DIR:scarlett_arena>/MicrosoftGame.Config"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:xgameruntime>"
-        "$<TARGET_FILE:d3d12_xs>"
-        "$<TARGET_FILE:XboxBvhBuilder>"
-        "$<TARGET_FILE:dstorage>"
-        "$<TARGET_FILE:xaudio2_9>"
-        "$<TARGET_FILE:GameInput>"
-        "$<TARGET_FILE_DIR:scarlett_arena>"
 )
 
 # Synthetic Scarlett Game 5: ue5_slice (Encrypted GDFX .xvc Gen9 UE5 vertical slice)
@@ -330,9 +342,7 @@ target_link_libraries(ue5_slice PRIVATE
     $<$<BOOL:${WIN32}>:ole32>
 )
 target_include_directories(ue5_slice PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_target_properties(ue5_slice PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/ue5_slice"
-)
+scarlettx_set_package_output(ue5_slice ue5_slice)
 add_custom_command(TARGET ue5_slice POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/ue5_slice/MicrosoftGame.Config"
@@ -353,13 +363,31 @@ target_link_libraries(openworld_slice PRIVATE
     libHttpClient_GDK
 )
 target_include_directories(openworld_slice PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_target_properties(openworld_slice PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/packages/openworld_slice"
-)
+scarlettx_set_package_output(openworld_slice openworld_slice)
 add_custom_command(TARGET openworld_slice POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/openworld_slice/MicrosoftGame.Config"
         "$<TARGET_FILE_DIR:openworld_slice>/MicrosoftGame.Config"
+)
+
+# Synthetic Scarlett Game 7: real_title_com (True mainCRTStartup SCARLETTX_REAL_TITLE=1 COM vertical slice)
+add_executable(real_title_com tests/synthetic_games/real_title_com/main.cpp)
+target_link_libraries(real_title_com PRIVATE
+    xgameruntime
+    d3d12_xs
+    xcrdapi
+    xaudio2_9
+    GameInput
+    kernelx
+    libHttpClient_GDK
+    $<$<BOOL:${WIN32}>:ole32>
+)
+target_include_directories(real_title_com PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+scarlettx_set_package_output(real_title_com real_title_com)
+add_custom_command(TARGET real_title_com POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_games/real_title_com/MicrosoftGame.Config"
+        "$<TARGET_FILE_DIR:real_title_com>/MicrosoftGame.Config"
 )
 
 # ---------------------------------------------------------------------------
@@ -373,7 +401,7 @@ function(scarlettx_add_test name src)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )
     target_compile_definitions(${name} PRIVATE
-        SCARLETTX_BINARY_DIR="${CMAKE_BINARY_DIR}"
+        SCARLETTX_BINARY_DIR="$<TARGET_FILE_DIR:scarlettx_core>"
         SCARLETTX_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     add_test(NAME ${name} COMMAND ${name})
@@ -385,7 +413,8 @@ add_dependencies(test_pe_loader hello_scarlett rt_showcase)
 
 if(WIN32)
     scarlettx_add_test(test_inproc_loader tests/test_inproc_loader.cpp)
-    add_dependencies(test_inproc_loader iat_probe xgameruntime)
+    add_dependencies(test_inproc_loader iat_probe xgameruntime xvc_crypto pixevt_stub)
+    set_tests_properties(test_inproc_loader PROPERTIES RESOURCE_LOCK "virtual_drive_g")
     scarlettx_add_test(test_guest_loader tests/test_guest_loader.cpp)
 endif()
 
@@ -406,7 +435,7 @@ scarlettx_add_test(test_d3d12_list_layout tests/test_d3d12_list_layout.cpp)
 target_link_libraries(test_d3d12_list_layout PRIVATE d3d12_xs)
 set_tests_properties(test_d3d12_list_layout PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
 scarlettx_add_test(test_d3d12_present_window tests/test_d3d12_present_window.cpp)
-target_link_libraries(test_d3d12_present_window PRIVATE d3d12_xs)
+target_link_libraries(test_d3d12_present_window PRIVATE d3d12_xs $<$<BOOL:${WIN32}>:user32>)
 set_tests_properties(test_d3d12_present_window PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
 scarlettx_add_test(test_d3d12_frame_pacing tests/test_d3d12_frame_pacing.cpp)
 target_link_libraries(test_d3d12_frame_pacing PRIVATE d3d12_xs)
@@ -449,6 +478,7 @@ target_link_libraries(test_codecs PRIVATE xbox_codecs)
 
 scarlettx_add_test(test_xsapi tests/test_xsapi.cpp)
 target_link_libraries(test_xsapi PRIVATE xsapi xgameruntime)
+set_tests_properties(test_xsapi PROPERTIES RESOURCE_LOCK "temp_saves")
 
 scarlettx_add_test(test_xs2_lifting tests/test_xs2_lifting.cpp)
 target_link_libraries(test_xs2_lifting PRIVATE xs2_lifting)
@@ -464,18 +494,24 @@ add_dependencies(test_scarlett_arena_e2e
     d3d12_xs
     XboxBvhBuilder
     dstorage
+    dstorage_xs
+    xcrdapi
+    xbox_codecs
     xaudio2_9
     GameInput
 )
+set_tests_properties(test_scarlett_arena_e2e PROPERTIES RESOURCE_LOCK "virtual_drive_g;temp_saves")
 
 add_test(
     NAME test_boot_hello_scarlett
     COMMAND $<TARGET_FILE:scarlettx> boot "${CMAKE_BINARY_DIR}/packages/hello_scarlett" --headless --warp --frames 2
 )
+set_tests_properties(test_boot_hello_scarlett PROPERTIES RESOURCE_LOCK "virtual_drive_g")
 add_test(
     NAME test_boot_rt_showcase
     COMMAND $<TARGET_FILE:scarlettx> boot "${CMAKE_BINARY_DIR}/packages/rt_showcase" --headless --warp --frames 2 --rt-dump "${CMAKE_BINARY_DIR}/rt_showcase_frame.ppm"
 )
+set_tests_properties(test_boot_rt_showcase PROPERTIES RESOURCE_LOCK "virtual_drive_g")
 
 scarlettx_add_test(test_aaa_bringup_e2e tests/test_aaa_bringup_e2e.cpp)
 target_link_libraries(test_aaa_bringup_e2e PRIVATE dstorage xbox_codecs xaudio2_9)
@@ -487,6 +523,8 @@ add_dependencies(test_aaa_bringup_e2e
     d3d12_xs
     XboxBvhBuilder
     dstorage
+    dstorage_xs
+    xcrdapi
     xbox_codecs
     xaudio2_9
     Bink2Scarlett
@@ -496,3 +534,38 @@ add_dependencies(test_aaa_bringup_e2e
     xsapi
     libHttpClient_GDK
 )
+set_tests_properties(test_aaa_bringup_e2e PROPERTIES RESOURCE_LOCK "virtual_drive_g;temp_saves")
+
+scarlettx_add_test(test_retail_parity tests/test_retail_parity.cpp)
+target_link_libraries(test_retail_parity PRIVATE
+    dstorage
+    xbox_codecs
+    xaudio2_9
+    xs2_lifting
+    AcpHal
+)
+add_dependencies(test_retail_parity hello_scarlett pixevt_stub)
+
+scarlettx_add_test(test_real_title_com_e2e tests/test_real_title_com_e2e.cpp)
+add_dependencies(test_real_title_com_e2e
+    real_title_com
+    xgameruntime
+    d3d12_xs
+    xcrdapi
+    dstorage_xs
+    xaudio2_9
+    GameInput
+    kernelx
+    libHttpClient_GDK
+    xsapi
+)
+set_tests_properties(test_real_title_com_e2e PROPERTIES RESOURCE_LOCK "virtual_drive_g;temp_saves")
+
+scarlettx_add_test(test_flight_recorder tests/test_flight_recorder.cpp)
+target_link_libraries(test_flight_recorder PRIVATE
+    d3d12_xs
+    xgameruntime
+    GameInput
+    xcrdapi
+)
+add_dependencies(test_flight_recorder scarlettx hello_scarlett)

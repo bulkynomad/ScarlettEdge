@@ -6,6 +6,8 @@
 
 #include "xgr_task_queue.h"
 
+#include "scarlettx/core/flight_recorder.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -92,15 +94,38 @@ struct DelayedItem {
     Item item;
 };
 
+#if defined(_WIN32)
+struct OwnedWinHandle {
+    HANDLE handle = nullptr;
+    explicit OwnedWinHandle(HANDLE h) : handle(h) {}
+    ~OwnedWinHandle() {
+        if (handle) {
+            CloseHandle(handle);
+        }
+    }
+    OwnedWinHandle(const OwnedWinHandle&) = delete;
+    OwnedWinHandle& operator=(const OwnedWinHandle&) = delete;
+};
+#endif
+
 struct Waiter {
     uint64_t id = 0;
     std::shared_ptr<QueueCore> owner;
     std::shared_ptr<Port> port;
     uint32_t port_index = 0;
+#if defined(_WIN32)
+    std::shared_ptr<OwnedWinHandle> owned_handle;
+#else
     void* handle = nullptr;
+#endif
     XTaskQueueCallback* callback = nullptr;
     void* context = nullptr;
     bool armed = true;
+};
+
+struct PoolThreadEntry {
+    std::thread thread;
+    std::shared_ptr<std::atomic<bool>> kill_flag;
 };
 
 struct AsyncState;
@@ -114,16 +139,21 @@ struct Engine {
 
     std::deque<std::shared_ptr<Port>> pool_jobs;
     std::condition_variable pool_cv;
-    std::vector<std::thread> pool_threads;
+    std::vector<PoolThreadEntry> pool_threads;
     uint32_t pool_idle = 0;
 
     std::multimap<Clock::time_point, DelayedItem> timers;
     std::condition_variable timer_cv;
     std::thread timer_thread;
+    std::shared_ptr<std::atomic<bool>> timer_kill_flag;
 
     std::vector<Waiter> waiters;
     std::thread wait_thread;
+    std::shared_ptr<std::atomic<bool>> wait_kill_flag;
     void* wait_wake = nullptr;
+    uint64_t wait_epoch = 0;
+    std::condition_variable wait_cv;
+    std::vector<std::pair<uint64_t, std::thread::id>> running_waiters;
 
     bool stopping = false;
 
@@ -133,22 +163,70 @@ struct Engine {
     std::mutex block_locks[64];
 };
 
+#if defined(_WIN32)
+INIT_ONCE g_engine_once = INIT_ONCE_STATIC_INIT;
+Engine* g_engine_instance = nullptr;
+
+BOOL CALLBACK InitEngineOnce(PINIT_ONCE, PVOID, PVOID*) {
+    g_engine_instance = new Engine();
+    return TRUE;
+}
+
+Engine& GetEngine() {
+    InitOnceExecuteOnce(&g_engine_once, &InitEngineOnce, nullptr, nullptr);
+    return *g_engine_instance;
+}
+
+INIT_ONCE g_running_fls_once = INIT_ONCE_STATIC_INIT;
+DWORD g_running_fls_index = FLS_OUT_OF_INDEXES;
+
+VOID NTAPI RunningFlsCleanup(PVOID lpFlsData) {
+    delete static_cast<std::vector<QueueCore*>*>(lpFlsData);
+}
+
+BOOL CALLBACK InitRunningFlsOnce(PINIT_ONCE, PVOID, PVOID*) {
+    g_running_fls_index = FlsAlloc(&RunningFlsCleanup);
+    return TRUE;
+}
+
+std::vector<QueueCore*>* GetRunningVec(bool create) {
+    InitOnceExecuteOnce(&g_running_fls_once, &InitRunningFlsOnce, nullptr, nullptr);
+    if (g_running_fls_index == FLS_OUT_OF_INDEXES) {
+        return nullptr;
+    }
+    auto* vec = static_cast<std::vector<QueueCore*>*>(FlsGetValue(g_running_fls_index));
+    if (!vec && create) {
+        vec = new std::vector<QueueCore*>();
+        FlsSetValue(g_running_fls_index, vec);
+    }
+    return vec;
+}
+#else
 Engine& GetEngine() {
     static Engine* engine = new Engine();
     return *engine;
 }
 
+thread_local std::vector<QueueCore*> t_running_posix;
+
+std::vector<QueueCore*>* GetRunningVec(bool /*create*/) {
+    return &t_running_posix;
+}
+#endif
+
 using Lock = std::unique_lock<std::mutex>;
 
-thread_local std::vector<QueueCore*> t_running;
-
 uint32_t RunningOnThisThread(const QueueCore* q) {
-    return static_cast<uint32_t>(std::count(t_running.begin(), t_running.end(), q));
+    auto* vec = GetRunningVec(false);
+    if (!vec) {
+        return 0;
+    }
+    return static_cast<uint32_t>(std::count(vec->begin(), vec->end(), q));
 }
 
-void PoolWorker();
-void TimerLoop();
-void WaitLoop();
+void PoolWorker(std::shared_ptr<std::atomic<bool>> kill_flag);
+void TimerLoop(std::shared_ptr<std::atomic<bool>> kill_flag);
+void WaitLoop(std::shared_ptr<std::atomic<bool>> kill_flag);
 
 uint32_t PoolLimit() {
     const uint32_t n = std::thread::hardware_concurrency();
@@ -158,7 +236,8 @@ uint32_t PoolLimit() {
 void PostPoolJobLocked(Engine& e, const std::shared_ptr<Port>& port) {
     e.pool_jobs.push_back(port);
     if (e.pool_idle == 0 && e.pool_threads.size() < PoolLimit()) {
-        e.pool_threads.emplace_back(PoolWorker);
+        auto flag = std::make_shared<std::atomic<bool>>(false);
+        e.pool_threads.push_back({std::thread(PoolWorker, flag), flag});
     }
     e.pool_cv.notify_one();
 }
@@ -167,7 +246,7 @@ void EnqueueReadyLocked(Engine& e, const std::shared_ptr<Port>& port, Item item)
     port->ready.push_back(std::move(item));
     switch (port->mode) {
         case XTaskQueueDispatchMode_Manual:
-            port->cv.notify_one();
+            port->cv.notify_all();
             break;
         case XTaskQueueDispatchMode_SerializedThreadPool:
             if (!port->serial_busy) {
@@ -182,15 +261,17 @@ void EnqueueReadyLocked(Engine& e, const std::shared_ptr<Port>& port, Item item)
 }
 
 void NotifyMonitors(Lock& lk, const std::shared_ptr<QueueCore>& core, uint32_t port_index) {
-    if (core->monitors.empty() || !core->handle) {
+    if (core->monitors.empty() || !core->handle || core->handle->handle_refs == 0) {
         return;
     }
     const std::vector<Monitor> monitors = core->monitors;
     XTaskQueueObject* handle = core->handle;
+    ++handle->handle_refs;
     lk.unlock();
     for (const auto& m : monitors) {
         m.callback(m.context, handle, static_cast<XTaskQueuePort>(port_index));
     }
+    XTaskQueueCloseHandle(handle);
     lk.lock();
 }
 
@@ -233,14 +314,36 @@ void RunItemLocked(Engine& e, Lock& lk, Item item) {
     --owner->pending;
     ++owner->active;
     const bool canceled = owner->state != QueueState::Active;
+    const uint64_t waiter_id = item.waiter_id;
+    const std::thread::id self_tid = std::this_thread::get_id();
+    if (waiter_id != 0) {
+        e.running_waiters.emplace_back(waiter_id, self_tid);
+    }
     lk.unlock();
-    t_running.push_back(owner.get());
+    auto* running_vec = GetRunningVec(true);
+    if (running_vec) {
+        running_vec->push_back(owner.get());
+    }
+    struct ScopedPop {
+        std::vector<QueueCore*>* vec;
+        ~ScopedPop() {
+            if (vec && !vec->empty()) {
+                vec->pop_back();
+            }
+        }
+    } pop_guard{running_vec};
+    scarlettx::FlightRecorder::Instance().BeatProgress("XTaskQueueCallback");
     item.callback(item.context, canceled);
-    t_running.pop_back();
     lk.lock();
     --owner->active;
-    if (item.waiter_id != 0) {
-        RearmWaiterLocked(e, item.waiter_id);
+    if (waiter_id != 0) {
+        auto wit = std::find(e.running_waiters.begin(), e.running_waiters.end(),
+                             std::make_pair(waiter_id, self_tid));
+        if (wit != e.running_waiters.end()) {
+            e.running_waiters.erase(wit);
+        }
+        RearmWaiterLocked(e, waiter_id);
+        e.wait_cv.notify_all();
     }
     if (owner->state == QueueState::Terminating) {
         owner->idle_cv.notify_all();
@@ -308,14 +411,19 @@ bool RunOwnedLocked(Engine& e, Lock& lk, const std::shared_ptr<Port>& port,
     return true;
 }
 
-void PoolWorker() {
+void PoolWorker(std::shared_ptr<std::atomic<bool>> kill_flag) {
     Engine& e = GetEngine();
     Lock lk(e.mutex);
     for (;;) {
+        if (e.stopping || kill_flag->load(std::memory_order_acquire)) {
+            return;
+        }
         ++e.pool_idle;
-        e.pool_cv.wait(lk, [&] { return e.stopping || !e.pool_jobs.empty(); });
+        e.pool_cv.wait(lk, [&] {
+            return e.stopping || kill_flag->load(std::memory_order_acquire) || !e.pool_jobs.empty();
+        });
         --e.pool_idle;
-        if (e.stopping) {
+        if (e.stopping || kill_flag->load(std::memory_order_acquire)) {
             return;
         }
         std::shared_ptr<Port> port = std::move(e.pool_jobs.front());
@@ -324,10 +432,10 @@ void PoolWorker() {
     }
 }
 
-void TimerLoop() {
+void TimerLoop(std::shared_ptr<std::atomic<bool>> kill_flag) {
     Engine& e = GetEngine();
     Lock lk(e.mutex);
-    while (!e.stopping) {
+    while (!e.stopping && !kill_flag->load(std::memory_order_acquire)) {
         if (e.timers.empty()) {
             e.timer_cv.wait(lk);
             continue;
@@ -346,29 +454,39 @@ void TimerLoop() {
 }
 
 #if defined(_WIN32)
-void WaitLoop() {
+void WaitLoop(std::shared_ptr<std::atomic<bool>> kill_flag) {
     Engine& e = GetEngine();
     Lock lk(e.mutex);
-    while (!e.stopping) {
+    while (!e.stopping && !kill_flag->load(std::memory_order_acquire)) {
         HANDLE handles[MAXIMUM_WAIT_OBJECTS];
         uint64_t ids[MAXIMUM_WAIT_OBJECTS];
+        std::vector<std::shared_ptr<OwnedWinHandle>> pinned;
+        pinned.reserve(e.waiters.size());
         DWORD count = 0;
         handles[count] = static_cast<HANDLE>(e.wait_wake);
         ids[count++] = 0;
         for (const auto& w : e.waiters) {
-            if (w.armed && count < MAXIMUM_WAIT_OBJECTS) {
-                handles[count] = static_cast<HANDLE>(w.handle);
+            if (w.armed && w.owned_handle && w.owned_handle->handle && count < MAXIMUM_WAIT_OBJECTS) {
+                handles[count] = w.owned_handle->handle;
                 ids[count++] = w.id;
+                pinned.push_back(w.owned_handle);
             }
         }
         lk.unlock();
         const DWORD r = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+        pinned.clear();  // Drop duplicate handles now that WaitForMultipleObjects has returned.
         lk.lock();
+        ++e.wait_epoch;
+        e.wait_cv.notify_all();
+        if (e.stopping || kill_flag->load(std::memory_order_acquire)) {
+            break;
+        }
         if (r == WAIT_FAILED) {
-            // A registered handle was closed; drop the waiters that no longer wait.
+            // Drop any waiter whose duplicated handle is invalid.
             e.waiters.erase(
                 std::remove_if(e.waiters.begin(), e.waiters.end(), [](const Waiter& w) {
-                    return WaitForSingleObject(static_cast<HANDLE>(w.handle), 0) == WAIT_FAILED;
+                    return !w.owned_handle ||
+                           WaitForSingleObject(w.owned_handle->handle, 0) == WAIT_FAILED;
                 }),
                 e.waiters.end());
             continue;
@@ -434,9 +552,17 @@ XTaskQueueObject* EnsureProcessQueueLocked(Engine& e) {
 }
 
 void RemoveWaitersLocked(Engine& e, const QueueCore* core) {
+    const size_t before = e.waiters.size();
     e.waiters.erase(std::remove_if(e.waiters.begin(), e.waiters.end(),
                                    [&](const Waiter& w) { return w.owner.get() == core; }),
                     e.waiters.end());
+#if defined(_WIN32)
+    if (e.waiters.size() != before && e.wait_wake) {
+        SetEvent(static_cast<HANDLE>(e.wait_wake));
+    }
+#else
+    (void)before;
+#endif
 }
 
 XGameResult SubmitInternal(XTaskQueueHandle queue, uint32_t port_index, uint32_t delay_ms,
@@ -460,8 +586,8 @@ XGameResult SubmitInternal(XTaskQueueHandle queue, uint32_t port_index, uint32_t
     item.context = context;
 
     if (delay_ms == 0 && port->mode == XTaskQueueDispatchMode_Immediate) {
-        NotifyMonitors(lk, core, port_index);
         ++core->pending;
+        NotifyMonitors(lk, core, port_index);
         RunItemLocked(e, lk, std::move(item));
         return XGR_S_OK;
     }
@@ -474,7 +600,8 @@ XGameResult SubmitInternal(XTaskQueueHandle queue, uint32_t port_index, uint32_t
         d.item = std::move(item);
         e.timers.emplace(Clock::now() + std::chrono::milliseconds(delay_ms), std::move(d));
         if (!e.timer_thread.joinable()) {
-            e.timer_thread = std::thread(TimerLoop);
+            e.timer_kill_flag = std::make_shared<std::atomic<bool>>(false);
+            e.timer_thread = std::thread(TimerLoop, e.timer_kill_flag);
         }
         e.timer_cv.notify_one();
         return XGR_S_OK;
@@ -619,15 +746,29 @@ bool XTaskQueueDispatch(XTaskQueueHandle queue, XTaskQueuePort port, uint32_t ti
     Engine& e = GetEngine();
     Lock lk(e.mutex);
     const std::shared_ptr<QueueCore> core = LookupLocked(e, queue);
-    if (!core || static_cast<uint32_t>(port) > 1) {
+    if (!core || static_cast<uint32_t>(port) > 1 || core->state == QueueState::Terminated) {
         return false;
     }
     const std::shared_ptr<Port> p = core->ports[static_cast<uint32_t>(port)];
     if (p->mode != XTaskQueueDispatchMode_Manual) {
         return false;  // the engine dispatches the other modes itself
     }
+    auto find_next = [&]() -> std::deque<Item>::iterator {
+        // Prefer items submitted directly to `core`; if `core` is Active and shares
+        // a composite port, also pump ready items on that shared manual port.
+        auto own_it = std::find_if(p->ready.begin(), p->ready.end(),
+                                   [&](const Item& i) { return i.owner == core; });
+        if (own_it != p->ready.end()) {
+            return own_it;
+        }
+        if (core->state == QueueState::Active && !p->ready.empty()) {
+            return p->ready.begin();
+        }
+        return p->ready.end();
+    };
     const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutInMs);
-    while (p->ready.empty()) {
+    auto it = find_next();
+    while (it == p->ready.end()) {
         // A terminating queue accepts nothing new and its delayed items are already
         // ready, so an empty port stays empty.
         if (timeoutInMs == 0 || e.stopping || core->state != QueueState::Active) {
@@ -635,12 +776,17 @@ bool XTaskQueueDispatch(XTaskQueueHandle queue, XTaskQueuePort port, uint32_t ti
         }
         if (timeoutInMs == kInfiniteTimeout) {
             p->cv.wait(lk);
-        } else if (p->cv.wait_until(lk, deadline) == std::cv_status::timeout && p->ready.empty()) {
-            return false;
+        } else if (p->cv.wait_until(lk, deadline) == std::cv_status::timeout) {
+            it = find_next();
+            if (it == p->ready.end()) {
+                return false;
+            }
+            break;
         }
+        it = find_next();
     }
-    Item item = std::move(p->ready.front());
-    p->ready.pop_front();
+    Item item = std::move(*it);
+    p->ready.erase(it);
     RunItemLocked(e, lk, std::move(item));
     return true;
 }
@@ -653,7 +799,17 @@ bool XTaskQueueIsEmpty(XTaskQueueHandle queue, XTaskQueuePort port) {
         return true;
     }
     const std::shared_ptr<Port> p = core->ports[static_cast<uint32_t>(port)];
-    return p->ready.empty();
+    for (const auto& item : p->ready) {
+        if (item.owner == core) {
+            return false;
+        }
+    }
+    for (const auto& kv : e.timers) {
+        if (kv.second.item.owner == core && kv.second.port == p) {
+            return false;
+        }
+    }
+    return true;
 }
 
 XGameResult XTaskQueueTerminate(XTaskQueueHandle queue, bool wait, void* callbackContext,
@@ -803,18 +959,25 @@ XGameResult XTaskQueueRegisterWaiter(XTaskQueueHandle queue, XTaskQueuePort port
             return XGR_E_OUTOFMEMORY;
         }
     }
+    HANDLE dup_handle = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), static_cast<HANDLE>(waitHandle),
+                         GetCurrentProcess(), &dup_handle, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+        !dup_handle) {
+        return XGR_E_HANDLE;
+    }
     Waiter w;
     w.id = e.next_token++;
     w.owner = core;
     w.port = core->ports[static_cast<uint32_t>(port)];
     w.port_index = static_cast<uint32_t>(port);
-    w.handle = waitHandle;
+    w.owned_handle = std::make_shared<OwnedWinHandle>(dup_handle);
     w.callback = callback;
     w.context = callbackContext;
     token->token = w.id;
     e.waiters.push_back(std::move(w));
     if (!e.wait_thread.joinable()) {
-        e.wait_thread = std::thread(WaitLoop);
+        e.wait_kill_flag = std::make_shared<std::atomic<bool>>(false);
+        e.wait_thread = std::thread(WaitLoop, e.wait_kill_flag);
     }
     SetEvent(static_cast<HANDLE>(e.wait_wake));
     return XGR_S_OK;
@@ -829,16 +992,42 @@ XGameResult XTaskQueueRegisterWaiter(XTaskQueueHandle queue, XTaskQueuePort port
 #endif
 }
 
-void XTaskQueueUnregisterWaiter(XTaskQueueHandle /*queue*/, XTaskQueueRegistrationToken token) {
+void XTaskQueueUnregisterWaiter(XTaskQueueHandle queue, XTaskQueueRegistrationToken token) {
+    if (token.token == 0) {
+        return;
+    }
     Engine& e = GetEngine();
     Lock lk(e.mutex);
-    e.waiters.erase(std::remove_if(e.waiters.begin(), e.waiters.end(),
-                                   [&](const Waiter& w) { return w.id == token.token; }),
-                    e.waiters.end());
-#if defined(_WIN32)
-    if (e.wait_wake) {
-        SetEvent(static_cast<HANDLE>(e.wait_wake));
+    const std::shared_ptr<QueueCore> core = queue ? LookupLocked(e, queue) : nullptr;
+    if (queue && !core) {
+        return;
     }
+    const size_t before = e.waiters.size();
+    e.waiters.erase(
+        std::remove_if(e.waiters.begin(), e.waiters.end(), [&](const Waiter& w) {
+            return w.id == token.token && (!core || w.owner == core);
+        }),
+        e.waiters.end());
+#if defined(_WIN32)
+    const std::thread::id self_tid = std::this_thread::get_id();
+    if (before != e.waiters.size() && e.wait_wake) {
+        const uint64_t target_epoch = e.wait_epoch + 1;
+        SetEvent(static_cast<HANDLE>(e.wait_wake));
+        if (e.wait_thread.joinable() && e.wait_thread.get_id() != self_tid) {
+            e.wait_cv.wait(lk, [&] {
+                return e.stopping || !e.wait_thread.joinable() || e.wait_epoch >= target_epoch;
+            });
+        }
+    }
+    // Wait for any in-flight callback produced by this waiter on another thread to finish.
+    e.wait_cv.wait(lk, [&] {
+        return std::none_of(e.running_waiters.begin(), e.running_waiters.end(),
+                            [&](const std::pair<uint64_t, std::thread::id>& rw) {
+                                return rw.first == token.token && rw.second != self_tid;
+                            });
+    });
+#else
+    (void)before;
 #endif
 }
 
@@ -1304,6 +1493,9 @@ XGameResult SCARLETTX_GDK_CALLBACK HleProvider(XAsyncOp op, const XAsyncProvider
             {
                 std::lock_guard<std::mutex> lock(st->mutex);
                 canceled = st->canceled;
+                if (!canceled) {
+                    st->started = true;
+                }
             }
             if (canceled) {
                 CompleteHleAsync(st, XGR_E_ABORT, 0);
@@ -1312,21 +1504,56 @@ XGameResult SCARLETTX_GDK_CALLBACK HleProvider(XAsyncOp op, const XAsyncProvider
             }
             XGameResult status = XGR_E_FAIL;
             size_t size = 0;
+            void* orphan_handle = nullptr;
+            void (*orphan_cleanup)(void*) = nullptr;
             {
                 std::lock_guard<std::mutex> lock(st->mutex);
                 if (!st->completed) {
                     st->status = XGR_E_FAIL;
+                    st->result_size = 0;
                     st->completed = true;
+                }
+                if (st->status < 0 && st->result_handle && st->cleanup_result) {
+                    orphan_handle = st->result_handle;
+                    orphan_cleanup = st->cleanup_result;
+                    st->result_handle = nullptr;
+                    st->cleanup_result = nullptr;
                 }
                 status = st->status;
                 size = st->result_size;
+            }
+            if (orphan_handle && orphan_cleanup) {
+                orphan_cleanup(orphan_handle);
             }
             XAsyncComplete(data->async, status, size);
             return XGR_E_PENDING;
         }
         case XAsyncOp_Cancel: {
-            std::lock_guard<std::mutex> lock(st->mutex);
-            st->canceled = true;
+            bool complete_now = false;
+            void* orphan_handle = nullptr;
+            void (*orphan_cleanup)(void*) = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(st->mutex);
+                st->canceled = true;
+                if (!st->started && !st->completed) {
+                    st->completed = true;
+                    st->status = XGR_E_ABORT;
+                    st->result_size = 0;
+                    complete_now = true;
+                }
+                if (st->completed && st->status < 0 && st->result_handle && st->cleanup_result) {
+                    orphan_handle = st->result_handle;
+                    orphan_cleanup = st->cleanup_result;
+                    st->result_handle = nullptr;
+                    st->cleanup_result = nullptr;
+                }
+            }
+            if (orphan_handle && orphan_cleanup) {
+                orphan_cleanup(orphan_handle);
+            }
+            if (complete_now) {
+                XAsyncComplete(data->async, XGR_E_ABORT, 0);
+            }
             return XGR_S_OK;
         }
         case XAsyncOp_GetResult:
@@ -1361,11 +1588,25 @@ XGameResult BeginHleAsync(XAsyncBlock* async, std::function<void(HleAsyncState*)
 }
 
 void CompleteHleAsync(HleAsyncState* state, XGameResult hr, size_t result_size) {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (!state->completed) {
-        state->status = state->canceled ? XGR_E_ABORT : hr;
-        state->result_size = result_size;
-        state->completed = true;
+    void* orphan_handle = nullptr;
+    void (*orphan_cleanup)(void*) = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->completed) {
+            const XGameResult final_hr = state->canceled ? XGR_E_ABORT : hr;
+            state->status = final_hr;
+            state->result_size = final_hr < 0 ? 0 : result_size;
+            state->completed = true;
+        }
+        if (state->status < 0 && state->result_handle && state->cleanup_result) {
+            orphan_handle = state->result_handle;
+            orphan_cleanup = state->cleanup_result;
+            state->result_handle = nullptr;
+            state->cleanup_result = nullptr;
+        }
+    }
+    if (orphan_handle && orphan_cleanup) {
+        orphan_cleanup(orphan_handle);
     }
 }
 
@@ -1416,44 +1657,81 @@ void ShutdownTaskSystem() {
         XTaskQueueCloseHandle(process_queue);
     }
 
-    std::vector<std::thread> threads;
+    std::vector<PoolThreadEntry> pool_entries;
+    std::thread timer_thread;
+    std::thread wait_thread;
     {
         Lock lk(e.mutex);
         e.stopping = true;
-        threads.swap(e.pool_threads);
+        pool_entries.swap(e.pool_threads);
+        for (auto& entry : pool_entries) {
+            if (entry.kill_flag) {
+                entry.kill_flag->store(true, std::memory_order_release);
+            }
+        }
+        if (e.timer_kill_flag) {
+            e.timer_kill_flag->store(true, std::memory_order_release);
+            e.timer_kill_flag.reset();
+        }
+        if (e.wait_kill_flag) {
+            e.wait_kill_flag->store(true, std::memory_order_release);
+            e.wait_kill_flag.reset();
+        }
         if (e.timer_thread.joinable()) {
-            threads.push_back(std::move(e.timer_thread));
+            timer_thread = std::move(e.timer_thread);
         }
         if (e.wait_thread.joinable()) {
-            threads.push_back(std::move(e.wait_thread));
+            wait_thread = std::move(e.wait_thread);
         }
         e.pool_cv.notify_all();
         e.timer_cv.notify_all();
+        e.wait_cv.notify_all();
 #if defined(_WIN32)
         if (e.wait_wake) {
             SetEvent(static_cast<HANDLE>(e.wait_wake));
         }
 #endif
     }
-    for (auto& t : threads) {
-        if (t.get_id() == std::this_thread::get_id()) {
-            t.detach();  // called from one of our own callbacks
+    const std::thread::id self_tid = std::this_thread::get_id();
+    for (auto& entry : pool_entries) {
+        if (!entry.thread.joinable()) {
+            continue;
+        }
+        if (entry.thread.get_id() == self_tid) {
+            entry.thread.detach();  // kill_flag is true, so worker exits immediately on callback return
         } else {
-            t.join();
+            entry.thread.join();
+        }
+    }
+    if (timer_thread.joinable()) {
+        if (timer_thread.get_id() == self_tid) {
+            timer_thread.detach();
+        } else {
+            timer_thread.join();
+        }
+    }
+    if (wait_thread.joinable()) {
+        if (wait_thread.get_id() == self_tid) {
+            wait_thread.detach();
+        } else {
+            wait_thread.join();
         }
     }
     Lock lk(e.mutex);
     e.stopping = false;
     // Work that was queued for the pool or the timer is picked up again on restart.
     if (!e.pool_jobs.empty()) {
-        e.pool_threads.emplace_back(PoolWorker);
+        auto flag = std::make_shared<std::atomic<bool>>(false);
+        e.pool_threads.push_back({std::thread(PoolWorker, flag), flag});
     }
     if (!e.timers.empty()) {
-        e.timer_thread = std::thread(TimerLoop);
+        e.timer_kill_flag = std::make_shared<std::atomic<bool>>(false);
+        e.timer_thread = std::thread(TimerLoop, e.timer_kill_flag);
     }
 #if defined(_WIN32)
     if (!e.waiters.empty()) {
-        e.wait_thread = std::thread(WaitLoop);  // queues that outlive the shutdown
+        e.wait_kill_flag = std::make_shared<std::atomic<bool>>(false);
+        e.wait_thread = std::thread(WaitLoop, e.wait_kill_flag);  // queues that outlive the shutdown
     }
 #endif
 }

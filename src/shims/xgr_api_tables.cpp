@@ -5,6 +5,7 @@
 // first argument.
 #include "xgr_api_tables.h"
 
+#include "scarlettx/core/flight_recorder.h"
 #include "scarlettx/gdk/xgameruntime_abi.h"
 
 #include <array>
@@ -45,7 +46,11 @@ constexpr Guid kIidGameLater = {0x2549F142u, 0x6419u, 0x4A06u, {0x97, 0xB5, 0x93
 constexpr Guid kIidUserLater = {0x079415E3u, 0x6727u, 0x437Fu, {0x8E, 0x9D, 0x8F, 0x8F, 0x9B, 0x24, 0x39, 0xF7}};
 // For these the console object answers both ids with one table.
 constexpr Guid kIidGameSaveLater = {0x704C3F58u, 0xE629u, 0x4CC2u, {0xB1, 0x97, 0x30, 0x51, 0x1B, 0x99, 0x6E, 0xE2}};
+constexpr Guid kIidGameSave2510 = {0x1BFFF3AFu, 0xF14Au, 0x40A3u, {0x8E, 0x35, 0x9A, 0xDA, 0x90, 0x65, 0x93, 0xF9}};
 constexpr Guid kIidSystemLater = {0x67CE4BFCu, 0xB1D1u, 0x4AC7u, {0xBC, 0x3A, 0xCB, 0x92, 0x19, 0xA9, 0x7A, 0x85}};
+constexpr Guid kIidSystem2510 = {0x1861CF2Eu, 0xE18Bu, 0x4834u, {0xA9, 0xF5, 0xB4, 0xA4, 0xE6, 0xEF, 0xB4, 0xCF}};
+// XSystemGetAnalyticsInfo (observed in Microsoft.GDK.PC 2510.5.6322).
+constexpr Guid kApiAnalytics = {0xB884675Du, 0xB738u, 0x4A9Cu, {0x81, 0x5D, 0x9A, 0x9A, 0x1E, 0x0C, 0x6C, 0x9B}};
 // XGameRuntimeIsFeatureAvailable.
 constexpr Guid kApiFeature = {0x8836FE87u, 0xEDB9u, 0x4FE3u, {0x8D, 0xAD, 0x05, 0xF0, 0xD2, 0xCD, 0x5B, 0x40}};
 // XGameEventWrite.
@@ -54,10 +59,13 @@ constexpr Guid kApiGameEvent = {0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED
 constexpr Guid kApiPackage = {0xAF406016u, 0xE850u, 0x4AA8u, {0xA8, 0x8D, 0x2F, 0x3D, 0xCB, 0x9D, 0xAC, 0x7E}};
 constexpr Guid kIidPackageLater = {0xF92D8712u, 0x2B27u, 0x4D8Au, {0xBF, 0x01, 0x11, 0xA6, 0xF8, 0xE3, 0xEB, 0x42}};
 constexpr Guid kIidPackage2025 = {0xA8C4234Eu, 0x7F1Bu, 0x4D3Au, {0x9C, 0x81, 0x5E, 0x2B, 0x7D, 0x90, 0xA1, 0x14}};
-// GDK 2022-2026 XUser later IID & XStore API/IIDs.
+constexpr Guid kIidPackage2510 = {0xE2A4734Bu, 0x2F4Au, 0x456Du, {0xAA, 0x8F, 0xD0, 0x65, 0xE0, 0x4F, 0xB2, 0x09}};
+// GDK 2022-2026 XUser later IID & XStore API/IIDs (synthetic + official GDK 2510.5.6322).
 constexpr Guid kIidUser2025 = {0x8B3F21C4u, 0x5D9Eu, 0x42A1u, {0x97, 0xC8, 0x1E, 0x4F, 0xA8, 0x02, 0xB6, 0x3D}};
 constexpr Guid kApiStore = {0xCE8E7A26u, 0x2A0Eu, 0x4982u, {0xA2, 0x37, 0x71, 0xF9, 0x67, 0xB0, 0x5C, 0x3A}};
 constexpr Guid kIidStore2025 = {0xD4B92E11u, 0x5C84u, 0x49A2u, {0x8E, 0x17, 0x63, 0xF0, 0xB8, 0xC9, 0x12, 0x45}};
+constexpr Guid kApiStoreReal = {0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}};
+constexpr Guid kIidStore2510 = {0xB09D803Cu, 0x2414u, 0x4A05u, {0x82, 0xC6, 0x66, 0xDF, 0xDC, 0x9E, 0x9A, 0x44}};
 
 constexpr XGameResult kNoInterface = static_cast<XGameResult>(0x80004002u);
 constexpr XGameResult kNotImplemented = static_cast<XGameResult>(0x80004001u);
@@ -98,7 +106,11 @@ XGameResult SCARLETTX_GDK_CALLBACK TableQueryInterface(void* self, const void* r
     // Another interface of the same API is a separate table object.
     Guid iid{};
     const Slot* vtbl = FindVtbl(&table->api, riid, &iid);
-    if (!vtbl) return kNoInterface;
+    if (!vtbl) {
+        scarlettx::FlightRecorder::Instance().RecordComQiMiss(
+            "XGR::TableQI", riid, SCARLETTX_CALLER_RIP());
+        return kNoInterface;
+    }
     *out = NewTable(vtbl, &table->api, iid);
     return *out ? XGR_S_OK : XGR_E_OUTOFMEMORY;
 }
@@ -147,6 +159,31 @@ XGameResult SCARLETTX_GDK_CALLBACK SystemGetXboxLiveSandboxId(void* /*self*/, si
     return XSystemGetXboxLiveSandboxId(size, buffer, used);
 }
 
+// {E349BD1A} slot 5 (GDK 2510 iid {1861CF2E}): XSystemGetAppSpecificDeviceId.
+XGameResult SCARLETTX_GDK_CALLBACK SystemGetAppSpecificDeviceId(void* /*self*/, size_t size, char* buffer,
+                                                                size_t* used) {
+    return XSystemGetAppSpecificDeviceId(size, buffer, used);
+}
+
+void SCARLETTX_GDK_CALLBACK SystemAllowFullDownloadBandwidth(void* /*self*/, bool enable) {
+    XSystemAllowFullDownloadBandwidth(enable);
+}
+
+bool SCARLETTX_GDK_CALLBACK SystemIsHandleValidSlot(void* /*self*/, void* handle) {
+    return XSystemIsHandleValid(handle);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK SystemHandleTrackSlot(void* /*self*/, void* /*cb*/, void* /*ctx*/) {
+    return XGR_S_OK;
+}
+
+XGameResult LogUnimplemented(const char* name, const char* api, int slot, uintptr_t a1, uintptr_t a2, uintptr_t a3);
+
+template <int Index>
+XGameResult SCARLETTX_GDK_CALLBACK SystemUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    return LogUnimplemented("XSystem", "E349BD1A", Index, a1, a2, a3);
+}
+
 const Slot kGameVtbl[] = {
     reinterpret_cast<Slot>(&TableQueryInterface),
     reinterpret_cast<Slot>(&TableAddRef),
@@ -160,6 +197,32 @@ const Slot kSystemVtbl[] = {
     reinterpret_cast<Slot>(&TableRelease),
     reinterpret_cast<Slot>(&SystemGetConsoleId),
     reinterpret_cast<Slot>(&SystemGetXboxLiveSandboxId),
+    reinterpret_cast<Slot>(&SystemGetAppSpecificDeviceId),
+    reinterpret_cast<Slot>(&SystemHandleTrackSlot),
+    reinterpret_cast<Slot>(&SystemIsHandleValidSlot),
+    reinterpret_cast<Slot>(&SystemAllowFullDownloadBandwidth),
+    reinterpret_cast<Slot>(&SystemUnimplemented<9>),
+    reinterpret_cast<Slot>(&SystemUnimplemented<10>),
+    reinterpret_cast<Slot>(&SystemUnimplemented<11>),
+};
+
+// {B884675D} slot 3: XSystemGetAnalyticsInfo (x64 struct-by-value sret in RDX, returned in RAX).
+XSystemAnalyticsInfo* SCARLETTX_GDK_CALLBACK AnalyticsGetInfo(void* /*self*/, XSystemAnalyticsInfo* out_sret) {
+    if (!out_sret) return nullptr;
+    *out_sret = XSystemGetAnalyticsInfo();
+    const char* lockhart = std::getenv("SCARLETTX_LOCKHART");
+    if (lockhart && lockhart[0] == '1') {
+        std::memset(out_sret->form, 0, sizeof(out_sret->form));
+        std::strncpy(out_sret->form, "Xbox Series S", sizeof(out_sret->form) - 1);
+    }
+    return out_sret;
+}
+
+const Slot kAnalyticsVtbl[] = {
+    reinterpret_cast<Slot>(&TableQueryInterface),
+    reinterpret_cast<Slot>(&TableAddRef),
+    reinterpret_cast<Slot>(&TableRelease),
+    reinterpret_cast<Slot>(&AnalyticsGetInfo),
 };
 
 // {01ACD177}: XUser, in the declaration order of the public XUser.h. The
@@ -188,6 +251,8 @@ XGameResult LogUnimplemented(const char* name, const char* api, int slot, uintpt
                  name, api, slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
                  static_cast<unsigned long long>(a3));
     std::fflush(stderr);
+    scarlettx::FlightRecorder::Instance().RecordVtableSlotMiss(
+        name ? name : "XGR::ApiImpl", slot, static_cast<uint64_t>(a1), 0ull);
     return kNotImplemented;
 }
 
@@ -237,7 +302,37 @@ XGameResult SCARLETTX_GDK_CALLBACK UserGetLocalId(void*, XUserHandle user, XUser
     return XUserGetLocalId(user, local_id);
 }
 
+XGameResult SCARLETTX_GDK_CALLBACK UserFindUserByLocalId(void*, XUserLocalId local_id, XUserHandle* handle) {
+    return XUserFindUserByLocalId(local_id, handle);
+}
+
 XGameResult SCARLETTX_GDK_CALLBACK UserGetId(void*, XUserHandle user, uint64_t* id) { return XUserGetId(user, id); }
+
+XGameResult SCARLETTX_GDK_CALLBACK UserFindUserById(void*, uint64_t user_id, XUserHandle* handle) {
+    if (user_id == 0 && !handle) return kNotImplemented;
+    return XUserFindUserById(user_id, handle);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserGetGamerPictureAsync(
+    void*,
+    XUserHandle user,
+    XUserGamerPictureSize picture_size,
+    XAsyncBlock* async) {
+    return XUserGetGamerPictureAsync(user, picture_size, async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserGetGamerPictureResultSize(void*, XAsyncBlock* async, size_t* buffer_size) {
+    return XUserGetGamerPictureResultSize(async, buffer_size);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserGetGamerPictureResult(
+    void*,
+    XAsyncBlock* async,
+    size_t buffer_size,
+    void* buffer,
+    size_t* buffer_used) {
+    return XUserGetGamerPictureResult(async, buffer_size, buffer, buffer_used);
+}
 
 XGameResult SCARLETTX_GDK_CALLBACK UserGetIsGuest(void*, XUserHandle user, bool* is_guest) {
     return XUserGetIsGuest(user, is_guest);
@@ -389,6 +484,18 @@ XGameResult SCARLETTX_GDK_CALLBACK UserResolveIssueWithUiResult(void* /*self*/, 
     return XUserResolveIssueWithUiResult(async);
 }
 
+XGameResult SCARLETTX_GDK_CALLBACK UserResolveIssueWithUiUtf16Async(
+    void* /*self*/,
+    XUserHandle user,
+    const wchar_t* url,
+    XAsyncBlock* async) {
+    return XUserResolveIssueWithUiUtf16Async(user, url, async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK UserResolveIssueWithUiUtf16Result(void* /*self*/, XAsyncBlock* async) {
+    return XUserResolveIssueWithUiUtf16Result(async);
+}
+
 template <size_t... I>
 std::array<Slot, kUserSlots> MakeUserVtbl(std::index_sequence<I...>) {
     std::array<Slot, kUserSlots> vtbl = {reinterpret_cast<Slot>(&UserUnimplemented<static_cast<int>(I)>)...};
@@ -402,10 +509,15 @@ std::array<Slot, kUserSlots> MakeUserVtbl(std::index_sequence<I...>) {
     vtbl[7] = reinterpret_cast<Slot>(&UserAddAsync);
     vtbl[8] = reinterpret_cast<Slot>(&UserAddResult);
     vtbl[9] = reinterpret_cast<Slot>(&UserGetLocalId);
+    vtbl[10] = reinterpret_cast<Slot>(&UserFindUserByLocalId);
     vtbl[11] = reinterpret_cast<Slot>(&UserGetId);
+    vtbl[12] = reinterpret_cast<Slot>(&UserFindUserById);
     vtbl[13] = reinterpret_cast<Slot>(&UserGetIsGuest);
     vtbl[14] = reinterpret_cast<Slot>(&UserGetState);
     vtbl[15] = reinterpret_cast<Slot>(&UserGetGamertag);
+    vtbl[16] = reinterpret_cast<Slot>(&UserGetGamerPictureAsync);
+    vtbl[17] = reinterpret_cast<Slot>(&UserGetGamerPictureResultSize);
+    vtbl[18] = reinterpret_cast<Slot>(&UserGetGamerPictureResult);
     vtbl[19] = reinterpret_cast<Slot>(&UserGetAgeGroup);
     vtbl[20] = reinterpret_cast<Slot>(&UserCheckPrivilege);
     vtbl[21] = reinterpret_cast<Slot>(&UserResolvePrivilegeWithUiAsync);
@@ -418,6 +530,8 @@ std::array<Slot, kUserSlots> MakeUserVtbl(std::index_sequence<I...>) {
     vtbl[28] = reinterpret_cast<Slot>(&UserGetTokenAndSignatureUtf16Result);
     vtbl[29] = reinterpret_cast<Slot>(&UserResolveIssueWithUiAsync);
     vtbl[30] = reinterpret_cast<Slot>(&UserResolveIssueWithUiResult);
+    vtbl[31] = reinterpret_cast<Slot>(&UserResolveIssueWithUiUtf16Async);
+    vtbl[32] = reinterpret_cast<Slot>(&UserResolveIssueWithUiUtf16Result);
     vtbl[33] = reinterpret_cast<Slot>(&UserRegisterForChangeEvent);
     vtbl[34] = reinterpret_cast<Slot>(&UserUnregisterForChangeEvent);
     return vtbl;
@@ -436,7 +550,7 @@ const Slot kUserGamertagVtbl[] = {
 // reports, and the order of the others was matched by argument shape.
 // Slots 30-32 are XGameSaveFiles.h in the same way: the console names slot
 // 32, and a title's calls to 30 and 31 pass the Async/Result arguments.
-constexpr int kGameSaveSlots = 33;
+constexpr int kGameSaveSlots = 35;
 constexpr const char* kGameSaveSlotNames[kGameSaveSlots] = {
     "QueryInterface", "AddRef", "Release",
     "XGameSaveInitializeProvider", "XGameSaveInitializeProviderAsync", "XGameSaveInitializeProviderResult",
@@ -449,7 +563,8 @@ constexpr const char* kGameSaveSlotNames[kGameSaveSlots] = {
     "XGameSaveCloseUpdate", "XGameSaveSubmitBlobWrite", "XGameSaveSubmitBlobDelete",
     "XGameSaveSubmitUpdate", "XGameSaveSubmitUpdateAsync", "XGameSaveSubmitUpdateResult",
     "XGameSaveFilesGetFolderWithUiAsync", "XGameSaveFilesGetFolderWithUiResult",
-    "XGameSaveFilesGetRemainingQuota",
+    "XGameSaveFilesGetRemainingQuota", "XGameSaveFilesGetRemainingQuotaAsync",
+    "XGameSaveFilesGetRemainingQuotaResult",
 };
 
 template <int Index>
@@ -489,10 +604,31 @@ XGameResult SCARLETTX_GDK_CALLBACK SaveGetRemainingQuota(void*, XGameSaveProvide
     return XGameSaveGetRemainingQuota(provider, quota);
 }
 
+XGameResult SCARLETTX_GDK_CALLBACK SaveGetRemainingQuotaAsync(void*, XGameSaveProviderHandle provider,
+                                                              XAsyncBlock* async) {
+    return XGameSaveGetRemainingQuotaAsync(provider, async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK SaveGetRemainingQuotaResult(void*, XAsyncBlock* async, int64_t* quota) {
+    return XGameSaveGetRemainingQuotaResult(async, quota);
+}
+
 XGameResult SCARLETTX_GDK_CALLBACK SaveDeleteContainer(void*, XGameSaveProviderHandle provider, const char* name) {
     const XGameResult hr = XGameSaveDeleteContainer(provider, name);
     TraceGameSave("XGameSaveDeleteContainer", hr);
     return hr;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK SaveDeleteContainerAsync(void*, XGameSaveProviderHandle provider, const char* name,
+                                                            XAsyncBlock* async) {
+    if (!provider && !name && !async) return kNotImplemented;
+    const XGameResult hr = XGameSaveDeleteContainerAsync(provider, name, async);
+    TraceGameSave("XGameSaveDeleteContainerAsync", hr);
+    return hr;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK SaveDeleteContainerResult(void*, XAsyncBlock* async) {
+    return XGameSaveDeleteContainerResult(async);
 }
 
 XGameResult SCARLETTX_GDK_CALLBACK SaveEnumerateContainerInfo(void*, XGameSaveProviderHandle provider, void* context,
@@ -639,6 +775,15 @@ XGameResult SCARLETTX_GDK_CALLBACK SaveFilesGetRemainingQuota(void*, XUserHandle
     return XGameSaveFilesGetRemainingQuota(user, configuration_id, quota);
 }
 
+XGameResult SCARLETTX_GDK_CALLBACK SaveFilesGetRemainingQuotaAsync(void*, XUserHandle user,
+                                                                   const char* configuration_id, XAsyncBlock* async) {
+    return XGameSaveFilesGetRemainingQuotaAsync(user, configuration_id, async);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK SaveFilesGetRemainingQuotaResult(void*, XAsyncBlock* async, int64_t* quota) {
+    return XGameSaveFilesGetRemainingQuotaResult(async, quota);
+}
+
 template <size_t... I>
 std::array<Slot, kGameSaveSlots> MakeGameSaveVtbl(std::index_sequence<I...>) {
     std::array<Slot, kGameSaveSlots> vtbl = {reinterpret_cast<Slot>(&GameSaveUnimplemented<static_cast<int>(I)>)...};
@@ -650,7 +795,11 @@ std::array<Slot, kGameSaveSlots> MakeGameSaveVtbl(std::index_sequence<I...>) {
     vtbl[5] = reinterpret_cast<Slot>(&SaveInitializeProviderResult);
     vtbl[6] = reinterpret_cast<Slot>(&SaveCloseProvider);
     vtbl[7] = reinterpret_cast<Slot>(&SaveGetRemainingQuota);
+    vtbl[8] = reinterpret_cast<Slot>(&SaveGetRemainingQuotaAsync);
+    vtbl[9] = reinterpret_cast<Slot>(&SaveGetRemainingQuotaResult);
     vtbl[10] = reinterpret_cast<Slot>(&SaveDeleteContainer);
+    vtbl[11] = reinterpret_cast<Slot>(&SaveDeleteContainerAsync);
+    vtbl[12] = reinterpret_cast<Slot>(&SaveDeleteContainerResult);
     vtbl[13] = reinterpret_cast<Slot>(&SaveGetContainerInfo);
     vtbl[14] = reinterpret_cast<Slot>(&SaveEnumerateContainerInfo);
     vtbl[15] = reinterpret_cast<Slot>(&SaveEnumerateContainerInfoByName);
@@ -671,6 +820,8 @@ std::array<Slot, kGameSaveSlots> MakeGameSaveVtbl(std::index_sequence<I...>) {
     vtbl[30] = reinterpret_cast<Slot>(&SaveFilesGetFolderWithUiAsync);
     vtbl[31] = reinterpret_cast<Slot>(&SaveFilesGetFolderWithUiResult);
     vtbl[32] = reinterpret_cast<Slot>(&SaveFilesGetRemainingQuota);
+    vtbl[33] = reinterpret_cast<Slot>(&SaveFilesGetRemainingQuotaAsync);
+    vtbl[34] = reinterpret_cast<Slot>(&SaveFilesGetRemainingQuotaResult);
     return vtbl;
 }
 const std::array<Slot, kGameSaveSlots> kGameSaveVtbl = MakeGameSaveVtbl(std::make_index_sequence<kGameSaveSlots>{});
@@ -723,7 +874,7 @@ const Slot kGameEventVtbl[] = {
 //   11       XPackageGetUserLocale(size, buffer)
 //   20/28/35 XPackageEnumeratePackages(kind, scope, context, callback)
 //   21/29/36 XPackageRegisterPackageInstalled(queue, context, callback, token)
-constexpr int kPackageSlots = 39;
+constexpr int kPackageSlots = 48;
 
 template <int Index>
 XGameResult SCARLETTX_GDK_CALLBACK PackageUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
@@ -794,8 +945,8 @@ std::array<Slot, kPackageSlots> MakePackageVtbl(std::index_sequence<I...>) {
     vtbl[1] = reinterpret_cast<Slot>(&TableAddRef);
     vtbl[2] = reinterpret_cast<Slot>(&TableRelease);
     vtbl[11] = reinterpret_cast<Slot>(&PackageGetUserLocale);
-    for (int slot : {20, 28, 35}) vtbl[slot] = reinterpret_cast<Slot>(&PackageEnumeratePackages);
-    for (int slot : {21, 29, 36}) vtbl[slot] = reinterpret_cast<Slot>(&PackageRegisterPackageInstalled);
+    for (int slot : {20, 28, 35, 39}) vtbl[slot] = reinterpret_cast<Slot>(&PackageEnumeratePackages);
+    for (int slot : {21, 29, 36, 40}) vtbl[slot] = reinterpret_cast<Slot>(&PackageRegisterPackageInstalled);
     vtbl[22] = reinterpret_cast<Slot>(&PackageMountWithUiAsync);
     vtbl[23] = reinterpret_cast<Slot>(&PackageMountWithUiResult);
     vtbl[24] = reinterpret_cast<Slot>(&PackageGetMountPathSize);
@@ -837,19 +988,72 @@ void SCARLETTX_GDK_CALLBACK StoreCloseProductsQueryHandle(void* /*self*/, XStore
     XStoreCloseProductsQueryHandle(q);
 }
 
-const Slot kStoreVtbl[] = {
-    reinterpret_cast<Slot>(&TableQueryInterface),
-    reinterpret_cast<Slot>(&TableAddRef),
-    reinterpret_cast<Slot>(&TableRelease),
-    reinterpret_cast<Slot>(&StoreCreateContext),               // 3 (+0x18)
-    reinterpret_cast<Slot>(&StoreCloseContextHandle),          // 4 (+0x20)
-    reinterpret_cast<Slot>(&StoreQueryGameLicenseAsync),       // 5 (+0x28)
-    reinterpret_cast<Slot>(&StoreQueryGameLicenseResult),      // 6 (+0x30)
-    reinterpret_cast<Slot>(&StoreQueryEntitledProductsAsync),  // 7 (+0x38)
-    reinterpret_cast<Slot>(&StoreQueryEntitledProductsResult), // 8 (+0x40)
-    reinterpret_cast<Slot>(&StoreEnumerateProductsQuery),      // 9 (+0x48)
-    reinterpret_cast<Slot>(&StoreCloseProductsQueryHandle),    // 10 (+0x50)
-};
+constexpr int kStoreSlots = 40;
+
+template <int Index>
+XGameResult SCARLETTX_GDK_CALLBACK StoreUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    return LogUnimplemented("XStore", "CE8E7A26", Index, a1, a2, a3);
+}
+
+template <size_t... I>
+std::array<Slot, kStoreSlots> MakeStoreVtbl(std::index_sequence<I...>) {
+    std::array<Slot, kStoreSlots> vtbl = {reinterpret_cast<Slot>(&StoreUnimplemented<static_cast<int>(I)>)...};
+    vtbl[0] = reinterpret_cast<Slot>(&TableQueryInterface);
+    vtbl[1] = reinterpret_cast<Slot>(&TableAddRef);
+    vtbl[2] = reinterpret_cast<Slot>(&TableRelease);
+    vtbl[3] = reinterpret_cast<Slot>(&StoreCreateContext);               // 3 (+0x18)
+    vtbl[4] = reinterpret_cast<Slot>(&StoreCloseContextHandle);          // 4 (+0x20)
+    vtbl[5] = reinterpret_cast<Slot>(&StoreQueryGameLicenseAsync);       // 5 (+0x28)
+    vtbl[6] = reinterpret_cast<Slot>(&StoreQueryGameLicenseResult);      // 6 (+0x30)
+    vtbl[7] = reinterpret_cast<Slot>(&StoreQueryEntitledProductsAsync);  // 7 (+0x38)
+    vtbl[8] = reinterpret_cast<Slot>(&StoreQueryEntitledProductsResult); // 8 (+0x40)
+    vtbl[9] = reinterpret_cast<Slot>(&StoreEnumerateProductsQuery);      // 9 (+0x48)
+    vtbl[10] = reinterpret_cast<Slot>(&StoreCloseProductsQueryHandle);   // 10 (+0x50)
+    return vtbl;
+}
+const std::array<Slot, kStoreSlots> kStoreVtbl = MakeStoreVtbl(std::make_index_sequence<kStoreSlots>{});
+
+// Official GDK 2510 XStore table ({0DD112AC} / {B09D803C}): slots follow public XStore.h declaration order.
+constexpr int kRealStoreSlots = 68;
+
+bool SCARLETTX_GDK_CALLBACK StoreProductsQueryHasMorePagesSlot(void* /*self*/, XStoreProductQueryHandle /*q*/) {
+    return false;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK StoreQueryCurrentGameAsyncSlot(void* /*self*/, XStoreContextHandle ctx,
+                                                                  XAsyncBlock* async) {
+    return XStoreQueryEntitledProductsAsync(ctx, 0xFFFFFFFFu, 25u, async);
+}
+
+template <int Index>
+XGameResult SCARLETTX_GDK_CALLBACK RealStoreUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    return LogUnimplemented("XStore2510", "0DD112AC", Index, a1, a2, a3);
+}
+
+template <size_t... I>
+std::array<Slot, kRealStoreSlots> MakeRealStoreVtbl(std::index_sequence<I...>) {
+    std::array<Slot, kRealStoreSlots> vtbl = {
+        reinterpret_cast<Slot>(&RealStoreUnimplemented<static_cast<int>(I)>)...};
+    vtbl[0] = reinterpret_cast<Slot>(&TableQueryInterface);
+    vtbl[1] = reinterpret_cast<Slot>(&TableAddRef);
+    vtbl[2] = reinterpret_cast<Slot>(&TableRelease);
+    vtbl[3] = reinterpret_cast<Slot>(&StoreCreateContext);                 // XStoreCreateContext
+    vtbl[4] = reinterpret_cast<Slot>(&StoreCloseContextHandle);            // XStoreCloseContextHandle
+    vtbl[5] = reinterpret_cast<Slot>(&StoreQueryEntitledProductsAsync);    // XStoreQueryAssociatedProductsAsync
+    vtbl[6] = reinterpret_cast<Slot>(&StoreQueryEntitledProductsResult);   // XStoreQueryAssociatedProductsResult
+    vtbl[9] = reinterpret_cast<Slot>(&StoreQueryEntitledProductsAsync);    // XStoreQueryEntitledProductsAsync
+    vtbl[10] = reinterpret_cast<Slot>(&StoreQueryEntitledProductsResult);  // XStoreQueryEntitledProductsResult
+    vtbl[11] = reinterpret_cast<Slot>(&StoreQueryCurrentGameAsyncSlot);    // XStoreQueryProductForCurrentGameAsync
+    vtbl[12] = reinterpret_cast<Slot>(&StoreQueryEntitledProductsResult);  // XStoreQueryProductForCurrentGameResult
+    vtbl[15] = reinterpret_cast<Slot>(&StoreEnumerateProductsQuery);       // XStoreEnumerateProductsQuery
+    vtbl[16] = reinterpret_cast<Slot>(&StoreProductsQueryHasMorePagesSlot);// XStoreProductsQueryHasMorePages
+    vtbl[19] = reinterpret_cast<Slot>(&StoreCloseProductsQueryHandle);     // XStoreCloseProductsQueryHandle
+    vtbl[28] = reinterpret_cast<Slot>(&StoreQueryGameLicenseAsync);        // XStoreQueryGameLicenseAsync
+    vtbl[29] = reinterpret_cast<Slot>(&StoreQueryGameLicenseResult);       // XStoreQueryGameLicenseResult
+    return vtbl;
+}
+const std::array<Slot, kRealStoreSlots> kRealStoreVtbl =
+    MakeRealStoreVtbl(std::make_index_sequence<kRealStoreSlots>{});
 
 // Discovery table for API ids nothing implements, enabled with
 // SCARLETTX_XGR_DISCOVER=1: every method logs its slot and first arguments
@@ -866,6 +1070,8 @@ XGameResult SCARLETTX_GDK_CALLBACK DiscoverySlot(void* self, uintptr_t a1, uintp
                  iid, Index * 8, Index, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
                  static_cast<unsigned long long>(a3));
     std::fflush(stderr);
+    scarlettx::FlightRecorder::Instance().RecordVtableSlotMiss(
+        iid, Index, static_cast<uint64_t>(a1), SCARLETTX_CALLER_RIP());
     return kNotImplemented;
 }
 
@@ -894,23 +1100,31 @@ const Slot* FindVtbl(const void* api_id, const void* riid, Guid* iid) {
     // An API's main interface has the API's own id.
     const bool main = std::memcmp(api_id, riid, sizeof(Guid)) == 0 || Equal(riid, kIidIUnknown);
     std::memcpy(iid, main ? api_id : riid, sizeof(Guid));
-    if (Equal(api_id, kApiGame)) return main || Equal(riid, kIidGameLater) ? kGameVtbl : nullptr;
-    if (Equal(api_id, kApiSystem)) return main || Equal(riid, kIidSystemLater) ? kSystemVtbl : nullptr;
-    if (Equal(api_id, kApiGameSave)) return main || Equal(riid, kIidGameSaveLater) ? kGameSaveVtbl.data() : nullptr;
-    if (Equal(api_id, kApiUser)) {
+    if (Equal(api_id, kApiGame)) {
+        if (main || Equal(riid, kIidGameLater)) return kGameVtbl;
+    } else if (Equal(api_id, kApiSystem)) {
+        if (main || Equal(riid, kIidSystemLater) || Equal(riid, kIidSystem2510)) return kSystemVtbl;
+    } else if (Equal(api_id, kApiAnalytics)) {
+        if (main) return kAnalyticsVtbl;
+    } else if (Equal(api_id, kApiGameSave)) {
+        if (main || Equal(riid, kIidGameSaveLater) || Equal(riid, kIidGameSave2510)) return kGameSaveVtbl.data();
+    } else if (Equal(api_id, kApiUser)) {
         if (main || Equal(riid, kIidUserLater) || Equal(riid, kIidUser2025)) return kUserVtbl.data();
-        return Equal(riid, kIidUserGamertag) ? kUserGamertagVtbl : nullptr;
+        if (Equal(riid, kIidUserGamertag)) return kUserGamertagVtbl;
+    } else if (Equal(api_id, kApiFeature)) {
+        if (main) return kFeatureVtbl;
+    } else if (Equal(api_id, kApiGameEvent)) {
+        if (main) return kGameEventVtbl;
+    } else if (Equal(api_id, kApiPackage)) {
+        if (main || Equal(riid, kIidPackageLater) || Equal(riid, kIidPackage2025) || Equal(riid, kIidPackage2510)) {
+            return kPackageVtbl.data();
+        }
+    } else if (Equal(api_id, kApiStore)) {
+        if (main || Equal(riid, kIidStore2025)) return kStoreVtbl.data();
+    } else if (Equal(api_id, kApiStoreReal)) {
+        if (main || Equal(riid, kIidStore2510)) return kRealStoreVtbl.data();
     }
-    if (Equal(api_id, kApiFeature)) return main ? kFeatureVtbl : nullptr;
-    if (Equal(api_id, kApiGameEvent)) return main ? kGameEventVtbl : nullptr;
-    if (Equal(api_id, kApiPackage)) {
-        return (main || Equal(riid, kIidPackageLater) || Equal(riid, kIidPackage2025)) ? kPackageVtbl.data() : nullptr;
-    }
-    if (Equal(api_id, kApiStore)) {
-        return (main || Equal(riid, kIidStore2025)) ? kStoreVtbl : nullptr;
-    }
-    // An API nothing implements: titles ask for it by a later interface id
-    // as often as by its own.
+    // An API or newer interface id nothing implements yet: fall back to discovery table if enabled.
     return DiscoveryEnabled() ? kDiscoveryVtbl.data() : nullptr;
 }
 

@@ -70,6 +70,24 @@ struct GAMEINPUT_KEY_STATE {
     uint16_t Reserved;
 };
 
+enum GAMEINPUT_MOUSE_BUTTONS : uint32_t {
+    GAMEINPUT_MOUSE_NONE = 0x00000000,
+    GAMEINPUT_MOUSE_LEFT_BUTTON = 0x00000001,
+    GAMEINPUT_MOUSE_RIGHT_BUTTON = 0x00000002,
+    GAMEINPUT_MOUSE_MIDDLE_BUTTON = 0x00000004,
+    GAMEINPUT_MOUSE_BUTTON4 = 0x00000008,
+    GAMEINPUT_MOUSE_BUTTON5 = 0x00000010,
+};
+
+struct GAMEINPUT_MOUSE_STATE {
+    uint32_t Buttons;
+    uint32_t Reserved;
+    int64_t PositionX;
+    int64_t PositionY;
+    int64_t WheelX;
+    int64_t WheelY;
+};
+
 struct GAMEINPUT_RUMBLE_PARAMS {
     float LowFrequency;
     float HighFrequency;

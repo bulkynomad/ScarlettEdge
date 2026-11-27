@@ -50,6 +50,31 @@ typedef struct XS2_REGISTER_REMAP {
     uint32_t registerSpace;
 } XS2_REGISTER_REMAP;
 
+#define XS2_SHADER_HEADER_MAGIC 0x48325358u /* 'XS2H' */
+#define XS2_HEADER_FLAG_BINDLESS 0x00000001u
+#define XS2_HEADER_FLAG_IA_VERTEX_INPUTS 0x00000002u
+
+typedef struct XS2_ROOT_REGISTER_MAP {
+    uint32_t userSgprOffset;
+    uint32_t registerIndex;
+    uint32_t registerSpace;
+} XS2_ROOT_REGISTER_MAP;
+
+typedef struct XS2_SHADER_HEADER {
+    uint32_t magic;              // XS2_SHADER_HEADER_MAGIC ('XS2H' = 0x48325358u)
+    uint32_t version;            // Header version (low 16 bits) | XS2_HEADER_FLAG_* (high 16 bits)
+    uint32_t stage;              // 0=Auto, 1=VS, 2=PS, 3=CS, 7=Library, 13=Mesh, 14=Amplification
+    uint32_t codeByteSize;       // RDNA2 ISA payload size in bytes (0 = remainder after root table)
+    uint32_t pgmRsrc1;           // SPI_SHADER_PGM_RSRC1 / COMPUTE_PGM_RSRC1
+    uint32_t pgmRsrc2;           // SPI_SHADER_PGM_RSRC2 / COMPUTE_PGM_RSRC2
+    uint32_t threadsX;           // COMPUTE_NUM_THREAD_X workgroup dimension
+    uint32_t threadsY;           // COMPUTE_NUM_THREAD_Y workgroup dimension
+    uint32_t threadsZ;           // COMPUTE_NUM_THREAD_Z workgroup dimension
+    uint32_t mrtExportMask;      // SPI_SHADER_COL_FORMAT / MRT export bitmask (mrt0..mrt7)
+    uint32_t userSgprCount;      // Active User-SGPR dword count (0..32)
+    uint32_t rootMapCount;       // Number of XS2_ROOT_REGISTER_MAP entries following this header
+} XS2_SHADER_HEADER;
+
 typedef struct XS2_WAVEFRONT_PROPS {
     uint32_t waveSize;            // 32 or 64
     uint32_t maxWavesPerComputeUnit;

@@ -18,6 +18,7 @@ struct StubCallRecord {
     uint64_t return_value = 0;
     uint64_t hit_count = 0;
     uint64_t last_args[4] = {0, 0, 0, 0};
+    uint64_t last_caller_rip = 0;
 };
 
 // Allocates executable x86-64 Windows-ABI trampolines for unresolved guest
@@ -49,7 +50,7 @@ public:
     uint64_t TotalHitCount() const;
 
     // Called from generated x86-64 trampolines.
-    uint64_t Dispatch(uint32_t stub_id, const uint64_t* args4);
+    uint64_t Dispatch(uint32_t stub_id, const uint64_t* args4, uint64_t caller_rip = 0);
 
 private:
     static constexpr size_t kSlotSize = 64;

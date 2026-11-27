@@ -64,7 +64,13 @@ bool IntersectAabb(const RtAabb& box, const RtRay& ray, float t_best) {
     return true;
 }
 
-bool IntersectTriangle(const RtTriangle& tri, const RtRay& ray, float t_best, float& out_t, Vec3& out_normal) {
+bool IntersectTriangle(const RtTriangle& tri,
+                       const RtRay& ray,
+                       float t_best,
+                       float& out_t,
+                       float& out_u,
+                       float& out_v,
+                       Vec3& out_normal) {
     const Vec3 e1 = Sub(tri.v1, tri.v0);
     const Vec3 e2 = Sub(tri.v2, tri.v0);
     const Vec3 pvec = Cross(ray.direction, e2);
@@ -88,6 +94,8 @@ bool IntersectTriangle(const RtTriangle& tri, const RtRay& ray, float t_best, fl
         return false;
     }
     out_t = t;
+    out_u = u;
+    out_v = v;
     Vec3 n = Normalize(Cross(e1, e2));
     if (Dot(n, ray.direction) > 0.0f) {
         n = Mul(n, -1.0f);
@@ -181,10 +189,14 @@ bool BvhAccelerationStructure::TraceRay(const RtRay& ray, RtHit& out_hit, RtStat
                 const RtTriangle& tri = triangles_[tri_idx];
                 if (stats) ++stats->triangle_tests;
                 float t = 0.0f;
+                float u = 0.0f;
+                float v = 0.0f;
                 Vec3 n{};
-                if (IntersectTriangle(tri, ray, out_hit.t, t, n)) {
+                if (IntersectTriangle(tri, ray, out_hit.t, t, u, v, n)) {
                     out_hit.hit = true;
                     out_hit.t = t;
+                    out_hit.u = u;
+                    out_hit.v = v;
                     out_hit.triangle_index = tri_idx;
                     out_hit.normal = n;
                     out_hit.color = tri.color;
@@ -257,7 +269,8 @@ Status BvhAccelerationStructure::RenderScene(const RtDispatchParams& params,
     local_stats.bvh_nodes = NodeCount();
 
     const Vec3 forward = Normalize(Sub(params.camera_look_at, params.camera_pos));
-    const Vec3 right = Normalize(Cross({0.0f, 1.0f, 0.0f}, forward));
+    const Vec3 world_up = (std::fabs(forward.y) > 0.999f) ? Vec3{0.0f, 0.0f, 1.0f} : Vec3{0.0f, 1.0f, 0.0f};
+    const Vec3 right = Normalize(Cross(world_up, forward));
     const Vec3 up = Cross(forward, right);
     const float aspect = static_cast<float>(params.width) / static_cast<float>(params.height);
     const float fov_scale = 0.65f;

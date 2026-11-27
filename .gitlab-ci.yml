@@ -7,22 +7,30 @@ stages:
   tags:
     - windows
   script:
-    - cmake -S . -B $BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE
-    - cmake --build $BUILD_DIR --parallel
+    - |
+      $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+      if ($vs) { cmd /c "`"$vs\Common7\Tools\VsDevCmd.bat`" -arch=x64 -host_arch=x64 && cmake -S . -B $BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE && cmake --build $BUILD_DIR --parallel" }
+      else { cmake -S . -B $BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE; cmake --build $BUILD_DIR --parallel }
   artifacts:
+    expire_in: 3 days
     paths:
-      - $BUILD_DIR/
+      - $BUILD_DIR/*.dll
+      - $BUILD_DIR/*.exe
+      - $BUILD_DIR/packages/
+      - $BUILD_DIR/CTestTestfile.cmake
 
 .test_windows:
   stage: test
   tags:
     - windows
   script:
-    - ctest --test-dir $BUILD_DIR --output-on-failure
+    - ctest --test-dir $BUILD_DIR --parallel 4 --output-on-failure
   artifacts:
-    when: always
+    when: on_failure
+    expire_in: 7 days
     paths:
       - $BUILD_DIR/*.ppm
+      - $BUILD_DIR/*.wav
 
 build_windows:
   extends: .build_windows

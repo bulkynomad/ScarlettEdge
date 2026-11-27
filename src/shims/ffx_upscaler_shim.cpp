@@ -8,7 +8,15 @@
 #include <mutex>
 #include <unordered_map>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <d3d12.h>
+#endif
+
 namespace {
+
+constexpr uint64_t kFfxProviderVersionId = 0x00030102ull;
+constexpr const char* kFfxProviderVersionName = "ScarlettX FidelityFX Upscaler 3.1.2-HLE";
 
 struct FfxUpscalerContextState {
     uint32_t max_render_w = 0;
@@ -55,15 +63,110 @@ uint64_t Fnv1aBytes(const uint8_t* data, size_t size) {
     return h;
 }
 
+#if defined(_WIN32)
+bool IsCommittedReadable(const void* ptr, size_t min_bytes) {
+    if (!ptr) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(ptr, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    const DWORD prot = mbi.Protect & 0xFFu;
+    const bool readable = (prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+                           prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+                           prot == PAGE_EXECUTE_WRITECOPY);
+    if (!readable) return false;
+    const auto* end = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+    return end >= static_cast<const uint8_t*>(ptr) + min_bytes;
+}
+
+bool IsExecutableCodePtr(const void* fn_ptr) {
+    if (!fn_ptr) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(fn_ptr, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
+    const DWORD prot = mbi.Protect & 0xFFu;
+    return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
+           prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+}
+
+// Detects COM / guest-vtable objects (e.g. ID3D12GraphicsCommandList* or ID3D12Resource*)
+// so CPU RGBA8 bilinear fallback NEVER overwrites a COM object's vtable!
+bool LooksLikeComObject(const void* p) {
+    if (!p || (reinterpret_cast<uintptr_t>(p) & (sizeof(void*) - 1u)) != 0u) return false;
+    if (!IsCommittedReadable(p, sizeof(void*))) return false;
+    void* const* vtbl = *static_cast<void* const* const*>(p);
+    if (!vtbl || (reinterpret_cast<uintptr_t>(vtbl) & (sizeof(void*) - 1u)) != 0u) return false;
+    if (!IsCommittedReadable(vtbl, sizeof(void*) * 3u)) return false;
+    return IsExecutableCodePtr(vtbl[0]) && IsExecutableCodePtr(vtbl[1]) && IsExecutableCodePtr(vtbl[2]);
+}
+
+void TryGpuUpscaleCopyFallback(const ffxApiHeader* desc) {
+    const auto* raw = reinterpret_cast<const uint8_t*>(desc);
+    if (!IsCommittedReadable(raw, 0x20u)) return;
+
+    void* cmd_candidate = *reinterpret_cast<void* const*>(raw + 0x10u);
+    void* color_candidate = *reinterpret_cast<void* const*>(raw + 0x18u);
+    if (!LooksLikeComObject(cmd_candidate) || !LooksLikeComObject(color_candidate)) return;
+
+    ID3D12GraphicsCommandList* cmd_list = nullptr;
+    if (FAILED(static_cast<IUnknown*>(cmd_candidate)->QueryInterface(IID_PPV_ARGS(&cmd_list))) || !cmd_list) {
+        return;
+    }
+
+    ID3D12Resource* src_res = nullptr;
+    if (FAILED(static_cast<IUnknown*>(color_candidate)->QueryInterface(IID_PPV_ARGS(&src_res))) || !src_res) {
+        cmd_list->Release();
+        return;
+    }
+
+    // Probe output.resource at official FFX 1.1 (+0x138) and FFX 1.0 (+0x108) offsets
+    ID3D12Resource* dst_res = nullptr;
+    const size_t kCandidateOffsets[2] = {0x138u, 0x108u};
+    for (size_t off : kCandidateOffsets) {
+        if (!IsCommittedReadable(raw, off + sizeof(void*))) continue;
+        void* out_cand = *reinterpret_cast<void* const*>(raw + off);
+        if (out_cand && out_cand != color_candidate && LooksLikeComObject(out_cand)) {
+            if (SUCCEEDED(static_cast<IUnknown*>(out_cand)->QueryInterface(IID_PPV_ARGS(&dst_res))) && dst_res) {
+                break;
+            }
+        }
+    }
+
+    if (dst_res) {
+        const D3D12_RESOURCE_DESC sd = src_res->GetDesc();
+        const D3D12_RESOURCE_DESC dd = dst_res->GetDesc();
+        if (sd.Dimension == dd.Dimension && sd.Width == dd.Width &&
+            sd.Height == dd.Height && sd.Format == dd.Format) {
+            cmd_list->CopyResource(dst_res, src_res);
+        }
+        dst_res->Release();
+    }
+
+    src_res->Release();
+    cmd_list->Release();
+}
+#endif
+
+const ffxCreateContextDescUpscale* FindUpscaleCreateDesc(const ffxApiHeader* desc) {
+    for (const ffxApiHeader* cur = desc; cur != nullptr; cur = cur->pNext) {
+        if (cur->type == FFX_API_DESC_TYPE_UPSCALE_CREATE) {
+            return reinterpret_cast<const ffxCreateContextDescUpscale*>(cur);
+        }
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 extern "C" {
 
 ffxReturnCode_t ffxUpscalerCreateContext(ffxContext* context, ffxApiHeader* desc) {
-    if (!context || !desc || desc->type != FFX_API_DESC_TYPE_UPSCALE_CREATE) {
+    if (!context || !desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    const auto* cd = reinterpret_cast<const ffxCreateContextDescUpscale*>(desc);
+    const ffxCreateContextDescUpscale* cd = FindUpscaleCreateDesc(desc);
+    if (!cd) {
+        return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
+    }
     if (cd->maxRenderWidth == 0 || cd->maxRenderHeight == 0 ||
         cd->maxUpscaleWidth == 0 || cd->maxUpscaleHeight == 0) {
         return FFX_API_RETURN_ERROR_PARAMETER;
@@ -93,7 +196,13 @@ ffxReturnCode_t ffxUpscalerDestroyContext(ffxContext* context) {
 }
 
 ffxReturnCode_t ffxUpscalerConfigure(ffxContext* context, const ffxApiHeader* desc) {
-    if (!context || !*context || !desc) {
+    if (!desc) {
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    }
+    if (desc->type == FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1) {
+        return FFX_API_RETURN_OK;
+    }
+    if (!context || !*context) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -118,10 +227,21 @@ ffxReturnCode_t ffxUpscalerQuery(ffxContext* context, ffxApiHeader* desc) {
     switch (desc->type) {
         case FFX_API_DESC_TYPE_GET_PROVIDER_VERSION: {
             auto* q = reinterpret_cast<ffxQueryDescGetProviderVersion*>(desc);
-            q->versionId = 0x00030102ull;  // FSR 3.1.2 HLE
-            q->versionName = "ScarlettX FidelityFX Upscaler 3.1.2-HLE";
+            q->versionId = kFfxProviderVersionId;
+            q->versionName = kFfxProviderVersionName;
             return FFX_API_RETURN_OK;
         }
+        case FFX_API_QUERY_DESC_TYPE_GET_VERSIONS: {
+            auto* q = reinterpret_cast<ffxQueryDescGetVersions*>(desc);
+            if (!q->outputCount) return FFX_API_RETURN_ERROR_PARAMETER;
+            if (*q->outputCount > 0u) {
+                if (q->versionIds) q->versionIds[0] = kFfxProviderVersionId;
+                if (q->versionNames) q->versionNames[0] = kFfxProviderVersionName;
+            }
+            *q->outputCount = 1u;
+            return FFX_API_RETURN_OK;
+        }
+        case 0x00010001u:  // Official AMD FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE
         case FFX_API_DESC_TYPE_UPSCALE_GET_UPSCALERATIO: {
             auto* q = reinterpret_cast<ffxQueryDescUpscaleGetUpscaleRatioFromQualityMode*>(desc);
             if (!q->pOutUpscaleRatio) return FFX_API_RETURN_ERROR_PARAMETER;
@@ -164,14 +284,12 @@ ffxReturnCode_t ffxUpscalerQuery(ffxContext* context, ffxApiHeader* desc) {
 }
 
 ffxReturnCode_t ffxUpscalerDispatch(ffxContext* context, const ffxApiHeader* desc) {
-    if (!context || !*context || !desc || desc->type != FFX_API_DESC_TYPE_UPSCALE_DISPATCH) {
+    if (!context || !*context || !desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    const auto* d = reinterpret_cast<const ffxDispatchDescUpscale*>(desc);
-    if (!d->colorRgba8 || !d->outputRgba8 ||
-        d->renderWidth == 0 || d->renderHeight == 0 ||
-        d->upscaleWidth == 0 || d->upscaleHeight == 0) {
-        return FFX_API_RETURN_ERROR_PARAMETER;
+    if (desc->type != FFX_API_DESC_TYPE_UPSCALE_DISPATCH &&
+        desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
+        return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     }
 
     {
@@ -183,7 +301,30 @@ ffxReturnCode_t ffxUpscalerDispatch(ffxContext* context, const ffxApiHeader* des
         ++it->second->dispatch_count;
     }
 
-    // Deterministic bilinear upscale from renderWidth x renderHeight to upscaleWidth x upscaleHeight
+    const auto* d = reinterpret_cast<const ffxDispatchDescUpscale*>(desc);
+
+    // Official AMD ffx_api GPU dispatch (0x10004) or COM resource/commandList pointers at +0x10 / +0x18:
+    // NEVER treat ID3D12Resource* as a CPU RGBA8 buffer!
+    bool is_gpu_com_dispatch = (desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE);
+#if defined(_WIN32)
+    if (!is_gpu_com_dispatch && (LooksLikeComObject(d->colorRgba8) || LooksLikeComObject(d->outputRgba8))) {
+        is_gpu_com_dispatch = true;
+    }
+#endif
+    if (is_gpu_com_dispatch) {
+#if defined(_WIN32)
+        TryGpuUpscaleCopyFallback(desc);
+#endif
+        return FFX_API_RETURN_OK;
+    }
+
+    if (!d->colorRgba8 || !d->outputRgba8 ||
+        d->renderWidth == 0 || d->renderHeight == 0 ||
+        d->upscaleWidth == 0 || d->upscaleHeight == 0) {
+        return FFX_API_RETURN_ERROR_PARAMETER;
+    }
+
+    // Deterministic CPU bilinear upscale for headless / unit-test RGBA8 buffers
     for (uint32_t y = 0; y < d->upscaleHeight; ++y) {
         const float fy = (d->upscaleHeight > 1)
                              ? (static_cast<float>(y) * static_cast<float>(d->renderHeight - 1) /

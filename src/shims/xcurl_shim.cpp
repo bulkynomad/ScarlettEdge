@@ -2,12 +2,15 @@
 #include "scarlettx/net/xcurl_abi.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -24,14 +27,20 @@ namespace {
 struct XCurlEasyHandle {
     std::string url;
     std::string method = "GET";
+    bool custom_method = false;
     std::string user_agent;
     const char* raw_post_ptr = nullptr;
+    bool has_copied_post = false;
     int64_t explicit_post_size = -1;
     std::vector<uint8_t> post_data;
     std::vector<std::string> headers;
     curl_write_callback write_cb = nullptr;
     void* write_data = nullptr;
-    int64_t timeout_sec = 30;
+    curl_write_callback header_cb = nullptr;
+    void* header_data = nullptr;
+    void* private_ptr = nullptr;
+    char* error_buffer = nullptr;
+    int64_t timeout_ms = 30000;
     int64_t response_code = 0;
     int64_t downloaded_bytes = 0;
     std::string content_type;
@@ -44,8 +53,6 @@ struct XCurlMockRule {
     std::vector<uint8_t> body;
 };
 
-// There is no network behind this shim, so a transfer runs to completion
-// inside curl_multi_perform, exactly as curl_easy_perform does it.
 struct XCurlMultiHandle {
     std::vector<CURL*> attached;
     std::vector<CURL*> pending;
@@ -56,13 +63,35 @@ struct XCurlMultiHandle {
 std::mutex g_mutex;
 std::condition_variable g_multi_wake;
 bool g_global_inited = false;
-std::unordered_map<void*, std::unique_ptr<XCurlEasyHandle>> g_handles;
+std::unordered_map<void*, std::shared_ptr<XCurlEasyHandle>> g_handles;
 std::unordered_map<void*, std::unique_ptr<XCurlMultiHandle>> g_multis;
 std::vector<XCurlMockRule> g_mocks;
 
 bool XCurlLiveNetworkEnabled() {
     const char* v = std::getenv("SCARLETTX_LIVE_NETWORK");
     return v && v[0] == '1';
+}
+
+void WriteCurlError(char* err_buf, const char* msg) {
+    if (!err_buf) return;
+    if (!msg) {
+        err_buf[0] = '\0';
+        return;
+    }
+    std::strncpy(err_buf, msg, CURL_ERROR_SIZE - 1);
+    err_buf[CURL_ERROR_SIZE - 1] = '\0';
+}
+
+bool StartsWithIgnoreCase(const std::string& s, const char* prefix) {
+    const size_t n = std::strlen(prefix);
+    if (s.size() < n) return false;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::tolower(static_cast<unsigned char>(s[i])) !=
+            std::tolower(static_cast<unsigned char>(prefix[i]))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 #if defined(_WIN32)
@@ -75,13 +104,25 @@ std::wstring Utf8ToWide(const std::string& s) {
     return out;
 }
 
+std::string WideToUtf8(const wchar_t* ws, size_t wlen) {
+    if (!ws || wlen == 0) return {};
+    int needed = WideCharToMultiByte(CP_UTF8, 0, ws, static_cast<int>(wlen), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, static_cast<int>(wlen), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
 bool XCurlPerformWinHttp(
     const std::string& method,
     const std::string& url,
+    const std::string& user_agent,
     const std::vector<std::string>& headers,
     const std::vector<uint8_t>& post_data,
-    int64_t timeout_sec,
+    int64_t timeout_ms,
     int64_t& out_code,
+    std::string& out_content_type,
+    std::vector<std::string>& out_header_lines,
     std::vector<uint8_t>& out_body) {
     static HMODULE wh = LoadLibraryW(L"winhttp.dll");
     if (!wh) return false;
@@ -102,6 +143,7 @@ bool XCurlPerformWinHttp(
 
     std::wstring wurl = Utf8ToWide(url);
     std::wstring wmethod = Utf8ToWide(method);
+    std::wstring wua = Utf8ToWide(user_agent.empty() ? "ScarlettEdge-XCurl/1.0" : user_agent);
     std::string hdr_joined;
     for (const auto& hdr : headers) {
         hdr_joined += hdr;
@@ -118,10 +160,12 @@ bool XCurlPerformWinHttp(
     uc.dwUrlPathLength = 2048;
     if (!fnCrack(wurl.c_str(), static_cast<DWORD>(wurl.size()), 0, &uc)) return false;
 
-    HINTERNET hSession = fnOpen(L"ScarlettEdge-XCurl/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
+    HINTERNET hSession = fnOpen(wua.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
     if (!hSession) return false;
     if (fnSetTimeouts) {
-        const int ms = static_cast<int>(timeout_sec > 0 ? timeout_sec * 1000 : 15000);
+        constexpr int64_t kMaxIntMs = static_cast<int64_t>((std::numeric_limits<int>::max)());
+        const int ms = (timeout_ms <= 0) ? 15000
+                                         : static_cast<int>(std::min<int64_t>(timeout_ms, kMaxIntMs));
         fnSetTimeouts(hSession, ms, ms, ms, ms);
     }
     HINTERNET hConnect = fnConnect(hSession, host, uc.nPort, 0);
@@ -143,6 +187,37 @@ bool XCurlPerformWinHttp(
         DWORD status_sz = sizeof(status);
         fnQueryHdr(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &status_sz, nullptr);
         out_code = static_cast<int64_t>(status);
+
+        out_header_lines.clear();
+        out_content_type = "application/octet-stream";
+        DWORD raw_hdr_bytes = 0;
+        fnQueryHdr(hReq, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX,
+                   nullptr, &raw_hdr_bytes, WINHTTP_NO_HEADER_INDEX);
+        if (raw_hdr_bytes > sizeof(wchar_t)) {
+            std::vector<wchar_t> wbuf((raw_hdr_bytes / sizeof(wchar_t)) + 1, L'\0');
+            if (fnQueryHdr(hReq, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX,
+                           wbuf.data(), &raw_hdr_bytes, WINHTTP_NO_HEADER_INDEX)) {
+                const std::string raw = WideToUtf8(wbuf.data(), raw_hdr_bytes / sizeof(wchar_t));
+                size_t pos = 0;
+                while (pos < raw.size()) {
+                    size_t eol = raw.find("\r\n", pos);
+                    if (eol == std::string::npos) break;
+                    std::string line = raw.substr(pos, eol - pos + 2);
+                    pos = eol + 2;
+                    out_header_lines.push_back(line);
+                    if (StartsWithIgnoreCase(line, "Content-Type:")) {
+                        size_t v = 13;
+                        while (v < line.size() && (line[v] == ' ' || line[v] == '\t')) ++v;
+                        std::string ct = line.substr(v);
+                        while (!ct.empty() && (ct.back() == '\r' || ct.back() == '\n' || ct.back() == ' ')) {
+                            ct.pop_back();
+                        }
+                        if (!ct.empty()) out_content_type = ct;
+                    }
+                }
+            }
+        }
+
         out_body.clear();
         for (;;) {
             DWORD avail = 0;
@@ -194,7 +269,7 @@ void curl_global_cleanup(void) {
 
 CURL* curl_easy_init(void) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    auto h = std::make_unique<XCurlEasyHandle>();
+    auto h = std::make_shared<XCurlEasyHandle>();
     void* raw = h.get();
     g_handles[raw] = std::move(h);
     return raw;
@@ -234,7 +309,12 @@ CURLcode curl_easy_setopt(CURL* curl, CURLoption option, ...) {
         }
         case CURLOPT_CUSTOMREQUEST: {
             const char* s = va_arg(args, const char*);
-            if (s) h.method = s;
+            if (s && *s) {
+                h.method = s;
+                h.custom_method = true;
+            } else {
+                h.custom_method = false;
+            }
             break;
         }
         case CURLOPT_USERAGENT: {
@@ -242,20 +322,52 @@ CURLcode curl_easy_setopt(CURL* curl, CURLoption option, ...) {
             h.user_agent = s ? s : "";
             break;
         }
+        case CURLOPT_HTTPGET: {
+            const long v = va_arg(args, long);
+            if (v) {
+                if (!h.custom_method) h.method = "GET";
+                h.raw_post_ptr = nullptr;
+                h.has_copied_post = false;
+                h.post_data.clear();
+                h.explicit_post_size = -1;
+            }
+            break;
+        }
         case CURLOPT_POST: {
             const long v = va_arg(args, long);
-            if (v) h.method = "POST";
+            if (v) {
+                if (!h.custom_method) h.method = "POST";
+            } else if (!h.custom_method) {
+                h.method = "GET";
+            }
             break;
         }
         case CURLOPT_POSTFIELDS: {
+            // Do NOT call strlen(p) here: caller may set CURLOPT_POSTFIELDSIZE on a binary
+            // buffer in the next curl_easy_setopt call! Length resolution is deferred to
+            // curl_easy_perform when explicit_post_size < 0.
             const char* p = va_arg(args, const char*);
             h.raw_post_ptr = p;
+            h.has_copied_post = false;
+            h.post_data.clear();
+            if (p && !h.custom_method && h.method == "GET") {
+                h.method = "POST";
+            }
+            break;
+        }
+        case CURLOPT_COPYPOSTFIELDS: {
+            const char* p = va_arg(args, const char*);
+            h.raw_post_ptr = nullptr;
+            h.has_copied_post = true;
             if (p) {
                 const size_t len = (h.explicit_post_size >= 0)
                                        ? static_cast<size_t>(h.explicit_post_size)
                                        : std::strlen(p);
                 h.post_data.assign(reinterpret_cast<const uint8_t*>(p),
                                    reinterpret_cast<const uint8_t*>(p) + len);
+                if (!h.custom_method && h.method == "GET") {
+                    h.method = "POST";
+                }
             } else {
                 h.post_data.clear();
             }
@@ -263,19 +375,17 @@ CURLcode curl_easy_setopt(CURL* curl, CURLoption option, ...) {
         }
         case CURLOPT_POSTFIELDSIZE: {
             const long sz = va_arg(args, long);
-            h.explicit_post_size = sz;
-            if (h.raw_post_ptr && sz >= 0) {
-                h.post_data.assign(reinterpret_cast<const uint8_t*>(h.raw_post_ptr),
-                                   reinterpret_cast<const uint8_t*>(h.raw_post_ptr) + static_cast<size_t>(sz));
+            h.explicit_post_size = (sz < 0) ? -1 : static_cast<int64_t>(sz);
+            if (h.has_copied_post && sz >= 0 && static_cast<size_t>(sz) < h.post_data.size()) {
+                h.post_data.resize(static_cast<size_t>(sz));
             }
             break;
         }
-        case 30120: /* CURLOPT_POSTFIELDSIZE_LARGE */ {
+        case CURLOPT_POSTFIELDSIZE_LARGE: {
             const int64_t sz = va_arg(args, int64_t);
-            h.explicit_post_size = sz;
-            if (h.raw_post_ptr && sz >= 0) {
-                h.post_data.assign(reinterpret_cast<const uint8_t*>(h.raw_post_ptr),
-                                   reinterpret_cast<const uint8_t*>(h.raw_post_ptr) + static_cast<size_t>(sz));
+            h.explicit_post_size = (sz < 0) ? -1 : sz;
+            if (h.has_copied_post && sz >= 0 && static_cast<size_t>(sz) < h.post_data.size()) {
+                h.post_data.resize(static_cast<size_t>(sz));
             }
             break;
         }
@@ -287,6 +397,23 @@ CURLcode curl_easy_setopt(CURL* curl, CURLoption option, ...) {
             h.write_data = va_arg(args, void*);
             break;
         }
+        case CURLOPT_HEADERFUNCTION: {
+            h.header_cb = va_arg(args, curl_write_callback);
+            break;
+        }
+        case CURLOPT_HEADERDATA: {
+            h.header_data = va_arg(args, void*);
+            break;
+        }
+        case CURLOPT_PRIVATE: {
+            h.private_ptr = va_arg(args, void*);
+            break;
+        }
+        case CURLOPT_ERRORBUFFER: {
+            h.error_buffer = va_arg(args, char*);
+            if (h.error_buffer) h.error_buffer[0] = '\0';
+            break;
+        }
         case CURLOPT_HTTPHEADER: {
             const curl_slist* list = va_arg(args, const curl_slist*);
             h.headers.clear();
@@ -296,7 +423,20 @@ CURLcode curl_easy_setopt(CURL* curl, CURLoption option, ...) {
             break;
         }
         case CURLOPT_TIMEOUT: {
-            h.timeout_sec = va_arg(args, long);
+            const long sec = va_arg(args, long);
+            constexpr long kMaxSec = 2147483L;
+            if (sec <= 0) {
+                h.timeout_ms = 0;
+            } else if (sec > kMaxSec) {
+                h.timeout_ms = static_cast<int64_t>(kMaxSec) * 1000LL;
+            } else {
+                h.timeout_ms = static_cast<int64_t>(sec) * 1000LL;
+            }
+            break;
+        }
+        case CURLOPT_TIMEOUT_MS: {
+            const long ms = va_arg(args, long);
+            h.timeout_ms = (ms <= 0) ? 0 : static_cast<int64_t>(ms);
             break;
         }
         case CURLOPT_FOLLOWLOCATION:
@@ -313,53 +453,146 @@ CURLcode curl_easy_setopt(CURL* curl, CURLoption option, ...) {
 
 CURLcode curl_easy_perform(CURL* curl) {
     if (!curl) return CURLE_BAD_FUNCTION_ARGUMENT;
-    curl_write_callback cb = nullptr;
-    void* ud = nullptr;
+
+    std::shared_ptr<XCurlEasyHandle> h_sp;
+    std::string req_method;
+    std::string req_url;
+    std::string req_ua;
+    std::vector<std::string> req_headers;
+    std::vector<uint8_t> req_post;
+    int64_t req_timeout_ms = 30000;
+    curl_write_callback write_cb = nullptr;
+    void* write_ud = nullptr;
+    curl_write_callback header_cb = nullptr;
+    void* header_ud = nullptr;
+    char* err_buf = nullptr;
+
     std::vector<uint8_t> body;
+    std::vector<std::string> header_lines;
+    bool matched_mock_or_offline = false;
+
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         auto it = g_handles.find(curl);
         if (it == g_handles.end()) return CURLE_BAD_FUNCTION_ARGUMENT;
-        auto& h = *it->second;
-        if (h.url.empty()) return CURLE_URL_MALFORMAT;
+        h_sp = it->second;
+        auto& h = *h_sp;
+        err_buf = h.error_buffer;
+        WriteCurlError(err_buf, "");
 
-        bool matched = false;
+        if (h.url.empty()) {
+            WriteCurlError(err_buf, "URL using bad/illegal format or missing URL");
+            return CURLE_URL_MALFORMAT;
+        }
+
+        // Resolve POST payload length now that both POSTFIELDS and POSTFIELDSIZE have been set.
+        if (h.has_copied_post) {
+            req_post = h.post_data;
+        } else if (h.raw_post_ptr != nullptr) {
+            const size_t len = (h.explicit_post_size >= 0)
+                                   ? static_cast<size_t>(h.explicit_post_size)
+                                   : std::strlen(h.raw_post_ptr);
+            req_post.assign(reinterpret_cast<const uint8_t*>(h.raw_post_ptr),
+                            reinterpret_cast<const uint8_t*>(h.raw_post_ptr) + len);
+        }
+
+        write_cb = h.write_cb;
+        write_ud = h.write_data;
+        header_cb = h.header_cb;
+        header_ud = h.header_data;
+
         for (const auto& rule : g_mocks) {
             if (h.url.rfind(rule.url_prefix, 0) == 0) {
                 h.response_code = rule.response_code;
                 h.content_type = rule.content_type;
                 body = rule.body;
-                matched = true;
+                h.downloaded_bytes = static_cast<int64_t>(body.size());
+                char status_line[64]{};
+                std::snprintf(status_line, sizeof(status_line), "HTTP/1.1 %lld OK\r\n",
+                              static_cast<long long>(rule.response_code));
+                header_lines.emplace_back(status_line);
+                header_lines.push_back("Content-Type: " + rule.content_type + "\r\n");
+                header_lines.emplace_back("\r\n");
+                matched_mock_or_offline = true;
                 break;
             }
         }
-        if (!matched) {
-#if defined(_WIN32)
-            int64_t live_code = 0;
-            std::vector<uint8_t> live_body;
-            if (XCurlLiveNetworkEnabled() &&
-                XCurlPerformWinHttp(h.method, h.url, h.headers, h.post_data, h.timeout_sec, live_code, live_body)) {
-                h.response_code = live_code;
-                h.content_type = "application/octet-stream";
-                body = std::move(live_body);
-                matched = true;
+
+        if (!matched_mock_or_offline) {
+            if (XCurlLiveNetworkEnabled()) {
+                req_method = h.method;
+                req_url = h.url;
+                req_ua = h.user_agent;
+                req_headers = h.headers;
+                req_timeout_ms = h.timeout_ms;
+            } else {
+                h.response_code = 503;
+                h.content_type = "application/json";
+                const std::string fallback = "{\"status\":\"offline\",\"emulator\":\"ScarlettX-XCurl\"}";
+                body.assign(fallback.begin(), fallback.end());
+                h.downloaded_bytes = static_cast<int64_t>(body.size());
+                header_lines.emplace_back("HTTP/1.1 503 Service Unavailable\r\n");
+                header_lines.emplace_back("Content-Type: application/json\r\n");
+                header_lines.emplace_back("\r\n");
+                matched_mock_or_offline = true;
             }
-#endif
         }
-        if (!matched) {
-            h.response_code = 503;
-            h.content_type = "application/json";
-            const std::string fallback = "{\"status\":\"offline\",\"emulator\":\"ScarlettX-XCurl\"}";
-            body.assign(fallback.begin(), fallback.end());
-        }
-        h.downloaded_bytes = static_cast<int64_t>(body.size());
-        cb = h.write_cb;
-        ud = h.write_data;
     }
 
-    if (cb && !body.empty()) {
-        const size_t written = cb(reinterpret_cast<char*>(body.data()), 1, body.size(), ud);
+    if (!matched_mock_or_offline) {
+#if defined(_WIN32)
+        // Perform live WinHTTP I/O WITHOUT holding g_mutex!
+        int64_t live_code = 0;
+        std::string live_ct;
+        std::vector<std::string> live_hdrs;
+        std::vector<uint8_t> live_body;
+        if (!XCurlPerformWinHttp(req_method, req_url, req_ua, req_headers, req_post,
+                                 req_timeout_ms, live_code, live_ct, live_hdrs, live_body)) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            h_sp->response_code = 0;
+            h_sp->downloaded_bytes = 0;
+            WriteCurlError(h_sp->error_buffer, curl_easy_strerror(CURLE_COULDNT_CONNECT));
+            return CURLE_COULDNT_CONNECT;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            h_sp->response_code = live_code;
+            h_sp->content_type = std::move(live_ct);
+            h_sp->downloaded_bytes = static_cast<int64_t>(live_body.size());
+            write_cb = h_sp->write_cb;
+            write_ud = h_sp->write_data;
+            header_cb = h_sp->header_cb;
+            header_ud = h_sp->header_data;
+            err_buf = h_sp->error_buffer;
+        }
+        body = std::move(live_body);
+        header_lines = std::move(live_hdrs);
+        if (header_lines.empty() || header_lines.back() != "\r\n") {
+            header_lines.emplace_back("\r\n");
+        }
+#else
+        std::lock_guard<std::mutex> lock(g_mutex);
+        h_sp->response_code = 0;
+        h_sp->downloaded_bytes = 0;
+        WriteCurlError(h_sp->error_buffer, curl_easy_strerror(CURLE_COULDNT_CONNECT));
+        return CURLE_COULDNT_CONNECT;
+#endif
+    }
+
+    if (header_cb) {
+        for (std::string& line : header_lines) {
+            const size_t written = header_cb(line.data(), 1, line.size(), header_ud);
+            if (written != line.size()) {
+                WriteCurlError(err_buf, curl_easy_strerror(CURLE_WRITE_ERROR));
+                return CURLE_WRITE_ERROR;
+            }
+        }
+    }
+
+    if (write_cb && !body.empty()) {
+        const size_t written = write_cb(reinterpret_cast<char*>(body.data()), 1, body.size(), write_ud);
         if (written != body.size()) {
+            WriteCurlError(err_buf, curl_easy_strerror(CURLE_WRITE_ERROR));
             return CURLE_WRITE_ERROR;
         }
     }
@@ -390,6 +623,11 @@ CURLcode curl_easy_getinfo(CURL* curl, CURLINFO info, ...) {
         case CURLINFO_CONTENT_TYPE: {
             const char** out = va_arg(args, const char**);
             if (out) *out = h.content_type.c_str();
+            break;
+        }
+        case CURLINFO_PRIVATE: {
+            void** out = va_arg(args, void**);
+            if (out) *out = h.private_ptr;
             break;
         }
         default:
@@ -493,7 +731,6 @@ CURLMcode curl_multi_perform(CURLM* multi, int* running_handles) {
         batch.swap(it->second->pending);
     }
     for (CURL* curl : batch) {
-        // Runs the title's callbacks, which may remove handles or clean up.
         const CURLcode result = curl_easy_perform(curl);
         std::lock_guard<std::mutex> lock(g_mutex);
         auto it = g_multis.find(multi);
@@ -524,8 +761,6 @@ CURLMsg* curl_multi_info_read(CURLM* multi, int* msgs_in_queue) {
     return &m.current;
 }
 
-// No sockets to wait on: returns once a transfer is waiting for
-// curl_multi_perform, or when the timeout has passed.
 CURLMcode curl_multi_poll(
     CURLM* multi,
     struct curl_waitfd* /*extra_fds*/,

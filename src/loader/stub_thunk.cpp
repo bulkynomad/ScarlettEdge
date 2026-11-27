@@ -1,5 +1,7 @@
 #include "scarlettx/loader/stub_thunk.h"
 
+#include "scarlettx/core/flight_recorder.h"
+
 #include <cstring>
 #include <iostream>
 
@@ -18,7 +20,10 @@ extern "C" uint64_t ScarlettxStubDispatchEntry(void* table_ptr,
     if (!table) {
         return 0;
     }
-    return table->Dispatch(stub_id, args4);
+    // In AllocateStub's x64 frame (`sub rsp, 0x48`), `args4` points to `[rsp+0x20]`,
+    // so `args4[5]` (`[rsp+0x48]`) is the exact guest return address pushed by `call`.
+    const uint64_t caller_rip = args4 ? args4[5] : 0ull;
+    return table->Dispatch(stub_id, args4, caller_rip);
 }
 
 void WriteU32LE(uint8_t* dst, uint32_t v) {
@@ -101,7 +106,7 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
     uint8_t* slot = code_buffer_ + static_cast<size_t>(stub_id) * kSlotSize;
     uint8_t* p = slot;
 
-    // Windows x64 ABI trampoline (61 bytes):
+    // Windows x64 ABI trampoline (64 bytes):
     //   sub rsp, 0x48              ; 32B shadow + 32B saved args + 8B alignment
     //   mov [rsp+0x20], rcx
     //   mov [rsp+0x28], rdx
@@ -113,6 +118,7 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
     //   mov rax, <&ScarlettxStubDispatchEntry>
     //   call rax
     //   add rsp, 0x48
+    //   xorps xmm0, xmm0           ; deterministic 0.0f/0.0 for float/double stubs
     //   ret
     static constexpr uint8_t kPrologue[] = {
         0x48, 0x83, 0xEC, 0x48,              // sub rsp, 0x48
@@ -145,8 +151,11 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
     static constexpr uint8_t kEpilogue[] = {
         0xFF, 0xD0,              // call rax
         0x48, 0x83, 0xC4, 0x48,  // add rsp, 0x48
+        0x0F, 0x57, 0xC0,        // xorps xmm0, xmm0
         0xC3,                    // ret
     };
+    static_assert(sizeof(kPrologue) + 10 + 5 + sizeof(kLeaR8) + 10 + sizeof(kEpilogue) <= kSlotSize,
+                  "StubThunkTable x64 trampoline exceeds kSlotSize");
     std::memcpy(p, kEpilogue, sizeof(kEpilogue));
     p += sizeof(kEpilogue);
 
@@ -169,7 +178,7 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
 #endif
 }
 
-uint64_t StubThunkTable::Dispatch(uint32_t stub_id, const uint64_t* args4) {
+uint64_t StubThunkTable::Dispatch(uint32_t stub_id, const uint64_t* args4, uint64_t caller_rip) {
     std::string dll;
     std::string sym;
     uint16_t ord = 0;
@@ -190,12 +199,18 @@ uint64_t StubThunkTable::Dispatch(uint32_t stub_id, const uint64_t* args4) {
                 rec.last_args[i] = args4[i];
             }
         }
+        if (caller_rip != 0) {
+            rec.last_caller_rip = caller_rip;
+        }
         dll = rec.dll_name;
         sym = rec.symbol_name;
         ord = rec.ordinal;
         by_ord = rec.by_ordinal;
         ret = rec.return_value;
     }
+
+    FlightRecorder::Instance().RecordStubHit(
+        dll.c_str(), sym.c_str(), by_ord, ord, args4, ret, caller_rip);
 
     if (hits == 1 || verbose_logging_) {
         std::cout << "[ScarlettX][STUB] " << dll << "!";

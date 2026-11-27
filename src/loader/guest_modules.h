@@ -30,11 +30,23 @@ Status AttachTls(uint8_t* image_base, const void* tls_directory, bool is_exe, Tl
 void EnableTlsCallbacks(TlsBinding* binding);
 void DetachTls(TlsBinding* binding);
 
+struct GuestModuleAddrInfo {
+    uint64_t base = 0;
+    uint32_t size = 0;
+    uint32_t rva = 0;
+    uint64_t ghidra_va = 0;
+    bool is_exe = false;
+    char name[64] = {};
+};
+
 void RegisterModule(uint8_t* base, uint32_t size, const std::string& path, bool is_exe);
 void UnregisterModule(uint8_t* base);
 
 // Base of the guest module containing `address`, or null.
 void* FindModuleBase(const void* address);
+
+// Lock-free, VEH/SuspendThread-safe resolution of an address inside a mapped guest PE64 image.
+bool TryResolveGuestAddressLockFree(uint64_t address, GuestModuleAddrInfo* out) noexcept;
 
 // Replacement for a host import the guest (or a host CRT acting for it) must not
 // call directly. `target_dll_lower` is the resolved host DLL name in lower case.

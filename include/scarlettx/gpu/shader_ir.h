@@ -25,7 +25,36 @@ enum class ShaderStage : uint32_t {
     Geometry = 4,
     Hull = 5,
     Domain = 6,
-    Library = 7,  // DXR raytracing library (lib_6_3+)
+    Library = 7,        // DXR raytracing library / stages (lib_6_3+, raygen/hit/miss/callable)
+    Mesh = 13,          // Mesh shader (ms_6_5+)
+    Amplification = 14, // Amplification / Task shader (as_6_5+)
+};
+
+struct Xs2RootRegMapEntry {
+    uint32_t user_sgpr_offset = 0;
+    uint32_t register_index = 0;
+    uint32_t register_space = 0;
+};
+
+struct Xs2ParsedHeaderInfo {
+    bool has_header = false;
+    bool has_workgroup_size = false;
+    bool is_bindless = false;
+    bool has_ia_vertex_inputs = false;
+    uint32_t stage = 0;
+    uint32_t pgm_rsrc1 = 0;
+    uint32_t pgm_rsrc2 = 0;
+    uint32_t vgpr_count = 0;
+    uint32_t sgpr_count = 0;
+    uint32_t lds_bytes = 0;
+    uint32_t user_sgpr_count = 0;
+    uint32_t threads_x = 8;
+    uint32_t threads_y = 8;
+    uint32_t threads_z = 1;
+    uint32_t mrt_export_mask = 0;
+    const uint8_t* isa_ptr = nullptr;
+    size_t isa_size = 0;
+    std::vector<Xs2RootRegMapEntry> root_map;
 };
 
 struct ShaderModuleInfo {
@@ -57,6 +86,15 @@ uint64_t HashShaderBytes(const uint8_t* data, size_t size);
 // Computes and writes the retail 16-byte DXBC modified-MD5 checksum at bytes 4..19
 // of a DXBC/DXIL container (hashing bytes 20..size). Returns false if size < 32.
 bool UpdateDxbcContainerChecksum(uint8_t* dxbc_data, size_t total_size);
+
+// Cryptographically validates and signs a DXIL container in-place at bytes 4..19 using
+// Windows dxil.dll (IDxcValidator::Validate with DxcValidatorFlags_InPlaceEdit).
+// Returns true if dxil.dll validated and wrote a non-zero retail signature.
+bool SignDxilContainerInPlace(uint8_t* dxbc_data, size_t total_size);
+
+// Parses optional Xbox Scarlett XS2 precompiled shader headers ('XS2H', 'XS2\0',
+// 'PGMR' PGM_RSRC1/2 prefix, or DXBC wrapping XS2M/XBIN chunks) and locates the ISA stream.
+bool ParseXs2PrecompiledHeader(const uint8_t* data, size_t byte_size, Xs2ParsedHeaderInfo& out_hdr);
 
 Status InspectShaderContainer(const std::vector<uint8_t>& bytecode, ShaderModuleInfo& out_info);
 

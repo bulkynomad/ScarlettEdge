@@ -1,6 +1,8 @@
 #include "scarlettx/io/dstorage_abi.h"
 #include "scarlettx/gpu/xg_layout.h"
 #include "scarlettx/io/deflate_rfc1951.h"
+#include "scarlettx/loader/package_vfs.h"
+#include "scarlettx/loader/xvd_container.h"
 #include "scarlettx/media/codecs_abi.h"
 
 #include <algorithm>
@@ -24,8 +26,6 @@
 #include <utility>
 #include <vector>
 
-#include "scarlettx/loader/xvd_container.h"
-
 namespace {
 
 constexpr int32_t kS_OK = 0;
@@ -37,15 +37,14 @@ constexpr int32_t kE_OUTOFMEMORY = static_cast<int32_t>(0x8007000Eu);
 constexpr int32_t kE_DSTORAGE_FILE_NOT_FOUND = static_cast<int32_t>(0x80070002u);
 constexpr int32_t kE_DSTORAGE_BUFFER_TOO_SMALL = static_cast<int32_t>(0x8007007Au);
 
-// Simple lossless packet-RLE codec framed with 'SXCR' magic so both GDeflate-compat
-// and LZ_RLE requests round-trip deterministically in headless tests.
-// Packet format:
-//   [0..3]  magic 'SXCR'
-//   [4..7]  uncompressed_size (u32 LE)
-//   stream of control bytes:
-//     if (ctrl & 0x80): repeat next byte ((ctrl & 0x7F) + 3) times
-//     else:             copy (ctrl + 1) literal bytes
 constexpr uint8_t kCodecMagic[4] = {'S', 'X', 'C', 'R'};
+
+uint32_t ReadLe32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
 
 int32_t CompressLzRle(
     const uint8_t* src,
@@ -66,7 +65,6 @@ int32_t CompressLzRle(
 
     uint32_t i = 0;
     while (i < src_size) {
-        // Check for run of >= 3 identical bytes
         uint32_t run = 1;
         while (i + run < src_size && src[i + run] == src[i] && run < 130) {
             ++run;
@@ -78,7 +76,6 @@ int32_t CompressLzRle(
             continue;
         }
 
-        // Accumulate literals until a run of >= 3 or 128 literals
         uint32_t lit_start = i;
         while (i < src_size && (i - lit_start) < 128) {
             if (i + 2 < src_size && src[i] == src[i + 1] && src[i] == src[i + 2]) {
@@ -109,11 +106,7 @@ int32_t DecompressLzRle(
     if (std::memcmp(src, kCodecMagic, 4) != 0) {
         return kE_FAIL;
     }
-    const uint32_t expected =
-        static_cast<uint32_t>(src[4]) |
-        (static_cast<uint32_t>(src[5]) << 8) |
-        (static_cast<uint32_t>(src[6]) << 16) |
-        (static_cast<uint32_t>(src[7]) << 24);
+    const uint32_t expected = ReadLe32(src + 4);
     if (!dst || dst_cap < expected) {
         *out_size = expected;
         return kE_DSTORAGE_BUFFER_TOO_SMALL;
@@ -146,8 +139,45 @@ int32_t DecompressLzRle(
     return kS_OK;
 }
 
+int32_t DecompressUnifiedGDeflateOrZlib(
+    const uint8_t* src,
+    uint32_t src_size,
+    uint8_t* dst,
+    uint32_t dst_cap,
+    uint32_t* out_size) {
+    if (!src || src_size == 0 || !out_size) return kE_INVALIDARG;
+
+    if (src_size >= 8u && std::memcmp(src, kCodecMagic, 4) == 0) {
+        return DecompressLzRle(src, src_size, dst, dst_cap, out_size);
+    }
+
+    if (!dst || dst_cap == 0) return kE_DSTORAGE_BUFFER_TOO_SMALL;
+
+    if (src_size >= 8u && src[0] == 0x04u && src[1] == 0xFBu) {
+        size_t written = 0;
+        const int32_t hr = XboxCodecGDeflateDecompress(src, src_size, dst, dst_cap, &written);
+        if (hr == 0 && written > 0) {
+            *out_size = static_cast<uint32_t>(written);
+            return kS_OK;
+        }
+        return hr < 0 ? hr : kE_FAIL;
+    }
+
+    if (scarlettx::io::LooksLikeRfc1950ZlibHeader(src, src_size)) {
+        size_t written = 0;
+        if (scarlettx::io::InflateZlibRfc1950(src, src_size, dst, dst_cap, written) && written > 0) {
+            *out_size = static_cast<uint32_t>(written);
+            return kS_OK;
+        }
+        return kE_FAIL;
+    }
+
+    return kE_FAIL;
+}
+
 struct FileObject {
     bool is_xvd = false;
+    bool is_vfs = false;
     std::string path;
     uint64_t size = 0;
     scarlettx::XvdContainer xvd;
@@ -198,7 +228,7 @@ struct QueueObject {
     std::condition_variable idle_cv;
     std::condition_variable space_cv;
     std::deque<QueueItem> entries;
-    std::size_t submitted_count = 0;  // Only this prefix is visible to the worker.
+    std::size_t submitted_count = 0;
     bool stop = false;
     bool busy = false;
     DSTORAGE_ERROR_RECORD error_record{};
@@ -234,7 +264,6 @@ int32_t EnqueueItem(QueueObject& q, QueueItem item) {
     const auto has_room = [&]() {
         return capacity == 0 || q.entries.size() + static_cast<std::size_t>(q.busy) < capacity;
     };
-    // A signal callback runs on this worker and cannot wait for it to retire an entry.
     if (!q.stop && !has_room() && std::this_thread::get_id() == q.worker_id) {
         return kE_FAIL;
     }
@@ -270,6 +299,15 @@ int32_t ReadSourcePayload(
         if (file->is_xvd) {
             auto st = file->xvd.ReadUserData(file_offset, source_size, out_raw);
             if (!st.ok()) return kE_FAIL;
+        } else if (file->is_vfs) {
+            if (source_size == 0) {
+                out_raw.clear();
+                return kS_OK;
+            }
+            auto st = scarlettx::PackageVfs::Global().ReadFileRange(file->path, file_offset, source_size, out_raw);
+            if (!st.ok() || out_raw.size() != source_size) {
+                return kE_FAIL;
+            }
         } else {
             out_raw.resize(source_size);
             bool read_done = false;
@@ -323,6 +361,13 @@ struct GpuLzPacket {
     uint32_t is_rle;
 };
 
+struct GpuGDeflateTileDesc {
+    uint32_t comp_off;
+    uint32_t comp_len;
+    uint32_t out_off;
+    uint32_t out_cap;
+};
+
 const std::vector<uint8_t>& GetGpuLzComputeBytecode() {
     static const std::vector<uint8_t> bytecode = []() -> std::vector<uint8_t> {
         static const char kHlsl[] = R"(
@@ -364,7 +409,7 @@ uint DecodeOutputByte(uint outByteIdx) {
     return ReadCompressedByte(pkt.z + (outByteIdx - pkt.x));
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(32, 1, 1)]
 void main(uint3 dtid : SV_DispatchThreadID) {
     uint baseByte = dtid.x * 4u;
     if (baseByte >= g_UncompressedBytes) return;
@@ -377,7 +422,7 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 )";
         ID3DBlob* cs_blob = nullptr;
         ID3DBlob* err_blob = nullptr;
-        HRESULT hr = D3DCompile(kHlsl, sizeof(kHlsl) - 1, "DStorageGpuGDeflate.hlsl",
+        HRESULT hr = D3DCompile(kHlsl, sizeof(kHlsl) - 1, "DStorageGpuSxcr.hlsl",
                                 nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                                 &cs_blob, &err_blob);
         if (err_blob) err_blob->Release();
@@ -392,14 +437,424 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     return bytecode;
 }
 
+// Real 32-lane SIMD bit-interleaved GDeflate GPU Compute Shader (1 HLSL thread = 1 GDeflate bitlane).
+const std::vector<uint8_t>& GetGpuGDeflate32ComputeBytecode() {
+    static const std::vector<uint8_t> bytecode = []() -> std::vector<uint8_t> {
+        static const char kHlsl[] = R"(
+cbuffer Params : register(b0) {
+    uint g_TileCount;
+    uint g_CompressedBytes;
+    uint g_UncompressedBytes;
+    uint g_MaxWaves;
+};
+ByteAddressBuffer g_Tiles                     : register(t0);
+ByteAddressBuffer g_Compressed                : register(t1);
+globallycoherent RWByteAddressBuffer g_Output : register(u0);
+
+groupshared uint gs_WordCursor;
+groupshared uint gs_OutPos;
+groupshared uint gs_NeedWord[32];
+groupshared uint gs_OutLen[32];
+groupshared uint gs_IsMatch[32];
+groupshared uint gs_LitOrLen[32];
+groupshared uint gs_Dist[32];
+groupshared uint gs_HasIntraOverlap;
+
+uint Reverse5(uint v) {
+    uint r = ((v & 1u) << 4u) | ((v & 2u) << 2u) | (v & 4u) | ((v >> 2u) & 2u) | ((v >> 4u) & 1u);
+    return r;
+}
+
+uint Reverse9(uint v) {
+    uint r = 0u;
+    [unroll]
+    for (uint i = 0u; i < 9u; ++i) {
+        r = (r << 1u) | ((v >> i) & 1u);
+    }
+    return r;
+}
+
+uint GetLenExtra(uint idx) {
+    if (idx < 8u || idx >= 28u) return 0u;
+    return (idx - 4u) >> 2u;
+}
+
+uint GetLenBase(uint idx) {
+    if (idx < 8u) return 3u + idx;
+    if (idx >= 28u) return 258u;
+    uint ex = (idx - 4u) >> 2u;
+    return 3u + ((4u + (idx & 3u)) << ex);
+}
+
+uint GetDistExtra(uint idx) {
+    if (idx < 4u) return 0u;
+    return (idx - 2u) >> 1u;
+}
+
+uint GetDistBase(uint idx) {
+    if (idx < 4u) return 1u + idx;
+    uint ex = (idx - 2u) >> 1u;
+    return 1u + ((2u + (idx & 1u)) << ex);
+}
+
+uint ReadCompByte(uint idx) {
+    if (idx >= g_CompressedBytes) return 0u;
+    uint w = g_Compressed.Load(idx & ~3u);
+    return (w >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+uint ReadCompWord(uint bytePos) {
+    if ((bytePos & 3u) == 0u && bytePos + 4u <= g_CompressedBytes) {
+        return g_Compressed.Load(bytePos);
+    }
+    return ReadCompByte(bytePos) |
+           (ReadCompByte(bytePos + 1u) << 8u) |
+           (ReadCompByte(bytePos + 2u) << 16u) |
+           (ReadCompByte(bytePos + 3u) << 24u);
+}
+
+uint ReadOutByte(uint idx) {
+    uint w = g_Output.Load(idx & ~3u);
+    return (w >> ((idx & 3u) * 8u)) & 0xFFu;
+}
+
+void WriteOutByteAtomic(uint idx, uint bval) {
+    uint dummy = 0u;
+    g_Output.InterlockedOr(idx & ~3u, (bval & 0xFFu) << ((idx & 3u) * 8u), dummy);
+}
+
+[numthreads(32, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    uint lane = gtid.x;
+    uint4 td = (gid.x < g_TileCount) ? g_Tiles.Load4(gid.x * 16u) : uint4(0u, 0u, 0u, 0u);
+    uint compOff = td.x;
+    uint compLen = td.y;
+    uint outOff  = td.z;
+    uint outCap  = td.w;
+    uint alignedCap = (outCap + 3u) & ~3u;
+
+    [loop]
+    for (uint ci = 0u; ci < 512u; ++ci) {
+        uint rel = (ci * 32u + lane) * 4u;
+        if (gid.x < g_TileCount && rel < alignedCap) {
+            g_Output.Store(outOff + rel, 0u);
+        }
+    }
+    AllMemoryBarrierWithGroupSync();
+
+    uint tileWords = compLen >> 2u;
+    uint curWord  = (lane < tileWords) ? ReadCompWord(compOff + lane * 4u) : 0u;
+    uint nextWord = (32u + lane < tileWords) ? ReadCompWord(compOff + (32u + lane) * 4u) : 0u;
+    uint bitOff = 0u;
+    uint laneDone = (gid.x < g_TileCount && outCap > 0u) ? 0u : 1u;
+
+    if (lane == 0u) {
+        gs_WordCursor = (tileWords > 64u) ? 64u : tileWords;
+        gs_OutPos = 0u;
+    }
+    if (laneDone == 0u) {
+        uint hdr = curWord & 0x7u;
+        if (((hdr >> 1u) & 0x3u) != 1u) {
+            laneDone = 1u;
+        }
+        bitOff = 3u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    [loop]
+    for (uint wave = 0u; wave < g_MaxWaves; ++wave) {
+        uint isMatch = 0u;
+        uint litOrLen = 0u;
+        uint dist = 0u;
+        uint outBytes = 0u;
+        uint nbits = 0u;
+
+        if (laneDone == 0u) {
+            uint bits = (bitOff == 0u) ? curWord : ((curWord >> bitOff) | (nextWord << (32u - bitOff)));
+            uint rev9 = Reverse9(bits & 0x1FFu);
+            uint rev7 = rev9 >> 2u;
+            uint rev8 = rev9 >> 1u;
+            uint sym = 256u;
+            uint cbits = 7u;
+            if (rev7 <= 23u) {
+                sym = 256u + rev7;
+                cbits = 7u;
+            } else if (rev8 >= 48u && rev8 <= 191u) {
+                sym = rev8 - 48u;
+                cbits = 8u;
+            } else if (rev8 >= 192u && rev8 <= 199u) {
+                sym = 280u + (rev8 - 192u);
+                cbits = 8u;
+            } else {
+                sym = 144u + (rev9 - 400u);
+                cbits = 9u;
+            }
+
+            if (sym < 256u) {
+                litOrLen = sym;
+                outBytes = 1u;
+                nbits = cbits;
+            } else if (sym == 256u) {
+                laneDone = 1u;
+                nbits = 7u;
+            } else if (sym <= 285u) {
+                uint lenIdx = sym - 257u;
+                uint lexBits = GetLenExtra(lenIdx);
+                uint lexVal = (lexBits > 0u) ? ((bits >> cbits) & ((1u << lexBits) - 1u)) : 0u;
+                uint mlen = GetLenBase(lenIdx) + lexVal;
+                uint posAfterLen = cbits + lexBits;
+                uint distSym = Reverse5((bits >> posAfterLen) & 0x1Fu);
+                uint dexBits = GetDistExtra(distSym);
+                uint dexVal = (dexBits > 0u) ? ((bits >> (posAfterLen + 5u)) & ((1u << dexBits) - 1u)) : 0u;
+                uint mdist = GetDistBase(distSym) + dexVal;
+                isMatch = 1u;
+                litOrLen = mlen;
+                dist = mdist;
+                outBytes = mlen;
+                nbits = posAfterLen + 5u + dexBits;
+            } else {
+                laneDone = 1u;
+            }
+            bitOff += nbits;
+        }
+
+        uint needRefill = (bitOff >= 32u) ? 1u : 0u;
+        gs_NeedWord[lane] = needRefill;
+        gs_OutLen[lane] = outBytes;
+        gs_IsMatch[lane] = isMatch;
+        gs_LitOrLen[lane] = litOrLen;
+        gs_Dist[lane] = dist;
+        if (lane == 0u) gs_HasIntraOverlap = 0u;
+        GroupMemoryBarrierWithGroupSync();
+
+        if (needRefill != 0u) {
+            uint wPrefix = 0u;
+            [unroll]
+            for (uint k = 0u; k < 32u; ++k) {
+                if (k < lane) wPrefix += gs_NeedWord[k];
+            }
+            uint fetchIdx = gs_WordCursor + wPrefix;
+            curWord = nextWord;
+            nextWord = (fetchIdx < tileWords) ? ReadCompWord(compOff + fetchIdx * 4u) : 0u;
+            bitOff -= 32u;
+        }
+
+        uint outPrefix = 0u;
+        [unroll]
+        for (uint p = 0u; p < 32u; ++p) {
+            if (p < lane) outPrefix += gs_OutLen[p];
+        }
+        uint laneDstRel = gs_OutPos + outPrefix;
+        if (isMatch != 0u && dist < (outPrefix + litOrLen)) {
+            uint prevFlag = 0u;
+            InterlockedOr(gs_HasIntraOverlap, 1u, prevFlag);
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        if (gs_HasIntraOverlap == 0u) {
+            if (outBytes > 0u && laneDstRel < outCap) {
+                if (isMatch == 0u) {
+                    WriteOutByteAtomic(outOff + laneDstRel, litOrLen);
+                } else {
+                    uint copyCnt = min(litOrLen, outCap - laneDstRel);
+                    [loop]
+                    for (uint m = 0u; m < copyCnt; ++m) {
+                        uint b = (laneDstRel + m >= dist) ? ReadOutByte(outOff + laneDstRel + m - dist) : 0u;
+                        WriteOutByteAtomic(outOff + laneDstRel + m, b);
+                    }
+                }
+            }
+        } else if (lane == 0u) {
+            uint curRel = gs_OutPos;
+            [loop]
+            for (uint k = 0u; k < 32u; ++k) {
+                uint kLen = gs_OutLen[k];
+                if (kLen > 0u && curRel < outCap) {
+                    if (gs_IsMatch[k] == 0u) {
+                        WriteOutByteAtomic(outOff + curRel, gs_LitOrLen[k]);
+                    } else {
+                        uint kDist = gs_Dist[k];
+                        uint copyCnt = min(kLen, outCap - curRel);
+                        [loop]
+                        for (uint m = 0u; m < copyCnt; ++m) {
+                            uint b = (curRel + m >= kDist) ? ReadOutByte(outOff + curRel + m - kDist) : 0u;
+                            WriteOutByteAtomic(outOff + curRel + m, b);
+                        }
+                    }
+                }
+                curRel += kLen;
+            }
+        }
+
+        if (lane == 0u) {
+            uint totalWords = 0u;
+            uint totalOut = 0u;
+            [unroll]
+            for (uint q = 0u; q < 32u; ++q) {
+                totalWords += gs_NeedWord[q];
+                totalOut += gs_OutLen[q];
+            }
+            gs_WordCursor += totalWords;
+            gs_OutPos += totalOut;
+        }
+        AllMemoryBarrierWithGroupSync();
+    }
+}
+)";
+        ID3DBlob* cs_blob = nullptr;
+        ID3DBlob* err_blob = nullptr;
+        HRESULT hr = D3DCompile(kHlsl, sizeof(kHlsl) - 1, "DStorageGpuGDeflate32.hlsl",
+                                nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                &cs_blob, &err_blob);
+        if (err_blob) err_blob->Release();
+        std::vector<uint8_t> out;
+        if (SUCCEEDED(hr) && cs_blob) {
+            const auto* ptr = static_cast<const uint8_t*>(cs_blob->GetBufferPointer());
+            out.assign(ptr, ptr + cs_blob->GetBufferSize());
+            cs_blob->Release();
+        }
+        return out;
+    }();
+    return bytecode;
+}
+
+// Per-ID3D12Device cached Compute RootSignature + PSOs attached via SetPrivateDataInterface
+// so D3D12 automatically releases them when the device is destroyed.
+static const GUID kScarlettDsGpuCacheGuid = {
+    0x7c8e91a4u, 0x3f2du, 0x4b91u, {0x9au, 0x12u, 0x55u, 0xe4u, 0x08u, 0xc7u, 0x33u, 0x19u}};
+
+class GpuDecompressPipelineCache final : public IUnknown {
+public:
+    ID3D12RootSignature* root_sig = nullptr;
+    ID3D12PipelineState* pso_sxcr = nullptr;
+    ID3D12PipelineState* pso_gdeflate32 = nullptr;
+
+    ~GpuDecompressPipelineCache() {
+        if (pso_gdeflate32) pso_gdeflate32->Release();
+        if (pso_sxcr) pso_sxcr->Release();
+        if (root_sig) root_sig->Release();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        if (riid == __uuidof(IUnknown)) {
+            AddRef();
+            *ppvObject = static_cast<IUnknown*>(this);
+            return S_OK;
+        }
+        *ppvObject = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(refs_.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const uint32_t rem = refs_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (rem == 0) delete this;
+        return static_cast<ULONG>(rem);
+    }
+
+private:
+    std::atomic<uint32_t> refs_{1};
+};
+
+GpuDecompressPipelineCache* AcquireOrCreateGpuPipelineCache(ID3D12Device* dev) {
+    static std::mutex cache_mu;
+    std::lock_guard<std::mutex> lk(cache_mu);
+
+    GpuDecompressPipelineCache* existing = nullptr;
+    UINT ptr_sz = sizeof(existing);
+    if (SUCCEEDED(dev->GetPrivateData(kScarlettDsGpuCacheGuid, &ptr_sz, &existing)) &&
+        ptr_sz == sizeof(existing) && existing) {
+        return existing;  // GetPrivateData already called AddRef() on the stored IUnknown
+    }
+
+    const auto& sxcr_dxbc = GetGpuLzComputeBytecode();
+    const auto& gdef_dxbc = GetGpuGDeflate32ComputeBytecode();
+    if (sxcr_dxbc.empty() || gdef_dxbc.empty()) {
+        return nullptr;
+    }
+
+    auto* cache = new (std::nothrow) GpuDecompressPipelineCache();
+    if (!cache) return nullptr;
+
+    D3D12_ROOT_PARAMETER params[4]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.ShaderRegister = 0;
+    params[0].Constants.Num32BitValues = 4;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor.ShaderRegister = 0;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[2].Descriptor.ShaderRegister = 1;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[3].Descriptor.ShaderRegister = 0;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 4;
+    rsd.pParameters = params;
+    ID3DBlob* rs_blob = nullptr;
+    ID3DBlob* rs_err = nullptr;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err)) || !rs_blob) {
+        if (rs_err) rs_err->Release();
+        cache->Release();
+        return nullptr;
+    }
+    if (rs_err) rs_err->Release();
+    HRESULT hr = dev->CreateRootSignature(
+        0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&cache->root_sig));
+    rs_blob->Release();
+    if (FAILED(hr) || !cache->root_sig) {
+        cache->Release();
+        return nullptr;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = cache->root_sig;
+    pso_desc.CS.pShaderBytecode = sxcr_dxbc.data();
+    pso_desc.CS.BytecodeLength = sxcr_dxbc.size();
+    if (FAILED(dev->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&cache->pso_sxcr))) || !cache->pso_sxcr) {
+        cache->Release();
+        return nullptr;
+    }
+
+    pso_desc.CS.pShaderBytecode = gdef_dxbc.data();
+    pso_desc.CS.BytecodeLength = gdef_dxbc.size();
+    if (FAILED(dev->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&cache->pso_gdeflate32))) ||
+        !cache->pso_gdeflate32) {
+        cache->Release();
+        return nullptr;
+    }
+
+    (void)dev->SetPrivateDataInterface(kScarlettDsGpuCacheGuid, cache);
+    return cache;  // Caller holds the initial ref (1) and releases in cleanup()
+}
+
+bool WaitForGpuFenceSafe(ID3D12Device* dev, ID3D12Fence* fence, uint64_t target_val, HANDLE ev) {
+    while (fence->GetCompletedValue() < target_val) {
+        if (dev && FAILED(dev->GetDeviceRemovedReason())) {
+            return false;
+        }
+        if (FAILED(fence->SetEventOnCompletion(target_val, ev))) {
+            return false;
+        }
+        WaitForSingleObject(ev, INFINITE);
+    }
+    return !dev || SUCCEEDED(dev->GetDeviceRemovedReason());
+}
+
 bool ParseSxcrPacketsForGpu(const uint8_t* src, uint32_t src_size,
                             std::vector<GpuLzPacket>& out_packets, uint32_t* out_expected) {
     if (!src || src_size < 8 || std::memcmp(src, kCodecMagic, 4) != 0) return false;
-    const uint32_t expected =
-        static_cast<uint32_t>(src[4]) |
-        (static_cast<uint32_t>(src[5]) << 8) |
-        (static_cast<uint32_t>(src[6]) << 16) |
-        (static_cast<uint32_t>(src[7]) << 24);
+    const uint32_t expected = ReadLe32(src + 4);
     out_packets.clear();
     uint32_t in_pos = 8;
     uint32_t out_pos = 0;
@@ -422,6 +877,70 @@ bool ParseSxcrPacketsForGpu(const uint8_t* src, uint32_t src_size,
     }
     if (out_pos != expected) return false;
     if (out_expected) *out_expected = expected;
+    return true;
+}
+
+bool ParseGDeflate32TilesForGpu(
+    const uint8_t* src,
+    uint32_t src_size,
+    uint32_t dst_cap,
+    std::vector<GpuGDeflateTileDesc>& out_tiles,
+    uint32_t* out_expected,
+    uint32_t* out_max_waves) {
+    if (!src || src_size < 12u || src[0] != 0x04u || src[1] != 0xFBu) return false;
+    const uint16_t num_tiles = static_cast<uint16_t>(src[2] | (static_cast<uint16_t>(src[3]) << 8));
+    if (num_tiles == 0u) return false;
+    const uint32_t table_end = 8u + static_cast<uint32_t>(num_tiles) * 4u;
+    if (src_size < table_end) return false;
+
+    const uint32_t param = ReadLe32(src + 4);
+    if ((param & 0x3u) != 1u) return false;
+    uint32_t last_tile_sz = (param >> 2u) & 0x3FFFFu;
+    if (last_tile_sz == 0u) last_tile_sz = 65536u;
+    if (last_tile_sz > 65536u) return false;
+
+    const uint64_t total_expected64 =
+        static_cast<uint64_t>(num_tiles - 1u) * 65536ull + static_cast<uint64_t>(last_tile_sz);
+    if (total_expected64 == 0ull || total_expected64 > dst_cap) return false;
+
+    std::vector<uint32_t> offs(num_tiles);
+    for (uint16_t t = 0; t < num_tiles; ++t) {
+        offs[t] = ReadLe32(src + 8u + static_cast<uint32_t>(t) * 4u);
+    }
+    const uint32_t last_comp = offs[0];
+    if (last_comp == 0u) return false;
+    const uint32_t last_rel = (num_tiles == 1u) ? 0u : offs[num_tiles - 1u];
+    if (static_cast<uint64_t>(table_end) + last_rel + last_comp != src_size) return false;
+
+    out_tiles.resize(num_tiles);
+    uint32_t max_tile_comp = 0u;
+    uint32_t max_tile_uncomp = 0u;
+    for (uint16_t t = 0; t < num_tiles; ++t) {
+        const uint32_t rel = (t == 0u) ? 0u : offs[t];
+        uint32_t csz = 0u;
+        if (t + 1u == num_tiles) {
+            csz = last_comp;
+        } else {
+            if (offs[t + 1u] <= rel) return false;
+            csz = offs[t + 1u] - rel;
+        }
+        if (csz < 256u || (csz % 4u) != 0u || table_end + rel + csz > src_size) return false;
+        const uint8_t* tile_ptr = src + table_end + rel;
+        for (uint32_t lane = 0; lane < 32u; ++lane) {
+            const uint32_t w0 = ReadLe32(tile_ptr + lane * 4u);
+            if ((w0 & 0x7u) != 0x3u) return false;  // Verify 32-lane BFINAL=1, BTYPE=01 Fixed-Huffman header
+        }
+        const uint32_t t_uncomp = (t + 1u == num_tiles) ? last_tile_sz : 65536u;
+        out_tiles[t] = {table_end + rel, csz, static_cast<uint32_t>(t) * 65536u, t_uncomp};
+        max_tile_comp = std::max(max_tile_comp, csz);
+        max_tile_uncomp = std::max(max_tile_uncomp, t_uncomp);
+    }
+
+    if (out_expected) *out_expected = static_cast<uint32_t>(total_expected64);
+    if (out_max_waves) {
+        const uint32_t bit_upper = (max_tile_comp * 8u) / 7u + 2u;
+        *out_max_waves = std::min<uint32_t>(max_tile_uncomp + 2u, bit_upper);
+    }
     return true;
 }
 
@@ -448,10 +967,13 @@ int32_t ExecuteGpuBufferDecompress(
     }
 
     std::vector<GpuLzPacket> packets;
+    std::vector<GpuGDeflateTileDesc> gdef_tiles;
     std::vector<uint8_t> fallback_stream;
     const uint8_t* gpu_stream_ptr = compressed_src;
     uint32_t gpu_stream_len = compressed_size;
     uint32_t target_bytes = uncompressed_size;
+    uint32_t gdef_max_waves = 0u;
+    bool use_native_gpu_gdeflate32 = false;
 
     if (format == DSTORAGE_COMPRESSION_FORMAT_NONE) {
         if (compressed_size < uncompressed_size) {
@@ -468,6 +990,11 @@ int32_t ExecuteGpuBufferDecompress(
                 return kE_DSTORAGE_BUFFER_TOO_SMALL;
             }
             target_bytes = parsed_expected;
+        } else if (ParseGDeflate32TilesForGpu(
+                       compressed_src, compressed_size, uncompressed_size,
+                       gdef_tiles, &parsed_expected, &gdef_max_waves)) {
+            target_bytes = parsed_expected;
+            use_native_gpu_gdeflate32 = true;
         } else if (compressed_size >= 8 && compressed_src[0] == 0x04u && compressed_src[1] == 0xFBu) {
             fallback_stream.resize(uncompressed_size);
             size_t written = 0;
@@ -503,16 +1030,14 @@ int32_t ExecuteGpuBufferDecompress(
         return kE_NOTIMPL;
     }
 
-    const auto& cs_dxbc = GetGpuLzComputeBytecode();
-    if (cs_dxbc.empty()) {
+    GpuDecompressPipelineCache* pipe_cache = AcquireOrCreateGpuPipelineCache(dev);
+    if (!pipe_cache) {
         if (owns_dev) dev->Release();
         return kE_FAIL;
     }
 
     ID3D12CommandQueue* queue = ext_queue;
     bool owns_queue = false;
-    ID3D12RootSignature* root_sig = nullptr;
-    ID3D12PipelineState* pso = nullptr;
     ID3D12CommandAllocator* alloc = nullptr;
     ID3D12GraphicsCommandList* cmd = nullptr;
     ID3D12Resource* pkt_buf = nullptr;
@@ -529,8 +1054,7 @@ int32_t ExecuteGpuBufferDecompress(
         if (pkt_buf) pkt_buf->Release();
         if (cmd) cmd->Release();
         if (alloc) alloc->Release();
-        if (pso) pso->Release();
-        if (root_sig) root_sig->Release();
+        if (pipe_cache) pipe_cache->Release();
         if (owns_queue && queue) queue->Release();
         if (owns_dev && dev) dev->Release();
     };
@@ -546,51 +1070,6 @@ int32_t ExecuteGpuBufferDecompress(
             return kE_FAIL;
         }
         owns_queue = true;
-    }
-
-    D3D12_ROOT_PARAMETER params[4]{};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 4;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    params[1].Descriptor.ShaderRegister = 0;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    params[2].Descriptor.ShaderRegister = 1;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
-    params[3].Descriptor.ShaderRegister = 0;
-    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-    D3D12_ROOT_SIGNATURE_DESC rsd{};
-    rsd.NumParameters = 4;
-    rsd.pParameters = params;
-    ID3DBlob* rs_blob = nullptr;
-    ID3DBlob* rs_err = nullptr;
-    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err)) || !rs_blob) {
-        if (rs_err) rs_err->Release();
-        cleanup();
-        return kE_FAIL;
-    }
-    if (rs_err) rs_err->Release();
-    HRESULT hr = dev->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&root_sig));
-    rs_blob->Release();
-    if (FAILED(hr) || !root_sig) {
-        cleanup();
-        return kE_FAIL;
-    }
-
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
-    pso_desc.pRootSignature = root_sig;
-    pso_desc.CS.pShaderBytecode = cs_dxbc.data();
-    pso_desc.CS.BytecodeLength = cs_dxbc.size();
-    if (FAILED(dev->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso))) || !pso) {
-        cleanup();
-        return kE_FAIL;
     }
 
     auto make_buf = [&](D3D12_HEAP_TYPE htype, uint64_t bytes, D3D12_RESOURCE_FLAGS flags,
@@ -609,11 +1088,13 @@ int32_t ExecuteGpuBufferDecompress(
         return SUCCEEDED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr, IID_PPV_ARGS(out_res)));
     };
 
-    const uint64_t pkt_bytes = std::max<uint64_t>(16ull, packets.size() * sizeof(GpuLzPacket));
+    const uint64_t meta_bytes = use_native_gpu_gdeflate32
+                                    ? std::max<uint64_t>(16ull, gdef_tiles.size() * sizeof(GpuGDeflateTileDesc))
+                                    : std::max<uint64_t>(16ull, packets.size() * sizeof(GpuLzPacket));
     const uint64_t cmp_bytes = std::max<uint64_t>(16ull, (static_cast<uint64_t>(gpu_stream_len) + 3ull) & ~3ull);
     const uint64_t uav_bytes = std::max<uint64_t>(16ull, (static_cast<uint64_t>(target_bytes) + 3ull) & ~3ull);
 
-    if (!make_buf(D3D12_HEAP_TYPE_UPLOAD, pkt_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &pkt_buf) ||
+    if (!make_buf(D3D12_HEAP_TYPE_UPLOAD, meta_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &pkt_buf) ||
         !make_buf(D3D12_HEAP_TYPE_UPLOAD, cmp_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, &cmp_buf) ||
         !make_buf(D3D12_HEAP_TYPE_DEFAULT, uav_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, &uav_buf)) {
         cleanup();
@@ -622,8 +1103,12 @@ int32_t ExecuteGpuBufferDecompress(
 
     void* mapped = nullptr;
     if (SUCCEEDED(pkt_buf->Map(0, nullptr, &mapped)) && mapped) {
-        std::memset(mapped, 0, static_cast<size_t>(pkt_bytes));
-        if (!packets.empty()) std::memcpy(mapped, packets.data(), packets.size() * sizeof(GpuLzPacket));
+        std::memset(mapped, 0, static_cast<size_t>(meta_bytes));
+        if (use_native_gpu_gdeflate32) {
+            std::memcpy(mapped, gdef_tiles.data(), gdef_tiles.size() * sizeof(GpuGDeflateTileDesc));
+        } else if (!packets.empty()) {
+            std::memcpy(mapped, packets.data(), packets.size() * sizeof(GpuLzPacket));
+        }
         pkt_buf->Unmap(0, nullptr);
     }
     mapped = nullptr;
@@ -633,8 +1118,10 @@ int32_t ExecuteGpuBufferDecompress(
         cmp_buf->Unmap(0, nullptr);
     }
 
+    ID3D12PipelineState* active_pso =
+        use_native_gpu_gdeflate32 ? pipe_cache->pso_gdeflate32 : pipe_cache->pso_sxcr;
     if (FAILED(dev->CreateCommandAllocator(list_type, IID_PPV_ARGS(&alloc))) ||
-        FAILED(dev->CreateCommandList(0, list_type, alloc, pso, IID_PPV_ARGS(&cmd)))) {
+        FAILED(dev->CreateCommandList(0, list_type, alloc, active_pso, IID_PPV_ARGS(&cmd)))) {
         cleanup();
         return kE_FAIL;
     }
@@ -647,21 +1134,35 @@ int32_t ExecuteGpuBufferDecompress(
     to_uav.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     cmd->ResourceBarrier(1, &to_uav);
 
-    const uint32_t consts[4] = {
-        target_bytes,
-        static_cast<uint32_t>(packets.size()),
-        gpu_stream_len,
-        0u,
-    };
-    cmd->SetComputeRootSignature(root_sig);
-    cmd->SetComputeRoot32BitConstants(0, 4, consts, 0);
+    cmd->SetComputeRootSignature(pipe_cache->root_sig);
+    if (use_native_gpu_gdeflate32) {
+        const uint32_t consts[4] = {
+            static_cast<uint32_t>(gdef_tiles.size()),
+            gpu_stream_len,
+            target_bytes,
+            gdef_max_waves,
+        };
+        cmd->SetComputeRoot32BitConstants(0, 4, consts, 0);
+    } else {
+        const uint32_t consts[4] = {
+            target_bytes,
+            static_cast<uint32_t>(packets.size()),
+            gpu_stream_len,
+            0u,
+        };
+        cmd->SetComputeRoot32BitConstants(0, 4, consts, 0);
+    }
     cmd->SetComputeRootShaderResourceView(1, pkt_buf->GetGPUVirtualAddress());
     cmd->SetComputeRootShaderResourceView(2, cmp_buf->GetGPUVirtualAddress());
     cmd->SetComputeRootUnorderedAccessView(3, uav_buf->GetGPUVirtualAddress());
 
-    const uint32_t dwords = (target_bytes + 3u) / 4u;
-    const uint32_t groups_x = std::max<uint32_t>(1u, (dwords + 63u) / 64u);
-    cmd->Dispatch(groups_x, 1u, 1u);
+    if (use_native_gpu_gdeflate32) {
+        cmd->Dispatch(static_cast<uint32_t>(gdef_tiles.size()), 1u, 1u);
+    } else {
+        const uint32_t dwords = (target_bytes + 3u) / 4u;
+        const uint32_t groups_x = std::max<uint32_t>(1u, (dwords + 31u) / 32u);
+        cmd->Dispatch(groups_x, 1u, 1u);
+    }
 
     D3D12_RESOURCE_BARRIER to_src{};
     to_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -678,9 +1179,6 @@ int32_t ExecuteGpuBufferDecompress(
         return kE_FAIL;
     }
 
-    ID3D12CommandList* lists[] = {cmd};
-    queue->ExecuteCommandLists(1, lists);
-
     if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
         cleanup();
         return kE_FAIL;
@@ -690,10 +1188,12 @@ int32_t ExecuteGpuBufferDecompress(
         cleanup();
         return kE_FAIL;
     }
-    queue->Signal(fence, 1ull);
-    if (fence->GetCompletedValue() < 1ull) {
-        fence->SetEventOnCompletion(1ull, ev);
-        WaitForSingleObject(ev, 5000);
+
+    ID3D12CommandList* lists[] = {cmd};
+    queue->ExecuteCommandLists(1, lists);
+    if (FAILED(queue->Signal(fence, 1ull)) || !WaitForGpuFenceSafe(dev, fence, 1ull, ev)) {
+        cleanup();
+        return kE_FAIL;
     }
 
     cleanup();
@@ -747,21 +1247,8 @@ int32_t ExecuteTextureRegion(const DSTORAGE_TEXTURE_REGION_DESC& desc) {
                desc.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_LZ_RLE) {
         decoded.resize(decompress_cap);
         uint32_t out_sz = 0;
-        int32_t d_hr = DecompressLzRle(raw.data(), static_cast<uint32_t>(raw.size()),
-                                       decoded.data(), decompress_cap, &out_sz);
-        if (d_hr != kS_OK) {
-            size_t written = 0;
-            if (XboxCodecGDeflateDecompress(raw.data(), raw.size(), decoded.data(), decompress_cap, &written) == 0 &&
-                written > 0) {
-                out_sz = static_cast<uint32_t>(written);
-                d_hr = kS_OK;
-            } else if (scarlettx::io::LooksLikeRfc1950ZlibHeader(raw.data(), raw.size()) &&
-                       scarlettx::io::InflateZlibRfc1950(raw.data(), raw.size(), decoded.data(), decompress_cap, written) &&
-                       written > 0) {
-                out_sz = static_cast<uint32_t>(written);
-                d_hr = kS_OK;
-            }
-        }
+        const int32_t d_hr = DecompressUnifiedGDeflateOrZlib(
+            raw.data(), static_cast<uint32_t>(raw.size()), decoded.data(), decompress_cap, &out_sz);
         if (d_hr != kS_OK) {
             if (owns_dev) dev->Release();
             return d_hr;
@@ -925,9 +1412,6 @@ int32_t ExecuteTextureRegion(const DSTORAGE_TEXTURE_REGION_DESC& desc) {
         return kE_FAIL;
     }
 
-    ID3D12CommandList* lists[] = {cmd};
-    queue->ExecuteCommandLists(1, lists);
-
     if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
         cleanup();
         return kE_FAIL;
@@ -937,10 +1421,12 @@ int32_t ExecuteTextureRegion(const DSTORAGE_TEXTURE_REGION_DESC& desc) {
         cleanup();
         return kE_FAIL;
     }
-    queue->Signal(fence, 1ull);
-    if (fence->GetCompletedValue() < 1ull) {
-        fence->SetEventOnCompletion(1ull, ev);
-        WaitForSingleObject(ev, 5000);
+
+    ID3D12CommandList* lists[] = {cmd};
+    queue->ExecuteCommandLists(1, lists);
+    if (FAILED(queue->Signal(fence, 1ull)) || !WaitForGpuFenceSafe(dev, fence, 1ull, ev)) {
+        cleanup();
+        return kE_FAIL;
     }
 
     cleanup();
@@ -989,22 +1475,16 @@ int32_t ExecuteRequest(const DSTORAGE_REQUEST& req) {
 
     if (req.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_GDEFLATE) {
         uint32_t out_sz = 0;
-        int32_t hr = DecompressLzRle(
+        return DecompressUnifiedGDeflateOrZlib(
             raw.data(),
             static_cast<uint32_t>(raw.size()),
             static_cast<uint8_t*>(req.DestinationMemory),
             req.DestinationSize,
             &out_sz);
-        if (hr == kS_OK) {
-            return kS_OK;
-        }
-        size_t written = 0;
-        int32_t codec_hr = XboxCodecGDeflateDecompress(
-            raw.data(), raw.size(), req.DestinationMemory, req.DestinationSize, &written);
-        if (codec_hr == 0 && written > 0) {
-            return kS_OK;
-        }
-        return hr;
+    }
+
+    if (req.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_BCPACK) {
+        return XboxCodecBcPackDecompress(raw.data(), raw.size(), req.DestinationMemory, req.DestinationSize, 1u);
     }
 
     if (req.CompressionFormat == DSTORAGE_COMPRESSION_FORMAT_LZ_RLE) {
@@ -1045,7 +1525,6 @@ void QueueWorkerLoop(std::shared_ptr<QueueObject> q) {
         }
 
         if (item.kind == QueueItemKind::kRequest || item.kind == QueueItemKind::kTextureRegion) {
-            // Cancelled requests retire in queue order without recording a failure.
             int32_t hr = kS_OK;
             if (!item.cancelled) {
                 if (item.kind == QueueItemKind::kRequest) {
@@ -1132,6 +1611,17 @@ int32_t DStorageGetConfiguration(DSTORAGE_CONFIGURATION* out_config) {
 
 int32_t DStorageGetFactory(uint64_t* out_factory) {
     if (!out_factory) return kE_INVALIDARG;
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(out_factory, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT) {
+        const DWORD prot = mbi.Protect & 0xFFu;
+        const bool writable = (prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+                               prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+        if (!writable) {
+            return kE_INVALIDARG;
+        }
+    }
+#endif
     std::lock_guard<std::mutex> lk(State().mu);
     const uint64_t h = State().next_handle++;
     State().factories[h] = true;
@@ -1152,8 +1642,43 @@ int32_t DStorageOpenFile(uint64_t factory, const char* path, uint64_t* out_file)
         if (State().factories.find(factory) == State().factories.end()) return kE_HANDLE;
     }
 
+    const bool is_virtual_drive =
+        (path[0] == 'G' || path[0] == 'g' || path[0] == 'D' || path[0] == 'd') && path[1] == ':';
+
+    // Prefer PackageVfs::Global() on G:/D: paths when mounted (handles embedded .xvc/.xvd and host G: collisions)
+    if (is_virtual_drive && scarlettx::PackageVfs::Global().Exists(path)) {
+        uint64_t vfs_sz = 0;
+        if (scarlettx::PackageVfs::Global().GetFileSize(path, vfs_sz)) {
+            auto obj = std::make_shared<FileObject>();
+            obj->is_vfs = true;
+            obj->path = path;
+            obj->size = vfs_sz;
+            std::lock_guard<std::mutex> lk(State().mu);
+            const uint64_t h = State().next_handle++;
+            State().files[h] = std::move(obj);
+            *out_file = h;
+            return kS_OK;
+        }
+    }
+
     std::ifstream ifs(path, std::ios::binary | std::ios::ate);
-    if (!ifs) return kE_DSTORAGE_FILE_NOT_FOUND;
+    if (!ifs) {
+        if (scarlettx::PackageVfs::Global().Exists(path)) {
+            uint64_t vfs_sz = 0;
+            if (scarlettx::PackageVfs::Global().GetFileSize(path, vfs_sz)) {
+                auto obj = std::make_shared<FileObject>();
+                obj->is_vfs = true;
+                obj->path = path;
+                obj->size = vfs_sz;
+                std::lock_guard<std::mutex> lk(State().mu);
+                const uint64_t h = State().next_handle++;
+                State().files[h] = std::move(obj);
+                *out_file = h;
+                return kS_OK;
+            }
+        }
+        return kE_DSTORAGE_FILE_NOT_FOUND;
+    }
     const auto end_pos = ifs.tellg();
     if (end_pos < 0) return kE_FAIL;
 
@@ -1484,8 +2009,15 @@ int32_t DStorageDecompressBuffer(
         if (src_size > 0 && src) std::memcpy(dst, src, src_size);
         return kS_OK;
     }
-    if (format == DSTORAGE_COMPRESSION_FORMAT_LZ_RLE ||
-        format == DSTORAGE_COMPRESSION_FORMAT_GDEFLATE) {
+    if (format == DSTORAGE_COMPRESSION_FORMAT_GDEFLATE) {
+        return DecompressUnifiedGDeflateOrZlib(
+            static_cast<const uint8_t*>(src),
+            src_size,
+            static_cast<uint8_t*>(dst),
+            dst_capacity,
+            out_decompressed_size);
+    }
+    if (format == DSTORAGE_COMPRESSION_FORMAT_LZ_RLE) {
         return DecompressLzRle(
             static_cast<const uint8_t*>(src),
             src_size,

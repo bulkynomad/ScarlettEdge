@@ -205,8 +205,10 @@ int main() {
 
     const auto rage_pkg_dir = bin_dir / "packages" / "openworld_slice";
     const auto title_storage_root = tmp_dir / "rage_title_storage";
+    std::error_code ec;
+    std::filesystem::remove_all(title_storage_root, ec);
     SetEnvStr("SCARLETTX_OPENWORLD_STREAM_PAK", rage_pak_path.string());
-    SetEnvStr("SCARLETTX_TITLE_STORAGE_DIR", title_storage_root.string());
+    SetEnvStr("SCARLETTX_SAVE_ROOT", title_storage_root.string());
     SetEnvStr("SCARLETTX_OPENWORLD_VERIFY_PERSIST", "0");
 
     // Run 1: In-process relocated PE64 boot (uploads persistent TitleStorage checkpoint + Vulkan Wave32 + 2MB alias)
@@ -239,6 +241,8 @@ int main() {
         SX_CHECK(st.ok());
     }
 
+    SetEnvStr("SCARLETTX_SAVE_ROOT", "");
+    std::filesystem::remove_all(tmp_dir, ec);
     std::cout << "[PASS] test_aaa_bringup_e2e (Encrypted GDFX .xvc UE5 boot + Open-World Vulkan Wave32 & 2MB alias slice)\n";
     return 0;
 }

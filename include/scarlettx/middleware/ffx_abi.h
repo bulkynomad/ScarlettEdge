@@ -44,7 +44,13 @@ enum {
     FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_PHASE_COUNT = 0x00010004u,
     FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_OFFSET = 0x00010005u,
     FFX_API_DESC_TYPE_UPSCALE_CONFIGURE = 0x00010006u,
-    FFX_API_DESC_TYPE_GET_PROVIDER_VERSION = 0x00000001u
+    FFX_API_DESC_TYPE_GET_PROVIDER_VERSION = 0x00000001u,
+
+    // Official AMD FidelityFX SDK ffx_api / ffx_upscale descriptor IDs
+    FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1 = 0x00000001u,
+    FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12 = 0x00000002u,
+    FFX_API_QUERY_DESC_TYPE_GET_VERSIONS = 0x00000004u,
+    FFX_API_DISPATCH_DESC_TYPE_UPSCALE = 0x00010004u
 };
 
 enum {
@@ -71,8 +77,8 @@ typedef struct ffxCreateContextDescUpscale {
 
 typedef struct ffxDispatchDescUpscale {
     ffxApiHeader header;
-    const uint8_t* colorRgba8;   // renderWidth * renderHeight * 4
-    uint8_t* outputRgba8;        // upscaleWidth * upscaleHeight * 4
+    const uint8_t* colorRgba8;   // renderWidth * renderHeight * 4 (or commandList in official AMD ffx_api)
+    uint8_t* outputRgba8;        // upscaleWidth * upscaleHeight * 4 (or color.resource in official AMD ffx_api)
     uint32_t renderWidth;
     uint32_t renderHeight;
     uint32_t upscaleWidth;
@@ -125,6 +131,15 @@ typedef struct ffxQueryDescGetProviderVersion {
     uint64_t versionId;
     const char* versionName;
 } ffxQueryDescGetProviderVersion;
+
+typedef struct ffxQueryDescGetVersions {
+    ffxApiHeader header;
+    uint64_t createDescType;
+    void* device;
+    uint64_t* outputCount;
+    uint64_t* versionIds;
+    const char** versionNames;
+} ffxQueryDescGetVersions;
 
 // amd_fidelityfx_upscaler_xbox.dll provider exports
 SCARLETTX_FFX_UPSCALER_API ffxReturnCode_t ffxUpscalerCreateContext(

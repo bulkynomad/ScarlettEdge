@@ -444,6 +444,25 @@ SCARLETTX_XGR_API XGameResult XUserIsSystemReserved(
 SCARLETTX_XGR_API XGameResult XUserIsSponsoredUser(
     XUserHandle user,
     bool* isSponsoredUser);
+enum XUserGamerPictureSize : uint32_t {
+    XUserGamerPictureSize_Small = 0,
+    XUserGamerPictureSize_Medium = 1,
+    XUserGamerPictureSize_Large = 2,
+    XUserGamerPictureSize_ExtraLarge = 3,
+};
+
+SCARLETTX_XGR_API XGameResult XUserGetGamerPictureAsync(
+    XUserHandle user,
+    XUserGamerPictureSize pictureSize,
+    XAsyncBlock* async);
+SCARLETTX_XGR_API XGameResult XUserGetGamerPictureResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize);
+SCARLETTX_XGR_API XGameResult XUserGetGamerPictureResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    size_t* bufferUsed);
 SCARLETTX_XGR_API XGameResult XUserResolvePrivilegeWithUiAsync(
     XUserHandle user,
     XUserPrivilegeOptions options,
@@ -456,6 +475,12 @@ SCARLETTX_XGR_API XGameResult XUserResolveIssueWithUiAsync(
     const char* url,
     XAsyncBlock* async);
 SCARLETTX_XGR_API XGameResult XUserResolveIssueWithUiResult(
+    XAsyncBlock* async);
+SCARLETTX_XGR_API XGameResult XUserResolveIssueWithUiUtf16Async(
+    XUserHandle user,
+    const wchar_t* url,
+    XAsyncBlock* async);
+SCARLETTX_XGR_API XGameResult XUserResolveIssueWithUiUtf16Result(
     XAsyncBlock* async);
 
 // ---------------------------------------------------------------------------
@@ -668,13 +693,44 @@ struct XStoreGameLicense {
     int64_t expirationDate;
 };
 
+struct XStorePrice {
+    float basePrice;
+    float price;
+    float recurrencePrice;
+    uint32_t pad0;
+    const char* currencyCode;
+    char formattedBasePrice[16];
+    char formattedPrice[16];
+    char formattedRecurrencePrice[16];
+    bool isOnSale;
+    uint8_t pad1[7];
+    int64_t saleEndDate;
+};
+
 struct XStoreProduct {
     const char* storeId;
     const char* title;
     const char* description;
     const char* language;
+    const char* inAppOfferToken;
+    const char* linkUri;
     uint32_t productKind;
+    uint32_t pad0;
+    XStorePrice price;
+    bool hasDigitalDownload;
     bool isInUserCollection;
+    uint16_t pad1;
+    uint32_t keywordsCount;
+    const char** keywords;
+    uint32_t skusCount;
+    uint32_t pad2;
+    void* skus;
+    uint32_t imagesCount;
+    uint32_t pad3;
+    void* images;
+    uint32_t videosCount;
+    uint32_t pad4;
+    void* videos;
 };
 
 typedef bool(SCARLETTX_GDK_CALLBACK XStoreProductQueryCallback)(
@@ -764,6 +820,11 @@ SCARLETTX_XGR_API XGameResult XGameGetXboxTitleId(uint32_t* titleId);
 SCARLETTX_XGR_API void XErrorReport(XGameResult hr, const char* msg);
 SCARLETTX_XGR_API XGameResult InitializeApiImpl(uint32_t build, uint32_t revision);
 SCARLETTX_XGR_API XGameResult InitializeApiImplEx(uint32_t build, uint32_t revision, uint64_t flags);
+SCARLETTX_XGR_API XGameResult InitializeApiImplEx2(
+    uint32_t build,
+    uint32_t revision,
+    uint64_t flags,
+    const XGameRuntimeOptions* options);
 SCARLETTX_XGR_API void UninitializeApiImpl();
 SCARLETTX_XGR_API XGameResult QueryApiImpl(const void* api_id, const void* riid, void** out_impl);
 

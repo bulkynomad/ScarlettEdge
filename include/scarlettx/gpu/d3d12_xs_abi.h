@@ -88,6 +88,7 @@ struct D3D12XBOX_PRESENT_PLANE_PARAMETERS {
     uint32_t Width;
     uint32_t Height;
     uint64_t Token;
+    void* Resource;  // Optional ID3D12Resource* (24B plane layout compatibility)
 };
 
 struct D3D12XBOX_PRESENT_PARAMETERS {
@@ -159,10 +160,18 @@ struct SCARLETT_RT_DISPATCH_DESC {
     uint32_t MaxBounces;
 };
 
+struct SCARLETT_BVH_INSTANCE_DESC {
+    float Transform[3][4];  // Row-major 3x4 world transform (all-zero defaults to identity)
+    uint32_t InstanceID;
+    uint32_t InstanceMask;
+    uint64_t BlasHandle;
+};
+
 struct D3D12XBOX_RT_AS_BUILD_DESC {
     D3D12XBOX_RT_AS_INPUTS Inputs;
-    const SCARLETT_BVH_TRIANGLE* Triangles;  // Used when Type == BOTTOM_LEVEL
-    const uint64_t* BlasHandles;             // Used when Type == TOP_LEVEL
+    const SCARLETT_BVH_TRIANGLE* Triangles;       // Used when Type == BOTTOM_LEVEL
+    const uint64_t* BlasHandles;                  // Used when Type == TOP_LEVEL
+    const SCARLETT_BVH_INSTANCE_DESC* Instances;  // Optional per-instance 3x4 transforms for TOP_LEVEL
 };
 
 struct SCARLETT_BVH_STATS {
@@ -588,6 +597,10 @@ SCARLETTX_BVH_API int32_t XboxBvhBuildTlas(
     const uint64_t* blas_handles,
     uint32_t blas_count,
     uint64_t* out_tlas_handle);
+SCARLETTX_BVH_API int32_t XboxBvhBuildTlasInstances(
+    const SCARLETT_BVH_INSTANCE_DESC* instances,
+    uint32_t instance_count,
+    uint64_t* out_tlas_handle);
 SCARLETTX_BVH_API int32_t XboxBvhGetStats(
     uint64_t handle,
     SCARLETT_BVH_STATS* out_stats);
@@ -610,3 +623,12 @@ SCARLETTX_BVH_API int32_t XboxBvhCopy(
 SCARLETTX_BVH_API int32_t XboxBvhDestroy(uint64_t handle);
 
 }  // extern "C"
+
+#ifdef __cplusplus
+inline int32_t XboxBvhBuildTlas(
+    const SCARLETT_BVH_INSTANCE_DESC* instances,
+    uint32_t instance_count,
+    uint64_t* out_tlas_handle) {
+    return XboxBvhBuildTlasInstances(instances, instance_count, out_tlas_handle);
+}
+#endif

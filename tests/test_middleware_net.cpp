@@ -77,7 +77,10 @@ int main() {
         BinkClose(bnk);
 
         // 1b. Real KB2 container with frame-offset table + YCbCr decode + A/V PTS lip-sync frame catch-up
-        const auto kb2_path = std::filesystem::temp_directory_path() / "scarlett_pts_test.bk2";
+        int pts_bnk_tag = 0;
+        const auto kb2_path = std::filesystem::temp_directory_path() /
+                              ("scarlett_pts_test_" +
+                               std::to_string(reinterpret_cast<uintptr_t>(&pts_bnk_tag)) + ".bk2");
         {
             std::vector<uint8_t> kb2(256, 0);
             kb2[0] = 'K'; kb2[1] = 'B'; kb2[2] = '2'; kb2[3] = 'i';

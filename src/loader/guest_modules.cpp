@@ -313,23 +313,93 @@ Status AttachTls(uint8_t* image_base, const void* tls_directory, bool is_exe, Tl
     uint32_t zero_fill = (raw_size == 0 && dir->SizeOfZeroFill == 0) ? 8 : dir->SizeOfZeroFill;
     uint32_t saved_offset = 0;
     if (is_exe) {
-        // Host code in this process's executable reads slot 0 too, so the block
-        // must be at least as large as the one it replaces.
+        // Host code in this process's executable (or the first loaded DLL that
+        // acquired _tls_index == 0 when the host executable had no TLS directory)
+        // reads slot 0 too, so the block must be at least as large as the one it
+        // replaces.
         uint32_t block_size = AlignUp32(raw_size + zero_fill, 16);
-        auto* host = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
-        const auto* host_nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
-            host + reinterpret_cast<const IMAGE_DOS_HEADER*>(host)->e_lfanew);
-        const auto& host_tls = host_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-        if (host_tls.VirtualAddress != 0) {
-            const auto* host_dir =
-                reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(host + host_tls.VirtualAddress);
-            const uint64_t host_size = host_dir->EndAddressOfRawData -
-                                       host_dir->StartAddressOfRawData + host_dir->SizeOfZeroFill;
-            if (host_size > kMaxTlsBytes) {
-                return Status::Error(StatusCode::DeviceError, "Host TLS block is too large to shadow");
+
+        auto inspect_module_tls = [&](const uint8_t* mod_base, size_t mod_size,
+                                      bool force_shadow) -> Status {
+            if (!mod_base || mod_size < sizeof(IMAGE_DOS_HEADER)) {
+                return Status::Ok();
             }
-            block_size = std::max(block_size, AlignUp32(static_cast<uint32_t>(host_size), 16));
+            const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod_base);
+            if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
+                static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > mod_size) {
+                return Status::Ok();
+            }
+            const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(mod_base + dos->e_lfanew);
+            if (nt->Signature != IMAGE_NT_SIGNATURE ||
+                nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+                nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_TLS) {
+                return Status::Ok();
+            }
+            const auto& mod_tls = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+            if (mod_tls.VirtualAddress == 0 ||
+                static_cast<size_t>(mod_tls.VirtualAddress) + sizeof(IMAGE_TLS_DIRECTORY64) >
+                    mod_size) {
+                return Status::Ok();
+            }
+            const auto* mod_dir =
+                reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(mod_base + mod_tls.VirtualAddress);
+            if (mod_dir->EndAddressOfRawData < mod_dir->StartAddressOfRawData) {
+                return Status::Ok();
+            }
+            bool owns_slot0 = force_shadow;
+            if (!owns_slot0 && mod_dir->AddressOfIndex != 0) {
+                const uintptr_t lo = reinterpret_cast<uintptr_t>(mod_base);
+                const uintptr_t idx_va = static_cast<uintptr_t>(mod_dir->AddressOfIndex);
+                if (idx_va >= lo && idx_va + sizeof(uint32_t) <= lo + mod_size) {
+                    uint32_t mod_index = 0xFFFFFFFFu;
+                    std::memcpy(&mod_index, reinterpret_cast<const void*>(idx_va), sizeof(mod_index));
+                    owns_slot0 = (mod_index == 0);
+                }
+            }
+            if (!owns_slot0) {
+                return Status::Ok();
+            }
+            const uint64_t owner_tls_size =
+                (mod_dir->EndAddressOfRawData - mod_dir->StartAddressOfRawData) +
+                mod_dir->SizeOfZeroFill;
+            if (owner_tls_size > kMaxTlsBytes) {
+                return Status::Error(StatusCode::DeviceError,
+                                     "Host TLS block is too large to shadow");
+            }
+            block_size = std::max(block_size, AlignUp32(static_cast<uint32_t>(owner_tls_size), 16));
+            return Status::Ok();
+        };
+
+        if (const auto* host = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr))) {
+            const auto* host_dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(host);
+            if (host_dos->e_magic == IMAGE_DOS_SIGNATURE && host_dos->e_lfanew > 0) {
+                const auto* host_nt =
+                    reinterpret_cast<const IMAGE_NT_HEADERS64*>(host + host_dos->e_lfanew);
+                if (host_nt->Signature == IMAGE_NT_SIGNATURE &&
+                    host_nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                    Status st =
+                        inspect_module_tls(host, host_nt->OptionalHeader.SizeOfImage, true);
+                    if (!st.ok()) {
+                        return st;
+                    }
+                }
+            }
         }
+
+        HANDLE mod_snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+        if (mod_snap != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32W me{};
+            me.dwSize = sizeof(me);
+            for (BOOL ok = Module32FirstW(mod_snap, &me); ok; ok = Module32NextW(mod_snap, &me)) {
+                Status st = inspect_module_tls(me.modBaseAddr, me.modBaseSize, false);
+                if (!st.ok()) {
+                    CloseHandle(mod_snap);
+                    return st;
+                }
+            }
+            CloseHandle(mod_snap);
+        }
+
         saved_offset = block_size;
         zero_fill = block_size + 16 - raw_size;
     }
@@ -402,12 +472,29 @@ Status AttachTls(uint8_t* image_base, const void* tls_directory, bool is_exe, Tl
     slot.guest_base = image_base;
     slot.callbacks = reinterpret_cast<const PIMAGE_TLS_CALLBACK*>(dir->AddressOfCallBacks);
     slot.index = index;
-    slot.takes_slot0 = is_exe && index != 0;
     slot.saved_offset = saved_offset;
-    slot.helper.store(module, std::memory_order_release);
+    slot.takes_slot0 = is_exe && index != 0;
     if (slot.takes_slot0) {
-        // Threads started from here on are handled in TlsCarrierMain.
+        // Hold the OS loader lock while publishing the carrier and updating
+        // existing thread TEBs (matching DetachTls) so no starting thread can
+        // race TlsCarrierMain or hold the loader lock while suspended.
+        using LockFn = LONG(NTAPI*)(ULONG, ULONG*, ULONG_PTR*);
+        using UnlockFn = LONG(NTAPI*)(ULONG, ULONG_PTR);
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const auto lock_loader = reinterpret_cast<LockFn>(
+            reinterpret_cast<void*>(GetProcAddress(ntdll, "LdrLockLoaderLock")));
+        const auto unlock_loader = reinterpret_cast<UnlockFn>(
+            reinterpret_cast<void*>(GetProcAddress(ntdll, "LdrUnlockLoaderLock")));
+        ULONG_PTR cookie = 0;
+        const bool locked =
+            lock_loader && unlock_loader && lock_loader(0, nullptr, &cookie) >= 0;
+        slot.helper.store(module, std::memory_order_release);
         ForEachThreadTeb([&](void* teb) { TakeSlot0(teb, slot); });
+        if (locked) {
+            unlock_loader(0, cookie);
+        }
+    } else {
+        slot.helper.store(module, std::memory_order_release);
     }
 
     out->helper_module = module;
@@ -481,10 +568,31 @@ struct Module {
     bool is_exe = false;
 };
 
+constexpr size_t kMaxCrashSafeModules = 64;
+
+struct CrashSafeModuleSlot {
+    std::atomic<uint64_t> seq{0};  // seqlock: odd = writer active, even = consistent (0 = empty)
+    uint64_t base = 0;
+    uint32_t size = 0;
+    bool is_exe = false;
+    char name[64] = {};
+};
+
+CrashSafeModuleSlot g_crash_safe_modules[kMaxCrashSafeModules];
 std::mutex g_modules_mutex;
 std::vector<Module> g_modules;
 
 const char kBackslash = static_cast<char>(92);
+
+std::string BaseNamePreservingCase(const std::string& path) {
+    size_t start = 0;
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '/' || path[i] == kBackslash) {
+            start = i + 1;
+        }
+    }
+    return path.substr(start);
+}
 
 std::string BaseNameLower(const std::string& path) {
     size_t start = 0;
@@ -504,22 +612,34 @@ std::wstring Widen(const std::string& s) {
     if (s.empty()) {
         return std::wstring();
     }
-    const int len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring out(static_cast<size_t>(len > 0 ? len : 0), L'x');
+    UINT cp = CP_UTF8;
+    DWORD flags = MB_ERR_INVALID_CHARS;
+    int len = MultiByteToWideChar(cp, flags, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (len <= 0) {
+        cp = CP_ACP;
+        flags = 0;
+        len = MultiByteToWideChar(cp, flags, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    }
+    std::wstring out(static_cast<size_t>(len > 0 ? len : 0), L'\0');
     if (len > 0) {
-        MultiByteToWideChar(CP_ACP, 0, s.c_str(), static_cast<int>(s.size()), &out[0], len);
+        MultiByteToWideChar(cp, flags, s.c_str(), static_cast<int>(s.size()), &out[0], len);
     }
     return out;
 }
 
 std::string Narrow(const wchar_t* s) {
-    if (!s) {
+    if (!s || !*s) {
         return std::string();
     }
-    const int len = WideCharToMultiByte(CP_ACP, 0, s, -1, nullptr, 0, nullptr, nullptr);
-    std::string out(static_cast<size_t>(len > 1 ? len - 1 : 0), 'x');
+    UINT cp = CP_UTF8;
+    int len = WideCharToMultiByte(cp, 0, s, -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) {
+        cp = CP_ACP;
+        len = WideCharToMultiByte(cp, 0, s, -1, nullptr, 0, nullptr, nullptr);
+    }
+    std::string out(static_cast<size_t>(len > 1 ? len - 1 : 0), '\0');
     if (len > 1) {
-        WideCharToMultiByte(CP_ACP, 0, s, -1, &out[0], len, nullptr, nullptr);
+        WideCharToMultiByte(cp, 0, s, -1, &out[0], len, nullptr, nullptr);
     }
     return out;
 }
@@ -685,20 +805,100 @@ void RegisterModule(uint8_t* base, uint32_t size, const std::string& path, bool 
     m.wide_path = Widen(path);
     m.name_lower = BaseNameLower(path);
     m.is_exe = is_exe;
+    const std::string base_name = BaseNamePreservingCase(path);
+    const uint64_t base_u64 = reinterpret_cast<uint64_t>(base);
+
     std::lock_guard<std::mutex> lock(g_modules_mutex);
     g_modules.push_back(std::move(m));
+
+    size_t target_idx = kMaxCrashSafeModules;
+    for (size_t i = 0; i < kMaxCrashSafeModules; ++i) {
+        if (g_crash_safe_modules[i].base == base_u64) {
+            target_idx = i;
+            break;
+        }
+        if (target_idx == kMaxCrashSafeModules && g_crash_safe_modules[i].base == 0) {
+            target_idx = i;
+        }
+    }
+    if (target_idx < kMaxCrashSafeModules) {
+        auto& slot = g_crash_safe_modules[target_idx];
+        const uint64_t prev = slot.seq.load(std::memory_order_relaxed);
+        slot.seq.store((prev | 1ull) + (prev & 1ull ? 0ull : 0ull), std::memory_order_release);
+        std::atomic_thread_fence(std::memory_order_acq_rel);
+        slot.base = base_u64;
+        slot.size = size;
+        slot.is_exe = is_exe;
+        std::memset(slot.name, 0, sizeof(slot.name));
+        const size_t copy_len = std::min<size_t>(base_name.size(), sizeof(slot.name) - 1u);
+        if (copy_len > 0) {
+            std::memcpy(slot.name, base_name.data(), copy_len);
+        }
+        slot.seq.store(((prev >> 1ull) + 1ull) * 2ull, std::memory_order_release);
+    }
 }
 
 void UnregisterModule(uint8_t* base) {
+    const uint64_t base_u64 = reinterpret_cast<uint64_t>(base);
     std::lock_guard<std::mutex> lock(g_modules_mutex);
     g_modules.erase(std::remove_if(g_modules.begin(), g_modules.end(),
                                    [&](const Module& m) { return m.base == base; }),
                     g_modules.end());
+    for (size_t i = 0; i < kMaxCrashSafeModules; ++i) {
+        auto& slot = g_crash_safe_modules[i];
+        if (slot.base == base_u64) {
+            const uint64_t prev = slot.seq.load(std::memory_order_relaxed);
+            slot.seq.store(prev | 1ull, std::memory_order_release);
+            std::atomic_thread_fence(std::memory_order_acq_rel);
+            slot.base = 0;
+            slot.size = 0;
+            slot.is_exe = false;
+            std::memset(slot.name, 0, sizeof(slot.name));
+            slot.seq.store(((prev >> 1ull) + 1ull) * 2ull, std::memory_order_release);
+        }
+    }
 }
 
 void* FindModuleBase(const void* address) {
     Module m;
     return FindByAddress(address, &m) ? m.base : nullptr;
+}
+
+bool TryResolveGuestAddressLockFree(uint64_t address, GuestModuleAddrInfo* out) noexcept {
+    if (address < 0x10000ull || !out) {
+        return false;
+    }
+    for (size_t i = 0; i < kMaxCrashSafeModules; ++i) {
+        const auto& slot = g_crash_safe_modules[i];
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            const uint64_t s1 = slot.seq.load(std::memory_order_acquire);
+            if (s1 == 0 || (s1 & 1ull) != 0) {
+                break;
+            }
+            const uint64_t base = slot.base;
+            const uint32_t size = slot.size;
+            const bool is_exe = slot.is_exe;
+            char local_name[64];
+            std::memcpy(local_name, slot.name, sizeof(local_name));
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint64_t s2 = slot.seq.load(std::memory_order_relaxed);
+            if (s1 != s2) {
+                continue;
+            }
+            if (base != 0 && size > 0 && address >= base && address < base + static_cast<uint64_t>(size)) {
+                out->base = base;
+                out->size = size;
+                out->rva = static_cast<uint32_t>(address - base);
+                out->ghidra_va = (is_exe ? 0x140000000ull : 0x180000000ull) + out->rva;
+                out->is_exe = is_exe;
+                std::memcpy(out->name, local_name, sizeof(out->name));
+                out->name[sizeof(out->name) - 1u] = '\0';
+                return true;
+            }
+            break;
+        }
+    }
+    return false;
 }
 
 void* LookupImportOverride(const std::string& target_dll_lower, const std::string& symbol) {
@@ -729,13 +929,34 @@ void* LookupImportOverride(const std::string& target_dll_lower, const std::strin
 
 namespace {
 
-std::wstring LowerWide(std::wstring s) {
+std::wstring LowerWideNormalized(std::wstring s) {
     for (auto& c : s) {
-        if (c >= L'A' && c <= L'Z') {
+        if (c == L'/') {
+            c = static_cast<wchar_t>(kBackslash);
+        } else if (c >= L'A' && c <= L'Z') {
             c = static_cast<wchar_t>(c + 32);
         }
     }
     return s;
+}
+
+std::wstring GetHostModulePathWide(HMODULE mod) {
+    size_t cap = MAX_PATH + 1;
+    while (cap <= 32768u) {
+        std::vector<wchar_t> buf(cap, L'\0');
+        const DWORD len = GetModuleFileNameW(mod, buf.data(), static_cast<DWORD>(buf.size()));
+        if (len == 0) {
+            return {};
+        }
+        if (len < buf.size()) {
+            return std::wstring(buf.data(), len);
+        }
+        if (cap == 32768u) {
+            break;
+        }
+        cap = std::min<size_t>(cap * 2u, 32768u);
+    }
+    return {};
 }
 
 // True for a host-loaded DLL that lives in the guest executable's directory
@@ -745,10 +966,10 @@ bool IsPackageModule(void* host_module) {
     if (!FindPrimaryExe(&exe)) {
         return false;
     }
-    std::wstring dir = LowerWide(exe.wide_path);
+    std::wstring dir = LowerWideNormalized(exe.wide_path);
     size_t cut = std::wstring::npos;
     for (size_t i = 0; i < dir.size(); ++i) {
-        if (dir[i] == L'/' || dir[i] == static_cast<wchar_t>(kBackslash)) {
+        if (dir[i] == static_cast<wchar_t>(kBackslash)) {
             cut = i;
         }
     }
@@ -756,12 +977,11 @@ bool IsPackageModule(void* host_module) {
         return false;
     }
     dir.resize(cut + 1);
-    wchar_t path[MAX_PATH + 1] = {};
-    const DWORD len = GetModuleFileNameW(static_cast<HMODULE>(host_module), path, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
+    const std::wstring mod_path = GetHostModulePathWide(static_cast<HMODULE>(host_module));
+    if (mod_path.empty()) {
         return false;
     }
-    return LowerWide(path).compare(0, dir.size(), dir) == 0;
+    return LowerWideNormalized(mod_path).compare(0, dir.size(), dir) == 0;
 }
 
 }  // namespace
@@ -785,9 +1005,10 @@ void PatchHostModuleForGuests(void* host_module) {
     // throw looks up the image that owns the exception's type data, and DLLs
     // that shipped with the title. System DLLs keep their imports.
     const bool package_module = IsPackageModule(host_module);
-    wchar_t module_path[MAX_PATH + 1] = {};
-    GetModuleFileNameW(static_cast<HMODULE>(host_module), module_path, MAX_PATH);
-    const bool runtime_module = BaseNameLower(Narrow(module_path)).compare(0, 9, "vcruntime") == 0;
+    const std::wstring module_path = GetHostModulePathWide(static_cast<HMODULE>(host_module));
+    const bool runtime_module =
+        !module_path.empty() &&
+        BaseNameLower(Narrow(module_path.c_str())).compare(0, 9, "vcruntime") == 0;
     if (!package_module && !runtime_module) {
         return;
     }
@@ -846,6 +1067,7 @@ void DetachTls(TlsBinding*) {}
 void RegisterModule(uint8_t*, uint32_t, const std::string&, bool) {}
 void UnregisterModule(uint8_t*) {}
 void* FindModuleBase(const void*) { return nullptr; }
+bool TryResolveGuestAddressLockFree(uint64_t, GuestModuleAddrInfo*) noexcept { return false; }
 void* LookupImportOverride(const std::string&, const std::string&) { return nullptr; }
 void PatchHostModuleForGuests(void*) {}
 

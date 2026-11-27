@@ -2,15 +2,13 @@
 //
 // A title imports a single function, XCRDAPI.dll!DStorageGetFactory, and
 // drives everything else through COM-style objects: the factory, queues,
-// files and status arrays. Requests are read from host files on one worker
-// thread per queue, in the order they were enqueued.
-//
-// Structure layouts follow the public GDK reference for dstorage_xs.h and
-// match what a title builds. A vtable slot has a name here only if a title's
-// call confirmed it; the others report themselves when called.
+// files and status arrays. Requests are read from host files or PackageVfs
+// on one worker thread per queue, in the order they were enqueued.
+#include "scarlettx/core/flight_recorder.h"
 #include "scarlettx/gpu/xg_layout.h"
-#include "scarlettx/media/codecs_abi.h"
 #include "scarlettx/io/deflate_rfc1951.h"
+#include "scarlettx/loader/package_vfs.h"
+#include "scarlettx/media/codecs_abi.h"
 
 #include <algorithm>
 #include <atomic>
@@ -31,6 +29,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <winioctl.h>
 
 namespace {
 
@@ -52,8 +51,7 @@ constexpr uint64_t kOptSwizzle = 0xFFFFull << 5;
 constexpr uint64_t kOptDestinationPhysical = 1ull << 21;
 constexpr uint64_t kOptSourceMemory = 1ull << 22;
 constexpr uint64_t kOptSourcePhysical = 1ull << 23;
-constexpr uint64_t kOptUnsupported =
-    kOptDestinationPhysical | kOptSourcePhysical;
+constexpr uint64_t kOptUnsupported = kOptDestinationPhysical | kOptSourcePhysical;
 
 bool TraceEnabled() {
     static const bool on = [] {
@@ -70,7 +68,6 @@ bool TraceEnabled() {
         std::fflush(stderr);                                       \
     } while (0)
 
-// Traces the first calls of a kind only; requests arrive by the thousand.
 #define DS_TRACE(limit, ...)                                             \
     do {                                                                 \
         static std::atomic<int> ds_trace_count{0};                       \
@@ -83,6 +80,38 @@ int32_t HresultFromWin32(DWORD error) {
     return error == 0 ? kOk : static_cast<int32_t>((error & 0xFFFFu) | 0x80070000u);
 }
 
+std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string s(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+
+uint32_t BcPackModeToDxgiFormat(uint32_t bcpack_mode) {
+    switch (bcpack_mode) {
+        case 1u: return 71u;  // DXGI_FORMAT_BC1_UNORM
+        case 2u: return 74u;  // DXGI_FORMAT_BC2_UNORM
+        case 3u: return 77u;  // DXGI_FORMAT_BC3_UNORM
+        case 4u: return 80u;  // DXGI_FORMAT_BC4_UNORM
+        case 5u: return 83u;  // DXGI_FORMAT_BC5_UNORM
+        case 6u: return 95u;  // DXGI_FORMAT_BC6H_UF16
+        case 7u: return 98u;  // DXGI_FORMAT_BC7_UNORM
+        case 8u: return 99u;  // DXGI_FORMAT_BC7_UNORM_SRGB
+        default: return 28u;  // DXGI_FORMAT_R8G8B8A8_UNORM
+    }
+}
+
 // DSTORAGE_QUEUE_DESC
 struct QueueDesc {
     uint64_t source_type;  // 0 = file, 1 = memory
@@ -92,11 +121,12 @@ struct QueueDesc {
 };
 static_assert(sizeof(QueueDesc) == 0x18 && offsetof(QueueDesc, name) == 0x10, "DSTORAGE_QUEUE_DESC layout");
 
-// DSTORAGE_REQUEST
+// DSTORAGE_REQUEST (GDK dstorage_xs.h)
 struct Request {
     uint64_t options;
     void* destination;
-    uint64_t destination_page_offset;  // UINT16 in the SDK, padded
+    uint16_t destination_page_offset;
+    uint16_t destination_pad[3];
     uint32_t destination_size;
     uint32_t reserved;
     void* source;                      // IDStorageFileX* or the source memory
@@ -111,7 +141,19 @@ static_assert(offsetof(Request, destination_size) == 0x18 && offsetof(Request, s
                   offsetof(Request, source_size) == 0x30 && offsetof(Request, name) == 0x40,
               "DSTORAGE_REQUEST layout");
 
-// What the title holds: a pointer to the vtable pointer.
+// DSTORAGE_ERROR_RECORD (GDK dstorage_xs.h)
+struct GuestErrorFirstFailure {
+    int32_t hresult;
+    int32_t command_type;  // -1 = NONE, 0 = REQUEST, 1 = STATUS, 2 = SIGNAL
+    Request request;
+};
+
+struct GuestErrorRecord {
+    uint32_t failure_count;
+    GuestErrorFirstFailure first_failure;
+};
+static_assert(sizeof(GuestErrorRecord) == 0x58, "DSTORAGE_ERROR_RECORD layout");
+
 struct Object {
     void* const* vtbl = nullptr;
     std::atomic<int32_t> refs{1};
@@ -128,7 +170,6 @@ uint32_t WINAPI ObjectRelease(Object* self) {
     return static_cast<uint32_t>(left);
 }
 
-// Every object has one interface, so any interface id answers with it.
 int32_t WINAPI ObjectQueryInterface(Object* self, const void* /*riid*/, void** out) {
     if (!out) return kPointer;
     ObjectAddRef(self);
@@ -147,7 +188,7 @@ intptr_t WINAPI UnnamedSlot(Object* /*self*/, uintptr_t a1, uintptr_t a2, uintpt
                static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
                static_cast<unsigned long long>(a3));
     }
-    return 0;
+    return static_cast<intptr_t>(kNotImpl);
 }
 
 #define DS_SLOT(fn) reinterpret_cast<void*>(&fn)
@@ -194,9 +235,14 @@ void* const kStatusArrayVtbl[] = {
 struct File : Object {
     std::mutex mu;
     HANDLE handle = INVALID_HANDLE_VALUE;
+    bool is_vfs = false;
+    bool closed = false;
+    std::string vfs_path;
+    uint64_t vfs_size = 0;
 };
 
 void CloseFileLocked(File* file) {
+    file->closed = true;
     if (file->handle != INVALID_HANDLE_VALUE) {
         CloseHandle(file->handle);
         file->handle = INVALID_HANDLE_VALUE;
@@ -205,7 +251,10 @@ void CloseFileLocked(File* file) {
 
 void DestroyFile(Object* self) {
     auto* file = static_cast<File*>(self);
-    CloseFileLocked(file);
+    {
+        std::lock_guard<std::mutex> lock(file->mu);
+        CloseFileLocked(file);
+    }
     delete file;
 }
 
@@ -219,6 +268,44 @@ void WINAPI FileClose(Object* self) {
 HANDLE WINAPI FileGetHandle(Object* self) {
     auto* file = static_cast<File*>(self);
     std::lock_guard<std::mutex> lock(file->mu);
+    if (file->closed) return INVALID_HANDLE_VALUE;
+
+    if (file->handle == INVALID_HANDLE_VALUE && file->is_vfs) {
+        wchar_t tmp_dir[MAX_PATH] = {};
+        wchar_t tmp_file[MAX_PATH] = {};
+        if (GetTempPathW(MAX_PATH, tmp_dir) != 0 && GetTempFileNameW(tmp_dir, L"sxv", 0, tmp_file) != 0) {
+            HANDLE h = CreateFileW(
+                tmp_file,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                if (file->vfs_size <= 4ull * 1024ull * 1024ull) {
+                    std::vector<uint8_t> bytes;
+                    if (scarlettx::PackageVfs::Global().ReadFileRange(file->vfs_path, 0, file->vfs_size, bytes).ok() &&
+                        !bytes.empty()) {
+                        DWORD wr = 0;
+                        (void)WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &wr, nullptr);
+                    }
+                } else {
+                    DWORD ret_bytes = 0;
+                    (void)DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &ret_bytes, nullptr);
+                    LARGE_INTEGER li{};
+                    li.QuadPart = static_cast<LONGLONG>(file->vfs_size);
+                    if (SetFilePointerEx(h, li, nullptr, FILE_BEGIN)) {
+                        (void)SetEndOfFile(h);
+                    }
+                }
+                LARGE_INTEGER zero{};
+                (void)SetFilePointerEx(h, zero, nullptr, FILE_BEGIN);
+                file->handle = h;
+            }
+        }
+    }
+
     HANDLE copy = nullptr;
     if (file->handle == INVALID_HANDLE_VALUE ||
         !DuplicateHandle(GetCurrentProcess(), file->handle, GetCurrentProcess(), &copy, 0, FALSE,
@@ -264,11 +351,12 @@ struct Queue : Object {
     uint16_t capacity = 0;
     std::mutex mu;
     std::condition_variable wake;
-    std::vector<Entry> pending;    // enqueued, not yet submitted
+    std::vector<Entry> pending;
     std::deque<Entry> submitted;
     std::thread worker;
     bool stop = false;
     int32_t first_failure = kOk;   // since the last status write; worker thread only
+    GuestErrorRecord error_record{0u, {kOk, -1, {}}};
 };
 
 int32_t RunRequest(const Queue* queue, const Entry& entry) {
@@ -285,7 +373,10 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
         return kInvalidArg;
     }
 
-    uint8_t* dst_ptr = static_cast<uint8_t*>(r.destination) + r.destination_page_offset;
+    // Only apply destination_page_offset when DestinationIsPhysicalPages is set;
+    // virtual-memory requests leave uninitialized stack bytes in destination_page_offset / pad.
+    uint8_t* dst_ptr = static_cast<uint8_t*>(r.destination) +
+                       ((r.options & kOptDestinationPhysical) ? static_cast<size_t>(r.destination_page_offset) : 0u);
     std::vector<uint8_t> raw_buf;
     std::vector<uint8_t> swizzle_linear_buf;
     uint8_t* decode_dst = dst_ptr;
@@ -305,34 +396,59 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
     if (from_memory) {
         std::memcpy(io_target, r.source, r.source_size);
     } else {
-        HANDLE file_handle = INVALID_HANDLE_VALUE;
+        if (!entry.file) return HresultFromWin32(ERROR_INVALID_HANDLE);
+        HANDLE dup_handle = INVALID_HANDLE_VALUE;
+        bool use_vfs = false;
+        std::string vfs_path;
+        uint64_t vfs_size = 0;
         {
             std::lock_guard<std::mutex> lock(entry.file->mu);
-            file_handle = entry.file->handle;
-        }
-        if (file_handle == INVALID_HANDLE_VALUE) return HresultFromWin32(ERROR_INVALID_HANDLE);
-        OVERLAPPED at{};
-        at.Offset = static_cast<DWORD>(r.file_offset);
-        at.OffsetHigh = static_cast<DWORD>(r.file_offset >> 32);
-        at.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        DWORD read = 0;
-        BOOL ok = ReadFile(file_handle, io_target, r.source_size, &read, &at);
-        if (!ok) {
-            const DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                ok = GetOverlappedResult(file_handle, &at, &read, TRUE);
+            if (entry.file->closed) {
+                return HresultFromWin32(ERROR_INVALID_HANDLE);
+            }
+            if (entry.file->is_vfs && entry.file->handle == INVALID_HANDLE_VALUE) {
+                use_vfs = true;
+                vfs_path = entry.file->vfs_path;
+                vfs_size = entry.file->vfs_size;
+            } else if (entry.file->handle == INVALID_HANDLE_VALUE ||
+                       !DuplicateHandle(GetCurrentProcess(), entry.file->handle, GetCurrentProcess(),
+                                        &dup_handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                return HresultFromWin32(ERROR_INVALID_HANDLE);
             }
         }
-        const DWORD final_err = ok ? 0 : GetLastError();
-        if (at.hEvent) CloseHandle(at.hEvent);
-        if (!ok) return HresultFromWin32(final_err);
-        if (read != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
+
+        if (use_vfs) {
+            if (r.file_offset > vfs_size || r.source_size > vfs_size - r.file_offset) {
+                return HresultFromWin32(ERROR_HANDLE_EOF);
+            }
+            std::vector<uint8_t> vfs_slice;
+            auto st = scarlettx::PackageVfs::Global().ReadFileRange(vfs_path, r.file_offset, r.source_size, vfs_slice);
+            if (!st.ok()) return HresultFromWin32(ERROR_READ_FAULT);
+            if (vfs_slice.size() != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
+            std::memcpy(io_target, vfs_slice.data(), r.source_size);
+        } else {
+            OVERLAPPED at{};
+            at.Offset = static_cast<DWORD>(r.file_offset);
+            at.OffsetHigh = static_cast<DWORD>(r.file_offset >> 32);
+            at.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            DWORD read = 0;
+            BOOL ok = ReadFile(dup_handle, io_target, r.source_size, &read, &at);
+            if (!ok) {
+                const DWORD err = GetLastError();
+                if (err == ERROR_IO_PENDING) {
+                    ok = GetOverlappedResult(dup_handle, &at, &read, TRUE);
+                }
+            }
+            const DWORD final_err = ok ? 0 : GetLastError();
+            if (at.hEvent) CloseHandle(at.hEvent);
+            CloseHandle(dup_handle);
+            if (!ok) return HresultFromWin32(final_err);
+            if (read != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
+        }
     }
 
     size_t decoded_bytes = r.source_size;
     if (is_zlib) {
-        // Dispatch tile-framed GDeflate streams (0x04 0xFB) and spec-compliant RFC 1950 Zlib streams;
-        // return E_NOTIMPL for unrecognized/unframed payloads without overwriting destination memory.
         if (raw_buf.size() >= 8 && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu) {
             size_t written = 0;
             const int32_t gd_hr = XboxCodecGDeflateDecompress(
@@ -352,7 +468,11 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
             return kNotImpl;
         }
     } else if (bcpack_fmt != 0) {
-        if (raw_buf.size() >= 8 && std::memcmp(raw_buf.data(), "BCPK", 4) == 0) {
+        const bool is_framed_bcpack =
+            (raw_buf.size() >= 8 && std::memcmp(raw_buf.data(), "BCPK", 4) == 0) ||
+            (raw_buf.size() >= 12 && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu) ||
+            scarlettx::io::LooksLikeRfc1950ZlibHeader(raw_buf.data(), raw_buf.size());
+        if (is_framed_bcpack) {
             const int32_t bc_hr = XboxCodecBcPackDecompress(
                 raw_buf.data(), raw_buf.size(), decode_dst, decode_cap, bcpack_fmt);
             if (bc_hr < 0) return bc_hr;
@@ -366,15 +486,17 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
 
     if (swizzle_opt != 0) {
         const uint32_t mode = swizzle_opt & 0xFFu;
-        const uint32_t dxgi_fmt = (bcpack_fmt != 0) ? bcpack_fmt : 28u;  // default RGBA8_UNORM
+        const uint32_t dxgi_fmt = (bcpack_fmt != 0) ? BcPackModeToDxgiFormat(bcpack_fmt) : 28u;
         const uint32_t bpe = scarlettx::gpu::xg::FormatBytesPerElement(dxgi_fmt);
         const bool is_bc = scarlettx::gpu::xg::IsBlockCompressed(dxgi_fmt);
 
         uint32_t tex_w = static_cast<uint32_t>(r.reserved & 0xFFFFu);
         uint32_t tex_h = static_cast<uint32_t>(r.reserved >> 16u);
         if (tex_w == 0 || tex_h == 0) {
-            const uint32_t elem_count = std::max<uint32_t>(1u, static_cast<uint32_t>(decoded_bytes / std::max<uint32_t>(1u, bpe)));
-            const auto side_elems = std::max<uint32_t>(1u, static_cast<uint32_t>(std::sqrt(static_cast<double>(elem_count)) + 0.5));
+            const uint32_t elem_count =
+                std::max<uint32_t>(1u, static_cast<uint32_t>(decoded_bytes / std::max<uint32_t>(1u, bpe)));
+            const auto side_elems =
+                std::max<uint32_t>(1u, static_cast<uint32_t>(std::sqrt(static_cast<double>(elem_count)) + 0.5));
             tex_w = side_elems * (is_bc ? 4u : 1u);
             tex_h = tex_w;
         }
@@ -424,6 +546,15 @@ void QueueRun(Queue* queue) {
             const int32_t hr = entry.cancelled ? kAbort : RunRequest(queue, entry);
             if (hr < 0) {
                 if (queue->first_failure >= 0) queue->first_failure = hr;
+                {
+                    std::lock_guard<std::mutex> err_lock(queue->mu);
+                    if (queue->error_record.failure_count == 0u) {
+                        queue->error_record.first_failure.hresult = hr;
+                        queue->error_record.first_failure.command_type = 0;  // DSTORAGE_COMMAND_TYPE_REQUEST
+                        queue->error_record.first_failure.request = entry.request;
+                    }
+                    ++queue->error_record.failure_count;
+                }
                 static std::atomic<int> reported{0};
                 if (reported.fetch_add(1) < 16) {
                     DS_LOG("request failed: hr=0x%08X options=0x%llx offset=%llu size=%u", static_cast<unsigned>(hr),
@@ -433,11 +564,11 @@ void QueueRun(Queue* queue) {
             }
         }
         ReleaseEntry(entry);
+        scarlettx::FlightRecorder::Instance().BeatProgress("DirectStorageBatch");
         lock.lock();
     }
 }
 
-// Caller holds queue->mu.
 void SubmitLocked(Queue* queue) {
     if (queue->pending.empty()) return;
     queue->submitted.insert(queue->submitted.end(), queue->pending.begin(), queue->pending.end());
@@ -446,8 +577,6 @@ void SubmitLocked(Queue* queue) {
     queue->wake.notify_one();
 }
 
-// Caller holds queue->mu. The console submits on its own once more than
-// half of the queue's capacity is waiting.
 void EnqueueLocked(Queue* queue, const Entry& entry) {
     queue->pending.push_back(entry);
     if (queue->pending.size() * 2 > queue->capacity) SubmitLocked(queue);
@@ -539,6 +668,15 @@ void WINAPI QueueCancelRequestsWithTag(Object* self, uint64_t mask, uint64_t val
     }
 }
 
+int32_t WINAPI QueueRetrieveErrorRecord(Object* self, GuestErrorRecord* out_record) {
+    if (!out_record) return kPointer;
+    auto* queue = static_cast<Queue*>(self);
+    std::lock_guard<std::mutex> lock(queue->mu);
+    *out_record = queue->error_record;
+    queue->error_record = GuestErrorRecord{0u, {kOk, -1, {}}};
+    return kOk;
+}
+
 void* const kQueueVtbl[] = {
     DS_SLOT(ObjectQueryInterface), DS_SLOT(ObjectAddRef), DS_SLOT(ObjectRelease),
     DS_SLOT(QueueEnqueueRequest),         // 3, confirmed
@@ -546,7 +684,8 @@ void* const kQueueVtbl[] = {
     DS_SLOT(QueueEnqueueSignal),          // 5, confirmed
     DS_SLOT(QueueSubmit),                 // 6, confirmed
     DS_SLOT(QueueCancelRequestsWithTag),  // 7, confirmed
-    DS_SLOT((UnnamedSlot<1, 8>)),  DS_SLOT((UnnamedSlot<1, 9>)),
+    DS_SLOT(QueueRetrieveErrorRecord),    // 8, RetrieveErrorRecord
+    DS_SLOT((UnnamedSlot<1, 9>)),
     DS_SLOT((UnnamedSlot<1, 10>)), DS_SLOT((UnnamedSlot<1, 11>)),
 };
 
@@ -576,34 +715,93 @@ int32_t WINAPI FactoryOpenFile(Object* /*self*/, const wchar_t* path, const void
     if (!path) return kInvalidArg;
 
     std::wstring resolved_path(path);
-    HANDLE handle = CreateFileW(
-        resolved_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
-    if (handle == INVALID_HANDLE_VALUE && resolved_path.size() >= 2 && resolved_path[1] == L':') {
-        const wchar_t drv = resolved_path[0];
-        if ((drv == L'G' || drv == L'g' || drv == L'D' || drv == L'd') &&
-            std::getenv("SCARLETTX_PACKAGE_ROOT")) {
-            const char* pkg = std::getenv("SCARLETTX_PACKAGE_ROOT");
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, pkg, -1, nullptr, 0);
-            if (wlen > 1) {
-                std::wstring wpkg(static_cast<size_t>(wlen - 1), L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, pkg, -1, wpkg.data(), wlen);
-                size_t rel_pos = 2;
-                while (rel_pos < resolved_path.size() &&
-                       (resolved_path[rel_pos] == L'\\' || resolved_path[rel_pos] == L'/')) {
-                    ++rel_pos;
-                }
-                const auto candidate = std::filesystem::path(wpkg) / resolved_path.substr(rel_pos);
-                handle = CreateFileW(
-                    candidate.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+    const std::string utf8_path = WideToUtf8(resolved_path);
+    const bool is_virtual_drive =
+        resolved_path.size() >= 2 && resolved_path[1] == L':' &&
+        (resolved_path[0] == L'G' || resolved_path[0] == L'g' ||
+         resolved_path[0] == L'D' || resolved_path[0] == L'd');
+
+    // If path is mounted in PackageVfs::Global() (e.g., embedded .xvc/.xvd or when host G: is Google Drive),
+    // try resolving through PackageVfs first before touching a potentially colliding host G: drive.
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    if (is_virtual_drive && !utf8_path.empty() && scarlettx::PackageVfs::Global().Exists(utf8_path)) {
+        std::string host_resolved;
+        if (scarlettx::PackageVfs::Global().ResolvePath(utf8_path, host_resolved).ok() && !host_resolved.empty()) {
+            const std::wstring whost = Utf8ToWide(host_resolved);
+            handle = CreateFileW(
+                whost.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+        }
+        if (handle == INVALID_HANDLE_VALUE) {
+            uint64_t vfs_sz = 0;
+            if (scarlettx::PackageVfs::Global().GetFileSize(utf8_path, vfs_sz)) {
+                auto* file = new (std::nothrow) File();
+                if (!file) return kOutOfMemory;
+                file->vtbl = kFileVtbl;
+                file->destroy = &DestroyFile;
+                file->is_vfs = true;
+                file->vfs_path = utf8_path;
+                file->vfs_size = vfs_sz;
+                DS_TRACE(32, "OpenFile (PackageVfs) %ls (%llu bytes) -> %p",
+                         path, static_cast<unsigned long long>(vfs_sz), static_cast<void*>(file));
+                *out = static_cast<Object*>(file);
+                return kOk;
             }
         }
     }
+
     if (handle == INVALID_HANDLE_VALUE) {
-        const int32_t hr = HresultFromWin32(GetLastError());
+        handle = CreateFileW(
+            resolved_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+    }
+    const DWORD initial_err = (handle == INVALID_HANDLE_VALUE) ? GetLastError() : 0;
+
+    if (handle == INVALID_HANDLE_VALUE && is_virtual_drive && std::getenv("SCARLETTX_PACKAGE_ROOT")) {
+        const char* pkg = std::getenv("SCARLETTX_PACKAGE_ROOT");
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, pkg, -1, nullptr, 0);
+        if (wlen > 1) {
+            std::wstring wpkg(static_cast<size_t>(wlen - 1), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, pkg, -1, wpkg.data(), wlen);
+            size_t rel_pos = 2;
+            while (rel_pos < resolved_path.size() &&
+                   (resolved_path[rel_pos] == L'\\' || resolved_path[rel_pos] == L'/')) {
+                ++rel_pos;
+            }
+            const auto candidate = std::filesystem::path(wpkg) / resolved_path.substr(rel_pos);
+            handle = CreateFileW(
+                candidate.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+        }
+    }
+
+    if (handle == INVALID_HANDLE_VALUE && !utf8_path.empty() && scarlettx::PackageVfs::Global().Exists(utf8_path)) {
+        uint64_t vfs_sz = 0;
+        if (scarlettx::PackageVfs::Global().GetFileSize(utf8_path, vfs_sz)) {
+            auto* file = new (std::nothrow) File();
+            if (!file) return kOutOfMemory;
+            file->vtbl = kFileVtbl;
+            file->destroy = &DestroyFile;
+            file->is_vfs = true;
+            file->vfs_path = utf8_path;
+            file->vfs_size = vfs_sz;
+            DS_TRACE(32, "OpenFile (PackageVfs fallback) %ls -> %p", path, static_cast<void*>(file));
+            *out = static_cast<Object*>(file);
+            return kOk;
+        }
+    }
+
+    if (handle == INVALID_HANDLE_VALUE) {
+        const DWORD err = GetLastError();
+        const int32_t hr = HresultFromWin32(err != 0 ? err : initial_err);
         DS_LOG("OpenFile failed: %ls hr=0x%08X", path, static_cast<unsigned>(hr));
+        scarlettx::FlightRecorder::Instance().RecordVfsAccess(
+            utf8_path.c_str(), false, hr, SCARLETTX_CALLER_RIP());
         return hr;
+    }
+    if (is_virtual_drive && !utf8_path.empty()) {
+        scarlettx::FlightRecorder::Instance().RecordVfsAccess(
+            utf8_path.c_str(), true, 0, SCARLETTX_CALLER_RIP());
     }
     auto* file = new (std::nothrow) File();
     if (!file) {
@@ -648,12 +846,11 @@ void* const kFactoryVtbl[] = {
     DS_SLOT((UnnamedSlot<0, 9>)),  DS_SLOT((UnnamedSlot<0, 10>)), DS_SLOT((UnnamedSlot<0, 11>)),
 };
 
-// The factory is a process-wide singleton and is never destroyed.
 Object g_factory{kFactoryVtbl};
 
 }  // namespace
 
-extern "C" __declspec(dllexport) int32_t WINAPI DStorageGetFactory(const void* riid, void** out) {
+extern "C" __declspec(dllexport) int32_t WINAPI ScarlettXcrdGetFactory(const void* riid, void** out) {
     if (!out) return kPointer;
     if (riid) {
         const auto* g = static_cast<const uint32_t*>(riid);
@@ -664,11 +861,19 @@ extern "C" __declspec(dllexport) int32_t WINAPI DStorageGetFactory(const void* r
     return kOk;
 }
 
+extern "C" __declspec(dllexport) int32_t WINAPI DStorageGetFactory(const void* riid, void** out) {
+    return ScarlettXcrdGetFactory(riid, out);
+}
+
 #else  // !_WIN32
 
-extern "C" int32_t DStorageGetFactory(const void*, void** out) {
+extern "C" int32_t ScarlettXcrdGetFactory(const void*, void** out) {
     if (out) *out = nullptr;
     return static_cast<int32_t>(0x80004001u);
+}
+
+extern "C" int32_t DStorageGetFactory(const void* riid, void** out) {
+    return ScarlettXcrdGetFactory(riid, out);
 }
 
 #endif

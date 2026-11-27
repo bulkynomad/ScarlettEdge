@@ -2,7 +2,10 @@
 #include "scarlettx/kernel/kernelx_abi.h"
 
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -21,12 +24,18 @@ constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
 constexpr int32_t kOutOfMemory = static_cast<int32_t>(0x8007000Eu);
 constexpr int32_t kTimeout = static_cast<int32_t>(0x800705B4u);
 
+bool IsLockhartMode() {
+    const char* env = std::getenv("SCARLETTX_LOCKHART");
+    return env && env[0] != '\0' && env[0] != '0';
+}
+
 struct MemBlock {
     void* va = nullptr;
     uint64_t gpu_va = 0;
     uint64_t size = 0;
     uint32_t page_size = 0;
     uint32_t flags = 0;
+    bool is_external = false;
 #if defined(_WIN32)
     HANDLE section = nullptr;
     bool mapped_view = false;
@@ -50,12 +59,13 @@ struct Win32AddressRequirements {
 };
 
 struct alignas(8) Win32MemExtendedParam {
-    ULONG64 Type; // MemExtendedParameterAddressRequirements = 1
+    ULONG64 Type;  // MemExtendedParameterAddressRequirements = 1
     PVOID Pointer;
 };
 
-using VirtualAlloc2Fn = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
-using MapViewOfFile3Fn = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+using MapViewOfFile3Fn =
+    PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
 
 struct Win32MemApi {
     VirtualAlloc2Fn virtual_alloc2 = nullptr;
@@ -140,10 +150,18 @@ extern "C" {
 int32_t SCARLETTX_KERNELX_CALL KernelXAllocateMemory(
     uint64_t size, uint32_t pageSize, uint32_t flags, void** outVirtualAddress, uint64_t* outGpuAddress) {
     if (!outVirtualAddress || !outGpuAddress || size == 0) return kInvalidArg;
+    *outVirtualAddress = nullptr;
+    *outGpuAddress = 0;
 
-    const uint32_t align = (pageSize == KERNELX_PAGE_2MB) ? 0x200000 :
-                           (pageSize == KERNELX_PAGE_64KB) ? 0x10000 : 0x1000;
-    const uint64_t aligned_size = (size + align - 1) & ~(static_cast<uint64_t>(align) - 1);
+    const uint64_t align = (pageSize == KERNELX_PAGE_2MB) ? 0x200000ull :
+                           (pageSize == KERNELX_PAGE_64KB) ? 0x10000ull : 0x1000ull;
+    if (size > std::numeric_limits<uint64_t>::max() - (align - 1ull)) {
+        return kInvalidArg;
+    }
+    const uint64_t aligned_size = (size + (align - 1ull)) & ~(align - 1ull);
+    if (aligned_size > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return kOutOfMemory;
+    }
 
     void* mem = nullptr;
 #if defined(_WIN32)
@@ -153,7 +171,7 @@ int32_t SCARLETTX_KERNELX_CALL KernelXAllocateMemory(
         static_cast<DWORD>(aligned_size & 0xFFFFFFFFu), nullptr);
     bool mapped_view = false;
     if (section) {
-        mem = MapSectionWithPlaceholder(section, 0, aligned_size, align);
+        mem = MapSectionWithPlaceholder(section, 0, aligned_size, static_cast<uint32_t>(align));
         if (mem) {
             mapped_view = true;
         } else {
@@ -162,17 +180,22 @@ int32_t SCARLETTX_KERNELX_CALL KernelXAllocateMemory(
         }
     }
     if (!mem) {
-        mem = VirtualAlloc(nullptr, aligned_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        mem = VirtualAlloc(nullptr, static_cast<SIZE_T>(aligned_size),
+                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     }
-#else
-    if (posix_memalign(&mem, align, aligned_size) != 0) mem = nullptr;
-#endif
     if (!mem) return kOutOfMemory;
-    std::memset(mem, 0, aligned_size);
+    // Fresh CreateFileMappingW / VirtualAlloc pages are already kernel-zeroed on demand.
+#else
+    if (posix_memalign(&mem, static_cast<size_t>(align), static_cast<size_t>(aligned_size)) != 0) {
+        mem = nullptr;
+    }
+    if (!mem) return kOutOfMemory;
+    std::memset(mem, 0, static_cast<size_t>(aligned_size));
+#endif
 
     std::lock_guard<std::mutex> lk(State().mu);
-    const uint64_t gpu_addr = State().next_gpu_va;
-    State().next_gpu_va += aligned_size;
+    const uint64_t gpu_addr = (State().next_gpu_va + (align - 1ull)) & ~(align - 1ull);
+    State().next_gpu_va = gpu_addr + aligned_size;
     State().total_allocated += aligned_size;
     if (State().total_allocated > State().peak_allocated) {
         State().peak_allocated = State().total_allocated;
@@ -182,8 +205,9 @@ int32_t SCARLETTX_KERNELX_CALL KernelXAllocateMemory(
     b.va = mem;
     b.gpu_va = gpu_addr;
     b.size = aligned_size;
-    b.page_size = align;
+    b.page_size = static_cast<uint32_t>(align);
     b.flags = flags;
+    b.is_external = false;
 #if defined(_WIN32)
     b.section = section;
     b.mapped_view = mapped_view;
@@ -200,7 +224,7 @@ int32_t SCARLETTX_KERNELX_CALL KernelXFreeMemory(void* virtualAddress) {
     if (!virtualAddress) return kSuccess;
     std::lock_guard<std::mutex> lk(State().mu);
     auto it = State().by_va.find(reinterpret_cast<uintptr_t>(virtualAddress));
-    if (it == State().by_va.end()) return kInvalidArg;
+    if (it == State().by_va.end() || it->second.is_external) return kInvalidArg;
 
     State().total_allocated = State().total_allocated >= it->second.size ?
                               State().total_allocated - it->second.size : 0;
@@ -221,22 +245,93 @@ int32_t SCARLETTX_KERNELX_CALL KernelXFreeMemory(void* virtualAddress) {
     return kSuccess;
 }
 
+int32_t SCARLETTX_KERNELX_CALL KernelXRegisterExternalAllocation(
+    void* virtualAddress, uint64_t size, uint64_t* outGpuAddress) {
+    if (!virtualAddress || size == 0) return kInvalidArg;
+    const uintptr_t va_key = reinterpret_cast<uintptr_t>(virtualAddress);
+    if (size > std::numeric_limits<uintptr_t>::max() - va_key) {
+        return kInvalidArg;
+    }
+
+    constexpr uint64_t kGpuAlign = 0x10000ull;
+    if (size > std::numeric_limits<uint64_t>::max() - (2ull * kGpuAlign)) {
+        return kInvalidArg;
+    }
+
+    std::lock_guard<std::mutex> lk(State().mu);
+    auto existing = State().by_va.find(va_key);
+    if (existing != State().by_va.end()) {
+        if (existing->second.is_external && size > existing->second.size) {
+            const uint64_t delta = size - existing->second.size;
+            existing->second.size = size;
+            State().total_allocated += delta;
+            if (State().total_allocated > State().peak_allocated) {
+                State().peak_allocated = State().total_allocated;
+            }
+        }
+        if (outGpuAddress) {
+            *outGpuAddress = existing->second.gpu_va;
+        }
+        return kSuccess;
+    }
+
+    const uint64_t aligned_base = (State().next_gpu_va + (kGpuAlign - 1ull)) & ~(kGpuAlign - 1ull);
+    const uint64_t low_offset = static_cast<uint64_t>(va_key) & (kGpuAlign - 1ull);
+    const uint64_t gpu_addr = aligned_base + low_offset;
+    const uint64_t span = ((low_offset + size) + (kGpuAlign - 1ull)) & ~(kGpuAlign - 1ull);
+    State().next_gpu_va = aligned_base + span;
+
+    State().total_allocated += size;
+    if (State().total_allocated > State().peak_allocated) {
+        State().peak_allocated = State().total_allocated;
+    }
+
+    MemBlock b{};
+    b.va = virtualAddress;
+    b.gpu_va = gpu_addr;
+    b.size = size;
+    b.page_size = static_cast<uint32_t>(kGpuAlign);
+    b.flags = KERNELX_MEM_GPU_VISIBLE;
+    b.is_external = true;
+    State().by_va[va_key] = b;
+    State().by_gpu_va[gpu_addr] = va_key;
+
+    if (outGpuAddress) {
+        *outGpuAddress = gpu_addr;
+    }
+    return kSuccess;
+}
+
+int32_t SCARLETTX_KERNELX_CALL KernelXUnregisterExternalAllocation(void* virtualAddress) {
+    if (!virtualAddress) return kSuccess;
+    std::lock_guard<std::mutex> lk(State().mu);
+    auto it = State().by_va.find(reinterpret_cast<uintptr_t>(virtualAddress));
+    if (it == State().by_va.end() || !it->second.is_external) {
+        return kInvalidArg;
+    }
+    State().total_allocated = State().total_allocated >= it->second.size ?
+                              State().total_allocated - it->second.size : 0;
+    State().by_gpu_va.erase(it->second.gpu_va);
+    State().by_va.erase(it);
+    return kSuccess;
+}
+
 int32_t SCARLETTX_KERNELX_CALL KernelXMapVirtualToGpu(const void* virtualAddress, uint64_t* outGpuAddress) {
     if (!virtualAddress || !outGpuAddress) return kInvalidArg;
     const uintptr_t va = reinterpret_cast<uintptr_t>(virtualAddress);
     std::lock_guard<std::mutex> lk(State().mu);
     for (const auto& kv : State().by_va) {
         const uintptr_t base = kv.first;
-        if (va >= base && va < base + kv.second.size) {
-            *outGpuAddress = kv.second.gpu_va + (va - base);
+        if (va >= base && va - base < kv.second.size) {
+            *outGpuAddress = kv.second.gpu_va + static_cast<uint64_t>(va - base);
             return kSuccess;
         }
     }
 #if defined(_WIN32)
     for (const auto& kv : State().aliases) {
         const uintptr_t base = kv.first;
-        if (va >= base && va < base + kv.second.size) {
-            *outGpuAddress = kv.second.gpu_va + (va - base);
+        if (va >= base && va - base < kv.second.size) {
+            *outGpuAddress = kv.second.gpu_va + static_cast<uint64_t>(va - base);
             return kSuccess;
         }
     }
@@ -249,11 +344,22 @@ int32_t SCARLETTX_KERNELX_CALL KernelXMapGpuToVirtual(uint64_t gpuAddress, void*
     std::lock_guard<std::mutex> lk(State().mu);
     for (const auto& kv : State().by_va) {
         const uint64_t base = kv.second.gpu_va;
-        if (gpuAddress >= base && gpuAddress < base + kv.second.size) {
-            *outVirtualAddress = reinterpret_cast<void*>(kv.first + (gpuAddress - base));
+        if (gpuAddress >= base && gpuAddress - base < kv.second.size) {
+            *outVirtualAddress =
+                reinterpret_cast<void*>(kv.first + static_cast<uintptr_t>(gpuAddress - base));
             return kSuccess;
         }
     }
+#if defined(_WIN32)
+    for (const auto& kv : State().aliases) {
+        const uint64_t base = kv.second.gpu_va;
+        if (gpuAddress >= base && gpuAddress - base < kv.second.size) {
+            *outVirtualAddress =
+                reinterpret_cast<void*>(kv.first + static_cast<uintptr_t>(gpuAddress - base));
+            return kSuccess;
+        }
+    }
+#endif
     return kInvalidArg;
 }
 
@@ -291,6 +397,7 @@ int32_t SCARLETTX_KERNELX_CALL KernelXCreateMemoryAlias(
     *outAliasVirtualAddress = alias_va;
     return kSuccess;
 #else
+    (void)offset;
     return kInvalidArg;
 #endif
 }
@@ -315,18 +422,22 @@ int32_t SCARLETTX_KERNELX_CALL KernelXProtectMemory(void* virtualAddress, uint64
 #if defined(_WIN32)
     DWORD old_p = 0;
     DWORD new_p = (protectFlags & KERNELX_MEM_READ_ONLY) ? PAGE_READONLY : PAGE_READWRITE;
-    if (!VirtualProtect(virtualAddress, size, new_p, &old_p)) return kInvalidArg;
+    if (!VirtualProtect(virtualAddress, static_cast<SIZE_T>(size), new_p, &old_p)) return kInvalidArg;
+#else
+    (void)protectFlags;
 #endif
     return kSuccess;
 }
 
 int32_t SCARLETTX_KERNELX_CALL KernelXQueryMemoryStatistics(KERNELX_MEMORY_STATS* outStats) {
     if (!outStats) return kInvalidArg;
+    const uint64_t total_bytes =
+        (IsLockhartMode() ? 10ull : 16ull) * 1024ull * 1024ull * 1024ull;
     std::lock_guard<std::mutex> lk(State().mu);
-    constexpr uint64_t kAnacondaTotal = 16ull * 1024ull * 1024ull * 1024ull;
-    outStats->totalUnifiedBytes = kAnacondaTotal;
+    outStats->totalUnifiedBytes = total_bytes;
     outStats->allocatedBytes = State().total_allocated;
-    outStats->freeBytes = (kAnacondaTotal > State().total_allocated) ? (kAnacondaTotal - State().total_allocated) : 0;
+    outStats->freeBytes =
+        (total_bytes > State().total_allocated) ? (total_bytes - State().total_allocated) : 0;
     outStats->peakAllocatedBytes = State().peak_allocated;
     outStats->activeAllocations = static_cast<uint32_t>(State().by_va.size());
     return kSuccess;
@@ -335,6 +446,7 @@ int32_t SCARLETTX_KERNELX_CALL KernelXQueryMemoryStatistics(KERNELX_MEMORY_STATS
 int32_t SCARLETTX_KERNELX_CALL KernelXCreateSynchronizationEvent(
     int32_t manualReset, int32_t initialState, KERNELX_EVENT_HANDLE* outEvent) {
     if (!outEvent) return kInvalidArg;
+    *outEvent = nullptr;
 #if defined(_WIN32)
     HANDLE ev = CreateEventW(nullptr, manualReset ? TRUE : FALSE, initialState ? TRUE : FALSE, nullptr);
     if (!ev) return kOutOfMemory;
@@ -351,7 +463,9 @@ int32_t SCARLETTX_KERNELX_CALL KernelXCreateSynchronizationEvent(
 int32_t SCARLETTX_KERNELX_CALL KernelXSetSynchronizationEvent(KERNELX_EVENT_HANDLE eventHandle) {
     if (!eventHandle) return kInvalidArg;
 #if defined(_WIN32)
-    SetEvent(reinterpret_cast<HANDLE>(eventHandle));
+    if (eventHandle == INVALID_HANDLE_VALUE || !SetEvent(reinterpret_cast<HANDLE>(eventHandle))) {
+        return kInvalidArg;
+    }
 #else
     auto* ev = static_cast<PosixEvent*>(eventHandle);
     {
@@ -367,7 +481,9 @@ int32_t SCARLETTX_KERNELX_CALL KernelXSetSynchronizationEvent(KERNELX_EVENT_HAND
 int32_t SCARLETTX_KERNELX_CALL KernelXResetSynchronizationEvent(KERNELX_EVENT_HANDLE eventHandle) {
     if (!eventHandle) return kInvalidArg;
 #if defined(_WIN32)
-    ResetEvent(reinterpret_cast<HANDLE>(eventHandle));
+    if (eventHandle == INVALID_HANDLE_VALUE || !ResetEvent(reinterpret_cast<HANDLE>(eventHandle))) {
+        return kInvalidArg;
+    }
 #else
     auto* ev = static_cast<PosixEvent*>(eventHandle);
     std::lock_guard<std::mutex> lk(ev->mu);
@@ -379,6 +495,7 @@ int32_t SCARLETTX_KERNELX_CALL KernelXResetSynchronizationEvent(KERNELX_EVENT_HA
 int32_t SCARLETTX_KERNELX_CALL KernelXWaitForSynchronizationEvent(KERNELX_EVENT_HANDLE eventHandle, uint32_t timeoutMs) {
     if (!eventHandle) return kInvalidArg;
 #if defined(_WIN32)
+    if (eventHandle == INVALID_HANDLE_VALUE) return kInvalidArg;
     DWORD res = WaitForSingleObject(reinterpret_cast<HANDLE>(eventHandle), timeoutMs);
     if (res == WAIT_OBJECT_0) return kSuccess;
     if (res == WAIT_TIMEOUT) return kTimeout;
@@ -403,7 +520,9 @@ int32_t SCARLETTX_KERNELX_CALL KernelXWaitForSynchronizationEvent(KERNELX_EVENT_
 int32_t SCARLETTX_KERNELX_CALL KernelXCloseSynchronizationEvent(KERNELX_EVENT_HANDLE eventHandle) {
     if (!eventHandle) return kInvalidArg;
 #if defined(_WIN32)
-    CloseHandle(reinterpret_cast<HANDLE>(eventHandle));
+    if (eventHandle == INVALID_HANDLE_VALUE || !CloseHandle(reinterpret_cast<HANDLE>(eventHandle))) {
+        return kInvalidArg;
+    }
 #else
     delete static_cast<PosixEvent*>(eventHandle);
 #endif
@@ -413,8 +532,8 @@ int32_t SCARLETTX_KERNELX_CALL KernelXCloseSynchronizationEvent(KERNELX_EVENT_HA
 int32_t SCARLETTX_KERNELX_CALL KernelXQueryPerformanceCounter(uint64_t* outCounter) {
     if (!outCounter) return kInvalidArg;
 #if defined(_WIN32)
-    LARGE_INTEGER li;
-    QueryPerformanceCounter(&li);
+    LARGE_INTEGER li{};
+    if (!QueryPerformanceCounter(&li)) return kInvalidArg;
     *outCounter = static_cast<uint64_t>(li.QuadPart);
 #else
     auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -426,23 +545,32 @@ int32_t SCARLETTX_KERNELX_CALL KernelXQueryPerformanceCounter(uint64_t* outCount
 int32_t SCARLETTX_KERNELX_CALL KernelXQueryPerformanceFrequency(uint64_t* outFrequency) {
     if (!outFrequency) return kInvalidArg;
 #if defined(_WIN32)
-    LARGE_INTEGER li;
-    QueryPerformanceFrequency(&li);
+    LARGE_INTEGER li{};
+    if (!QueryPerformanceFrequency(&li)) return kInvalidArg;
     *outFrequency = static_cast<uint64_t>(li.QuadPart);
 #else
-    *outFrequency = 1000000000ull; // nanoseconds
+    *outFrequency = 1000000000ull;  // nanoseconds
 #endif
     return kSuccess;
 }
 
 int32_t SCARLETTX_KERNELX_CALL KernelXGetSystemInfo(KERNELX_SYSTEM_INFO* outInfo) {
     if (!outInfo) return kInvalidArg;
-    outInfo->consoleType = 1; // Xbox Series X (Anaconda)
-    outInfo->computeUnitCount = 52; // 52 RDNA2 CUs active @ 1.825 GHz (12.15 TFLOPS)
-    outInfo->totalPhysicalMemory = 16ull * 1024ull * 1024ull * 1024ull; // 16 GB GDDR6
-    outInfo->memoryBandwidthBytesPerSec = 560ull * 1024ull * 1024ull * 1024ull; // 560 GB/s peak
-    outInfo->cpuCoreCount = 8;
-    outInfo->cpuClockMhz = 3800; // 3.8 GHz Zen 2 (3.66 GHz SMT)
+    if (IsLockhartMode()) {
+        outInfo->consoleType = 2;  // Xbox Series S (Lockhart)
+        outInfo->computeUnitCount = 20;  // 20 RDNA2 CUs @ 1.565 GHz
+        outInfo->totalPhysicalMemory = 10ull * 1024ull * 1024ull * 1024ull;  // 10 GB GDDR6
+        outInfo->memoryBandwidthBytesPerSec = 224ull * 1024ull * 1024ull * 1024ull;  // 224 GB/s
+        outInfo->cpuCoreCount = 8;
+        outInfo->cpuClockMhz = 3600;  // 3.6 GHz Zen 2 (3.4 GHz SMT)
+    } else {
+        outInfo->consoleType = 1;  // Xbox Series X (Anaconda)
+        outInfo->computeUnitCount = 52;  // 52 RDNA2 CUs active @ 1.825 GHz (12.15 TFLOPS)
+        outInfo->totalPhysicalMemory = 16ull * 1024ull * 1024ull * 1024ull;  // 16 GB GDDR6
+        outInfo->memoryBandwidthBytesPerSec = 560ull * 1024ull * 1024ull * 1024ull;  // 560 GB/s
+        outInfo->cpuCoreCount = 8;
+        outInfo->cpuClockMhz = 3800;  // 3.8 GHz Zen 2 (3.66 GHz SMT)
+    }
     return kSuccess;
 }
 

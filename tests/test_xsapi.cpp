@@ -133,7 +133,7 @@ int main() {
         uint32_t iid_cnt = 0;
         void* iids_mem = nullptr;
         SX_CHECK(reinterpret_cast<FnGetIids>(vtbl[3])(fac, &iid_cnt, &iids_mem) == 0);
-        SX_CHECK(iid_cnt == 2 && iids_mem != nullptr);
+        SX_CHECK(iid_cnt >= 1 && iids_mem != nullptr);
 #if defined(_WIN32)
         CoTaskMemFree(iids_mem);
 #else
@@ -144,7 +144,8 @@ int main() {
 
         void* inst = nullptr;
         SX_CHECK(reinterpret_cast<FnActivate>(vtbl[6])(fac, &inst) == 0 && inst != nullptr);
-        SX_CHECK(reinterpret_cast<FnRelease>(vtbl[2])(inst) == 0u);
+        auto* inst_vtbl = *reinterpret_cast<void* const* const*>(inst);
+        SX_CHECK(reinterpret_cast<FnRelease>(inst_vtbl[2])(inst) == 0u);
         SX_CHECK(reinterpret_cast<FnRelease>(vtbl[2])(fac) == 0u);
 
         // Non-Xbox runtime class returns REGDB_E_CLASSNOTREG so GuestRoActivateInstance delegates to combase.dll

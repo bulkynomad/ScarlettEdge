@@ -155,14 +155,18 @@ SCARLETTX_XG_API int32_t SCARLETTX_XG_CALL XGCreateTexture3DComputer(
     const XG_TEXTURE3D_DESC* desc,
     void** computer);
 
-// RDNA2 DCC (Delta Color Compression) 8x8 tile sector control codes.
+// RDNA2 DCC (Delta Color Compression) 8x8 tile (256B = 4x64B sector) control codes.
 typedef enum XG_DCC_KEY_CODE {
-    XG_DCC_KEY_CLEAR_0000   = 0x00,  // Fast-clear RGBA8 = (0, 0, 0, 0)
-    XG_DCC_KEY_CLEAR_0001   = 0x20,  // Fast-clear RGBA8 = (0, 0, 0, 255)
-    XG_DCC_KEY_SOLID_COLOR  = 0x40,  // Uniform arbitrary RGBA8 color (4B payload)
-    XG_DCC_KEY_CLEAR_1111   = 0x80,  // Fast-clear RGBA8 = (255, 255, 255, 255)
-    XG_DCC_KEY_DELTA_4BIT   = 0xC0,  // Base RGBA8 (4B) + 64x4x4-bit unsigned delta (128B)
-    XG_DCC_KEY_UNCOMPRESSED = 0xFF   // Raw 8x8 RGBA8 sector (256B payload)
+    XG_DCC_KEY_CLEAR_0000    = 0x00,  // Fast-clear RGBA8 = (0, 0, 0, 0)
+    XG_DCC_KEY_CLEAR_0001    = 0x20,  // Fast-clear RGBA8 = (0, 0, 0, 255)
+    XG_DCC_KEY_SOLID_COLOR   = 0x40,  // Uniform arbitrary RGBA8 color (4B / 1x64B sector)
+    XG_DCC_KEY_SECTOR_1_64B  = 0x50,  // 1x64B sector-aligned 2-bit delta (base RGBA8 + 64x4x2-bit)
+    XG_DCC_KEY_CLEAR_1110    = 0x60,  // Fast-clear RGBA8 = (255, 255, 255, 0)
+    XG_DCC_KEY_CLEAR_1111    = 0x80,  // Fast-clear RGBA8 = (255, 255, 255, 255)
+    XG_DCC_KEY_SECTOR_2_64B  = 0x90,  // 2x64B (128B) sector-aligned 3-bit delta
+    XG_DCC_KEY_DELTA_4BIT    = 0xC0,  // Base RGBA8 (4B) + 64x4x4-bit unsigned delta (128B)
+    XG_DCC_KEY_SECTOR_3_64B  = 0xE0,  // 3x64B (192B) sector-aligned 4-bit delta
+    XG_DCC_KEY_UNCOMPRESSED  = 0xFF   // Raw 8x8 RGBA8 sector (4x64B = 256B payload)
 } XG_DCC_KEY_CODE;
 
 typedef struct XG_DCC_STATS {
@@ -201,6 +205,30 @@ SCARLETTX_XG_API int32_t SCARLETTX_XG_CALL XGDecompressDccSurface(
     uint32_t width,
     uint32_t height,
     uint32_t dstRowPitch);
+
+// In-place RDNA2 64B-sector-aligned DCC codec: each 8x8 RGBA8 tile occupies its fixed
+// 256-byte (4 x 64B cache-line sector) slot in `inoutTiledSurface256B`, with `metaKeys[t]`
+// encoding fast-clear (0x00/0x20/0x60/0x80) or 1..4 active 64B sectors (0x40/0x50/0x90/0xE0/0xFF).
+SCARLETTX_XG_API int32_t SCARLETTX_XG_CALL XGCompressDccInPlace(
+    uint8_t* inoutSurfaceRgba8,
+    uint32_t width,
+    uint32_t height,
+    uint32_t rowPitch,
+    uint8_t* outMetaKeys,
+    uint32_t metaCapacity,
+    uint8_t* optionalTiledSectors256B,
+    uint64_t tiledCapacityBytes,
+    XG_DCC_STATS* outStats);
+
+SCARLETTX_XG_API int32_t SCARLETTX_XG_CALL XGDecompressDccInPlace(
+    const uint8_t* metaKeys,
+    uint32_t metaSize,
+    const uint8_t* tiledSectors256B,
+    uint64_t tiledCapacityBytes,
+    uint8_t* inoutSurfaceRgba8,
+    uint32_t width,
+    uint32_t height,
+    uint32_t rowPitch);
 
 SCARLETTX_XG_API int32_t SCARLETTX_XG_CALL XGBuildHtileMetadata(
     const float* srcDepth,

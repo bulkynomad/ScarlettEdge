@@ -26,6 +26,7 @@ struct XAUDIO2_WAVE_FORMAT {
     uint16_t BlockAlign;
 };
 
+#pragma pack(push, 1)
 struct XAUDIO2_BUFFER {
     uint32_t Flags;
     uint32_t AudioBytes;
@@ -43,6 +44,7 @@ struct XAUDIO2_VOICE_STATE {
     uint32_t BuffersQueued;
     uint64_t SamplesPlayed;
 };
+#pragma pack(pop)
 
 struct XAUDIO2_PERFORMANCE_DATA {
     uint64_t AudioCyclesSinceLastQuery;

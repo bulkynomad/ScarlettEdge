@@ -1,4 +1,5 @@
 #include "scarlettx/gpu/d3d12_backend.h"
+#include "scarlettx/core/flight_recorder.h"
 
 #include <cstring>
 #include <fstream>
@@ -46,6 +47,44 @@ Status FrameBufferRgba8::WritePpm(const std::string& file_path) const {
 #if defined(_WIN32)
 
 namespace {
+
+HMODULE GetHostSystemD3D12Module() {
+    static HMODULE mod = []() -> HMODULE {
+        wchar_t sys_dir[MAX_PATH] = {};
+        if (GetSystemDirectoryW(sys_dir, MAX_PATH) == 0) return nullptr;
+        std::wstring path = std::wstring(sys_dir) + L"\\d3d12.dll";
+        return LoadLibraryW(path.c_str());
+    }();
+    return mod;
+}
+
+HRESULT HostD3D12CreateDevice(IUnknown* adapter, D3D_FEATURE_LEVEL fl, REFIID riid, void** ppv) {
+    HMODULE m = GetHostSystemD3D12Module();
+    if (!m) return E_FAIL;
+    using Fn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    auto fn = reinterpret_cast<Fn>(GetProcAddress(m, "D3D12CreateDevice"));
+    return fn ? fn(adapter, fl, riid, ppv) : E_FAIL;
+}
+
+HRESULT HostD3D12GetDebugInterface(REFIID riid, void** ppv) {
+    HMODULE m = GetHostSystemD3D12Module();
+    if (!m) return E_FAIL;
+    using Fn = HRESULT(WINAPI*)(REFIID, void**);
+    auto fn = reinterpret_cast<Fn>(GetProcAddress(m, "D3D12GetDebugInterface"));
+    return fn ? fn(riid, ppv) : E_FAIL;
+}
+
+HRESULT HostD3D12SerializeRootSignature(
+    const D3D12_ROOT_SIGNATURE_DESC* desc,
+    D3D_ROOT_SIGNATURE_VERSION ver,
+    ID3DBlob** blob,
+    ID3DBlob** err) {
+    HMODULE m = GetHostSystemD3D12Module();
+    if (!m) return E_FAIL;
+    using Fn = HRESULT(WINAPI*)(const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+    auto fn = reinterpret_cast<Fn>(GetProcAddress(m, "D3D12SerializeRootSignature"));
+    return fn ? fn(desc, ver, blob, err) : E_FAIL;
+}
 
 template <typename T>
 void SafeRelease(T*& ptr) {
@@ -127,14 +166,25 @@ struct D3D12Backend::Impl {
         const uint64_t target = ++fence_value;
         HRESULT hr = queue->Signal(fence, target);
         if (FAILED(hr)) {
+            FlightRecorder::Instance().RecordGpuDeviceRemoved(
+                device, static_cast<int32_t>(hr), "D3D12Backend::WaitForGpu::Signal");
             return Status::Error(StatusCode::DeviceError, "ID3D12CommandQueue::Signal failed");
         }
         if (fence->GetCompletedValue() < target) {
             hr = fence->SetEventOnCompletion(target, fence_event);
             if (FAILED(hr)) {
+                FlightRecorder::Instance().RecordGpuDeviceRemoved(
+                    device, static_cast<int32_t>(hr), "D3D12Backend::WaitForGpu::SetEventOnCompletion");
                 return Status::Error(StatusCode::DeviceError, "SetEventOnCompletion failed");
             }
             WaitForSingleObject(fence_event, 15000);
+        }
+        if (device) {
+            const HRESULT rem = device->GetDeviceRemovedReason();
+            if (rem != S_OK) {
+                FlightRecorder::Instance().RecordGpuDeviceRemoved(
+                    device, static_cast<int32_t>(rem), "D3D12Backend::WaitForGpu::Removed");
+            }
         }
         return Status::Ok();
     }
@@ -158,9 +208,11 @@ void* D3D12Backend::NativeDevice5() const noexcept {
 Status D3D12Backend::Initialize(bool prefer_warp, bool enable_debug_layer) {
     Shutdown();
 
+    FlightRecorder::Instance().EnableD3D12DredIfConfigured();
+
     if (enable_debug_layer) {
         ID3D12Debug* debug_ctrl = nullptr;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug_ctrl))) && debug_ctrl) {
+        if (SUCCEEDED(HostD3D12GetDebugInterface(IID_PPV_ARGS(&debug_ctrl))) && debug_ctrl) {
             debug_ctrl->EnableDebugLayer();
             debug_ctrl->Release();
         }
@@ -174,8 +226,8 @@ Status D3D12Backend::Initialize(bool prefer_warp, bool enable_debug_layer) {
     auto try_create_device = [&](IDXGIAdapter1* candidate) -> bool {
         if (!candidate) return false;
         ID3D12Device* dev = nullptr;
-        if (SUCCEEDED(D3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev))) ||
-            SUCCEEDED(D3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
+        if (SUCCEEDED(HostD3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev))) ||
+            SUCCEEDED(HostD3D12CreateDevice(candidate, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev)))) {
             impl_->device = dev;
             impl_->adapter = candidate;
             impl_->adapter->AddRef();
@@ -353,7 +405,7 @@ Status D3D12Backend::RenderTestTriangle(uint32_t width, uint32_t height, FrameBu
     D3D12_ROOT_SIGNATURE_DESC rs_desc{};
     rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
     SafeRelease(err_blob);
-    hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &err_blob);
+    hr = HostD3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &err_blob);
     if (FAILED(hr)) {
         cleanup();
         return Status::Error(StatusCode::DeviceError, "D3D12SerializeRootSignature failed");

@@ -39,6 +39,8 @@ struct RtRay {
 struct RtHit {
     bool hit = false;
     float t = 1e30f;
+    float u = 0.0f;
+    float v = 0.0f;
     uint32_t triangle_index = 0;
     Vec3 normal{};
     Vec3 color{};

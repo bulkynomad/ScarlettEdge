@@ -153,6 +153,11 @@ int main() {
     }
     SX_CHECK(std::filesystem::exists(xvd_path));
 
+    const auto arena_save_root = bin_dir / "test_arena_saves_tmp";
+    std::error_code save_ec;
+    std::filesystem::remove_all(arena_save_root, save_ec);
+    SetEnv("SCARLETTX_SAVE_ROOT", arena_save_root.string());
+
     // 2. Boot scarlett_arena through the IN-PROCESS PE64 mapper with forced relocation.
     SetEnv("SCARLETTX_ARENA_XVD", xvd_path.string());
     SetEnv("SCARLETTX_ARENA_BUNDLE_SIZE", std::to_string(raw_bundle.size()));

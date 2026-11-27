@@ -784,6 +784,67 @@ int main() {
         CHECK(LoadVtableSlot<FnUdpPort>(net25, 0x40)(net25, &udp_port) == XGR_S_OK && udp_port == 3074u);
         CHECK(LoadVtableSlot<FnRelease>(net25, 0x10)(net25) == 0u);
 
+        // Official Microsoft GDK 2510.5.6322 InitializeApiImplEx2 + real QueryApiImpl GUIDs & vtable slots.
+        CHECK(InitializeApiImplEx2(10002, 6322, 0x2, nullptr) == XGR_S_OK);
+
+        const TestGuid kGuidSys2510 = {0x1861CF2Eu, 0xE18Bu, 0x4834u, {0xA9, 0xF5, 0xB4, 0xA4, 0xE6, 0xEF, 0xB4, 0xCF}};
+        const TestGuid kGuidAnalytics = {0xB884675Du, 0xB738u, 0x4A9Cu, {0x81, 0x5D, 0x9A, 0x9A, 0x1E, 0x0C, 0x6C, 0x9B}};
+        const TestGuid kGuidSave2510 = {0x1BFFF3AFu, 0xF14Au, 0x40A3u, {0x8E, 0x35, 0x9A, 0xDA, 0x90, 0x65, 0x93, 0xF9}};
+        const TestGuid kGuidPkg2510 = {0xE2A4734Bu, 0x2F4Au, 0x456Du, {0xAA, 0x8F, 0xD0, 0x65, 0xE0, 0x4F, 0xB2, 0x09}};
+        const TestGuid kGuidStoreReal = {0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}};
+        const TestGuid kGuidStore2510 = {0xB09D803Cu, 0x2414u, 0x4A05u, {0x82, 0xC6, 0x66, 0xDF, 0xDC, 0x9E, 0x9A, 0x44}};
+
+        // 1) XSystem 2510 ({1861CF2E}) slot 5 (+0x28): XSystemGetAppSpecificDeviceId
+        void* sys2510 = nullptr;
+        CHECK(QueryApiImpl(&kGuidE349BD1A, &kGuidSys2510, &sys2510) == XGR_S_OK && sys2510 != nullptr);
+        using FnGetSysStr = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, size_t, char*, size_t*);
+        char app_dev_id[64] = {};
+        size_t app_dev_used = 0;
+        CHECK(LoadVtableSlot<FnGetSysStr>(sys2510, 0x28)(sys2510, sizeof(app_dev_id), app_dev_id, &app_dev_used) == XGR_S_OK);
+        CHECK(app_dev_used > 0 && std::strlen(app_dev_id) > 0);
+        CHECK(LoadVtableSlot<FnRelease>(sys2510, 0x10)(sys2510) == 0u);
+
+        // 2) XSystemAnalytics ({B884675D}) slot 3 (+0x18): x64 sret XSystemAnalyticsInfo*
+        void* analytics = nullptr;
+        CHECK(QueryApiImpl(&kGuidAnalytics, &kGuidAnalytics, &analytics) == XGR_S_OK && analytics != nullptr);
+        using FnAnalyticsInfo = XSystemAnalyticsInfo* (SCARLETTX_GDK_CALLBACK*)(void*, XSystemAnalyticsInfo*);
+        XSystemAnalyticsInfo ainfo{};
+        XSystemAnalyticsInfo* aret = LoadVtableSlot<FnAnalyticsInfo>(analytics, 0x18)(analytics, &ainfo);
+        CHECK(aret == &ainfo);
+        CHECK(std::strcmp(ainfo.family, "Xbox") == 0);
+        CHECK(std::strcmp(ainfo.form, "Xbox Series X") == 0);
+        CHECK(LoadVtableSlot<FnRelease>(analytics, 0x10)(analytics) == 0u);
+
+        // 3) XGameSave 2510 ({1BFFF3AF})
+        void* gs2510 = nullptr;
+        CHECK(QueryApiImpl(&kGuid704C3F58, &kGuidSave2510, &gs2510) == XGR_S_OK && gs2510 != nullptr);
+        CHECK(LoadVtableSlot<FnRelease>(gs2510, 0x10)(gs2510) == 0u);
+
+        // 4) XPackage 2510 ({E2A4734B}): slot 39 (+0x138) XPackageEnumeratePackages, slot 40 (+0x140) Register
+        void* pkg2510 = nullptr;
+        CHECK(QueryApiImpl(&kGuidAF406016, &kGuidPkg2510, &pkg2510) == XGR_S_OK && pkg2510 != nullptr);
+        std::string found_2510_pkg;
+        CHECK(LoadVtableSlot<FnEnumerate>(pkg2510, 39 * 8)(
+                  pkg2510, 1u, 0u, &found_2510_pkg, reinterpret_cast<void*>(on_pkg)) == XGR_S_OK);
+        CHECK(!found_2510_pkg.empty());
+        uint64_t tok2510 = 0;
+        CHECK(LoadVtableSlot<FnRegister>(pkg2510, 40 * 8)(
+                  pkg2510, nullptr, nullptr, &dummy_callback, &tok2510) == XGR_S_OK && tok2510 != 0);
+        CHECK(LoadVtableSlot<FnRelease>(pkg2510, 0x10)(pkg2510) == 0u);
+
+        // 5) Real XStore 2510 ({0DD112AC} / {B09D803C}): slot 3 CreateContext, slot 28/29 QueryGameLicense, slot 4 Close
+        void* rstore = nullptr;
+        CHECK(QueryApiImpl(&kGuidStoreReal, &kGuidStore2510, &rstore) == XGR_S_OK && rstore != nullptr);
+        XStoreContextHandle rs_ctx = nullptr;
+        CHECK(LoadVtableSlot<FnStoreCreate>(rstore, 3 * 8)(rstore, nullptr, &rs_ctx) == XGR_S_OK && rs_ctx != nullptr);
+        XAsyncBlock rlic_ab{};
+        CHECK(LoadVtableSlot<FnLicAsync>(rstore, 28 * 8)(rstore, rs_ctx, &rlic_ab) == XGR_S_OK);
+        XStoreGameLicense rlic{};
+        CHECK(LoadVtableSlot<FnLicResult>(rstore, 29 * 8)(rstore, &rlic_ab, &rlic) == XGR_S_OK);
+        CHECK(rlic.isActive && !rlic.isTrial);
+        LoadVtableSlot<FnStoreClose>(rstore, 4 * 8)(rstore, rs_ctx);
+        CHECK(LoadVtableSlot<FnRelease>(rstore, 0x10)(rstore) == 0u);
+
         set_env("SCARLETTX_PACKAGE_ROOT", "");
     }
 

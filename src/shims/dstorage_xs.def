@@ -1,0 +1,27 @@
+LIBRARY dstorage_xs
+EXPORTS
+    DStorageSetConfiguration=dstorage.DStorageSetConfiguration
+    DStorageGetConfiguration=dstorage.DStorageGetConfiguration
+    DStorageGetFactory=DStorageXsGetFactoryDispatch
+    DStorageDestroyFactory=dstorage.DStorageDestroyFactory
+    DStorageOpenFile=dstorage.DStorageOpenFile
+    DStorageOpenXvdFile=dstorage.DStorageOpenXvdFile
+    DStorageCloseFile=dstorage.DStorageCloseFile
+    DStorageGetFileSize=dstorage.DStorageGetFileSize
+    DStorageCreateQueue=dstorage.DStorageCreateQueue
+    DStorageDestroyQueue=dstorage.DStorageDestroyQueue
+    DStorageEnqueueRequest=dstorage.DStorageEnqueueRequest
+    DStorageEnqueueSignal=dstorage.DStorageEnqueueSignal
+    DStorageEnqueueStatus=dstorage.DStorageEnqueueStatus
+    DStorageSubmit=dstorage.DStorageSubmit
+    DStorageWaitForIdle=dstorage.DStorageWaitForIdle
+    DStorageCancelRequestsWithTag=dstorage.DStorageCancelRequestsWithTag
+    DStorageCreateStatusArray=dstorage.DStorageCreateStatusArray
+    DStorageDestroyStatusArray=dstorage.DStorageDestroyStatusArray
+    DStorageIsStatusComplete=dstorage.DStorageIsStatusComplete
+    DStorageGetStatusHResult=dstorage.DStorageGetStatusHResult
+    DStorageRetrieveErrorRecord=dstorage.DStorageRetrieveErrorRecord
+    DStorageCompressBuffer=dstorage.DStorageCompressBuffer
+    DStorageDecompressBuffer=dstorage.DStorageDecompressBuffer
+    DStorageDecompressGpuCompute=dstorage.DStorageDecompressGpuCompute
+    DStorageEnqueueTextureRegion=dstorage.DStorageEnqueueTextureRegion

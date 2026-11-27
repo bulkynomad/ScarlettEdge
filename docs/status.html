@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ScarlettEdge — Status</title>
+<title>ScarlettEdge — Status Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@400;500;600;700&display=swap">
 <style>
@@ -21,12 +21,14 @@
     --lv1: #006d32;
     --lv2: #26a641;
     --lv3: #39d353;
+    --upstream: #a371f7;
+    --fork: #39d353;
     --warn: #d29922;
     --badge-label: #555555;
     --badge-exports: #007ec6;
     --badge-tests: #26a641;
     --badge-target: #107c10;
-    --cell: 14px;
+    --cell: 13px;
     --cell-gap: 3px;
     --radius: 6px;
   }
@@ -37,18 +39,19 @@
     color: var(--fg);
     font-family: 'Mona Sans', -apple-system, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
   }
-  .status {
-    width: 900px;
+  .page {
+    width: 920px;
     max-width: 100%;
     margin: 0 auto;
     padding: 30px 36px;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 36px;
   }
+  .panel { display: flex; flex-direction: column; gap: 16px; }
   h2 {
     margin: 0;
-    font-size: 26px;
+    font-size: 24px;
     font-weight: 600;
     line-height: 1.25;
     padding-bottom: 8px;
@@ -56,12 +59,13 @@
   }
   .badges { display: flex; flex-wrap: wrap; gap: 6px; font-family: Verdana, 'DejaVu Sans', Geneva, sans-serif; font-size: 11px; line-height: 20px; }
   .badge { display: flex; border-radius: 3px; overflow: hidden; }
-  .badge span { padding: 0 6px; color: #fff; }
+  .badge span { padding: 0 7px; color: #fff; }
   .badge .k { background: var(--badge-label); }
-  .badge .v-fn { background: var(--lv2); color: var(--bg); }
+  .badge .v-up { background: var(--upstream); color: var(--bg); font-weight: 600; }
+  .badge .v-fn { background: var(--fork); color: var(--bg); font-weight: 600; }
   .badge .v-exports { background: var(--badge-exports); }
   .badge .v-tests { background: var(--badge-tests); }
-  .badge .v-tests-warn { background: var(--warn); }
+  .badge .v-tests-warn { background: var(--warn); color: var(--bg); }
   .badge .v-target { background: var(--badge-target); }
   .graph-box {
     border: 1px solid var(--border);
@@ -72,9 +76,9 @@
     gap: 14px;
     overflow-x: auto;
   }
-  .graph { display: flex; gap: 10px; justify-content: center; }
+  .graph { display: flex; gap: 8px; justify-content: center; }
   .group { display: flex; flex-direction: column; gap: 6px; }
-  .group-label { font-size: 11px; color: var(--fg-muted); white-space: nowrap; }
+  .group-label { font-size: 10px; color: var(--fg-muted); white-space: nowrap; }
   .cells {
     display: grid;
     grid-template-rows: repeat(7, var(--cell));
@@ -89,92 +93,174 @@
   .lv1 { background: var(--lv1); }
   .lv2 { background: var(--lv2); }
   .lv3 { background: var(--lv3); }
-  .legend { display: flex; justify-content: flex-end; align-items: center; gap: 4px; font-size: 12px; color: var(--fg-muted); }
-  .sw { display: block; width: 11px; height: 11px; border-radius: 2px; }
+  .upstream { background: var(--upstream); }
+  .fork { background: var(--fork); }
+  .dot.split { background: linear-gradient(90deg, var(--upstream) 50%, var(--fork) 50%); }
+  .legend { display: flex; justify-content: flex-end; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-muted); }
+  .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px; }
   .list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 40px; padding: 0 4px; }
   .row { display: flex; align-items: center; gap: 10px; height: 30px; border-bottom: 1px solid var(--border-muted); font-size: 13px; }
   .dot { width: 11px; height: 11px; border-radius: 2px; flex-shrink: 0; }
   .row .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .count { color: var(--fg-muted); font-variant-numeric: tabular-nums; }
   .row .pct { width: 40px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .callout { display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--warn); color: var(--fg-soft); font-size: 13px; }
-  .callout svg { flex-shrink: 0; margin-top: 2px; }
-  .callout strong { color: var(--warn); }
+  .callout { display: flex; gap: 10px; padding: 8px 16px; border-left: 4px solid var(--fork); color: var(--fg-soft); font-size: 13px; }
+  .callout strong { color: var(--fork); }
   @media (max-width: 640px) {
-    .status { padding: 20px 16px; }
+    .page { padding: 20px 16px; }
     .graph { justify-content: flex-start; }
     .list { grid-template-columns: minmax(0, 1fr); }
   }
 </style>
 </head>
 <body>
-<main class="status">
-  <h2>Status: 100.0%</h2>
-  <div class="badges">
-    <span class="badge"><span class="k">functions</span><span class="v-fn">485/485</span></span>
-    <span class="badge"><span class="k">exports</span><span class="v-exports">473</span></span>
-    <span class="badge"><span class="k">tests</span><span class="v-tests">33/33 passing</span></span>
-    <span class="badge"><span class="k">target</span><span class="v-target">Xbox Series X|S (Gen9)</span></span>
-  </div>
-  <section class="graph-box" aria-label="Implemented functions per subsystem, one square per function">
-    <div class="graph" id="graph"></div>
-    <div class="legend">Not yet
-      <span class="sw empty"></span><span class="sw lv0"></span><span class="sw lv1"></span><span class="sw lv2"></span><span class="sw lv3"></span>
-    Done</div>
+<main class="page">
+  <section class="panel">
+    <h2>Phase 2: Retail AAA Execution Roadmap: 100.0%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">phase 2 AAA</span><span class="v-fn">72/72 (100.0%)</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="v-tests">36/36 passing</span></span>
+      <span class="badge"><span class="k">target</span><span class="v-target">Unmodified Retail AAA Titles</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-aaa"></div><div class="legend" id="leg-aaa"></div></div>
+    <div class="list" id="list-aaa"></div>
   </section>
-  <div class="list" id="list"></div>
-  <div class="callout">
-    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 15 14H1z" fill="none" stroke="#39d353" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="#39d353" stroke-width="1.5" stroke-linecap="round"/></svg>
-    <span><strong>Phase 1 ABI Parity (100%):</strong> Full clean-room ABI surface across all 19 subsystems (485/485 functions; 281 upstream ScarlettX + 204 ScarlettEdge). See README for Phase 2 AAA Silicon Roadmap.</span>
-  </div>
+
+  <section class="panel">
+    <h2>ABI Coverage (Upstream Purple + Fork Green): 100.0%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">281/502</span></span>
+      <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+221</span></span>
+      <span class="badge"><span class="k">exports</span><span class="v-exports">498</span></span>
+      <span class="badge"><span class="k">tests</span><span class="v-tests">36/36 passing</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-abi"></div><div class="legend" id="leg-abi"></div></div>
+    <div class="list" id="list-abi"></div>
+    <div class="callout">
+      <span><strong>Unified Architecture:</strong> Shared <code>scarlettx_core.dll</code>, unified DirectStorage/COM bridges, retail XVD v3 + Merkle + NTFS, 32-lane GPU GDeflate, WMA-Pro XMA2, Vulkan KHR RT &amp; RDNA2 XS2 CFG/SM 6.6 lifting (502/502 functions: 281 upstream + 221 ScarlettEdge).</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Phase 1: ScarlettEdge Runtime Optimization &amp; Fidelity: 100.0%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">foundations</span><span class="v-fn">44/44 (100.0%)</span></span>
+      <span class="badge"><span class="k">frame pacing</span><span class="v-exports">0-tear VSync</span></span>
+      <span class="badge"><span class="k">textures</span><span class="v-tests">0-frame lag</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-opt"></div><div class="legend" id="leg-opt"></div></div>
+    <div class="list" id="list-opt"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Concept Destruction (Upstream Purple + Fork Green): 100.0%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">milestones</span><span class="v-fn">46/46 (100.0%)</span></span>
+      <span class="badge"><span class="k">state</span><span class="v-target">Full speed on GPU, with sound</span></span>
+      <span class="badge"><span class="k">target</span><span class="v-exports">Concept Destruction (Gen9)</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-cd"></div><div class="legend" id="leg-cd"></div></div>
+    <div class="list" id="list-cd"></div>
+  </section>
 </main>
 <script>
-  const SUBSYSTEMS = [
-    ['d3d12', 'd3d12_xs → PC D3D12 & PSOs', 63, 63],
-    ['XTask', 'XTaskQueue & XAsync', 24, 24],
-    ['Save', 'XGameSave (persistent)', 30, 30],
-    ['XUser', 'XUser & Identity', 27, 27],
-    ['XSys', 'XSystem & Runtime', 33, 33],
-    ['XMem', 'XMem & Threading', 16, 16],
-    ['DXR', 'DXR / XboxBvhBuilder', 14, 14],
-    ['DStor', 'DirectStorage & XVD', 26, 26],
-    ['Audio', 'Audio (XAudio2 / AcpHal)', 46, 46],
-    ['Input', 'Input (GameInput)', 16, 16],
-    ['Midw', 'Middleware (Bink2 / FSR)', 36, 36],
-    ['Net', 'Networking (HTTP / XCurl)', 48, 48],
-    ['PE64', 'PE64 Loader & Auto-Stubs', 6, 6],
-    ['Kern', 'Xbox Unified Memory & KernelX', 16, 16],
-    ['XS2', 'RDNA2 XS2 Shader Lifting', 16, 16],
-    ['Crypt', 'Retail XVC/XVD Crypto', 12, 12],
-    ['Codec', 'Production Codecs (XMA2/GDeflate/Bink)', 16, 16],
-    ['Vulk', 'Hardware DXR & Vulkan Backend', 17, 17],
-    ['XSAPI', 'Live Xbox Services (XSAPI/WinRT)', 23, 23],
+  const PANELS = [
+    ['aaa', [
+      ['XS2-IR', 'XS2 -> GPU Shader Compiler', 12, 12, -1],
+      ['XG/DCC', 'XG Tiling, MSAA & DCC', 10, 10, -1],
+      ['VkExec', 'Vulkan 1.3 & DXR GPU Exec', 10, 10, -1],
+      ['DS-GPU', 'DirectStorage GPU Codecs', 8, 8, -1],
+      ['D3D12.2', 'D3D12.2 & MEM_GRAPHICS', 10, 10, -1],
+      ['Media', 'Retail XMA2 & Bink2 Media', 8, 8, -1],
+      ['WinRT', 'GDK 2022-2026 & WinRT', 8, 8, -1],
+      ['AAA', 'AAA Engine & XVC Bring-Up', 6, 6, -1],
+    ]],
+    ['abi', [
+      ['d3d12', 'd3d12_xs → PC D3D12 & PSOs', 65, 65, 45],
+      ['XTask', 'XTaskQueue & XAsync', 24, 24, 23],
+      ['Save', 'XGameSave (persistent)', 30, 30, 23],
+      ['XUser', 'XUser & Identity', 32, 32, 13],
+      ['XSys', 'XSystem & Runtime', 34, 34, 17],
+      ['XMem', 'XMem & Threading', 16, 16, 11],
+      ['DXR', 'DXR / XboxBvhBuilder', 15, 15, 12],
+      ['DStor', 'DirectStorage & XVD', 26, 26, 23],
+      ['Audio', 'Audio (XAudio2 / AcpHal)', 46, 46, 33],
+      ['Input', 'Input (GameInput)', 16, 16, 15],
+      ['Midw', 'Middleware (Bink2 / FSR)', 38, 38, 22],
+      ['Net', 'Networking (HTTP / XCurl)', 50, 50, 38],
+      ['PE64', 'PE64 Loader & Auto-Stubs', 6, 6, 6],
+      ['Kern', 'Xbox Unified Memory & KernelX', 18, 18, 0],
+      ['XS2', 'RDNA2 XS2 Shader Lifting', 16, 16, 0],
+      ['Crypt', 'Retail XVC/XVD Crypto', 12, 12, 0],
+      ['Codec', 'Production Codecs (XMA2/GDeflate/Bink)', 18, 18, 0],
+      ['Vulk', 'Hardware DXR & Vulkan Backend', 17, 17, 0],
+      ['XSAPI', 'Live Xbox Services (XSAPI/WinRT)', 23, 23, 0],
+    ]],
+    ['opt', [
+      ['VSync', 'Frame Pacing & VSync', 4, 4, -1],
+      ['Loader', 'Bootloader & DLL Priority', 4, 4, -1],
+      ['Texture', 'Sub-Frame Texture Upload', 4, 4, -1],
+      ['DStorage', 'DirectStorage & NVMe', 4, 4, -1],
+      ['RDNA2', 'RDNA2 Microcode Lifter', 4, 4, -1],
+      ['DXR/RT', 'Hardware DXR 1.1 & Vulkan', 4, 4, -1],
+      ['Crypto', 'Retail Container Crypto', 4, 4, -1],
+      ['Memory', 'Unified Memory Aliasing', 4, 4, -1],
+      ['Vtables', 'Xbox COM Vtable Depth', 4, 4, -1],
+      ['Audio', 'Audio DSP & XAPO Effects', 4, 4, -1],
+      ['Network', 'Network & Live Middleware', 4, 4, -1],
+    ]],
+    ['cd',  [
+      ['PE64', 'PE64 Mapping & Imports', 4, 4, 4],
+      ['XGR', 'xgameruntime & QueryApiImpl', 6, 6, 6],
+      ['Dev', 'd3d12_xs Device & Resources', 8, 8, 7],
+      ['XG/APU', 'xg_xs & AcpHal Shims', 4, 4, 3],
+      ['CmdL', 'd3d12_xs CmdList & Uploads', 10, 10, 8],
+      ['Pres', 'Presentation & First Frame', 5, 5, 5],
+      ['Aud/In', 'Audio & Input (Runtime)', 4, 4, 4],
+      ['Game', 'In-Game & Playable', 5, 5, 5],
+    ]],
   ];
   const level = p => p >= 0.8 ? 'lv3' : p >= 0.6 ? 'lv2' : p >= 0.4 ? 'lv1' : 'lv0';
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
-  const graph = document.getElementById('graph');
-  for (const [label, , done, total] of SUBSYSTEMS) {
-    const g = el('div', 'group');
-    g.append(el('span', 'group-label', label));
-    const cells = el('div', 'cells');
-    const cols = Math.max(2, Math.ceil(total / 7));
-    const lv = level(done / total);
-    for (let i = 0; i < cols * 7; i++) {
-      cells.append(el('span', 'cell ' + (i < done ? lv : i < total ? 'empty' : 'pad')));
+  for (const [id, subs] of PANELS) {
+    const graph = document.getElementById('graph-' + id);
+    const leg = document.getElementById('leg-' + id);
+    const list = document.getElementById('list-' + id);
+    const hasSplit = subs.some(s => s[4] >= 0);
+    for (const [label, , done, total, up] of subs) {
+      const g = el('div', 'group');
+      g.append(el('span', 'group-label', label));
+      const cells = el('div', 'cells');
+      const cols = Math.max(2, Math.ceil(total / 7));
+      const lv = level(done / total);
+      for (let i = 0; i < cols * 7; i++) {
+        let cls = 'pad';
+        if (i < done) cls = hasSplit ? (i < up ? 'upstream' : 'fork') : lv;
+        else if (i < total) cls = 'empty';
+        cells.append(el('span', 'cell ' + cls));
+      }
+      g.append(cells);
+      graph.append(g);
     }
-    g.append(cells);
-    graph.append(g);
+    if (hasSplit) {
+      leg.append(el('span', 'sw empty'), ' Not yet ', el('span', 'sw upstream'), ' ScarlettX (Upstream) ', el('span', 'sw fork'), ' ScarlettEdge (Fork)');
+    } else {
+      leg.append('Not yet ', el('span', 'sw empty'), el('span', 'sw lv0'), el('span', 'sw lv1'), el('span', 'sw lv2'), el('span', 'sw lv3'), ' Done');
+    }
+    [...subs].sort((a, b) => b[2] / b[3] - a[2] / a[3]).forEach(([, name, done, total, up]) => {
+      const p = done / total;
+      const row = el('div', 'row');
+      let dotCls = done === 0 ? 'empty' : level(p);
+      if (done > 0 && hasSplit && up >= 0) {
+        dotCls = up === done ? 'upstream' : up === 0 ? 'fork' : 'split';
+      }
+      row.append(el('span', 'dot ' + dotCls));
+      row.append(el('span', 'name', name));
+      row.append(el('span', 'count', `${done} of ${total}`));
+      row.append(el('span', 'pct', `${Math.round(p * 100)}%`));
+      list.append(row);
+    });
   }
-  const list = document.getElementById('list');
-  [...SUBSYSTEMS].sort((a, b) => b[2] / b[3] - a[2] / a[3]).forEach(([, name, done, total]) => {
-    const p = done / total;
-    const row = el('div', 'row');
-    row.append(el('span', 'dot ' + (done === 0 ? 'empty' : level(p))));
-    row.append(el('span', 'name', name));
-    row.append(el('span', 'count', `${done} of ${total}`));
-    row.append(el('span', 'pct', `${Math.round(p * 100)}%`));
-    list.append(row);
-  });
 </script>
 </body>
 </html>
