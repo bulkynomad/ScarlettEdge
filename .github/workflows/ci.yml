@@ -11,7 +11,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Clean-Room & IP Hygiene Gate
+        run: python tools/check_cleanroom.py --commit-range HEAD~1..HEAD
 
       - name: Setup MSVC Developer Environment
         uses: ilammy/msvc-dev-cmd@v1

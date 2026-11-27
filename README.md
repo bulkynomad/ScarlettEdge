@@ -4,7 +4,7 @@
 
 **ScarlettEdge** is an independent, open-source, clean-room high-level emulator (HLE) fork of ScarlettX for **Xbox Series X|S (Scarlett / Gen9 Game Core)** x86-64 software, designed to execute legally obtained GDK titles end-to-end by emulating the Scarlett OS, Game Core runtime, unified memory model, `d3d12_xs`, and ray-tracing (`XboxBvhBuilder` / DXR) stack.
 
-> **Legal notice:** ScarlettEdge does not include or distribute any proprietary Microsoft/Xbox binaries, cryptographic keys, firmware, or commercial game assets. Optional encrypted container support uses standard public cryptographic algorithms (FIPS-197 AES-XTS / FIPS 180-4 SHA-256) and requires keys supplied independently by the user for legally owned software. All automated tests run against synthetic x86-64 PE titles built from source in this repository.
+> **Legal & Clean-Room Notice:** ScarlettEdge does not include or distribute any proprietary Microsoft/Xbox binaries, cryptographic keys, firmware, or commercial game assets. Optional encrypted container support uses standard public cryptographic algorithms (FIPS-197 AES-XTS / FIPS 180-4 SHA-256) and requires keys supplied independently by the user for legally owned software. All automated tests run against synthetic x86-64 PE titles built from source in this repository. See [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md), [CONTRIBUTING.md](CONTRIBUTING.md), and [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 
 ## Origin & Credits
 
@@ -16,13 +16,32 @@
 <!-- SCARLETTX_STATUS_START -->
 ## Status
 
+### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — 20/30)
+
+Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder analysis, multi-sample GDK 2510 ATG validation, Wave 1 commercial retail bring-up, and the [Compatibility Matrix](docs/COMPATIBILITY.md):
+
+![ScarlettEdge Phase 4: Clean-Room Governance & Retail Bring-Up](docs/status_phase4.svg)
+
+**Phase 4 Progress:** `66.7%` (20 of 30 milestones) · **Tests:** `37/37` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
+
+| Phase 4 Track | Category | Progress | Readiness | Details |
+| :--- | :--- | :---: | :---: | :--- |
+| **4A. Clean-Room Governance & CI Guard** | `Governance` | `5 of 5` | `100%` | **Complete (5/5):** CLEANROOM_POLICY.md, CONTRIBUTING.md, tools/check_cleanroom.py file/ext/size/commit gate in GitHub Actions CI, Node 24-compatible checkout@v5 |
+| **4B. Flight-Recorder Triage CLI** | `Diagnostics` | `5 of 5` | `100%` | **Complete (5/5):** scarlettx triage <dir> [--emit-stubs] [--json] (src/core/flight_triage.cpp), null-vtable/crash/hang/DRED verdicts, hit-ranked gaps, stub skeleton emitter, test_triage_cli |
+| **4C. Multi-Sample GDK 2510 ATG** | `Platform` | `5 of 5` | `100%` | **Complete (5/5):** Verified live on RTX 5070 Ti (--debug-layer, 0 errors, triage CLEAN_RUN): DirectStorage, XGameSave round-trip + XGameSaveFiles + PLS, GameInput, XAudio2 PCM, SM 6.6 ResourceDescriptorHeap + 30/30 ExecuteIndirect GPU frames |
+| **4D. Retail Wave 1 Bring-Up** | `Retail` | `0 of 5` | `0%` | **Queued (0/5):** Flight-recorder bring-up of user-supplied legal dumps (Concept Destruction, Unicorn Overlord) through inspect, boot, menus/audio/input, gameplay, and save round-trip |
+| **4E. Commercial Engine Hardening** | `Graphics` | `0 of 5` | `0%` | **Queued (0/5):** Versioned shader disk cache, multi-region .msixvc/.cik streaming, heap/alias churn telemetry, optional Media Foundation H.264/HEVC, p95/p99 stutter profiler |
+| **4F. Compatibility Matrix & Dashboard** | `Docs` | `5 of 5` | `100%` | **Complete (5/5):** docs/COMPATIBILITY.md tiered compatibility ledger, docs/status_phase4.svg, Phase 4 ROADMAP.md & generate_status.py live progress dashboard |
+
+---
+
 ### Phase 3: Unification, Retail Parity, Diagnostics & GDK 2510 (Completed — 30/30)
 
 Tracks the shared `scarlettx_core.dll` unification, 4-Part Flight-Recorder Diagnostic Suite, retail `.msixvc` + `.cik` key-ring & NTFS `$MFT` parity, and official Microsoft GDK `2510.5.6322` + ATG Gen9 DXR/MeshShader RTX validation (`30/30` completed):
 
 ![ScarlettEdge Phase 3: Unification, Diagnostics & GDK 2510](docs/status_phase3.svg)
 
-**Phase 3 Milestones:** `100.0%` (30 of 30 milestones) · **Tests:** `36/36` passing · **Next Wave:** `Per-Title Commercial Retail Title Bring-Up`
+**Phase 3 Milestones:** `100.0%` (30 of 30 milestones) · **Tests:** `37/37` passing · **Next Wave:** `Per-Title Commercial Retail Title Bring-Up`
 
 | Phase 3 Track | Category | Progress | Readiness | Verified Capabilities |
 | :--- | :--- | :---: | :---: | :--- |
@@ -62,7 +81,7 @@ Tracks the runtime fidelity, cryptography, memory aliasing, and tooling foundati
 
 ![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
 
-**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `498` · **Tests:** `36/36` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `498` · **Tests:** `37/37` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 ---
 
@@ -79,7 +98,7 @@ In the two charts below, **purple (`#a371f7`)** credits original work from **[Fr
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `56.0%` + `221` ScarlettEdge fork `+44.0%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `498` (`269` upstream + `229` fork) · **Tests:** `36/36` passing
+**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `56.0%` + `221` ScarlettEdge fork `+44.0%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `498` (`269` upstream + `229` fork) · **Tests:** `37/37` passing
 
 | Subsystem | Category | Progress | Origin Split | Details |
 | :--- | :--- | :---: | :---: | :--- |
@@ -168,7 +187,7 @@ Testing against an unencrypted commercial Xbox Series X|S (`Scarlett`) Unity IL2
 - **Bootloader & Middleware Precedence:** `scarlettx boot` defaults to in-process execution (`PeMapper`). Xbox OS/hardware shims (`xgameruntime`, `d3d12_xs`, `xg_xs`, `xcrdapi`, `kernelx`, `xaudio2_9`, `GameInput`, `AcpHal`, `pixevt_stub`) always load from ScarlettEdge's shim directory, whereas title-shipped middleware DLLs (`Bink2Scarlett`, `amd_fidelityfx_*`, `XCurl`, `libHttpClient.GDK`) load from the game package first when present and fall back to HLE shims only when absent.
 - **Subsystem Coverage & Honest Limitations:** All 19 tracked subsystems, Concept Destruction bring-up (`46/46` milestones), Phase 1 Fork Foundations (`44/44`), Phase 2 Retail AAA Execution Architecture (`72/72`), and Phase 3 Architectural Unification, Diagnostics & GDK `2510` Verification (`30/30`) are unified through a single shared `scarlettx_core.dll` runtime — including retail `msft-xvd` v3 / `makepkg` `.msixvc` + Merkle hash tree + read-only NTFS + 48-byte `.cik` mounting, 32-lane bit-interleaved HLSL `cs_5_0` GPU compute `GDeflate`, 512-sample WMA-Pro `XMA2` audio, `VK_KHR_ray_tracing_pipeline` + live Hardware DXR 1.1 & SM 6.5 Mesh Shaders on RTX 5070 Ti, RDNA2 `ADDR2` / `DCC` / `HTILE` surfaces, structured RDNA2 `XS2` CFG + SM 6.6 bindless / `dxil.dll`-signed shader lifting, and the 4-Part Flight-Recorder Diagnostic Suite (`--flight-recorder`, `--hang-timeout`). Passing synthetic, vertical-slice, and official GDK sample suites does not imply drop-in compatibility with untested commercial retail games, which require per-title validation with legally owned game dumps.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/ROADMAP.md](docs/ROADMAP.md) for detailed design notes.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/ROADMAP.md](docs/ROADMAP.md), [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md), and [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md) for detailed design, compatibility, and clean-room governance notes.
 
 ## Building & Running Tests
 
@@ -181,7 +200,8 @@ Requirements on Windows (x86-64):
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --parallel 8 --output-on-failure
+python tools/check_cleanroom.py
 ```
 
 ## Running the Synthetic Scarlett Test Games
@@ -205,7 +225,8 @@ ctest --test-dir build --output-on-failure
 ```bash
 # From the directory that holds scarlettx.exe and the shim DLLs
 scarlettx compat "<extracted package or .xvc/.msixvc>" [--volume-key key.cik]
-scarlettx boot "<extracted package>\Mount" --windowed --gpu --stats --flight-recorder
+scarlettx boot "<extracted package>\Mount" --windowed --gpu --stats --flight-recorder flight_logs --hang-timeout 15
+scarlettx triage flight_logs [--emit-stubs] [--json]
 ```
 
 - `scarlettx boot` runs in-process on the hardware GPU by default (`--separate-process` runs as a child process; `--warp` selects the software rasterizer; `--windowed` opens the `PresentX` swapchain window while `--headless` suppresses window creation; `--lockhart` emulates Xbox Series S memory/CU limits; `--flight-recorder [dir]` and `--hang-timeout <sec>` enable the 4-Part Flight-Recorder Diagnostic Suite writing `flight_summary.json`, `.pdata` crash dumps, D3D12 DRED reports, and failing shader artifacts). `--stats` prints fps and D3D12 call counts once per second, `--fcap N` holds N frames per second instead of the title's own rate (for example `--fcap 144`; `--fcap 0` removes the cap), and `--trace` logs the shim calls.

@@ -6,6 +6,7 @@
 #include <string>
 
 #include "scarlettx/core/flight_recorder.h"
+#include "scarlettx/core/flight_triage.h"
 #include "scarlettx/gpu/d3d12_backend.h"
 #include "scarlettx/gpu/rt_bvh.h"
 #include "scarlettx/loader/xvd_container.h"
@@ -25,7 +26,8 @@ void PrintUsage() {
               << "  scarlettx inspect <package_dir_or_xvc> [--volume-key hex|file]\n"
               << "  scarlettx compat <package_dir_or_xvc> [--volume-key hex|file] [--lockhart|--series-s]\n"
               << "  scarlettx boot <package_dir_or_xvc> [--headless|--windowed] [--in-process|--separate-process] [--gpu|--warp] [--lockhart|--series-s] [--debug-layer] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--volume-key hex|file] [--rt-dump path.ppm] [--raster-dump path.ppm] [--flight-recorder [dir]] [--hang-timeout sec]\n"
-              << "  scarlettx diag [--flight-recorder [dir]]\n";
+              << "  scarlettx diag [--flight-recorder [dir]]\n"
+              << "  scarlettx triage <flight_dir> [--emit-stubs] [--json]\n";
 }
 
 std::string ResolveVolumeKeyWithEnv(const std::string& cli_key) {
@@ -69,6 +71,36 @@ int main(int argc, char** argv) {
     }
 
     const std::string cmd = argv[1];
+    if (cmd == "triage" && argc >= 3) {
+        const std::string dir = argv[2];
+        bool emit_stubs = false;
+        bool as_json = false;
+        for (int i = 3; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (arg == "--emit-stubs") {
+                emit_stubs = true;
+            } else if (arg == "--json") {
+                as_json = true;
+            } else {
+                std::cerr << "[triage] Unknown option: " << arg << "\n";
+                PrintUsage();
+                return 1;
+            }
+        }
+        scarlettx::FlightTriageReport report;
+        const auto st = scarlettx::TriageFlightDirectory(dir, report);
+        if (!st.ok()) {
+            std::cerr << "[triage] Error: " << st.message << "\n";
+            return 1;
+        }
+        if (as_json) {
+            std::cout << scarlettx::FormatFlightTriageJson(report);
+        } else {
+            std::cout << scarlettx::FormatFlightTriageText(report, emit_stubs);
+        }
+        return 0;
+    }
+
     if (cmd == "diag") {
         bool diag_flight = false;
         std::string diag_flight_dir;

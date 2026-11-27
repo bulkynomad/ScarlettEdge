@@ -49,3 +49,16 @@ This document tracks the technical progression of **ScarlettEdge** from clean-ro
 | **5. 4-Part Flight-Recorder Suite (`5/5` — Complete)** | Lock-free 4096-slot cross-DLL event ring + deduplicated import/QI/vtable/VFS miss tables, VEH/SEH `.pdata` stack-walk crash dumper with Ghidra `0x140000000+RVA` guest address resolution, D3D12 DRED auto-breadcrumb/page-fault + failing Xbox shader/PSO binary dumper, and zero-lock `SuspendThread` hang/deadlock watchdog + `flight_summary.json`/`.txt` telemetry | Live telemetry aggregation across commercial title bring-up |
 | **6. Official GDK `2510.5.6322` & Gen9 Silicon (`5/5` — Complete)** | Hardware-verified on **NVIDIA GeForce RTX 5070 Ti** (`--debug-layer`, 0 errors) against official `Microsoft.GDK.PC` `2510.5.6322` (`InitializeApiImplEx2`, `XSystem` `{1861CF2E}`, `XSystemAnalytics` `{B884675D}` `sret`, `XGameSave` `{1BFFF3AF}` + `XGameSaveFiles`, `XPackage` `{E2A4734B}` Intelligent Delivery slots `3..19` & `39`, `XStore` `{0DD112AC}`/`{B09D803C}` 68-slot table, `XDisplay` `{03F0FE74}`/`{1B339674}`, `XPersistentLocalStorage` `{F4FAF4D4}`/`{41A4E10C}`, `XNetworking` `{37E56907}`, `D3D12_HEAP_FLAG_ALLOW_DISPLAY` stripping) + live hybrid Hardware DXR 1.1 & SM 6.5 Mesh Shaders via `PresentX` | Commercial Gen9 title validation with user-supplied dumps |
 
+---
+
+## Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (`In Progress`)
+
+| Track | Scope | Status |
+| :--- | :--- | :--- |
+| **4A. Clean-Room Governance & CI Guardrails (`5/5`)** | [CLEANROOM_POLICY.md](../CLEANROOM_POLICY.md), [CONTRIBUTING.md](../CONTRIBUTING.md), automated `tools/check_cleanroom.py` file/extension/size/commit-message gate in GitHub Actions CI, and Node 24-compatible `actions/checkout@v5` | **Complete** |
+| **4B. Flight-Recorder Triage CLI (`5/5`)** | `scarlettx triage <flight_dir> [--emit-stubs] [--json]` (`src/core/flight_triage.cpp`), crash/hang/DRED/null-vtable verdict classifier, hit-ranked gap tables, clean-room C++ stub skeleton emitter, and `test_triage_cli` CTest | **Complete** |
+| **4C. Multi-Sample GDK 2510 ATG Validation (`5/5`)** | Verified live on **NVIDIA GeForce RTX 5070 Ti** (`--debug-layer`, `0` errors, `scarlettx triage` `CLEAN_RUN`): DirectStorage (`dstorage_xs`), `XGameSave` write/read round-trip + `XGameSaveFiles` + `XPersistentLocalStorage`, `GameInput`, `XAudio2` 48 kHz PCM voice, and D3D12.2 SM 6.6 `ResourceDescriptorHeap[]` + 30/30 `ExecuteIndirect` GPU frames | **Complete** |
+| **4D. Commercial Retail Bring-Up — Wave 1 (`0/5`)** | Flight-recorder-driven validation of user-supplied legal dumps (**Concept Destruction**, **Unicorn Overlord**) through inspect, boot, menus/audio/input, gameplay, and persistent save round-trip | **Queued** |
+| **4E. Commercial Engine Hardening (`0/5`)** | Versioned shader disk cache, multi-region `.msixvc`/`.cik` streaming, `D3D12_HEAP_FLAG_*` & alias churn telemetry, optional Media Foundation H.264/HEVC path, and `p95`/`p99` stutter profiler in `flight_summary.json` | **Queued** |
+| **4F. Compatibility Matrix & Phase 4 Dashboard (`5/5`)** | [docs/COMPATIBILITY.md](COMPATIBILITY.md) tiered compatibility ledger, `docs/status_phase4.svg`, and Phase 4 tracking in `tools/generate_status.py` and `README.md` | **Complete** |
+

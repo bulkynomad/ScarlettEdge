@@ -28,6 +28,7 @@ endif()
 # Core emulator shared library (single process-wide singleton state across scarlettx.exe and all 22 shim DLLs)
 add_library(scarlettx_core SHARED
     src/core/flight_recorder.cpp
+    src/core/flight_triage.cpp
     src/core/status.cpp
     src/loader/game_config.cpp
     src/loader/pe_loader.cpp
@@ -569,3 +570,5 @@ target_link_libraries(test_flight_recorder PRIVATE
     xcrdapi
 )
 add_dependencies(test_flight_recorder scarlettx hello_scarlett)
+
+scarlettx_add_test(test_triage_cli tests/test_triage_cli.cpp)

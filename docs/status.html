@@ -116,11 +116,23 @@
 <body>
 <main class="page">
   <section class="panel">
+    <h2>Phase 4: Clean-Room Governance &amp; Commercial Retail Bring-Up: 66.7%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">phase 4</span><span class="v-fn">20/30 (66.7%)</span></span>
+      <span class="badge"><span class="k">clean-room CI</span><span class="v-exports">Automated Gate</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="v-tests">37/37 passing</span></span>
+      <span class="badge"><span class="k">focus</span><span class="v-target">ATG &amp; Retail Wave 1</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-p4"></div><div class="legend" id="leg-p4"></div></div>
+    <div class="list" id="list-p4"></div>
+  </section>
+
+  <section class="panel">
     <h2>Phase 3: Unification, Retail Parity, Diagnostics &amp; GDK 2510: 100.0%</h2>
     <div class="badges">
       <span class="badge"><span class="k">phase 3</span><span class="v-fn">30/30 (100.0%)</span></span>
       <span class="badge"><span class="k">GDK silicon</span><span class="v-exports">2510.5.6322 + DXR/MeshShader</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="v-tests">36/36 passing</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="v-tests">37/37 passing</span></span>
       <span class="badge"><span class="k">next wave</span><span class="v-target">Commercial Retail Bring-Up</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-p3"></div><div class="legend" id="leg-p3"></div></div>
@@ -131,7 +143,7 @@
     <h2>Phase 2: Retail AAA Execution Roadmap: 100.0%</h2>
     <div class="badges">
       <span class="badge"><span class="k">phase 2 AAA</span><span class="v-fn">72/72 (100.0%)</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="v-tests">36/36 passing</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="v-tests">37/37 passing</span></span>
       <span class="badge"><span class="k">target</span><span class="v-target">Unmodified Retail AAA Titles</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-aaa"></div><div class="legend" id="leg-aaa"></div></div>
@@ -144,7 +156,7 @@
       <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">281/502</span></span>
       <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+221</span></span>
       <span class="badge"><span class="k">exports</span><span class="v-exports">498</span></span>
-      <span class="badge"><span class="k">tests</span><span class="v-tests">36/36 passing</span></span>
+      <span class="badge"><span class="k">tests</span><span class="v-tests">37/37 passing</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-abi"></div><div class="legend" id="leg-abi"></div></div>
     <div class="list" id="list-abi"></div>
@@ -177,6 +189,14 @@
 </main>
 <script>
   const PANELS = [
+    ['p4',  [
+      ['CleanRoom', '4A. Clean-Room Governance & CI Guard', 5, 5, -1],
+      ['TriageCLI', '4B. Flight-Recorder Triage CLI', 5, 5, -1],
+      ['GDK-ATG', '4C. Multi-Sample GDK 2510 ATG', 5, 5, -1],
+      ['RetailW1', '4D. Retail Wave 1 Bring-Up', 0, 5, -1],
+      ['EngineHard', '4E. Commercial Engine Hardening', 0, 5, -1],
+      ['CompatDoc', '4F. Compatibility Matrix & Dashboard', 5, 5, -1],
+    ]],
     ['p3',  [
       ['Core', 'Shared Core & Loader Unification', 5, 5, -1],
       ['COM', 'Guest COM Bridge (Real-Title Mode)', 5, 5, -1],

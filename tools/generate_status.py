@@ -770,6 +770,60 @@ def collect_phase3_metrics() -> list[Subsystem]:
     ]
 
 
+def collect_phase4_metrics() -> list[Subsystem]:
+    """Return Phase 4 (Clean-Room Governance & Commercial Retail Bring-Up) progress."""
+    return [
+        Subsystem(
+            name="4A. Clean-Room Governance & CI Guard",
+            short_name="CleanRoom",
+            category="Governance",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** CLEANROOM_POLICY.md, CONTRIBUTING.md, tools/check_cleanroom.py file/ext/size/commit gate in GitHub Actions CI, Node 24-compatible checkout@v5",
+        ),
+        Subsystem(
+            name="4B. Flight-Recorder Triage CLI",
+            short_name="TriageCLI",
+            category="Diagnostics",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** scarlettx triage <dir> [--emit-stubs] [--json] (src/core/flight_triage.cpp), null-vtable/crash/hang/DRED verdicts, hit-ranked gaps, stub skeleton emitter, test_triage_cli",
+        ),
+        Subsystem(
+            name="4C. Multi-Sample GDK 2510 ATG",
+            short_name="GDK-ATG",
+            category="Platform",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** Verified live on RTX 5070 Ti (--debug-layer, 0 errors, triage CLEAN_RUN): DirectStorage, XGameSave round-trip + XGameSaveFiles + PLS, GameInput, XAudio2 PCM, SM 6.6 ResourceDescriptorHeap + 30/30 ExecuteIndirect GPU frames",
+        ),
+        Subsystem(
+            name="4D. Retail Wave 1 Bring-Up",
+            short_name="RetailW1",
+            category="Retail",
+            implemented=0,
+            target=5,
+            notes="**Queued (0/5):** Flight-recorder bring-up of user-supplied legal dumps (Concept Destruction, Unicorn Overlord) through inspect, boot, menus/audio/input, gameplay, and save round-trip",
+        ),
+        Subsystem(
+            name="4E. Commercial Engine Hardening",
+            short_name="EngineHard",
+            category="Graphics",
+            implemented=0,
+            target=5,
+            notes="**Queued (0/5):** Versioned shader disk cache, multi-region .msixvc/.cik streaming, heap/alias churn telemetry, optional Media Foundation H.264/HEVC, p95/p99 stutter profiler",
+        ),
+        Subsystem(
+            name="4F. Compatibility Matrix & Dashboard",
+            short_name="CompatDoc",
+            category="Docs",
+            implemented=5,
+            target=5,
+            notes="**Complete (5/5):** docs/COMPATIBILITY.md tiered compatibility ledger, docs/status_phase4.svg, Phase 4 ROADMAP.md & generate_status.py live progress dashboard",
+        ),
+    ]
+
+
 def _badge_width(text: str) -> int:
     # Approximate Verdana 11px width + 12px horizontal padding
     return max(26, int(round(len(text) * 6.4)) + 14)
@@ -1064,17 +1118,23 @@ def render_html(
     opt_subsystems: list[Subsystem] | None = None,
     aaa_subsystems: list[Subsystem] | None = None,
     phase3_subsystems: list[Subsystem] | None = None,
+    phase4_subsystems: list[Subsystem] | None = None,
 ) -> str:
     cd_subs = cd_subsystems or []
     opt_subs = opt_subsystems or []
     aaa_subs = aaa_subsystems or []
     p3_subs = phase3_subsystems or []
+    p4_subs = phase4_subsystems or []
 
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
     overall_pct = (total_impl / total_target * 100.0) if total_target else 0.0
     up_impl = sum(min(s.implemented, s.upstream_implemented or 0) for s in subsystems)
     fork_impl = total_impl - up_impl
+
+    p4_impl = sum(s.implemented for s in p4_subs)
+    p4_target = sum(s.target for s in p4_subs)
+    p4_pct = (p4_impl / p4_target * 100.0) if p4_target else 0.0
 
     p3_impl = sum(s.implemented for s in p3_subs)
     p3_target = sum(s.target for s in p3_subs)
@@ -1092,6 +1152,7 @@ def render_html(
     cd_target = sum(s.target for s in cd_subs)
     cd_pct = (cd_impl / cd_target * 100.0) if cd_target else 0.0
 
+    js_p4 = _serialize_js_subsystems(p4_subs)
     js_p3 = _serialize_js_subsystems(p3_subs)
     js_abi = _serialize_js_subsystems(subsystems)
     js_aaa = _serialize_js_subsystems(aaa_subs)
@@ -1216,6 +1277,18 @@ def render_html(
 <body>
 <main class="page">
   <section class="panel">
+    <h2>Phase 4: Clean-Room Governance &amp; Commercial Retail Bring-Up: {p4_pct:.1f}%</h2>
+    <div class="badges">
+      <span class="badge"><span class="k">phase 4</span><span class="v-fn">{p4_impl}/{p4_target} ({p4_pct:.1f}%)</span></span>
+      <span class="badge"><span class="k">clean-room CI</span><span class="v-exports">Automated Gate</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="{'v-tests' if tests_ok else 'v-tests-warn'}">{tests_text}</span></span>
+      <span class="badge"><span class="k">focus</span><span class="v-target">ATG &amp; Retail Wave 1</span></span>
+    </div>
+    <div class="graph-box"><div class="graph" id="graph-p4"></div><div class="legend" id="leg-p4"></div></div>
+    <div class="list" id="list-p4"></div>
+  </section>
+
+  <section class="panel">
     <h2>Phase 3: Unification, Retail Parity, Diagnostics &amp; GDK 2510: {p3_pct:.1f}%</h2>
     <div class="badges">
       <span class="badge"><span class="k">phase 3</span><span class="v-fn">{p3_impl}/{p3_target} ({p3_pct:.1f}%)</span></span>
@@ -1277,6 +1350,7 @@ def render_html(
 </main>
 <script>
   const PANELS = [
+    ['p4',  [\n{js_p4}\n    ]],
     ['p3',  [\n{js_p3}\n    ]],
     ['aaa', [\n{js_aaa}\n    ]],
     ['abi', [\n{js_abi}\n    ]],
@@ -1338,6 +1412,7 @@ def render_markdown_status(
     opt_subsystems: list[Subsystem] | None = None,
     aaa_subsystems: list[Subsystem] | None = None,
     phase3_subsystems: list[Subsystem] | None = None,
+    phase4_subsystems: list[Subsystem] | None = None,
 ) -> str:
     total_impl = sum(s.implemented for s in subsystems)
     total_target = sum(s.target for s in subsystems)
@@ -1359,10 +1434,37 @@ def render_markdown_status(
     p3_target = sum(s.target for s in phase3_subsystems) if phase3_subsystems else 0
     p3_pct = (p3_impl / p3_target * 100.0) if p3_target else 0.0
 
+    p4_impl = sum(s.implemented for s in phase4_subsystems) if phase4_subsystems else 0
+    p4_target = sum(s.target for s in phase4_subsystems) if phase4_subsystems else 0
+    p4_pct = (p4_impl / p4_target * 100.0) if p4_target else 0.0
+
     sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
     rows = [
         "<!-- SCARLETTX_STATUS_START -->",
         "## Status",
+        "",
+        f"### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — {p4_impl}/{p4_target})",
+        "",
+        "Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder analysis, multi-sample GDK 2510 ATG validation, Wave 1 commercial retail bring-up, and the [Compatibility Matrix](docs/COMPATIBILITY.md):",
+        "",
+        "![ScarlettEdge Phase 4: Clean-Room Governance & Retail Bring-Up](docs/status_phase4.svg)",
+        "",
+        f"**Phase 4 Progress:** `{p4_pct:.1f}%` ({p4_impl} of {p4_target} milestones) · "
+        f"**Tests:** {tests_md} · "
+        "**Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)",
+        "",
+        "| Phase 4 Track | Category | Progress | Readiness | Details |",
+        "| :--- | :--- | :---: | :---: | :--- |",
+    ]
+    if phase4_subsystems:
+        for s in phase4_subsystems:
+            rows.append(
+                f"| **{s.name}** | `{s.category}` | `{s.implemented} of {s.target}` | `{round(s.pct)}%` | {s.notes} |"
+            )
+
+    rows += [
+        "",
+        "---",
         "",
         f"### Phase 3: Unification, Retail Parity, Diagnostics & GDK 2510 (Completed — {p3_impl}/{p3_target})",
         "",
@@ -1603,6 +1705,25 @@ def main() -> None:
         callout_line2="Ready for per-title commercial retail testing with live flight-recorder telemetry, VEH crash dumps & hang watchdog.",
     )
 
+    p4_subsystems = collect_phase4_metrics()
+    p4_impl = sum(s.implemented for s in p4_subsystems)
+    p4_target = sum(s.target for s in p4_subsystems)
+    p4_pct = (p4_impl / p4_target * 100.0) if p4_target else 0.0
+    p4_badges = [
+        ("phase 4", f"{p4_pct:.1f}% ({p4_impl}/{p4_target})", LV3 if p4_pct >= 80.0 else LV1, p4_pct >= 80.0),
+        ("clean-room CI", "Automated Gate", BADGE_EXPORTS, False),
+        ("CI tests", tests_text, BADGE_TESTS if tests_ok else WARN, not tests_ok),
+        ("focus", "ATG & Retail Wave 1", BADGE_TARGET, False),
+    ]
+    p4_svg = render_svg(
+        p4_subsystems,
+        badges=p4_badges,
+        heading_prefix="Phase 4: Clean-Room Governance & Retail Bring-Up",
+        callout_lead="Phase 4 active:",
+        callout_line1=f"{p4_impl}/{p4_target} ({p4_pct:.1f}%) complete: Clean-room CI gate, scarlettx triage CLI & COMPATIBILITY.md are live.",
+        callout_line2="Next: Multi-sample GDK 2510 ATG validation on RTX 5070 Ti & Wave 1 commercial retail bring-up.",
+    )
+
     html_doc = render_html(
         subsystems,
         total_exports,
@@ -1612,6 +1733,7 @@ def main() -> None:
         opt_subsystems=opt_subsystems,
         aaa_subsystems=aaa_subsystems,
         phase3_subsystems=p3_subsystems,
+        phase4_subsystems=p4_subsystems,
     )
 
     out_svg = ROOT / "docs/status.svg"
@@ -1619,6 +1741,7 @@ def main() -> None:
     out_opt_svg = ROOT / "docs/status_optimizations.svg"
     out_aaa_svg = ROOT / "docs/status_aaa_roadmap.svg"
     out_p3_svg = ROOT / "docs/status_phase3.svg"
+    out_p4_svg = ROOT / "docs/status_phase4.svg"
     out_html = ROOT / "docs/status.html"
     out_svg.parent.mkdir(parents=True, exist_ok=True)
     out_svg.write_text(svg, encoding="utf-8")
@@ -1626,6 +1749,7 @@ def main() -> None:
     out_opt_svg.write_text(opt_svg, encoding="utf-8")
     out_aaa_svg.write_text(aaa_svg, encoding="utf-8")
     out_p3_svg.write_text(p3_svg, encoding="utf-8")
+    out_p4_svg.write_text(p4_svg, encoding="utf-8")
     out_html.write_text(html_doc, encoding="utf-8")
 
     md_block = render_markdown_status(
@@ -1636,6 +1760,7 @@ def main() -> None:
         opt_subsystems=opt_subsystems,
         aaa_subsystems=aaa_subsystems,
         phase3_subsystems=p3_subsystems,
+        phase4_subsystems=p4_subsystems,
     )
     readme_path = ROOT / "README.md"
     readme = readme_path.read_text(encoding="utf-8")
