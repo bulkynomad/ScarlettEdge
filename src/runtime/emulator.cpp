@@ -403,9 +403,9 @@ Status Emulator::BootPackage(const std::string& package_input) {
         return st;
     }
 
-    if (!report.config.IsNativeScarlett()) {
+    if (!report.config.IsNativeScarlett() && !config_.allow_pc_gdk) {
         return Status::Error(StatusCode::UnsupportedFormat,
-                             "Package is not a native XboxGen9/Scarlett Game Core target");
+                             "Package is not a native XboxGen9/Scarlett Game Core target (pass --allow-pc-gdk for PC GDK testing)");
     }
 
 #if defined(_WIN32)

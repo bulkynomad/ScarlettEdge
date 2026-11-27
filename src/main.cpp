@@ -31,7 +31,7 @@ void PrintUsage() {
               << "Usage:\n"
               << "  scarlettx inspect <package_dir_or_xvc> [--volume-key hex|file] [--keyring dir]\n"
               << "  scarlettx compat <package_dir_or_xvc> [--volume-key hex|file] [--keyring dir] [--lockhart|--series-s]\n"
-              << "  scarlettx boot <package_dir_or_xvc> [--headless|--windowed] [--in-process|--separate-process] [--gpu|--warp] [--lockhart|--series-s] [--debug-layer] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--volume-key hex|file] [--keyring dir] [--rt-dump path.ppm] [--raster-dump path.ppm] [--flight-recorder [dir]] [--hang-timeout sec]\n"
+              << "  scarlettx boot <package_dir_or_xvc> [--headless|--windowed] [--in-process|--separate-process] [--gpu|--warp] [--lockhart|--series-s] [--debug-layer] [--trace] [--stats] [--fcap N] [--force-relocate] [--allow-pc-gdk] [--frames N] [--volume-key hex|file] [--keyring dir] [--rt-dump path.ppm] [--raster-dump path.ppm] [--flight-recorder [dir]] [--hang-timeout sec]\n"
               << "  scarlettx diag [--full] [--json] [--flight-recorder [dir]]\n"
               << "  scarlettx triage <flight_dir> [--emit-stubs] [--json]\n";
 }
@@ -540,6 +540,8 @@ int main(int argc, char** argv) {
                 }
             } else if (arg == "--force-relocate") {
                 cfg.force_relocate = true;
+            } else if (arg == "--allow-pc-gdk") {
+                cfg.allow_pc_gdk = true;
             } else if (arg == "--frames" && i + 1 < argc) {
                 const char* val_str = argv[++i];
                 if (val_str[0] == '-') {

@@ -946,7 +946,8 @@ HMODULE TryLoadPackageOrFallbackMiddlewareA(const char* name, DWORD dwFlags = 0)
     if (vr == GuestPathResult::Resolved && std::filesystem::exists(vfs_resolved, ec)) {
         const std::wstring wide = Utf8ToWide(vfs_resolved);
         if (!wide.empty()) {
-            if (HMODULE mod = LoadLibraryExW(wide.c_str(), nullptr, dwFlags)) {
+            const DWORD eff_flags = dwFlags ? dwFlags : LOAD_WITH_ALTERED_SEARCH_PATH;
+            if (HMODULE mod = LoadLibraryExW(wide.c_str(), nullptr, eff_flags)) {
                 return AdoptHostModule(mod);
             }
         }
@@ -968,7 +969,8 @@ HMODULE TryLoadPackageOrFallbackMiddlewareA(const char* name, DWORD dwFlags = 0)
             const auto pkg_candidate = std::filesystem::path(pkg_dir) / rel;
             if (std::filesystem::exists(pkg_candidate, ec)) {
                 const std::wstring wide = pkg_candidate.wstring();
-                if (HMODULE mod = LoadLibraryExW(wide.c_str(), nullptr, dwFlags)) {
+                const DWORD eff_flags = dwFlags ? dwFlags : LOAD_WITH_ALTERED_SEARCH_PATH;
+                if (HMODULE mod = LoadLibraryExW(wide.c_str(), nullptr, eff_flags)) {
                     return AdoptHostModule(mod);
                 }
             }
@@ -2506,7 +2508,7 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
             for (const std::string& fname : {guest_dll, target_dll}) {
                 const auto pkg_candidate = pkg_dir / fname;
                 if (std::filesystem::exists(pkg_candidate, ec)) {
-                    mod = LoadLibraryW(pkg_candidate.wstring().c_str());
+                    mod = LoadLibraryExW(pkg_candidate.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
                     if (mod) break;
                 }
             }
@@ -2537,7 +2539,7 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
                     if (fname.empty() || HasDotDotSegment(fname)) continue;
                     const auto pkg_candidate = pkg_dir / fname;
                     if (std::filesystem::exists(pkg_candidate, ec)) {
-                        mod = LoadLibraryW(pkg_candidate.wstring().c_str());
+                        mod = LoadLibraryExW(pkg_candidate.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
                         if (mod) break;
                     }
                 }

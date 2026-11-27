@@ -45,4 +45,16 @@ When testing local out-of-repo GDK samples or user-supplied legal dumps, run wit
 .\build\scarlettx.exe triage <out-dir>
 ```
 
+### Testing with Legally Installed PC GDK Titles (`--allow-pc-gdk`)
+
+By default `scarlettx boot` requires `TargetDeviceFamilyForXboxOne="XboxGen9"` in `MicrosoftGame.Config`. Pass `--allow-pc-gdk` to test legally owned `Gaming.Desktop.x64` packages (for example, unencrypted loose `C:\XboxGames\<Title>\Content\` installs):
+
+```powershell
+.\build\scarlettx.exe compat "C:\XboxGames\<Title>\Content"
+.\build\scarlettx.exe boot "C:\XboxGames\<Title>\Content" --allow-pc-gdk --windowed --gpu --flight-recorder <out-dir> --hang-timeout 15
+.\build\scarlettx.exe triage <out-dir> --emit-stubs
+```
+
+**Why this exists:** PC GDK titles share ~70% of the runtime stack with Xbox Series X|S titles (PE64 loader, implicit TLS, `.pdata` unwinding, `xgameruntime` `QueryApiImpl` COM tables, `XUser`/`XGameSave`, `GameInput`, `XAudio2`, `DirectStorage`, and `WinRT`), allowing real commercial engine stress-testing without needing console-encrypted dumps. Console-only GPU paths (`d3d12_xs.dll` / `xg_xs.dll` / `XS2`) remain validated via `test_d3d12_xs_proxy_rtx` and true `XboxGen9` packages.
+
 Never commit raw dumps, shaders, or copyrighted logs from external titles into the repository—distill findings into minimal clean-room regression tests instead.

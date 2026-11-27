@@ -30,6 +30,7 @@ struct EmulatorConfig {
     bool flight_recorder = false;
     uint32_t hang_timeout_sec = 15;  // --hang-timeout <sec> (0 = disable hang watchdog)
     std::string flight_recorder_dir;
+    bool allow_pc_gdk = false;  // --allow-pc-gdk: permit Gaming.Desktop.x64 packages for GDK/loader testing
 };
 
 }  // namespace scarlettx
