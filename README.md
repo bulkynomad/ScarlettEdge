@@ -22,7 +22,7 @@ Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder an
 
 ![ScarlettEdge Phase 4: Clean-Room Governance & Retail Bring-Up](docs/status_phase4.svg)
 
-**Phase 4 Progress:** `90.0%` (45 of 50 milestones) · **Tests:** `41/41` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
+**Phase 4 Progress:** `90.0%` (45 of 50 milestones) · **Tests:** `42/42` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
 
 | Phase 4 Track | Category | Progress | Readiness | Details |
 | :--- | :--- | :---: | :---: | :--- |
@@ -45,7 +45,7 @@ Tracks the shared `scarlettx_core.dll` unification, 4-Part Flight-Recorder Diagn
 
 ![ScarlettEdge Phase 3: Unification, Diagnostics & GDK 2510](docs/status_phase3.svg)
 
-**Phase 3 Milestones:** `100.0%` (30 of 30 milestones) · **Tests:** `41/41` passing · **Next Wave:** `Per-Title Commercial Retail Title Bring-Up`
+**Phase 3 Milestones:** `100.0%` (30 of 30 milestones) · **Tests:** `42/42` passing · **Next Wave:** `Per-Title Commercial Retail Title Bring-Up`
 
 | Phase 3 Track | Category | Progress | Readiness | Verified Capabilities |
 | :--- | :--- | :---: | :---: | :--- |
@@ -85,7 +85,7 @@ Tracks the runtime fidelity, cryptography, memory aliasing, and tooling foundati
 
 ![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
 
-**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `513` · **Tests:** `41/41` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `513` · **Tests:** `42/42` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 ---
 
@@ -102,7 +102,7 @@ In the two charts below, **purple (`#a371f7`)** credits original work from **[Fr
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `54.4%` + `236` ScarlettEdge fork `+45.6%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `513` (`269` upstream + `244` fork) · **Tests:** `41/41` passing
+**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `54.4%` + `236` ScarlettEdge fork `+45.6%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `513` (`269` upstream + `244` fork) · **Tests:** `42/42` passing
 
 | Subsystem | Category | Progress | Origin Split | Details |
 | :--- | :--- | :---: | :---: | :--- |

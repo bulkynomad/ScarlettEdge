@@ -1380,6 +1380,21 @@ XGameResult SCARLETTX_GDK_CALLBACK StoreQueryCurrentGameAsyncSlot(void* /*self*/
     return XStoreQueryEntitledProductsAsync(ctx, 0xFFFFFFFFu, 25u, async);
 }
 
+XGameResult SCARLETTX_GDK_CALLBACK StoreSlot66SafeOffline(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    if (Trace()) {
+        std::fprintf(stderr,
+                     "[ScarlettX][xgameruntime] XStore2510 (ApiImpl{0DD112AC} slot 66)(0x%llx, 0x%llx, 0x%llx) -> S_OK\n",
+                     static_cast<unsigned long long>(a1),
+                     static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(a3));
+    }
+    // If caller passes an output token/result pointer in a3 and it is writable, write a non-zero handle/token.
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    return XGR_S_OK;
+}
+
 template <int Index>
 XGameResult SCARLETTX_GDK_CALLBACK RealStoreUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
     return LogUnimplemented("XStore2510", "0DD112AC", Index, a1, a2, a3);
@@ -1405,6 +1420,7 @@ std::array<Slot, kRealStoreSlots> MakeRealStoreVtbl(std::index_sequence<I...>) {
     vtbl[19] = reinterpret_cast<Slot>(&StoreCloseProductsQueryHandle);     // XStoreCloseProductsQueryHandle
     vtbl[28] = reinterpret_cast<Slot>(&StoreQueryGameLicenseAsync);        // XStoreQueryGameLicenseAsync
     vtbl[29] = reinterpret_cast<Slot>(&StoreQueryGameLicenseResult);       // XStoreQueryGameLicenseResult
+    vtbl[66] = reinterpret_cast<Slot>(&StoreSlot66SafeOffline);            // GDK 2510/260x license/store callback slot
     return vtbl;
 }
 const std::array<Slot, kRealStoreSlots> kRealStoreVtbl =

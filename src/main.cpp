@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +26,30 @@ namespace {
 // (such as ucrtbase/msvcp140/d3d12) from acquiring _tls_index == 0 before a
 // mapped guest executable swaps TEB ThreadLocalStoragePointer[0].
 thread_local volatile uint8_t g_scarlettx_slot0_anchor[64] = {};
+
+#if defined(_WIN32)
+std::atomic<bool> g_ctrl_handler_running{false};
+
+BOOL WINAPI ScarlettConsoleCtrlHandler(DWORD ctrl_type) {
+    if (ctrl_type != CTRL_C_EVENT && ctrl_type != CTRL_BREAK_EVENT && ctrl_type != CTRL_CLOSE_EVENT) {
+        return FALSE;
+    }
+    if (g_ctrl_handler_running.exchange(true)) {
+        return TRUE;
+    }
+    if (scarlettx::FlightRecorder::IsEnabled()) {
+        scarlettx::FlightRecorder::Instance().RecordEvent(
+            scarlettx::FlightEventCategory::Lifecycle,
+            "cli",
+            "Console interrupt -> flushing flight summary",
+            static_cast<int32_t>(ctrl_type));
+        scarlettx::FlightRecorder::Instance().WriteSummaryReport();
+        scarlettx::FlightRecorder::Instance().Disable();
+    }
+    ExitProcess(0);
+    return TRUE;
+}
+#endif
 
 void PrintUsage() {
     std::cout << "ScarlettEdge (ScarlettX Fork) - Xbox Series X|S (Scarlett) HLE Emulator\n"
@@ -70,6 +95,9 @@ bool ParseInspectOrCompatFlags(int argc, char** argv, const char* subcmd, scarle
 
 int main(int argc, char** argv) {
     g_scarlettx_slot0_anchor[0] = 1;
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(&ScarlettConsoleCtrlHandler, TRUE);
+#endif
 
     if (argc < 2) {
         PrintUsage();

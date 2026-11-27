@@ -587,6 +587,12 @@ target_link_libraries(test_d3d12_xs_proxy_rtx PRIVATE
     d3dcompiler
 )
 
+scarlettx_add_test(test_d3d12_xs_nextgen_rtx tests/test_d3d12_xs_nextgen_rtx.cpp)
+target_link_libraries(test_d3d12_xs_nextgen_rtx PRIVATE
+    d3d12_xs
+    d3d12
+)
+
 scarlettx_add_test(test_winrt_middleware tests/test_winrt_middleware.cpp)
 target_link_libraries(test_winrt_middleware PRIVATE
     GameInput

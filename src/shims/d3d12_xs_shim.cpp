@@ -4580,6 +4580,31 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
                   << ") -> S_OK\n";
     }
     MaybePrintStats(n);
+#if defined(_WIN32)
+    if (obj && obj->present_hwnd) {
+        static std::atomic<uint64_t> hud_last_tick{0};
+        static std::atomic<uint64_t> hud_last_frame{0};
+        const uint64_t now_tick = GetTickCount64();
+        const uint64_t prev_tick = hud_last_tick.load(std::memory_order_relaxed);
+        if (prev_tick == 0) {
+            hud_last_tick.store(now_tick, std::memory_order_relaxed);
+            hud_last_frame.store(n, std::memory_order_relaxed);
+        } else if (now_tick >= prev_tick + 500ull) {
+            const uint64_t prev_frame = hud_last_frame.exchange(n, std::memory_order_relaxed);
+            hud_last_tick.store(now_tick, std::memory_order_relaxed);
+            const double dt_sec = static_cast<double>(now_tick - prev_tick) / 1000.0;
+            const double fps = (dt_sec > 0.0) ? (static_cast<double>(n - prev_frame) / dt_sec) : 0.0;
+            const auto fp = scarlettx::FlightRecorder::Instance().GetFramePacingSummary();
+            const uint64_t draws = g_draw_instanced_count.load(std::memory_order_relaxed) +
+                                   g_draw_indexed_count.load(std::memory_order_relaxed);
+            char hud[256];
+            std::snprintf(hud, sizeof(hud),
+                          "ScarlettEdge | %.1f FPS | p95 %.2f ms | Draws: %llu",
+                          fps, fp.p95_ms, static_cast<unsigned long long>(draws));
+            SetWindowTextA(obj->present_hwnd, hud);
+        }
+    }
+#endif
     return 0;
 }
 
