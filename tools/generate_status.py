@@ -850,20 +850,25 @@ def render_svg(
     ROWS = 7
     CELL = 14
     CELL_GAP = 3
-    GROUP_GAP = 10
-    BOX_PAD_X = 22
-    BOX_PAD_TOP = 20
-    BOX_PAD_BOT = 16
+    GROUP_GAP = 14
+    BOX_PAD_X = 24
+    BOX_PAD_TOP = 24
+    BOX_PAD_BOT = 18
     LABEL_H = 14
-    LABEL_GAP = 6
+    LABEL_GAP = 10
+
+    def _group_width(sub: Subsystem, cell: int, cgap: int) -> tuple[int, int]:
+        cols = max(2, math.ceil(sub.target / ROWS))
+        cells_w = cols * cell + (cols - 1) * cgap
+        label_w = int(math.ceil(len(sub.short_name) * 6.5)) + 6
+        return cols, max(cells_w, label_w)
 
     groups: list[tuple[Subsystem, int, int]] = []
     for s in subsystems:
-        cols = max(2, math.ceil(s.target / ROWS))
-        gw = cols * CELL + (cols - 1) * CELL_GAP
+        cols, gw = _group_width(s, CELL, CELL_GAP)
         groups.append((s, cols, gw))
 
-    # If the sum of group widths exceeds the inner graph box width (784px), scale cell size slightly
+    # If the sum of group widths exceeds the inner graph box width, scale cell/gap slightly
     # so every square remains crisp and centered without overflowing the 900px SVG.
     avail_graph_w = INNER_W - 2 * BOX_PAD_X
     raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
@@ -871,12 +876,17 @@ def render_svg(
         scale = avail_graph_w / raw_graph_w
         CELL = max(7, int(math.floor(CELL * scale)))
         CELL_GAP = max(2, int(math.floor(CELL_GAP * scale)))
-        GROUP_GAP = max(5, int(math.floor(GROUP_GAP * scale)))
+        GROUP_GAP = max(6, int(math.floor(GROUP_GAP * scale)))
         groups = []
         for s in subsystems:
             cols = max(2, math.ceil(s.target / ROWS))
             gw = cols * CELL + (cols - 1) * CELL_GAP
             groups.append((s, cols, gw))
+        raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
+    elif len(groups) > 1:
+        # Give compact charts generous horizontal breathing room between group columns
+        extra_per_gap = int((avail_graph_w - raw_graph_w) // (len(groups) - 1))
+        GROUP_GAP = min(38, GROUP_GAP + min(24, extra_per_gap))
         raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
 
     grid_h = ROWS * CELL + (ROWS - 1) * CELL_GAP
@@ -901,22 +911,22 @@ def render_svg(
         bx_cur += bw + 6
     badges_total_h = (b_row + 1) * BADGE_H + b_row * BADGE_ROW_GAP
 
-    # Vertical flow (16px section spacing)
+    # Vertical flow (20px section spacing)
     y_heading_baseline = PAD_Y + 26
-    y_heading_rule = y_heading_baseline + 10  # ~8px gap above 1px underline
-    y_badges = y_heading_rule + 16
-    y_graph_box = y_badges + badges_total_h + 16
-    y_list = y_graph_box + graph_box_h + 16
+    y_heading_rule = y_heading_baseline + 12
+    y_badges = y_heading_rule + 18
+    y_graph_box = y_badges + badges_total_h + 20
+    y_list = y_graph_box + graph_box_h + 20
 
     sorted_subs = sorted(subsystems, key=lambda s: (-s.ratio, -s.implemented, s.name.lower()))
     list_rows_per_col = math.ceil(len(sorted_subs) / 2)
-    ROW_H = 30
+    ROW_H = 34
     list_h = list_rows_per_col * ROW_H
 
     has_callout = bool(callout_line1)
     callout_accent = FORK_GREEN if overall_pct >= 99.9 else WARN
-    callout_h = 44 if has_callout else 0
-    y_callout = y_list + list_h + (16 if has_callout else 0)
+    callout_h = 46 if has_callout else 0
+    y_callout = y_list + list_h + (20 if has_callout else 0)
     H = (y_callout + callout_h if has_callout else y_list + list_h) + PAD_Y
 
     lines: list[str] = [
