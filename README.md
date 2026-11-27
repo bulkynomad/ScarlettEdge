@@ -16,13 +16,13 @@
 <!-- SCARLETTX_STATUS_START -->
 ## Status
 
-### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — 30/50)
+### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — 35/50)
 
 Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder analysis, multi-sample GDK 2510 ATG validation, Wave 1 commercial retail bring-up, and the [Compatibility Matrix](docs/COMPATIBILITY.md):
 
 ![ScarlettEdge Phase 4: Clean-Room Governance & Retail Bring-Up](docs/status_phase4.svg)
 
-**Phase 4 Progress:** `60.0%` (30 of 50 milestones) · **Tests:** `38/38` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
+**Phase 4 Progress:** `70.0%` (35 of 50 milestones) · **Tests:** `39/39` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
 
 | Phase 4 Track | Category | Progress | Readiness | Details |
 | :--- | :--- | :---: | :---: | :--- |
@@ -33,7 +33,7 @@ Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder an
 | **4E. Commercial Engine Hardening** | `Graphics` | `5 of 5` | `100%` | **Complete (5/5):** Versioned .sxc shader disk cache (rootSigHash + FNV-1a eviction), multi-entry .cik keyring + LoadKeyringDirectory, KernelXQueryAliasTelemetry, dynamic MF H.264/HEVC probe, lock-free p95/p99 stutter profiler in flight_summary.json & triage |
 | **4F. Compatibility Matrix & Dashboard** | `Docs` | `5 of 5` | `100%` | **Complete (5/5):** docs/COMPATIBILITY.md tiered compatibility ledger, docs/status_phase4.svg, Phase 4 ROADMAP.md & generate_status.py live progress dashboard |
 | **4G. OS, Topology, VFS & Keyring CLI** | `Runtime` | `5 of 5` | `100%` | **Complete (5/5):** Zen 2 8-core GetSystemInfo/SetThreadAffinityMask hooks, T:\ scratch & D:\ alias + FindFirstFile*/GetDiskFreeSpaceEx*, live PresentX -> RecordFrameTimeUs pacing, --keyring <dir> CLI |
-| **4H. d3d12_xs Proxy RTX Torture-Test** | `Graphics` | `0 of 5` | `0%` | **Queued (0/5):** Live RTX 5070 Ti execution through d3d12_xs.dll proxies (SM 6.6 bindless, Mesh Shaders, DXR 1.1, CL7::Barrier, ExecuteIndirect, PlacedResourceX) + regression CTest |
+| **4H. d3d12_xs Proxy RTX Torture-Test** | `Graphics` | `5 of 5` | `100%` | **Complete (5/5):** Verified on RTX 5070 Ti (+ WARP CI) through d3d12_xs.dll SDK 0x20006 proxies: ALLOW_DISPLAY strip, CreatePlacedResource, ExecuteIndirect, ResourceBarrier unwrapping & 10/10 PresentX live pacing (test_d3d12_xs_proxy_rtx) |
 | **4I. WinRT & Middleware Expansion** | `Platform` | `0 of 5` | `0%` | **Queued (0/5):** WinRT Windows.Gaming.Input/AnalyticsInfo/Package factories, GameInput RegisterDeviceCallback, expanded Xbl offline achievements & stats |
 | **4J. Diagnostics UX & Portable CI** | `Tooling` | `0 of 5` | `0%` | **Queued (0/5):** One-command scarlettx diag --full host readiness probe (SM 6.6/DXR/Vulkan/MF/VirtualAlloc2) & GitHub Actions portable ScarlettEdge-win64.zip artifact |
 
@@ -45,7 +45,7 @@ Tracks the shared `scarlettx_core.dll` unification, 4-Part Flight-Recorder Diagn
 
 ![ScarlettEdge Phase 3: Unification, Diagnostics & GDK 2510](docs/status_phase3.svg)
 
-**Phase 3 Milestones:** `100.0%` (30 of 30 milestones) · **Tests:** `38/38` passing · **Next Wave:** `Per-Title Commercial Retail Title Bring-Up`
+**Phase 3 Milestones:** `100.0%` (30 of 30 milestones) · **Tests:** `39/39` passing · **Next Wave:** `Per-Title Commercial Retail Title Bring-Up`
 
 | Phase 3 Track | Category | Progress | Readiness | Verified Capabilities |
 | :--- | :--- | :---: | :---: | :--- |
@@ -85,7 +85,7 @@ Tracks the runtime fidelity, cryptography, memory aliasing, and tooling foundati
 
 ![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
 
-**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `501` · **Tests:** `38/38` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `501` · **Tests:** `39/39` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 ---
 
@@ -102,7 +102,7 @@ In the two charts below, **purple (`#a371f7`)** credits original work from **[Fr
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `55.6%` + `224` ScarlettEdge fork `+44.4%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `501` (`269` upstream + `232` fork) · **Tests:** `38/38` passing
+**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `55.6%` + `224` ScarlettEdge fork `+44.4%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `501` (`269` upstream + `232` fork) · **Tests:** `39/39` passing
 
 | Subsystem | Category | Progress | Origin Split | Details |
 | :--- | :--- | :---: | :---: | :--- |

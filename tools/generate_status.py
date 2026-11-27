@@ -833,9 +833,9 @@ def collect_phase4_metrics() -> list[Subsystem]:
             name="4H. d3d12_xs Proxy RTX Torture-Test",
             short_name="D3D12XS",
             category="Graphics",
-            implemented=0,
+            implemented=5,
             target=5,
-            notes="**Queued (0/5):** Live RTX 5070 Ti execution through d3d12_xs.dll proxies (SM 6.6 bindless, Mesh Shaders, DXR 1.1, CL7::Barrier, ExecuteIndirect, PlacedResourceX) + regression CTest",
+            notes="**Complete (5/5):** Verified on RTX 5070 Ti (+ WARP CI) through d3d12_xs.dll SDK 0x20006 proxies: ALLOW_DISPLAY strip, CreatePlacedResource, ExecuteIndirect, ResourceBarrier unwrapping & 10/10 PresentX live pacing (test_d3d12_xs_proxy_rtx)",
         ),
         Subsystem(
             name="4I. WinRT & Middleware Expansion",

@@ -579,3 +579,10 @@ target_link_libraries(test_engine_hardening PRIVATE
     kernelx
     xbox_codecs
 )
+
+scarlettx_add_test(test_d3d12_xs_proxy_rtx tests/test_d3d12_xs_proxy_rtx.cpp)
+target_link_libraries(test_d3d12_xs_proxy_rtx PRIVATE
+    d3d12_xs
+    d3d12
+    d3dcompiler
+)

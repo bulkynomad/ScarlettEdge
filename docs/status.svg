@@ -45,7 +45,7 @@
     <rect x="605" y="86" width="46" height="20" fill="#555555"/>
     <rect x="651" y="86" width="97" height="20" fill="#26a641"/>
     <text class="badge-txt" x="628.0" y="100" text-anchor="middle">tests</text>
-    <text class="badge-txt" x="699.5" y="100" text-anchor="middle">38/38 passing</text>
+    <text class="badge-txt" x="699.5" y="100" text-anchor="middle">39/39 passing</text>
   </g>
 
   <!-- 3. Contribution graph box -->
@@ -694,5 +694,5 @@
   <rect x="36" y="670" width="4" height="46" fill="#39d353"/>
   <g transform="translate(56,680)"><circle cx="8" cy="8" r="6.5" fill="none" stroke="#39d353" stroke-width="1.5"/><path d="M5.2 8.2 7.1 10.1 11 6.1" fill="none" stroke="#39d353" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
   <text class="callout-txt" x="82" y="689"><tspan class="callout-lead">Attribution:</tspan> Purple = original Freminet/ScarlettX (281/505, 55.6%); Green = ScarlettEdge additions (+224, +44.4%).</text>
-  <text class="callout-txt" x="82" y="706">Combined 100% clean-room ABI coverage across all 19 tracked subsystems (38/38 passing CTest suites).</text>
+  <text class="callout-txt" x="82" y="706">Combined 100% clean-room ABI coverage across all 19 tracked subsystems (39/39 passing CTest suites).</text>
 </svg>
