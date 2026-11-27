@@ -821,6 +821,38 @@ def collect_phase4_metrics() -> list[Subsystem]:
             target=5,
             notes="**Complete (5/5):** docs/COMPATIBILITY.md tiered compatibility ledger, docs/status_phase4.svg, Phase 4 ROADMAP.md & generate_status.py live progress dashboard",
         ),
+        Subsystem(
+            name="4G. OS, Topology, VFS & Keyring CLI",
+            short_name="OS/VFS",
+            category="Runtime",
+            implemented=0,
+            target=5,
+            notes="**Queued (0/5):** Zen 2 8C/16T topology & affinity hooks, T:\\/D:\\ virtual drives + Win32 file APIs, PresentX -> RecordFrameTimeUs live pacing hook, --keyring <dir> CLI",
+        ),
+        Subsystem(
+            name="4H. d3d12_xs Proxy RTX Torture-Test",
+            short_name="D3D12XS",
+            category="Graphics",
+            implemented=0,
+            target=5,
+            notes="**Queued (0/5):** Live RTX 5070 Ti execution through d3d12_xs.dll proxies (SM 6.6 bindless, Mesh Shaders, DXR 1.1, CL7::Barrier, ExecuteIndirect, PlacedResourceX) + regression CTest",
+        ),
+        Subsystem(
+            name="4I. WinRT & Middleware Expansion",
+            short_name="WinRT/GI",
+            category="Platform",
+            implemented=0,
+            target=5,
+            notes="**Queued (0/5):** WinRT Windows.Gaming.Input/AnalyticsInfo/Package factories, GameInput RegisterDeviceCallback, expanded Xbl offline achievements & stats",
+        ),
+        Subsystem(
+            name="4J. Diagnostics UX & Portable CI",
+            short_name="Diag/CI",
+            category="Tooling",
+            implemented=0,
+            target=5,
+            notes="**Queued (0/5):** One-command scarlettx diag --full host readiness probe (SM 6.6/DXR/Vulkan/MF/VirtualAlloc2) & GitHub Actions portable ScarlettEdge-win64.zip artifact",
+        ),
     ]
 
 

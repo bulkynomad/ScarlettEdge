@@ -16,13 +16,13 @@
 <!-- SCARLETTX_STATUS_START -->
 ## Status
 
-### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — 25/30)
+### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — 25/50)
 
 Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder analysis, multi-sample GDK 2510 ATG validation, Wave 1 commercial retail bring-up, and the [Compatibility Matrix](docs/COMPATIBILITY.md):
 
 ![ScarlettEdge Phase 4: Clean-Room Governance & Retail Bring-Up](docs/status_phase4.svg)
 
-**Phase 4 Progress:** `83.3%` (25 of 30 milestones) · **Tests:** `38/38` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
+**Phase 4 Progress:** `50.0%` (25 of 50 milestones) · **Tests:** `38/38` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
 
 | Phase 4 Track | Category | Progress | Readiness | Details |
 | :--- | :--- | :---: | :---: | :--- |
@@ -32,6 +32,10 @@ Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder an
 | **4D. Retail Wave 1 Bring-Up** | `Retail` | `0 of 5` | `0%` | **Queued (0/5):** Flight-recorder bring-up of user-supplied legal dumps (Concept Destruction, Unicorn Overlord) through inspect, boot, menus/audio/input, gameplay, and save round-trip |
 | **4E. Commercial Engine Hardening** | `Graphics` | `5 of 5` | `100%` | **Complete (5/5):** Versioned .sxc shader disk cache (rootSigHash + FNV-1a eviction), multi-entry .cik keyring + LoadKeyringDirectory, KernelXQueryAliasTelemetry, dynamic MF H.264/HEVC probe, lock-free p95/p99 stutter profiler in flight_summary.json & triage |
 | **4F. Compatibility Matrix & Dashboard** | `Docs` | `5 of 5` | `100%` | **Complete (5/5):** docs/COMPATIBILITY.md tiered compatibility ledger, docs/status_phase4.svg, Phase 4 ROADMAP.md & generate_status.py live progress dashboard |
+| **4G. OS, Topology, VFS & Keyring CLI** | `Runtime` | `0 of 5` | `0%` | **Queued (0/5):** Zen 2 8C/16T topology & affinity hooks, T:\/D:\ virtual drives + Win32 file APIs, PresentX -> RecordFrameTimeUs live pacing hook, --keyring <dir> CLI |
+| **4H. d3d12_xs Proxy RTX Torture-Test** | `Graphics` | `0 of 5` | `0%` | **Queued (0/5):** Live RTX 5070 Ti execution through d3d12_xs.dll proxies (SM 6.6 bindless, Mesh Shaders, DXR 1.1, CL7::Barrier, ExecuteIndirect, PlacedResourceX) + regression CTest |
+| **4I. WinRT & Middleware Expansion** | `Platform` | `0 of 5` | `0%` | **Queued (0/5):** WinRT Windows.Gaming.Input/AnalyticsInfo/Package factories, GameInput RegisterDeviceCallback, expanded Xbl offline achievements & stats |
+| **4J. Diagnostics UX & Portable CI** | `Tooling` | `0 of 5` | `0%` | **Queued (0/5):** One-command scarlettx diag --full host readiness probe (SM 6.6/DXR/Vulkan/MF/VirtualAlloc2) & GitHub Actions portable ScarlettEdge-win64.zip artifact |
 
 ---
 
