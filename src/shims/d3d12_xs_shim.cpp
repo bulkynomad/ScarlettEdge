@@ -4427,7 +4427,24 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyPresentX(
     const uint64_t n = present_count.fetch_add(1, std::memory_order_relaxed) + 1;
     g_frame_epoch.fetch_add(1, std::memory_order_relaxed);
     g_gpu_profiler.RecordQpcTick();
+#if defined(_WIN32)
+    {
+        static std::atomic<int64_t> last_present_qpc{0};
+        LARGE_INTEGER now_qpc{}, freq_qpc{};
+        QueryPerformanceCounter(&now_qpc);
+        QueryPerformanceFrequency(&freq_qpc);
+        const int64_t prev_qpc = last_present_qpc.exchange(now_qpc.QuadPart, std::memory_order_relaxed);
+        if (prev_qpc > 0 && freq_qpc.QuadPart > 0 && now_qpc.QuadPart > prev_qpc) {
+            const uint64_t delta_us = static_cast<uint64_t>(
+                ((now_qpc.QuadPart - prev_qpc) * 1000000ll) / freq_qpc.QuadPart);
+            scarlettx::FlightRecorder::Instance().RecordFrameTimeUs(delta_us);
+        } else {
+            scarlettx::FlightRecorder::Instance().BeatProgress("PresentX");
+        }
+    }
+#else
     scarlettx::FlightRecorder::Instance().BeatProgress("PresentX");
+#endif
 #if defined(_WIN32)
     auto* obj = static_cast<XboxD3D12CommandQueueProxy*>(self);
     XboxD3D12ResourceProxy* src_proxy = nullptr;

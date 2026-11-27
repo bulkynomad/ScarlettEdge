@@ -825,9 +825,9 @@ def collect_phase4_metrics() -> list[Subsystem]:
             name="4G. OS, Topology, VFS & Keyring CLI",
             short_name="OS/VFS",
             category="Runtime",
-            implemented=0,
+            implemented=5,
             target=5,
-            notes="**Queued (0/5):** Zen 2 8C/16T topology & affinity hooks, T:\\/D:\\ virtual drives + Win32 file APIs, PresentX -> RecordFrameTimeUs live pacing hook, --keyring <dir> CLI",
+            notes="**Complete (5/5):** Zen 2 8-core GetSystemInfo/SetThreadAffinityMask hooks, T:\\ scratch & D:\\ alias + FindFirstFile*/GetDiskFreeSpaceEx*, live PresentX -> RecordFrameTimeUs pacing, --keyring <dir> CLI",
         ),
         Subsystem(
             name="4H. d3d12_xs Proxy RTX Torture-Test",

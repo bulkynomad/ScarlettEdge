@@ -127,9 +127,13 @@ Status OpenXvdWithVolumeKey(const std::string& container_path,
     const std::string effective_key = ResolveEffectiveVolumeKey(configured_key);
     if (!effective_key.empty()) {
         std::error_code ec;
-        st = std::filesystem::exists(effective_key, ec)
-                 ? out_xvd.LoadVolumeKeyFile(effective_key)
-                 : out_xvd.SetVolumeKeyHex(effective_key);
+        if (std::filesystem::is_directory(effective_key, ec)) {
+            st = out_xvd.LoadKeyringDirectory(effective_key);
+        } else if (std::filesystem::exists(effective_key, ec)) {
+            st = out_xvd.LoadVolumeKeyFile(effective_key);
+        } else {
+            st = out_xvd.SetVolumeKeyHex(effective_key);
+        }
         if (!st.ok()) {
             return st;
         }

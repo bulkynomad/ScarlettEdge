@@ -23,9 +23,9 @@ thread_local volatile uint8_t g_scarlettx_slot0_anchor[64] = {};
 void PrintUsage() {
     std::cout << "ScarlettEdge (ScarlettX Fork) - Xbox Series X|S (Scarlett) HLE Emulator\n"
               << "Usage:\n"
-              << "  scarlettx inspect <package_dir_or_xvc> [--volume-key hex|file]\n"
-              << "  scarlettx compat <package_dir_or_xvc> [--volume-key hex|file] [--lockhart|--series-s]\n"
-              << "  scarlettx boot <package_dir_or_xvc> [--headless|--windowed] [--in-process|--separate-process] [--gpu|--warp] [--lockhart|--series-s] [--debug-layer] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--volume-key hex|file] [--rt-dump path.ppm] [--raster-dump path.ppm] [--flight-recorder [dir]] [--hang-timeout sec]\n"
+              << "  scarlettx inspect <package_dir_or_xvc> [--volume-key hex|file] [--keyring dir]\n"
+              << "  scarlettx compat <package_dir_or_xvc> [--volume-key hex|file] [--keyring dir] [--lockhart|--series-s]\n"
+              << "  scarlettx boot <package_dir_or_xvc> [--headless|--windowed] [--in-process|--separate-process] [--gpu|--warp] [--lockhart|--series-s] [--debug-layer] [--trace] [--stats] [--fcap N] [--force-relocate] [--frames N] [--volume-key hex|file] [--keyring dir] [--rt-dump path.ppm] [--raster-dump path.ppm] [--flight-recorder [dir]] [--hang-timeout sec]\n"
               << "  scarlettx diag [--flight-recorder [dir]]\n"
               << "  scarlettx triage <flight_dir> [--emit-stubs] [--json]\n";
 }
@@ -43,7 +43,7 @@ std::string ResolveVolumeKeyWithEnv(const std::string& cli_key) {
 bool ParseInspectOrCompatFlags(int argc, char** argv, const char* subcmd, scarlettx::EmulatorConfig& cfg) {
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i];
-        if (arg == "--volume-key" && i + 1 < argc) {
+        if ((arg == "--volume-key" || arg == "--keyring") && i + 1 < argc) {
             cfg.volume_key = argv[++i];
         } else if (arg == "--lockhart" || arg == "--series-s") {
             cfg.lockhart_mode = true;
@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
                 cfg.rt_dump_path = argv[++i];
             } else if (arg == "--raster-dump" && i + 1 < argc) {
                 cfg.raster_dump_path = argv[++i];
-            } else if (arg == "--volume-key" && i + 1 < argc) {
+            } else if ((arg == "--volume-key" || arg == "--keyring") && i + 1 < argc) {
                 cfg.volume_key = argv[++i];
             } else if (arg == "--flight-recorder") {
                 cfg.flight_recorder = true;
