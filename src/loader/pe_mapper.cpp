@@ -153,6 +153,72 @@ void RunAndClearGuestAtExitInRange(const uint8_t* base, size_t size) {
     }
 }
 
+struct GuestFlsEntry {
+    DWORD index = FLS_OUT_OF_INDEXES;
+    PFLS_CALLBACK_FUNCTION callback = nullptr;
+};
+
+std::mutex& GuestFlsMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::vector<GuestFlsEntry>& GuestFlsTable() {
+    static std::vector<GuestFlsEntry> table;
+    return table;
+}
+
+DWORD WINAPI GuestFlsAlloc(PFLS_CALLBACK_FUNCTION lpCallback) {
+    const DWORD idx = ::FlsAlloc(lpCallback);
+    if (idx != FLS_OUT_OF_INDEXES && lpCallback != nullptr) {
+        std::lock_guard<std::mutex> lock(GuestFlsMutex());
+        GuestFlsTable().push_back({idx, lpCallback});
+    }
+    return idx;
+}
+
+BOOL WINAPI GuestFlsFree(DWORD dwFlsIndex) {
+    {
+        std::lock_guard<std::mutex> lock(GuestFlsMutex());
+        auto& table = GuestFlsTable();
+        for (auto it = table.begin(); it != table.end();) {
+            if (it->index == dwFlsIndex) {
+                it = table.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    return ::FlsFree(dwFlsIndex);
+}
+
+void FreeGuestFlsInRange(const uint8_t* base, size_t size) {
+    if (!base || size == 0) {
+        return;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t hi = lo + size;
+    std::vector<DWORD> to_free;
+    {
+        std::lock_guard<std::mutex> lock(GuestFlsMutex());
+        auto& table = GuestFlsTable();
+        for (auto it = table.begin(); it != table.end();) {
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(it->callback);
+            if (addr >= lo && addr < hi) {
+                to_free.push_back(it->index);
+                it = table.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Free guest FLS slots while the guest PE image is still mapped so their
+    // callbacks run safely and ntdll never jumps into unmapped memory on host exit.
+    for (DWORD idx : to_free) {
+        ::FlsFree(idx);
+    }
+}
+
 std::mutex& GuestLoaderPathsMutex() {
     static std::mutex m;
     return m;
@@ -1929,6 +1995,8 @@ void* LookupGuestRuntimeHook(const std::string& target_lower, const std::string&
         if (sym_name == "GetSystemInfo") return reinterpret_cast<void*>(&GuestGetSystemInfo);
         if (sym_name == "GetNativeSystemInfo") return reinterpret_cast<void*>(&GuestGetNativeSystemInfo);
         if (sym_name == "SetThreadAffinityMask") return reinterpret_cast<void*>(&GuestSetThreadAffinityMask);
+        if (sym_name == "FlsAlloc") return reinterpret_cast<void*>(&GuestFlsAlloc);
+        if (sym_name == "FlsFree") return reinterpret_cast<void*>(&GuestFlsFree);
         return nullptr;
     }
     if (target_lower == "combase.dll") {
@@ -2121,6 +2189,7 @@ void MappedPeImage::Unmap() {
 #if defined(_WIN32)
     if (mapped_base_ && size_of_image_ > 0) {
         RunAndClearGuestAtExitInRange(mapped_base_, size_of_image_);
+        FreeGuestFlsInRange(mapped_base_, size_of_image_);
     }
     if (mapped_base_ && is_dll_ && dll_attached_ && entry_point_rva_ != 0) {
         using DllMainFn = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
