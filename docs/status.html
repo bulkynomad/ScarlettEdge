@@ -116,11 +116,11 @@
 <body>
 <main class="page">
   <section class="panel">
-    <h2>Phase 4: Clean-Room Governance &amp; Commercial Retail Bring-Up: 70.0%</h2>
+    <h2>Phase 4: Clean-Room Governance &amp; Commercial Retail Bring-Up: 90.0%</h2>
     <div class="badges">
-      <span class="badge"><span class="k">phase 4</span><span class="v-fn">35/50 (70.0%)</span></span>
+      <span class="badge"><span class="k">phase 4</span><span class="v-fn">45/50 (90.0%)</span></span>
       <span class="badge"><span class="k">clean-room CI</span><span class="v-exports">Automated Gate</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="v-tests">39/39 passing</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="v-tests">41/41 passing</span></span>
       <span class="badge"><span class="k">focus</span><span class="v-target">ATG &amp; Retail Wave 1</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-p4"></div><div class="legend" id="leg-p4"></div></div>
@@ -132,7 +132,7 @@
     <div class="badges">
       <span class="badge"><span class="k">phase 3</span><span class="v-fn">30/30 (100.0%)</span></span>
       <span class="badge"><span class="k">GDK silicon</span><span class="v-exports">2510.5.6322 + DXR/MeshShader</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="v-tests">39/39 passing</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="v-tests">41/41 passing</span></span>
       <span class="badge"><span class="k">next wave</span><span class="v-target">Commercial Retail Bring-Up</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-p3"></div><div class="legend" id="leg-p3"></div></div>
@@ -143,7 +143,7 @@
     <h2>Phase 2: Retail AAA Execution Roadmap: 100.0%</h2>
     <div class="badges">
       <span class="badge"><span class="k">phase 2 AAA</span><span class="v-fn">72/72 (100.0%)</span></span>
-      <span class="badge"><span class="k">CI tests</span><span class="v-tests">39/39 passing</span></span>
+      <span class="badge"><span class="k">CI tests</span><span class="v-tests">41/41 passing</span></span>
       <span class="badge"><span class="k">target</span><span class="v-target">Unmodified Retail AAA Titles</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-aaa"></div><div class="legend" id="leg-aaa"></div></div>
@@ -153,15 +153,15 @@
   <section class="panel">
     <h2>ABI Coverage (Upstream Purple + Fork Green): 100.0%</h2>
     <div class="badges">
-      <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">281/505</span></span>
-      <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+224</span></span>
-      <span class="badge"><span class="k">exports</span><span class="v-exports">501</span></span>
-      <span class="badge"><span class="k">tests</span><span class="v-tests">39/39 passing</span></span>
+      <span class="badge"><span class="k">upstream ScarlettX</span><span class="v-up">281/517</span></span>
+      <span class="badge"><span class="k">ScarlettEdge fork</span><span class="v-fn">+236</span></span>
+      <span class="badge"><span class="k">exports</span><span class="v-exports">513</span></span>
+      <span class="badge"><span class="k">tests</span><span class="v-tests">41/41 passing</span></span>
     </div>
     <div class="graph-box"><div class="graph" id="graph-abi"></div><div class="legend" id="leg-abi"></div></div>
     <div class="list" id="list-abi"></div>
     <div class="callout">
-      <span><strong>Unified Architecture:</strong> Shared <code>scarlettx_core.dll</code>, unified DirectStorage/COM bridges, retail XVD v3 + Merkle + NTFS, 32-lane GPU GDeflate, WMA-Pro XMA2, Vulkan KHR RT &amp; RDNA2 XS2 CFG/SM 6.6 lifting (505/505 functions: 281 upstream + 224 ScarlettEdge).</span>
+      <span><strong>Unified Architecture:</strong> Shared <code>scarlettx_core.dll</code>, unified DirectStorage/COM bridges, retail XVD v3 + Merkle + NTFS, 32-lane GPU GDeflate, WMA-Pro XMA2, Vulkan KHR RT &amp; RDNA2 XS2 CFG/SM 6.6 lifting (517/517 functions: 281 upstream + 236 ScarlettEdge).</span>
     </div>
   </section>
 
@@ -198,8 +198,8 @@
       ['CompatDoc', '4F. Compatibility Matrix & Dashboard', 5, 5, -1],
       ['OS/VFS', '4G. OS, Topology, VFS & Keyring CLI', 5, 5, -1],
       ['D3D12XS', '4H. d3d12_xs Proxy RTX Torture-Test', 5, 5, -1],
-      ['WinRT/GI', '4I. WinRT & Middleware Expansion', 0, 5, -1],
-      ['Diag/CI', '4J. Diagnostics UX & Portable CI', 0, 5, -1],
+      ['WinRT/GI', '4I. WinRT & Middleware Expansion', 5, 5, -1],
+      ['Diag/CI', '4J. Diagnostics UX & Portable CI', 5, 5, -1],
     ]],
     ['p3',  [
       ['Core', 'Shared Core & Loader Unification', 5, 5, -1],
@@ -238,7 +238,7 @@
       ['Crypt', 'Retail XVC/XVD Crypto', 12, 12, 0],
       ['Codec', 'Production Codecs (XMA2/GDeflate/Bink)', 19, 19, 0],
       ['Vulk', 'Hardware DXR & Vulkan Backend', 17, 17, 0],
-      ['XSAPI', 'Live Xbox Services (XSAPI/WinRT)', 23, 23, 0],
+      ['XSAPI', 'Live Xbox Services (XSAPI/WinRT)', 35, 35, 0],
     ]],
     ['opt', [
       ['VSync', 'Frame Pacing & VSync', 4, 4, -1],

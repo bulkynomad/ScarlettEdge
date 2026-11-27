@@ -57,11 +57,26 @@ SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblContextGetGamertag(
     XblContextHandle context, char* outGamertag, size_t bufferSize);
 
 // Achievements
+typedef struct XblAchievementRecord {
+    char id[64];
+    uint32_t titleId;
+    uint32_t progressPercent;
+    uint32_t isUnlocked;
+} XblAchievementRecord;
+
 SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblAchievementsGetAchievementsForTitleIdAsync(
     XblContextHandle context, uint32_t titleId, void* asyncBlock);
 
 SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblAchievementsGetAchievementsForTitleIdResult(
     void* asyncBlock, size_t bufferSize, void* buffer, XblAchievementsResultHandle* resultHandle, size_t* bufferUsed);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblAchievementsResultGetAchievements(
+    XblAchievementsResultHandle resultHandle,
+    const XblAchievementRecord** achievements,
+    size_t* achievementsCount);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblAchievementsResultCloseHandle(
+    XblAchievementsResultHandle resultHandle);
 
 SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblAchievementsUpdateAchievementAsync(
     XblContextHandle context, const char* achievementId, uint32_t percentComplete, void* asyncBlock);
@@ -69,7 +84,69 @@ SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblAchievementsUpdateAchievemen
 SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblAchievementsUpdateAchievementResult(
     void* asyncBlock);
 
+// Player Stats (offline title-managed & user statistics read/write)
+typedef enum XblTitleManagedStatType {
+    XblTitleManagedStatType_Number = 0,
+    XblTitleManagedStatType_String = 1,
+} XblTitleManagedStatType;
+
+typedef struct XblTitleManagedStatistic {
+    const char* statisticName;
+    XblTitleManagedStatType statisticType;
+    double numberValue;
+    const char* stringValue;
+} XblTitleManagedStatistic;
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsWriteAsync(
+    XblContextHandle context,
+    uint64_t xboxUserId,
+    const XblTitleManagedStatistic* statistics,
+    size_t statisticsCount,
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsWriteResult(
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsUpdateStatsAsync(
+    XblContextHandle context,
+    const XblTitleManagedStatistic* statistics,
+    size_t statisticsCount,
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsUpdateStatsResult(
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsDeleteStatsAsync(
+    XblContextHandle context,
+    const char* const* statisticNames,
+    size_t statisticNamesCount,
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsDeleteStatsResult(
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblUserStatisticsGetSingleUserStatisticAsync(
+    XblContextHandle context,
+    uint64_t xboxUserId,
+    const char* scid,
+    const char* statisticName,
+    void* asyncBlock);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblUserStatisticsGetSingleUserStatisticResultSize(
+    void* asyncBlock,
+    size_t* resultSizeInBytes);
+
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblUserStatisticsGetSingleUserStatisticResult(
+    void* asyncBlock,
+    size_t bufferSize,
+    void* buffer,
+    XblTitleManagedStatistic* outStatistic,
+    size_t* bufferUsed);
+
 // User Profile
+SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblProfileSetLocalUserProfile(
+    XblContextHandle context, const XblUserProfile* userProfile);
+
 SCARLETTX_XSAPI_API int32_t SCARLETTX_XSAPI_CALL XblProfileGetUserProfileAsync(
     XblContextHandle context, uint64_t xboxUserId, void* asyncBlock);
 

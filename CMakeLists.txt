@@ -586,3 +586,14 @@ target_link_libraries(test_d3d12_xs_proxy_rtx PRIVATE
     d3d12
     d3dcompiler
 )
+
+scarlettx_add_test(test_winrt_middleware tests/test_winrt_middleware.cpp)
+target_link_libraries(test_winrt_middleware PRIVATE
+    GameInput
+    xsapi
+    xgameruntime
+    $<$<BOOL:${WIN32}>:ole32>
+)
+
+scarlettx_add_test(test_diag_full tests/test_diag_full.cpp)
+add_dependencies(test_diag_full scarlettx)

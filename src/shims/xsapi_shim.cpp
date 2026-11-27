@@ -2,12 +2,14 @@
 #include "scarlettx/services/xsapi_abi.h"
 #include "scarlettx/gdk/xgameruntime_abi.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -23,6 +25,8 @@ namespace {
 
 constexpr int32_t kSuccess = 0;
 constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
+constexpr int32_t kNotFound = static_cast<int32_t>(0x80070490u);
+constexpr int32_t kInsufficientBuffer = static_cast<int32_t>(0x8007007Au);
 
 struct XblContext {
     uint64_t xuid = 0x0009000000000001ull;
@@ -34,6 +38,58 @@ struct XblMultiplayerSession {
     std::string template_name;
     std::vector<uint64_t> members;
 };
+
+struct XblAchievementsResult {
+    std::vector<XblAchievementRecord> records;
+};
+
+struct PendingAchievementQuery {
+    uint64_t xuid = 0;
+    uint32_t title_id = 0;
+};
+
+struct StoredStat {
+    std::string name;
+    XblTitleManagedStatType type = XblTitleManagedStatType_Number;
+    double number_value = 0.0;
+    std::string string_value;
+};
+
+struct OfflineXsapiStore {
+    std::mutex mu;
+    std::unordered_map<uint64_t, std::unordered_map<std::string, XblAchievementRecord>> achievements;
+    std::unordered_map<XblAchievementsResultHandle, std::unique_ptr<XblAchievementsResult>> ach_results;
+    std::unordered_map<void*, PendingAchievementQuery> pending_ach_queries;
+    PendingAchievementQuery last_sync_ach_query{};
+
+    std::unordered_map<uint64_t, std::unordered_map<std::string, StoredStat>> stats;
+    std::unordered_map<void*, StoredStat> pending_stat_queries;
+    StoredStat last_sync_stat_query{};
+    bool has_last_sync_stat_query = false;
+
+    std::unordered_map<uint64_t, XblUserProfile> profiles;
+    std::unordered_map<void*, uint64_t> pending_profile_queries;
+    uint64_t last_sync_profile_xuid = 0;
+};
+
+OfflineXsapiStore& OfflineStore() {
+    static OfflineXsapiStore s;
+    return s;
+}
+
+XblUserProfile MakeDefaultUserProfile() {
+    XblUserProfile p{};
+    p.xboxUserId = 0x0009000000000001ull;
+    std::strncpy(p.gamertag, "ScarlettPlayer", sizeof(p.gamertag) - 1);
+    std::strncpy(p.modernGamertag, "ScarlettPlayer", sizeof(p.modernGamertag) - 1);
+    std::strncpy(p.modernGamertagSuffix, "#1234", sizeof(p.modernGamertagSuffix) - 1);
+    std::strncpy(p.uniqueModernGamertag, "ScarlettPlayer#1234", sizeof(p.uniqueModernGamertag) - 1);
+    std::strncpy(p.gamerscore, "1000", sizeof(p.gamerscore) - 1);
+    std::strncpy(p.gameDisplayPictureResizeUri,
+                 "https://scarlettx.local/gamerpics/default.png",
+                 sizeof(p.gameDisplayPictureResizeUri) - 1);
+    return p;
+}
 
 std::mutex g_mu;
 std::string g_scid;
@@ -209,8 +265,25 @@ int32_t SCARLETTX_XSAPI_CALL XblInitialize(const char* scid) {
 }
 
 int32_t SCARLETTX_XSAPI_CALL XblCleanup(void) {
-    std::lock_guard<std::mutex> lk(g_mu);
-    g_scid.clear();
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_scid.clear();
+    }
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.achievements.clear();
+        st.ach_results.clear();
+        st.pending_ach_queries.clear();
+        st.last_sync_ach_query = {};
+        st.stats.clear();
+        st.pending_stat_queries.clear();
+        st.last_sync_stat_query = {};
+        st.has_last_sync_stat_query = false;
+        st.profiles.clear();
+        st.pending_profile_queries.clear();
+        st.last_sync_profile_xuid = 0;
+    }
     return kSuccess;
 }
 
@@ -247,8 +320,19 @@ int32_t SCARLETTX_XSAPI_CALL XblContextGetGamertag(XblContextHandle context, cha
 }
 
 int32_t SCARLETTX_XSAPI_CALL XblAchievementsGetAchievementsForTitleIdAsync(
-    XblContextHandle context, uint32_t /*titleId*/, void* asyncBlock) {
+    XblContextHandle context, uint32_t titleId, void* asyncBlock) {
     if (!context) return kInvalidArg;
+    auto* ctx = static_cast<XblContext*>(context);
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        PendingAchievementQuery q{ctx->xuid, titleId};
+        if (asyncBlock) {
+            st.pending_ach_queries[asyncBlock] = q;
+        } else {
+            st.last_sync_ach_query = q;
+        }
+    }
     return StartXsapiAsync(asyncBlock, "XblAchievementsGetAchievementsForTitleIdAsync", sizeof(uint32_t));
 }
 
@@ -256,17 +340,98 @@ int32_t SCARLETTX_XSAPI_CALL XblAchievementsGetAchievementsForTitleIdResult(
     void* asyncBlock, size_t bufferSize, void* buffer, XblAchievementsResultHandle* resultHandle, size_t* bufferUsed) {
     const int32_t hr = FinishXsapiAsync(asyncBlock);
     if (hr < 0) return hr;
-    if (resultHandle) *resultHandle = reinterpret_cast<XblAchievementsResultHandle>(0x1000);
+
+    auto snapshot = std::make_unique<XblAchievementsResult>();
+    uint32_t unlocked_count = 0;
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        PendingAchievementQuery q = st.last_sync_ach_query;
+        if (asyncBlock) {
+            auto it = st.pending_ach_queries.find(asyncBlock);
+            if (it != st.pending_ach_queries.end()) {
+                q = it->second;
+                st.pending_ach_queries.erase(it);
+            }
+        }
+        auto uit = st.achievements.find(q.xuid);
+        if (uit != st.achievements.end()) {
+            snapshot->records.reserve(uit->second.size());
+            for (const auto& kv : uit->second) {
+                XblAchievementRecord rec = kv.second;
+                if (rec.titleId == 0) {
+                    rec.titleId = q.title_id;
+                }
+                if (q.title_id == 0 || rec.titleId == q.title_id) {
+                    if (rec.isUnlocked != 0) {
+                        ++unlocked_count;
+                    }
+                    snapshot->records.push_back(rec);
+                }
+            }
+            std::sort(snapshot->records.begin(), snapshot->records.end(),
+                      [](const XblAchievementRecord& a, const XblAchievementRecord& b) {
+                          return std::strcmp(a.id, b.id) < 0;
+                      });
+        }
+        if (resultHandle) {
+            XblAchievementsResultHandle raw_handle = snapshot.get();
+            st.ach_results[raw_handle] = std::move(snapshot);
+            *resultHandle = raw_handle;
+        }
+    }
+
     if (bufferUsed) *bufferUsed = sizeof(uint32_t);
     if (buffer && bufferSize >= sizeof(uint32_t)) {
-        *static_cast<uint32_t*>(buffer) = 0; // 0 achievements unlocked in offline mode
+        *static_cast<uint32_t*>(buffer) = unlocked_count;
     }
     return kSuccess;
 }
 
+int32_t SCARLETTX_XSAPI_CALL XblAchievementsResultGetAchievements(
+    XblAchievementsResultHandle resultHandle,
+    const XblAchievementRecord** achievements,
+    size_t* achievementsCount) {
+    if (!resultHandle || !achievements || !achievementsCount) return kInvalidArg;
+    auto& st = OfflineStore();
+    std::lock_guard<std::mutex> lk(st.mu);
+    auto it = st.ach_results.find(resultHandle);
+    if (it == st.ach_results.end() || !it->second) {
+        *achievements = nullptr;
+        *achievementsCount = 0;
+        return kInvalidArg;
+    }
+    const auto& recs = it->second->records;
+    *achievements = recs.empty() ? nullptr : recs.data();
+    *achievementsCount = recs.size();
+    return kSuccess;
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblAchievementsResultCloseHandle(
+    XblAchievementsResultHandle resultHandle) {
+    if (!resultHandle) return kInvalidArg;
+    auto& st = OfflineStore();
+    std::lock_guard<std::mutex> lk(st.mu);
+    return st.ach_results.erase(resultHandle) > 0 ? kSuccess : kInvalidArg;
+}
+
 int32_t SCARLETTX_XSAPI_CALL XblAchievementsUpdateAchievementAsync(
-    XblContextHandle context, const char* achievementId, uint32_t /*percentComplete*/, void* asyncBlock) {
-    if (!context || !achievementId) return kInvalidArg;
+    XblContextHandle context, const char* achievementId, uint32_t percentComplete, void* asyncBlock) {
+    if (!context || !achievementId || !*achievementId) return kInvalidArg;
+    auto* ctx = static_cast<XblContext*>(context);
+    const uint32_t clamped = std::min<uint32_t>(percentComplete, 100u);
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        auto& user_map = st.achievements[ctx->xuid];
+        auto& rec = user_map[achievementId];
+        if (rec.id[0] == '\0') {
+            std::strncpy(rec.id, achievementId, sizeof(rec.id) - 1);
+            rec.id[sizeof(rec.id) - 1] = '\0';
+        }
+        rec.progressPercent = std::max(rec.progressPercent, clamped);
+        rec.isUnlocked = (rec.progressPercent >= 100u) ? 1u : 0u;
+    }
     return StartXsapiAsync(asyncBlock, "XblAchievementsUpdateAchievementAsync", 0);
 }
 
@@ -274,25 +439,260 @@ int32_t SCARLETTX_XSAPI_CALL XblAchievementsUpdateAchievementResult(void* asyncB
     return FinishXsapiAsync(asyncBlock);
 }
 
+int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsWriteAsync(
+    XblContextHandle context,
+    uint64_t xboxUserId,
+    const XblTitleManagedStatistic* statistics,
+    size_t statisticsCount,
+    void* asyncBlock) {
+    if (!context || (!statistics && statisticsCount > 0)) return kInvalidArg;
+    auto* ctx = static_cast<XblContext*>(context);
+    const uint64_t target_xuid = xboxUserId ? xboxUserId : ctx->xuid;
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        auto& user_stats = st.stats[target_xuid];
+        user_stats.clear();
+        for (size_t i = 0; i < statisticsCount; ++i) {
+            const auto& in = statistics[i];
+            if (!in.statisticName || !*in.statisticName) return kInvalidArg;
+            StoredStat s{};
+            s.name = in.statisticName;
+            s.type = in.statisticType;
+            s.number_value = in.numberValue;
+            s.string_value = in.stringValue ? in.stringValue : "";
+            user_stats[s.name] = std::move(s);
+        }
+    }
+    return StartXsapiAsync(asyncBlock, "XblTitleManagedStatsWriteAsync", 0);
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsWriteResult(void* asyncBlock) {
+    return FinishXsapiAsync(asyncBlock);
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsUpdateStatsAsync(
+    XblContextHandle context,
+    const XblTitleManagedStatistic* statistics,
+    size_t statisticsCount,
+    void* asyncBlock) {
+    if (!context || (!statistics && statisticsCount > 0)) return kInvalidArg;
+    auto* ctx = static_cast<XblContext*>(context);
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        auto& user_stats = st.stats[ctx->xuid];
+        for (size_t i = 0; i < statisticsCount; ++i) {
+            const auto& in = statistics[i];
+            if (!in.statisticName || !*in.statisticName) return kInvalidArg;
+            StoredStat s{};
+            s.name = in.statisticName;
+            s.type = in.statisticType;
+            s.number_value = in.numberValue;
+            s.string_value = in.stringValue ? in.stringValue : "";
+            user_stats[s.name] = std::move(s);
+        }
+    }
+    return StartXsapiAsync(asyncBlock, "XblTitleManagedStatsUpdateStatsAsync", 0);
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsUpdateStatsResult(void* asyncBlock) {
+    return FinishXsapiAsync(asyncBlock);
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsDeleteStatsAsync(
+    XblContextHandle context,
+    const char* const* statisticNames,
+    size_t statisticNamesCount,
+    void* asyncBlock) {
+    if (!context || (!statisticNames && statisticNamesCount > 0)) return kInvalidArg;
+    auto* ctx = static_cast<XblContext*>(context);
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        auto uit = st.stats.find(ctx->xuid);
+        if (uit != st.stats.end()) {
+            for (size_t i = 0; i < statisticNamesCount; ++i) {
+                if (statisticNames[i] && *statisticNames[i]) {
+                    uit->second.erase(statisticNames[i]);
+                }
+            }
+        }
+    }
+    return StartXsapiAsync(asyncBlock, "XblTitleManagedStatsDeleteStatsAsync", 0);
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblTitleManagedStatsDeleteStatsResult(void* asyncBlock) {
+    return FinishXsapiAsync(asyncBlock);
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblUserStatisticsGetSingleUserStatisticAsync(
+    XblContextHandle context,
+    uint64_t xboxUserId,
+    const char* /*scid*/,
+    const char* statisticName,
+    void* asyncBlock) {
+    if (!context || !statisticName || !*statisticName) return kInvalidArg;
+    auto* ctx = static_cast<XblContext*>(context);
+    const uint64_t target_xuid = xboxUserId ? xboxUserId : ctx->xuid;
+    StoredStat found{};
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        auto uit = st.stats.find(target_xuid);
+        if (uit == st.stats.end()) return kNotFound;
+        auto sit = uit->second.find(statisticName);
+        if (sit == uit->second.end()) return kNotFound;
+        found = sit->second;
+        if (asyncBlock) {
+            st.pending_stat_queries[asyncBlock] = found;
+        } else {
+            st.last_sync_stat_query = found;
+            st.has_last_sync_stat_query = true;
+        }
+    }
+    const size_t needed = found.name.size() + 1 + found.string_value.size() + 1;
+    return StartXsapiAsync(asyncBlock, "XblUserStatisticsGetSingleUserStatisticAsync", needed);
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblUserStatisticsGetSingleUserStatisticResultSize(
+    void* asyncBlock,
+    size_t* resultSizeInBytes) {
+    if (!resultSizeInBytes) return kInvalidArg;
+    *resultSizeInBytes = 0;
+    auto& st = OfflineStore();
+    std::lock_guard<std::mutex> lk(st.mu);
+    const StoredStat* rec = nullptr;
+    if (asyncBlock) {
+        auto it = st.pending_stat_queries.find(asyncBlock);
+        if (it == st.pending_stat_queries.end()) return kNotFound;
+        rec = &it->second;
+    } else {
+        if (!st.has_last_sync_stat_query) return kNotFound;
+        rec = &st.last_sync_stat_query;
+    }
+    *resultSizeInBytes = rec->name.size() + 1 + rec->string_value.size() + 1;
+    return kSuccess;
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblUserStatisticsGetSingleUserStatisticResult(
+    void* asyncBlock,
+    size_t bufferSize,
+    void* buffer,
+    XblTitleManagedStatistic* outStatistic,
+    size_t* bufferUsed) {
+    if (!outStatistic || !buffer) return kInvalidArg;
+    StoredStat rec{};
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        if (asyncBlock) {
+            auto it = st.pending_stat_queries.find(asyncBlock);
+            if (it == st.pending_stat_queries.end()) return kNotFound;
+            rec = it->second;
+        } else {
+            if (!st.has_last_sync_stat_query) return kNotFound;
+            rec = st.last_sync_stat_query;
+        }
+    }
+    const size_t name_bytes = rec.name.size() + 1;
+    const size_t val_bytes = rec.string_value.size() + 1;
+    const size_t needed = name_bytes + val_bytes;
+    if (bufferSize < needed) {
+        if (bufferUsed) *bufferUsed = needed;
+        return kInsufficientBuffer;
+    }
+    const int32_t hr = FinishXsapiAsync(asyncBlock);
+    if (hr < 0) return hr;
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        if (asyncBlock) {
+            st.pending_stat_queries.erase(asyncBlock);
+        }
+    }
+    char* dst = static_cast<char*>(buffer);
+    std::memcpy(dst, rec.name.c_str(), name_bytes);
+    char* val_dst = dst + name_bytes;
+    std::memcpy(val_dst, rec.string_value.c_str(), val_bytes);
+
+    outStatistic->statisticName = dst;
+    outStatistic->statisticType = rec.type;
+    outStatistic->numberValue = rec.number_value;
+    outStatistic->stringValue = (rec.type == XblTitleManagedStatType_String) ? val_dst : nullptr;
+    if (bufferUsed) *bufferUsed = needed;
+    return kSuccess;
+}
+
+int32_t SCARLETTX_XSAPI_CALL XblProfileSetLocalUserProfile(
+    XblContextHandle context, const XblUserProfile* userProfile) {
+    if (!context || !userProfile) return kInvalidArg;
+    auto* ctx = static_cast<XblContext*>(context);
+    XblUserProfile stored = *userProfile;
+    stored.gamertag[sizeof(stored.gamertag) - 1] = '\0';
+    stored.modernGamertag[sizeof(stored.modernGamertag) - 1] = '\0';
+    stored.modernGamertagSuffix[sizeof(stored.modernGamertagSuffix) - 1] = '\0';
+    stored.uniqueModernGamertag[sizeof(stored.uniqueModernGamertag) - 1] = '\0';
+    stored.gamerscore[sizeof(stored.gamerscore) - 1] = '\0';
+    stored.gameDisplayPictureResizeUri[sizeof(stored.gameDisplayPictureResizeUri) - 1] = '\0';
+    const uint64_t target_xuid = stored.xboxUserId ? stored.xboxUserId : ctx->xuid;
+    stored.xboxUserId = target_xuid;
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.profiles[target_xuid] = stored;
+    }
+    if (target_xuid == ctx->xuid && stored.gamertag[0] != '\0') {
+        ctx->gamertag = stored.gamertag;
+    }
+    return kSuccess;
+}
+
 int32_t SCARLETTX_XSAPI_CALL XblProfileGetUserProfileAsync(
-    XblContextHandle context, uint64_t /*xboxUserId*/, void* asyncBlock) {
+    XblContextHandle context, uint64_t xboxUserId, void* asyncBlock) {
     if (!context) return kInvalidArg;
+    auto* ctx = static_cast<XblContext*>(context);
+    const uint64_t target_xuid = xboxUserId ? xboxUserId : ctx->xuid;
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        if (asyncBlock) {
+            st.pending_profile_queries[asyncBlock] = target_xuid;
+        } else {
+            st.last_sync_profile_xuid = target_xuid;
+        }
+    }
     return StartXsapiAsync(asyncBlock, "XblProfileGetUserProfileAsync", sizeof(XblUserProfile));
 }
 
 int32_t SCARLETTX_XSAPI_CALL XblProfileGetUserProfileResult(
     void* asyncBlock, size_t bufferSize, void* buffer, XblUserProfile* userProfile, size_t* bufferUsed) {
-    (void)bufferSize;
-    (void)buffer;
     const int32_t hr = FinishXsapiAsync(asyncBlock);
     if (hr < 0) return hr;
+
+    XblUserProfile resolved = MakeDefaultUserProfile();
+    {
+        auto& st = OfflineStore();
+        std::lock_guard<std::mutex> lk(st.mu);
+        uint64_t query_xuid = st.last_sync_profile_xuid;
+        if (asyncBlock) {
+            auto it = st.pending_profile_queries.find(asyncBlock);
+            if (it != st.pending_profile_queries.end()) {
+                query_xuid = it->second;
+                st.pending_profile_queries.erase(it);
+            }
+        }
+        auto pit = st.profiles.find(query_xuid);
+        if (pit != st.profiles.end()) {
+            resolved = pit->second;
+        }
+    }
+
     if (userProfile) {
-        userProfile->xboxUserId = 0x0009000000000001ull;
-        std::strncpy(userProfile->gamertag, "ScarlettPlayer", sizeof(userProfile->gamertag) - 1);
-        std::strncpy(userProfile->modernGamertag, "ScarlettPlayer", sizeof(userProfile->modernGamertag) - 1);
-        std::strncpy(userProfile->modernGamertagSuffix, "#1234", sizeof(userProfile->modernGamertagSuffix) - 1);
-        std::strncpy(userProfile->uniqueModernGamertag, "ScarlettPlayer#1234", sizeof(userProfile->uniqueModernGamertag) - 1);
-        std::strncpy(userProfile->gamerscore, "1000", sizeof(userProfile->gamerscore) - 1);
+        *userProfile = resolved;
+    }
+    if (buffer && bufferSize >= sizeof(XblUserProfile)) {
+        std::memcpy(buffer, &resolved, sizeof(XblUserProfile));
     }
     if (bufferUsed) *bufferUsed = sizeof(XblUserProfile);
     return kSuccess;

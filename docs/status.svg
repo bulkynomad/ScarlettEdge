@@ -24,28 +24,28 @@
     <rect x="36" y="86" width="129" height="20" fill="#555555"/>
     <rect x="165" y="86" width="110" height="20" fill="#a371f7"/>
     <text class="badge-txt" x="100.5" y="100" text-anchor="middle">upstream ScarlettX</text>
-    <text class="badge-txt-dark" x="220.0" y="100" text-anchor="middle">281/505 (55.6%)</text>
+    <text class="badge-txt-dark" x="220.0" y="100" text-anchor="middle">281/517 (54.4%)</text>
   </g>
   <clipPath id="bclip1"><rect x="281" y="86" width="220" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip1)">
     <rect x="281" y="86" width="123" height="20" fill="#555555"/>
     <rect x="404" y="86" width="97" height="20" fill="#39d353"/>
     <text class="badge-txt" x="342.5" y="100" text-anchor="middle">ScarlettEdge fork</text>
-    <text class="badge-txt-dark" x="452.5" y="100" text-anchor="middle">+224 (+44.4%)</text>
+    <text class="badge-txt-dark" x="452.5" y="100" text-anchor="middle">+236 (+45.6%)</text>
   </g>
   <clipPath id="bclip2"><rect x="507" y="86" width="92" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip2)">
     <rect x="507" y="86" width="59" height="20" fill="#555555"/>
     <rect x="566" y="86" width="33" height="20" fill="#007ec6"/>
     <text class="badge-txt" x="536.5" y="100" text-anchor="middle">exports</text>
-    <text class="badge-txt" x="582.5" y="100" text-anchor="middle">501</text>
+    <text class="badge-txt" x="582.5" y="100" text-anchor="middle">513</text>
   </g>
   <clipPath id="bclip3"><rect x="605" y="86" width="143" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip3)">
     <rect x="605" y="86" width="46" height="20" fill="#555555"/>
     <rect x="651" y="86" width="97" height="20" fill="#26a641"/>
     <text class="badge-txt" x="628.0" y="100" text-anchor="middle">tests</text>
-    <text class="badge-txt" x="699.5" y="100" text-anchor="middle">39/39 passing</text>
+    <text class="badge-txt" x="699.5" y="100" text-anchor="middle">41/41 passing</text>
   </g>
 
   <!-- 3. Contribution graph box -->
@@ -574,6 +574,18 @@
   <rect x="977.0" y="234.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="987.0" y="174.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="987.0" y="184.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="987.0" y="194.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="987.0" y="204.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="987.0" y="214.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="987.0" y="224.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="987.0" y="234.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="997.0" y="174.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="997.0" y="184.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="997.0" y="194.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="997.0" y="204.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="997.0" y="214.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="997.0" y="224.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="997.0" y="234.0" width="8" height="8" rx="3" fill="#39d353"/>
   <text class="legend-txt" x="980" y="267" text-anchor="end">ScarlettEdge (Fork)</text>
   <rect x="864.0" y="257.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="legend-txt" x="852.0" y="267" text-anchor="end">ScarlettX (Upstream)</text>
@@ -606,39 +618,39 @@
   <text class="r-count" x="952.0" y="363" text-anchor="end">38 of 38</text>
   <text class="r-pct" x="1000.0" y="363" text-anchor="end">100%</text>
   <line x1="540.0" y1="378" x2="1000.0" y2="378" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="387.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
-  <rect x="45.5" y="387.0" width="5.5" height="11" rx="1" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="397">XSystem &amp; Runtime</text>
-  <text class="r-count" x="452.0" y="397" text-anchor="end">34 of 34</text>
+  <rect x="40.0" y="387.0" width="11" height="11" rx="2" fill="#39d353"/>
+  <text class="r-name" x="61.0" y="397">Live Xbox Services (XSAPI/WinRT)</text>
+  <text class="r-count" x="452.0" y="397" text-anchor="end">35 of 35</text>
   <text class="r-pct" x="500.0" y="397" text-anchor="end">100%</text>
   <line x1="40.0" y1="412" x2="500.0" y2="412" stroke="#21262d" stroke-width="1"/>
   <rect x="540.0" y="387.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
   <rect x="545.5" y="387.0" width="5.5" height="11" rx="1" fill="#39d353"/>
-  <text class="r-name" x="561.0" y="397">XUser &amp; Identity</text>
-  <text class="r-count" x="952.0" y="397" text-anchor="end">32 of 32</text>
+  <text class="r-name" x="561.0" y="397">XSystem &amp; Runtime</text>
+  <text class="r-count" x="952.0" y="397" text-anchor="end">34 of 34</text>
   <text class="r-pct" x="1000.0" y="397" text-anchor="end">100%</text>
   <line x1="540.0" y1="412" x2="1000.0" y2="412" stroke="#21262d" stroke-width="1"/>
   <rect x="40.0" y="421.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
   <rect x="45.5" y="421.0" width="5.5" height="11" rx="1" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="431">XGameSave (persistent)</text>
-  <text class="r-count" x="452.0" y="431" text-anchor="end">30 of 30</text>
+  <text class="r-name" x="61.0" y="431">XUser &amp; Identity</text>
+  <text class="r-count" x="452.0" y="431" text-anchor="end">32 of 32</text>
   <text class="r-pct" x="500.0" y="431" text-anchor="end">100%</text>
   <line x1="40.0" y1="446" x2="500.0" y2="446" stroke="#21262d" stroke-width="1"/>
   <rect x="540.0" y="421.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
   <rect x="545.5" y="421.0" width="5.5" height="11" rx="1" fill="#39d353"/>
-  <text class="r-name" x="561.0" y="431">DirectStorage &amp; XVD</text>
-  <text class="r-count" x="952.0" y="431" text-anchor="end">26 of 26</text>
+  <text class="r-name" x="561.0" y="431">XGameSave (persistent)</text>
+  <text class="r-count" x="952.0" y="431" text-anchor="end">30 of 30</text>
   <text class="r-pct" x="1000.0" y="431" text-anchor="end">100%</text>
   <line x1="540.0" y1="446" x2="1000.0" y2="446" stroke="#21262d" stroke-width="1"/>
   <rect x="40.0" y="455.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
   <rect x="45.5" y="455.0" width="5.5" height="11" rx="1" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="465">XTaskQueue &amp; XAsync</text>
-  <text class="r-count" x="452.0" y="465" text-anchor="end">24 of 24</text>
+  <text class="r-name" x="61.0" y="465">DirectStorage &amp; XVD</text>
+  <text class="r-count" x="452.0" y="465" text-anchor="end">26 of 26</text>
   <text class="r-pct" x="500.0" y="465" text-anchor="end">100%</text>
   <line x1="40.0" y1="480" x2="500.0" y2="480" stroke="#21262d" stroke-width="1"/>
-  <rect x="540.0" y="455.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="561.0" y="465">Live Xbox Services (XSAPI/WinRT)</text>
-  <text class="r-count" x="952.0" y="465" text-anchor="end">23 of 23</text>
+  <rect x="540.0" y="455.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
+  <rect x="545.5" y="455.0" width="5.5" height="11" rx="1" fill="#39d353"/>
+  <text class="r-name" x="561.0" y="465">XTaskQueue &amp; XAsync</text>
+  <text class="r-count" x="952.0" y="465" text-anchor="end">24 of 24</text>
   <text class="r-pct" x="1000.0" y="465" text-anchor="end">100%</text>
   <line x1="540.0" y1="480" x2="1000.0" y2="480" stroke="#21262d" stroke-width="1"/>
   <rect x="40.0" y="489.0" width="11" height="11" rx="2" fill="#39d353"/>
@@ -693,6 +705,6 @@
   <!-- 5. Status callout -->
   <rect x="36" y="670" width="4" height="46" fill="#39d353"/>
   <g transform="translate(56,680)"><circle cx="8" cy="8" r="6.5" fill="none" stroke="#39d353" stroke-width="1.5"/><path d="M5.2 8.2 7.1 10.1 11 6.1" fill="none" stroke="#39d353" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
-  <text class="callout-txt" x="82" y="689"><tspan class="callout-lead">Attribution:</tspan> Purple = original Freminet/ScarlettX (281/505, 55.6%); Green = ScarlettEdge additions (+224, +44.4%).</text>
-  <text class="callout-txt" x="82" y="706">Combined 100% clean-room ABI coverage across all 19 tracked subsystems (39/39 passing CTest suites).</text>
+  <text class="callout-txt" x="82" y="689"><tspan class="callout-lead">Attribution:</tspan> Purple = original Freminet/ScarlettX (281/517, 54.4%); Green = ScarlettEdge additions (+236, +45.6%).</text>
+  <text class="callout-txt" x="82" y="706">Combined 100% clean-room ABI coverage across all 19 tracked subsystems (41/41 passing CTest suites).</text>
 </svg>

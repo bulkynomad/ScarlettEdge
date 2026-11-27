@@ -1133,9 +1133,663 @@ HMODULE GetCachedXsapiModule() {
     return cached;
 }
 
+// Clean-room WinRT IInspectable / IActivationFactory broker for common Xbox / UWP
+// runtime classes: Windows.Gaming.Input.Gamepad, Windows.System.Profile.AnalyticsInfo,
+// and Windows.ApplicationModel.Package.
+enum class BrokerWinRtKind {
+    None = 0,
+    Gamepad,
+    AnalyticsInfo,
+    AnalyticsVersionInfo,
+    Package,
+    PackageId,
+};
+
+constexpr GUID kWinRtIidIUnknown = {
+    0x00000000u, 0x0000u, 0x0000u, {0xC0u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x46u}};
+constexpr GUID kWinRtIidIInspectable = {
+    0xAF86E2E0u, 0xB12Du, 0x4C6Au, {0x9Cu, 0x5Au, 0xD7u, 0xAAu, 0x65u, 0x10u, 0x1Eu, 0x90u}};
+constexpr GUID kWinRtIidIAgileObject = {
+    0x94EA2B94u, 0xE9CCu, 0x49E0u, {0xC0u, 0xFFu, 0xEEu, 0x64u, 0xCAu, 0x8Fu, 0x5Bu, 0x90u}};
+constexpr GUID kWinRtIidIActivationFactory = {
+    0x00000035u, 0x0000u, 0x0000u, {0xC0u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x46u}};
+
+// Windows.Gaming.Input.Gamepad
+constexpr GUID kWinRtIidIGamepadStatics = {
+    0x8BBCE529u, 0xD49Cu, 0x39E9u, {0x95u, 0x60u, 0xE4u, 0x7Du, 0xDEu, 0x96u, 0xB7u, 0xC8u}};
+constexpr GUID kWinRtIidIGamepadStatics2 = {
+    0x42676DC5u, 0x0856u, 0x47C4u, {0x92u, 0x13u, 0xB3u, 0x95u, 0x50u, 0x4Cu, 0x3Au, 0x3Cu}};
+constexpr GUID kWinRtIidIGamepad = {
+    0xBC7BB43Cu, 0x0A69u, 0x3903u, {0x9Eu, 0x9Du, 0xA5u, 0x0Fu, 0x86u, 0xA4u, 0x5Du, 0xE5u}};
+
+// Windows.System.Profile.AnalyticsInfo / AnalyticsVersionInfo
+constexpr GUID kWinRtIidIAnalyticsInfoStatics = {
+    0x1D5EE066u, 0x188Du, 0x5BA9u, {0x43u, 0x87u, 0xACu, 0xAEu, 0xB0u, 0xE7u, 0xE3u, 0x05u}};
+constexpr GUID kWinRtIidIAnalyticsVersionInfo = {
+    0x926130B8u, 0x9955u, 0x4C74u, {0xBDu, 0xC1u, 0x7Cu, 0xD0u, 0xDEu, 0xCFu, 0x9Bu, 0x03u}};
+
+// Windows.ApplicationModel.Package / PackageId
+constexpr GUID kWinRtIidIPackageStatics = {
+    0x4E534BDFu, 0x2960u, 0x4878u, {0x97u, 0xA4u, 0x96u, 0x24u, 0xDEu, 0xB7u, 0x2Fu, 0x2Du}};
+constexpr GUID kWinRtIidIPackage = {
+    0x163C792Fu, 0xBD75u, 0x413Cu, {0xBFu, 0x23u, 0xB1u, 0xFEu, 0x7Bu, 0x95u, 0xD8u, 0x25u}};
+constexpr GUID kWinRtIidIPackageId = {
+    0x1ADB665Eu, 0x37C7u, 0x4790u, {0x99u, 0x80u, 0xDDu, 0x7Au, 0xE7u, 0x4Eu, 0x8Bu, 0xB2u}};
+
+bool BrokerGuidEquals(const GUID* a, const GUID& b) {
+    return a && std::memcmp(a, &b, sizeof(GUID)) == 0;
+}
+
+void* BrokerCoTaskMemAlloc(size_t bytes) {
+    static HMODULE ole32 = LoadLibraryW(L"ole32.dll");
+    using FnAlloc = void*(WINAPI*)(size_t);
+    static const FnAlloc alloc_fn =
+        ole32 ? reinterpret_cast<FnAlloc>(reinterpret_cast<void*>(GetProcAddress(ole32, "CoTaskMemAlloc")))
+              : nullptr;
+    return alloc_fn ? alloc_fn(bytes) : nullptr;
+}
+
+HRESULT BrokerCreateHString(const wchar_t* text, void** out_hstr) {
+    if (!out_hstr) return E_POINTER;
+    *out_hstr = nullptr;
+    if (!text) return S_OK;
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using FnCreateStr = HRESULT(WINAPI*)(const wchar_t*, uint32_t, void**);
+    static const FnCreateStr create_str =
+        combase ? reinterpret_cast<FnCreateStr>(reinterpret_cast<void*>(
+                      GetProcAddress(combase, "WindowsCreateString")))
+                : nullptr;
+    if (!create_str) return E_NOTIMPL;
+    return create_str(text, static_cast<uint32_t>(std::wcslen(text)), out_hstr);
+}
+
+BrokerWinRtKind ClassifyBrokerWinRtClass(const wchar_t* cls) {
+    if (!cls || !*cls) return BrokerWinRtKind::None;
+    if (std::wcscmp(cls, L"Windows.Gaming.Input.Gamepad") == 0) return BrokerWinRtKind::Gamepad;
+    if (std::wcscmp(cls, L"Windows.System.Profile.AnalyticsInfo") == 0) return BrokerWinRtKind::AnalyticsInfo;
+    if (std::wcscmp(cls, L"Windows.ApplicationModel.Package") == 0) return BrokerWinRtKind::Package;
+    return BrokerWinRtKind::None;
+}
+
+struct BrokerGamepadVibration {
+    double left_motor = 0.0;
+    double right_motor = 0.0;
+    double left_trigger = 0.0;
+    double right_trigger = 0.0;
+};
+
+struct BrokerGamepadReading {
+    uint64_t timestamp = 0;
+    uint32_t buttons = 0;
+    uint32_t reserved = 0;
+    double left_trigger = 0.0;
+    double right_trigger = 0.0;
+    double left_thumbstick_x = 0.0;
+    double left_thumbstick_y = 0.0;
+    double right_thumbstick_x = 0.0;
+    double right_thumbstick_y = 0.0;
+};
+
+struct BrokerPackageVersion {
+    uint16_t major = 1;
+    uint16_t minor = 0;
+    uint16_t build = 0;
+    uint16_t revision = 0;
+};
+
+struct BrokerWinRtInstance {
+    const void* const* vtbl = nullptr;
+    volatile LONG refs = 1;
+    BrokerWinRtKind kind = BrokerWinRtKind::None;
+    GUID primary_iid{};
+    const wchar_t* class_name = L"";
+    BrokerGamepadVibration vibration{};
+};
+
+struct BrokerWinRtFactory;
+
+struct BrokerWinRtStaticsView {
+    const void* const* vtbl = nullptr;
+    BrokerWinRtFactory* owner = nullptr;
+};
+
+struct BrokerWinRtFactory {
+    const void* const* vtbl = nullptr;
+    BrokerWinRtStaticsView statics{};
+    volatile LONG refs = 1;
+    BrokerWinRtKind kind = BrokerWinRtKind::None;
+    GUID statics_iid{};
+    GUID statics_iid2{};
+    bool has_statics_iid2 = false;
+    volatile LONG next_event_token = 1;
+};
+
+BrokerWinRtInstance* CreateBrokerWinRtInstance(BrokerWinRtKind kind);
+
+HRESULT WINAPI BrokerInst_QueryInterface(void* self_ptr, const GUID* riid, void** ppv) {
+    if (!ppv) return E_POINTER;
+    *ppv = nullptr;
+    if (!self_ptr || !riid) return E_INVALIDARG;
+    auto* self = static_cast<BrokerWinRtInstance*>(self_ptr);
+    if (BrokerGuidEquals(riid, kWinRtIidIUnknown) ||
+        BrokerGuidEquals(riid, kWinRtIidIInspectable) ||
+        BrokerGuidEquals(riid, kWinRtIidIAgileObject) ||
+        BrokerGuidEquals(riid, self->primary_iid)) {
+        InterlockedIncrement(&self->refs);
+        *ppv = self;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+ULONG WINAPI BrokerInst_AddRef(void* self_ptr) {
+    if (!self_ptr) return 0;
+    return static_cast<ULONG>(InterlockedIncrement(&static_cast<BrokerWinRtInstance*>(self_ptr)->refs));
+}
+
+ULONG WINAPI BrokerInst_Release(void* self_ptr) {
+    if (!self_ptr) return 0;
+    auto* self = static_cast<BrokerWinRtInstance*>(self_ptr);
+    const LONG rem = InterlockedDecrement(&self->refs);
+    if (rem == 0) {
+        delete self;
+    }
+    return static_cast<ULONG>(rem);
+}
+
+HRESULT WINAPI BrokerInst_GetIids(void* self_ptr, ULONG* iid_count, GUID** iids) {
+    if (!iid_count || !iids) return E_POINTER;
+    *iid_count = 0;
+    *iids = nullptr;
+    if (!self_ptr) return E_INVALIDARG;
+    auto* self = static_cast<BrokerWinRtInstance*>(self_ptr);
+    auto* mem = static_cast<GUID*>(BrokerCoTaskMemAlloc(sizeof(GUID)));
+    if (!mem) return E_OUTOFMEMORY;
+    *mem = self->primary_iid;
+    *iid_count = 1;
+    *iids = mem;
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerInst_GetRuntimeClassName(void* self_ptr, void** out_hstr) {
+    if (!out_hstr) return E_POINTER;
+    *out_hstr = nullptr;
+    if (!self_ptr) return E_INVALIDARG;
+    auto* self = static_cast<BrokerWinRtInstance*>(self_ptr);
+    return BrokerCreateHString(self->class_name, out_hstr);
+}
+
+HRESULT WINAPI BrokerInst_GetTrustLevel(void* /*self_ptr*/, int32_t* trust_level) {
+    if (!trust_level) return E_POINTER;
+    *trust_level = 0;  // BaseTrust
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerWinRt_NotImpl(void* /*self_ptr*/) {
+    return E_NOTIMPL;
+}
+
+// IGamepad methods (slots 6..8)
+HRESULT WINAPI BrokerGamepad_GetVibration(void* self_ptr, BrokerGamepadVibration* out_vib) {
+    if (!out_vib) return E_POINTER;
+    if (!self_ptr) return E_INVALIDARG;
+    *out_vib = static_cast<BrokerWinRtInstance*>(self_ptr)->vibration;
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerGamepad_PutVibration(void* self_ptr, BrokerGamepadVibration vib) {
+    if (!self_ptr) return E_INVALIDARG;
+    static_cast<BrokerWinRtInstance*>(self_ptr)->vibration = vib;
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerGamepad_GetCurrentReading(void* self_ptr, BrokerGamepadReading* out_reading) {
+    if (!out_reading) return E_POINTER;
+    if (!self_ptr) return E_INVALIDARG;
+    *out_reading = BrokerGamepadReading{};
+    out_reading->timestamp = GetTickCount64() * 10000ull;
+    return S_OK;
+}
+
+// IAnalyticsVersionInfo methods (slots 6..7)
+HRESULT WINAPI BrokerAnalyticsVersion_GetDeviceFamily(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"Windows.Xbox", out_hstr);
+}
+
+HRESULT WINAPI BrokerAnalyticsVersion_GetDeviceFamilyVersion(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"2814751249596416", out_hstr);
+}
+
+// IPackage methods (slots 6..9)
+HRESULT WINAPI BrokerPackage_GetId(void* /*self_ptr*/, void** out_pkg_id) {
+    if (!out_pkg_id) return E_POINTER;
+    *out_pkg_id = CreateBrokerWinRtInstance(BrokerWinRtKind::PackageId);
+    return *out_pkg_id ? S_OK : E_OUTOFMEMORY;
+}
+
+HRESULT WINAPI BrokerPackage_GetInstalledLocation(void* /*self_ptr*/, void** out_folder) {
+    if (!out_folder) return E_POINTER;
+    *out_folder = nullptr;
+    return E_NOTIMPL;
+}
+
+HRESULT WINAPI BrokerPackage_GetDependencies(void* /*self_ptr*/, void** out_deps) {
+    if (!out_deps) return E_POINTER;
+    *out_deps = nullptr;
+    return E_NOTIMPL;
+}
+
+HRESULT WINAPI BrokerPackage_GetIsFramework(void* /*self_ptr*/, uint8_t* out_is_framework) {
+    if (!out_is_framework) return E_POINTER;
+    *out_is_framework = 0;
+    return S_OK;
+}
+
+// IPackageId methods (slots 6..13)
+HRESULT WINAPI BrokerPackageId_GetName(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"ScarlettX.Title", out_hstr);
+}
+
+HRESULT WINAPI BrokerPackageId_GetVersion(void* /*self_ptr*/, BrokerPackageVersion* out_ver) {
+    if (!out_ver) return E_POINTER;
+    *out_ver = BrokerPackageVersion{1, 0, 0, 0};
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerPackageId_GetArchitecture(void* /*self_ptr*/, int32_t* out_arch) {
+    if (!out_arch) return E_POINTER;
+    *out_arch = 9;  // ProcessorArchitecture_X64
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerPackageId_GetResourceId(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"", out_hstr);
+}
+
+HRESULT WINAPI BrokerPackageId_GetPublisher(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"CN=ScarlettX", out_hstr);
+}
+
+HRESULT WINAPI BrokerPackageId_GetPublisherId(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"scarlettx0000", out_hstr);
+}
+
+HRESULT WINAPI BrokerPackageId_GetFullName(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"ScarlettX.Title_1.0.0.0_x64__scarlettx0000", out_hstr);
+}
+
+HRESULT WINAPI BrokerPackageId_GetFamilyName(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"ScarlettX.Title_scarlettx0000", out_hstr);
+}
+
+const void* const kBrokerGamepadInstVtbl[16] = {
+    reinterpret_cast<const void*>(&BrokerInst_QueryInterface),
+    reinterpret_cast<const void*>(&BrokerInst_AddRef),
+    reinterpret_cast<const void*>(&BrokerInst_Release),
+    reinterpret_cast<const void*>(&BrokerInst_GetIids),
+    reinterpret_cast<const void*>(&BrokerInst_GetRuntimeClassName),
+    reinterpret_cast<const void*>(&BrokerInst_GetTrustLevel),
+    reinterpret_cast<const void*>(&BrokerGamepad_GetVibration),
+    reinterpret_cast<const void*>(&BrokerGamepad_PutVibration),
+    reinterpret_cast<const void*>(&BrokerGamepad_GetCurrentReading),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+};
+
+const void* const kBrokerAnalyticsVersionVtbl[16] = {
+    reinterpret_cast<const void*>(&BrokerInst_QueryInterface),
+    reinterpret_cast<const void*>(&BrokerInst_AddRef),
+    reinterpret_cast<const void*>(&BrokerInst_Release),
+    reinterpret_cast<const void*>(&BrokerInst_GetIids),
+    reinterpret_cast<const void*>(&BrokerInst_GetRuntimeClassName),
+    reinterpret_cast<const void*>(&BrokerInst_GetTrustLevel),
+    reinterpret_cast<const void*>(&BrokerAnalyticsVersion_GetDeviceFamily),
+    reinterpret_cast<const void*>(&BrokerAnalyticsVersion_GetDeviceFamilyVersion),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+};
+
+const void* const kBrokerPackageInstVtbl[16] = {
+    reinterpret_cast<const void*>(&BrokerInst_QueryInterface),
+    reinterpret_cast<const void*>(&BrokerInst_AddRef),
+    reinterpret_cast<const void*>(&BrokerInst_Release),
+    reinterpret_cast<const void*>(&BrokerInst_GetIids),
+    reinterpret_cast<const void*>(&BrokerInst_GetRuntimeClassName),
+    reinterpret_cast<const void*>(&BrokerInst_GetTrustLevel),
+    reinterpret_cast<const void*>(&BrokerPackage_GetId),
+    reinterpret_cast<const void*>(&BrokerPackage_GetInstalledLocation),
+    reinterpret_cast<const void*>(&BrokerPackage_GetDependencies),
+    reinterpret_cast<const void*>(&BrokerPackage_GetIsFramework),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+};
+
+const void* const kBrokerPackageIdInstVtbl[16] = {
+    reinterpret_cast<const void*>(&BrokerInst_QueryInterface),
+    reinterpret_cast<const void*>(&BrokerInst_AddRef),
+    reinterpret_cast<const void*>(&BrokerInst_Release),
+    reinterpret_cast<const void*>(&BrokerInst_GetIids),
+    reinterpret_cast<const void*>(&BrokerInst_GetRuntimeClassName),
+    reinterpret_cast<const void*>(&BrokerInst_GetTrustLevel),
+    reinterpret_cast<const void*>(&BrokerPackageId_GetName),
+    reinterpret_cast<const void*>(&BrokerPackageId_GetVersion),
+    reinterpret_cast<const void*>(&BrokerPackageId_GetArchitecture),
+    reinterpret_cast<const void*>(&BrokerPackageId_GetResourceId),
+    reinterpret_cast<const void*>(&BrokerPackageId_GetPublisher),
+    reinterpret_cast<const void*>(&BrokerPackageId_GetPublisherId),
+    reinterpret_cast<const void*>(&BrokerPackageId_GetFullName),
+    reinterpret_cast<const void*>(&BrokerPackageId_GetFamilyName),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+};
+
+BrokerWinRtInstance* CreateBrokerWinRtInstance(BrokerWinRtKind kind) {
+    auto* inst = new (std::nothrow) BrokerWinRtInstance();
+    if (!inst) return nullptr;
+    inst->kind = kind;
+    switch (kind) {
+        case BrokerWinRtKind::Gamepad:
+            inst->vtbl = kBrokerGamepadInstVtbl;
+            inst->primary_iid = kWinRtIidIGamepad;
+            inst->class_name = L"Windows.Gaming.Input.Gamepad";
+            break;
+        case BrokerWinRtKind::AnalyticsInfo:
+        case BrokerWinRtKind::AnalyticsVersionInfo:
+            inst->kind = BrokerWinRtKind::AnalyticsVersionInfo;
+            inst->vtbl = kBrokerAnalyticsVersionVtbl;
+            inst->primary_iid = kWinRtIidIAnalyticsVersionInfo;
+            inst->class_name = L"Windows.System.Profile.AnalyticsVersionInfo";
+            break;
+        case BrokerWinRtKind::Package:
+            inst->vtbl = kBrokerPackageInstVtbl;
+            inst->primary_iid = kWinRtIidIPackage;
+            inst->class_name = L"Windows.ApplicationModel.Package";
+            break;
+        case BrokerWinRtKind::PackageId:
+            inst->vtbl = kBrokerPackageIdInstVtbl;
+            inst->primary_iid = kWinRtIidIPackageId;
+            inst->class_name = L"Windows.ApplicationModel.PackageId";
+            break;
+        default:
+            delete inst;
+            return nullptr;
+    }
+    return inst;
+}
+
+HRESULT BrokerFactoryQueryInterfaceCommon(BrokerWinRtFactory* fac, const GUID* riid, void** ppv) {
+    if (!ppv) return E_POINTER;
+    *ppv = nullptr;
+    if (!fac || !riid) return E_INVALIDARG;
+    if (BrokerGuidEquals(riid, kWinRtIidIUnknown) ||
+        BrokerGuidEquals(riid, kWinRtIidIInspectable) ||
+        BrokerGuidEquals(riid, kWinRtIidIAgileObject) ||
+        BrokerGuidEquals(riid, kWinRtIidIActivationFactory)) {
+        InterlockedIncrement(&fac->refs);
+        *ppv = fac;
+        return S_OK;
+    }
+    if (BrokerGuidEquals(riid, fac->statics_iid) ||
+        (fac->has_statics_iid2 && BrokerGuidEquals(riid, fac->statics_iid2))) {
+        InterlockedIncrement(&fac->refs);
+        *ppv = &fac->statics;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+
+HRESULT WINAPI BrokerFac_QueryInterface(void* self_ptr, const GUID* riid, void** ppv) {
+    return BrokerFactoryQueryInterfaceCommon(static_cast<BrokerWinRtFactory*>(self_ptr), riid, ppv);
+}
+
+ULONG WINAPI BrokerFac_AddRef(void* self_ptr) {
+    if (!self_ptr) return 0;
+    return static_cast<ULONG>(InterlockedIncrement(&static_cast<BrokerWinRtFactory*>(self_ptr)->refs));
+}
+
+ULONG WINAPI BrokerFac_Release(void* self_ptr) {
+    if (!self_ptr) return 0;
+    auto* fac = static_cast<BrokerWinRtFactory*>(self_ptr);
+    const LONG rem = InterlockedDecrement(&fac->refs);
+    if (rem == 0) delete fac;
+    return static_cast<ULONG>(rem);
+}
+
+HRESULT BrokerFactoryGetIidsCommon(BrokerWinRtFactory* fac, ULONG* iid_count, GUID** iids) {
+    if (!iid_count || !iids) return E_POINTER;
+    *iid_count = 0;
+    *iids = nullptr;
+    if (!fac) return E_INVALIDARG;
+    const ULONG count = fac->has_statics_iid2 ? 3u : 2u;
+    auto* mem = static_cast<GUID*>(BrokerCoTaskMemAlloc(sizeof(GUID) * count));
+    if (!mem) return E_OUTOFMEMORY;
+    mem[0] = kWinRtIidIActivationFactory;
+    mem[1] = fac->statics_iid;
+    if (fac->has_statics_iid2) {
+        mem[2] = fac->statics_iid2;
+    }
+    *iid_count = count;
+    *iids = mem;
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerFac_GetIids(void* self_ptr, ULONG* iid_count, GUID** iids) {
+    return BrokerFactoryGetIidsCommon(static_cast<BrokerWinRtFactory*>(self_ptr), iid_count, iids);
+}
+
+HRESULT WINAPI BrokerFac_GetRuntimeClassName(void* /*self_ptr*/, void** out_hstr) {
+    if (!out_hstr) return E_POINTER;
+    *out_hstr = nullptr;
+    return static_cast<HRESULT>(0x8000000Eu);  // E_ILLEGAL_METHOD_CALL per WinRT IActivationFactory spec
+}
+
+HRESULT WINAPI BrokerFac_GetTrustLevel(void* /*self_ptr*/, int32_t* trust_level) {
+    if (!trust_level) return E_POINTER;
+    *trust_level = 0;  // BaseTrust
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerFac_ActivateInstance(void* self_ptr, void** out_instance) {
+    if (!out_instance) return E_POINTER;
+    *out_instance = nullptr;
+    if (!self_ptr) return E_INVALIDARG;
+    auto* fac = static_cast<BrokerWinRtFactory*>(self_ptr);
+    *out_instance = CreateBrokerWinRtInstance(fac->kind);
+    return *out_instance ? S_OK : E_OUTOFMEMORY;
+}
+
+HRESULT WINAPI BrokerStatics_QueryInterface(void* self_ptr, const GUID* riid, void** ppv) {
+    auto* view = static_cast<BrokerWinRtStaticsView*>(self_ptr);
+    return BrokerFactoryQueryInterfaceCommon(view ? view->owner : nullptr, riid, ppv);
+}
+
+ULONG WINAPI BrokerStatics_AddRef(void* self_ptr) {
+    auto* view = static_cast<BrokerWinRtStaticsView*>(self_ptr);
+    return (view && view->owner) ? BrokerFac_AddRef(view->owner) : 0;
+}
+
+ULONG WINAPI BrokerStatics_Release(void* self_ptr) {
+    auto* view = static_cast<BrokerWinRtStaticsView*>(self_ptr);
+    return (view && view->owner) ? BrokerFac_Release(view->owner) : 0;
+}
+
+HRESULT WINAPI BrokerStatics_GetIids(void* self_ptr, ULONG* iid_count, GUID** iids) {
+    auto* view = static_cast<BrokerWinRtStaticsView*>(self_ptr);
+    return BrokerFactoryGetIidsCommon(view ? view->owner : nullptr, iid_count, iids);
+}
+
+// IGamepadStatics methods (slots 6..10)
+HRESULT WINAPI BrokerGamepadStatics_AddEvent(void* self_ptr, void* /*handler*/, int64_t* out_token) {
+    if (!out_token) return E_POINTER;
+    auto* view = static_cast<BrokerWinRtStaticsView*>(self_ptr);
+    if (!view || !view->owner) return E_INVALIDARG;
+    *out_token = static_cast<int64_t>(InterlockedIncrement(&view->owner->next_event_token));
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerGamepadStatics_RemoveEvent(void* /*self_ptr*/, int64_t /*token*/) {
+    return S_OK;
+}
+
+HRESULT WINAPI BrokerGamepadStatics_GetGamepads(void* /*self_ptr*/, void** out_vec) {
+    if (!out_vec) return E_POINTER;
+    *out_vec = nullptr;
+    return E_NOTIMPL;
+}
+
+// IAnalyticsInfoStatics methods (slots 6..7)
+HRESULT WINAPI BrokerAnalyticsStatics_GetVersionInfo(void* /*self_ptr*/, void** out_ver_info) {
+    if (!out_ver_info) return E_POINTER;
+    *out_ver_info = CreateBrokerWinRtInstance(BrokerWinRtKind::AnalyticsVersionInfo);
+    return *out_ver_info ? S_OK : E_OUTOFMEMORY;
+}
+
+HRESULT WINAPI BrokerAnalyticsStatics_GetDeviceForm(void* /*self_ptr*/, void** out_hstr) {
+    return BrokerCreateHString(L"Xbox", out_hstr);
+}
+
+// IPackageStatics methods (slot 6)
+HRESULT WINAPI BrokerPackageStatics_GetCurrent(void* /*self_ptr*/, void** out_pkg) {
+    if (!out_pkg) return E_POINTER;
+    *out_pkg = CreateBrokerWinRtInstance(BrokerWinRtKind::Package);
+    return *out_pkg ? S_OK : E_OUTOFMEMORY;
+}
+
+const void* const kBrokerFactoryVtbl[16] = {
+    reinterpret_cast<const void*>(&BrokerFac_QueryInterface),
+    reinterpret_cast<const void*>(&BrokerFac_AddRef),
+    reinterpret_cast<const void*>(&BrokerFac_Release),
+    reinterpret_cast<const void*>(&BrokerFac_GetIids),
+    reinterpret_cast<const void*>(&BrokerFac_GetRuntimeClassName),
+    reinterpret_cast<const void*>(&BrokerFac_GetTrustLevel),
+    reinterpret_cast<const void*>(&BrokerFac_ActivateInstance),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+};
+
+const void* const kBrokerGamepadStaticsVtbl[16] = {
+    reinterpret_cast<const void*>(&BrokerStatics_QueryInterface),
+    reinterpret_cast<const void*>(&BrokerStatics_AddRef),
+    reinterpret_cast<const void*>(&BrokerStatics_Release),
+    reinterpret_cast<const void*>(&BrokerStatics_GetIids),
+    reinterpret_cast<const void*>(&BrokerFac_GetRuntimeClassName),
+    reinterpret_cast<const void*>(&BrokerFac_GetTrustLevel),
+    reinterpret_cast<const void*>(&BrokerGamepadStatics_AddEvent),
+    reinterpret_cast<const void*>(&BrokerGamepadStatics_RemoveEvent),
+    reinterpret_cast<const void*>(&BrokerGamepadStatics_AddEvent),
+    reinterpret_cast<const void*>(&BrokerGamepadStatics_RemoveEvent),
+    reinterpret_cast<const void*>(&BrokerGamepadStatics_GetGamepads),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+};
+
+const void* const kBrokerAnalyticsStaticsVtbl[16] = {
+    reinterpret_cast<const void*>(&BrokerStatics_QueryInterface),
+    reinterpret_cast<const void*>(&BrokerStatics_AddRef),
+    reinterpret_cast<const void*>(&BrokerStatics_Release),
+    reinterpret_cast<const void*>(&BrokerStatics_GetIids),
+    reinterpret_cast<const void*>(&BrokerFac_GetRuntimeClassName),
+    reinterpret_cast<const void*>(&BrokerFac_GetTrustLevel),
+    reinterpret_cast<const void*>(&BrokerAnalyticsStatics_GetVersionInfo),
+    reinterpret_cast<const void*>(&BrokerAnalyticsStatics_GetDeviceForm),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+};
+
+const void* const kBrokerPackageStaticsVtbl[16] = {
+    reinterpret_cast<const void*>(&BrokerStatics_QueryInterface),
+    reinterpret_cast<const void*>(&BrokerStatics_AddRef),
+    reinterpret_cast<const void*>(&BrokerStatics_Release),
+    reinterpret_cast<const void*>(&BrokerStatics_GetIids),
+    reinterpret_cast<const void*>(&BrokerFac_GetRuntimeClassName),
+    reinterpret_cast<const void*>(&BrokerFac_GetTrustLevel),
+    reinterpret_cast<const void*>(&BrokerPackageStatics_GetCurrent),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+    reinterpret_cast<const void*>(&BrokerWinRt_NotImpl),
+};
+
+HRESULT TryBrokerLocalWinRtActivateInstance(const wchar_t* cls, void** out_instance) {
+    const BrokerWinRtKind kind = ClassifyBrokerWinRtClass(cls);
+    if (kind == BrokerWinRtKind::None) return REGDB_E_CLASSNOTREG;
+    *out_instance = CreateBrokerWinRtInstance(kind);
+    return *out_instance ? S_OK : E_OUTOFMEMORY;
+}
+
+HRESULT TryBrokerLocalWinRtGetActivationFactory(const wchar_t* cls, const GUID* iid, void** out_factory) {
+    const BrokerWinRtKind kind = ClassifyBrokerWinRtClass(cls);
+    if (kind == BrokerWinRtKind::None) return REGDB_E_CLASSNOTREG;
+    auto* fac = new (std::nothrow) BrokerWinRtFactory();
+    if (!fac) return E_OUTOFMEMORY;
+    fac->vtbl = kBrokerFactoryVtbl;
+    fac->statics.owner = fac;
+    fac->kind = kind;
+    switch (kind) {
+        case BrokerWinRtKind::Gamepad:
+            fac->statics.vtbl = kBrokerGamepadStaticsVtbl;
+            fac->statics_iid = kWinRtIidIGamepadStatics;
+            fac->statics_iid2 = kWinRtIidIGamepadStatics2;
+            fac->has_statics_iid2 = true;
+            break;
+        case BrokerWinRtKind::AnalyticsInfo:
+            fac->statics.vtbl = kBrokerAnalyticsStaticsVtbl;
+            fac->statics_iid = kWinRtIidIAnalyticsInfoStatics;
+            break;
+        case BrokerWinRtKind::Package:
+            fac->statics.vtbl = kBrokerPackageStaticsVtbl;
+            fac->statics_iid = kWinRtIidIPackageStatics;
+            break;
+        default:
+            delete fac;
+            return REGDB_E_CLASSNOTREG;
+    }
+    const GUID* query_iid = iid ? iid : &kWinRtIidIActivationFactory;
+    const HRESULT hr = BrokerFac_QueryInterface(fac, query_iid, out_factory);
+    BrokerFac_Release(fac);
+    return hr;
+}
+
 // WinRT RoActivateInstance / RoGetActivationFactory guest IAT broker:
-// Intercepts Xbox/Game Core WinRT runtime classes via xsapi.dll's XblWinRtActivateClassByName
-// and delegates all standard desktop Windows runtime classes cleanly to host combase.dll.
+// Handles core clean-room WinRT classes (Gamepad, AnalyticsInfo, Package),
+// intercepts Xbox/Game Core WinRT runtime classes via xsapi.dll's XblWinRtActivateClassByName,
+// and delegates all remaining desktop Windows runtime classes cleanly to host combase.dll.
 HRESULT WINAPI GuestRoActivateInstance(void* activatableClassId, void** instance) {
     const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
     if (!instance) return E_POINTER;
@@ -1151,6 +1805,12 @@ HRESULT WINAPI GuestRoActivateInstance(void* activatableClassId, void** instance
         uint32_t len = 0;
         cls = get_raw(activatableClassId, &len);
         if (cls && len > 0) {
+            const HRESULT local_hr = TryBrokerLocalWinRtActivateInstance(cls, instance);
+            if (local_hr != REGDB_E_CLASSNOTREG) {
+                FlightRecorder::Instance().RecordWinRtActivation(
+                    "RoActivateInstance", cls, local_hr, true, caller_rip);
+                return local_hr;
+            }
             if (HMODULE xsapi_mod = GetCachedXsapiModule()) {
                 using FnBroker = int32_t(__stdcall*)(const wchar_t*, const void*, int32_t, void**);
                 auto broker = reinterpret_cast<FnBroker>(reinterpret_cast<void*>(
@@ -1185,6 +1845,12 @@ HRESULT WINAPI GuestRoGetActivationFactory(void* activatableClassId, const GUID*
         uint32_t len = 0;
         cls = get_raw(activatableClassId, &len);
         if (cls && len > 0) {
+            const HRESULT local_hr = TryBrokerLocalWinRtGetActivationFactory(cls, iid, factory);
+            if (local_hr != REGDB_E_CLASSNOTREG) {
+                FlightRecorder::Instance().RecordWinRtActivation(
+                    "RoGetActivationFactory", cls, local_hr, true, caller_rip);
+                return local_hr;
+            }
             if (HMODULE xsapi_mod = GetCachedXsapiModule()) {
                 using FnBroker = int32_t(__stdcall*)(const wchar_t*, const void*, int32_t, void**);
                 auto broker = reinterpret_cast<FnBroker>(reinterpret_cast<void*>(
@@ -1203,6 +1869,20 @@ HRESULT WINAPI GuestRoGetActivationFactory(void* activatableClassId, const GUID*
     FlightRecorder::Instance().RecordWinRtActivation("RoGetActivationFactory", cls, hr, false, caller_rip);
     return hr;
 }
+
+}  // namespace
+
+extern "C" __declspec(dllexport) HRESULT WINAPI ScarlettX_GuestRoActivateInstance(
+    void* activatableClassId, void** instance) {
+    return GuestRoActivateInstance(activatableClassId, instance);
+}
+
+extern "C" __declspec(dllexport) HRESULT WINAPI ScarlettX_GuestRoGetActivationFactory(
+    void* activatableClassId, const GUID* iid, void** factory) {
+    return GuestRoGetActivationFactory(activatableClassId, iid, factory);
+}
+
+namespace {
 
 void* LookupGuestRuntimeHook(const std::string& target_lower, const std::string& sym_name) {
     if (target_lower == "ucrtbase.dll" || target_lower == "msvcrt.dll") {

@@ -32,8 +32,30 @@ jobs:
       - name: Run CTest Suite (Parallel + Output on Failure)
         run: ctest --test-dir build --parallel 4 --output-on-failure
 
-      - name: Smoke Test scarlettx inspect & compat CLI
+      - name: Smoke Test scarlettx inspect, compat & diag CLI
         run: |
           ./build/scarlettx.exe inspect ./build/packages/hello_scarlett
           ./build/scarlettx.exe compat ./build/packages/hello_scarlett
           ./build/scarlettx.exe diag
+          ./build/scarlettx.exe diag --full
+
+      - name: Package Portable ScarlettEdge-win64.zip
+        shell: pwsh
+        run: |
+          $stage = "dist/ScarlettEdge-win64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Path "build/scarlettx.exe" -Destination $stage
+          $excluded = @("xtelemetry_missing.dll", "xgameoverlay_missing.dll", "xordinal_hle.dll")
+          Get-ChildItem -Path "build" -Filter "*.dll" -File |
+            Where-Object { $excluded -notcontains $_.Name } |
+            ForEach-Object { Copy-Item -Path $_.FullName -Destination $stage }
+          Copy-Item -Path "CLEANROOM_POLICY.md", "README.md" -Destination $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/ScarlettEdge-win64.zip" -Force
+          Get-Item "dist/ScarlettEdge-win64.zip" | Select-Object Name, Length
+
+      - name: Upload Portable Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScarlettEdge-win64
+          path: dist/ScarlettEdge-win64.zip
+          if-no-files-found: error

@@ -1107,6 +1107,8 @@ std::array<Slot, kPackageSlots> MakePackageVtbl(std::index_sequence<I...>) {
     vtbl[24] = reinterpret_cast<Slot>(&PackageGetMountPathSize);
     vtbl[25] = reinterpret_cast<Slot>(&PackageGetMountPath);
     vtbl[26] = reinterpret_cast<Slot>(&PackageCloseMountHandle);
+    vtbl[37] = reinterpret_cast<Slot>(&PackageMountWithUiAsync);   // GDK 2510 (+0x128)
+    vtbl[38] = reinterpret_cast<Slot>(&PackageMountWithUiResult);  // GDK 2510 (+0x130)
     vtbl[41] = reinterpret_cast<Slot>(&PackageUnregisterPackageInstalledSlot);
     return vtbl;
 }

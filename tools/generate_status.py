@@ -841,17 +841,17 @@ def collect_phase4_metrics() -> list[Subsystem]:
             name="4I. WinRT & Middleware Expansion",
             short_name="WinRT/GI",
             category="Platform",
-            implemented=0,
+            implemented=5,
             target=5,
-            notes="**Queued (0/5):** WinRT Windows.Gaming.Input/AnalyticsInfo/Package factories, GameInput RegisterDeviceCallback, expanded Xbl offline achievements & stats",
+            notes="**Complete (5/5):** WinRT Windows.Gaming.Input/AnalyticsInfo/Package factories, GameInput RegisterDeviceCallback + rumble transitions, expanded Xbl offline achievements/stats/profiles (test_winrt_middleware)",
         ),
         Subsystem(
             name="4J. Diagnostics UX & Portable CI",
             short_name="Diag/CI",
             category="Tooling",
-            implemented=0,
+            implemented=5,
             target=5,
-            notes="**Queued (0/5):** One-command scarlettx diag --full host readiness probe (SM 6.6/DXR/Vulkan/MF/VirtualAlloc2) & GitHub Actions portable ScarlettEdge-win64.zip artifact",
+            notes="**Complete (5/5):** One-command scarlettx diag --full [--json] host readiness probe (SM 6.6+/DXR/Mesh/Vulkan/MF/VirtualAlloc2/XAudio2), test_diag_full & GitHub Actions portable ScarlettEdge-win64.zip artifact",
         ),
     ]
 

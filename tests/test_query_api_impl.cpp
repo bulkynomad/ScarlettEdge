@@ -717,7 +717,7 @@ int main() {
               XGR_E_INVALIDARG);
 
         // A slot nothing identifies is in the table and fails.
-        CHECK(LoadVtableSlot<FnOther>(package, 37 * 8)(package, 0, 0, 0) == kENotImpl);
+        CHECK(LoadVtableSlot<FnOther>(package, 47 * 8)(package, 0, 0, 0) == kENotImpl);
         CHECK(LoadVtableSlot<FnRelease>(package, 0x10)(package) == 0u);
 
         // GDK 2022-2026 XPackage ({A8C4234E}) + XStore ({CE8E7A26} / {D4B92E11}) + XNetworking ({BF2346B2})
@@ -760,6 +760,28 @@ int main() {
         CHECK(std::filesystem::exists(std::filesystem::path(mpath.c_str()) / "dlc_manifest.bin"));
         LoadVtableSlot<FnMountClose>(pkg25, 0xD0)(pkg25, mh);
         CHECK(LoadVtableSlot<FnRelease>(pkg25, 0x10)(pkg25) == 0u);
+
+        // GDK 2510 XPackage ({E2A4734B}) MountWithUiAsync at slot 37 (+0x128) & Result at slot 38 (+0x130)
+        {
+            const TestGuid kGuidPkg2510 = {
+                0xE2A4734Bu, 0x2F4Au, 0x456Du, {0xAA, 0x8F, 0xD0, 0x65, 0xE0, 0x4F, 0xB2, 0x09}};
+            void* pkg2510 = nullptr;
+            CHECK(QueryApiImpl(&kGuidAF406016, &kGuidPkg2510, &pkg2510) == XGR_S_OK && pkg2510 != nullptr);
+            XAsyncBlock m2510_ab{};
+            CHECK(LoadVtableSlot<FnMountAsync>(pkg2510, 0x128)(pkg2510, found_pkg_id.c_str(), &m2510_ab) == XGR_S_OK);
+            XPackageMountHandle mh2510 = nullptr;
+            CHECK(LoadVtableSlot<FnMountResult>(pkg2510, 0x130)(pkg2510, &m2510_ab, &mh2510) == XGR_S_OK &&
+                  mh2510 != nullptr);
+            size_t mpath2510_sz = 0;
+            CHECK(LoadVtableSlot<FnMountSize>(pkg2510, 0xC0)(pkg2510, mh2510, &mpath2510_sz) == XGR_S_OK &&
+                  mpath2510_sz > 4);
+            std::string mpath2510(mpath2510_sz, '\0');
+            CHECK(LoadVtableSlot<FnMountPath>(pkg2510, 0xC8)(pkg2510, mh2510, mpath2510.size(), mpath2510.data()) ==
+                  XGR_S_OK);
+            CHECK(std::filesystem::exists(std::filesystem::path(mpath2510.c_str()) / "dlc_manifest.bin"));
+            LoadVtableSlot<FnMountClose>(pkg2510, 0xD0)(pkg2510, mh2510);
+            CHECK(LoadVtableSlot<FnRelease>(pkg2510, 0x10)(pkg2510) == 0u);
+        }
 
         void* store = nullptr;
         CHECK(QueryApiImpl(&kGuidStore, &kGuidStore2025, &store) == XGR_S_OK && store != nullptr);

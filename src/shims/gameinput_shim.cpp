@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
@@ -124,6 +125,25 @@ struct ReadingCallbackRegistration {
     bool active = true;
 };
 
+using DeviceCallbackFn = void(SCARLETTX_GI_CALL*)(
+    uint64_t callbackToken,
+    void* context,
+    void* device,
+    uint64_t timestamp,
+    uint32_t currentStatus,
+    uint32_t previousStatus);
+
+struct DeviceCallbackRegistration {
+    uint64_t token = 0;
+    void* device = nullptr;
+    uint32_t input_filter = 0;
+    uint32_t status_filter = 0;
+    uint32_t enum_kind = 0;
+    void* context = nullptr;
+    DeviceCallbackFn callback = nullptr;
+    bool active = true;
+};
+
 struct GameInputObject {
     // First field is the COM vtable pointer so real Xbox binaries can call
     // IGameInput methods directly through the pointer returned by GameInputCreate,
@@ -139,6 +159,7 @@ struct GameInputObject {
     std::deque<ReadingEntry> history;
     std::deque<ComReadingSnapshot> com_history;
     std::vector<ReadingCallbackRegistration> reading_callbacks;
+    std::vector<DeviceCallbackRegistration> device_callbacks;
     std::deque<std::function<void()>> dispatcher_jobs;
 
     // State behind guest-facing readings (IGameInput::GetCurrentReading).
@@ -270,7 +291,24 @@ struct GiDeviceProxy {
     std::atomic<uint32_t> ref_count{1};
     GiString name{};
     alignas(8) uint8_t info[kDeviceInfoSize] = {};
+    std::mutex rumble_mu;
+    GAMEINPUT_RUMBLE_PARAMS current_rumble{};
+    uint64_t rumble_transitions = 0;
 };
+
+GAMEINPUT_RUMBLE_PARAMS SanitizeRumbleParams(const GAMEINPUT_RUMBLE_PARAMS* params) {
+    GAMEINPUT_RUMBLE_PARAMS out{};
+    if (!params) return out;
+    const auto clamp_motor = [](float v) -> float {
+        if (!std::isfinite(v)) return 0.0f;
+        return std::clamp(v, 0.0f, 1.0f);
+    };
+    out.LowFrequency = clamp_motor(params->LowFrequency);
+    out.HighFrequency = clamp_motor(params->HighFrequency);
+    out.LeftTrigger = clamp_motor(params->LeftTrigger);
+    out.RightTrigger = clamp_motor(params->RightTrigger);
+    return out;
+}
 
 struct GiReadingProxy {
     const GiComFn* lpVtbl = nullptr;
@@ -343,7 +381,17 @@ intptr_t SCARLETTX_GI_CALL DevZeroBoolOrVoid(void*, uintptr_t, uintptr_t, uintpt
 
 std::atomic<uint32_t> g_host_pad_slot{0};
 
-intptr_t SCARLETTX_GI_CALL DevSetRumbleState(void*, uintptr_t params, uintptr_t, uintptr_t) {
+intptr_t SCARLETTX_GI_CALL DevSetRumbleState(void* self, uintptr_t params, uintptr_t, uintptr_t) {
+    if (params != 0 && params < 0x10000) return 0;  // not a pointer
+    const GAMEINPUT_RUMBLE_PARAMS clean =
+        SanitizeRumbleParams(reinterpret_cast<const GAMEINPUT_RUMBLE_PARAMS*>(params));
+    if (auto* dev = static_cast<GiDeviceProxy*>(self)) {
+        std::lock_guard<std::mutex> lk(dev->rumble_mu);
+        if (std::memcmp(&dev->current_rumble, &clean, sizeof(clean)) != 0) {
+            dev->current_rumble = clean;
+            ++dev->rumble_transitions;
+        }
+    }
 #if defined(_WIN32)
     struct Vibration {
         uint16_t low, high;
@@ -355,19 +403,10 @@ intptr_t SCARLETTX_GI_CALL DevSetRumbleState(void*, uintptr_t params, uintptr_t,
                             reinterpret_cast<void*>(GetProcAddress(module, "XInputSetState")))
                       : nullptr;
     }();
-    if (params != 0 && params < 0x10000) return 0;  // not a pointer
     Vibration v{};
-    if (params) {
-        const auto* p = reinterpret_cast<const GAMEINPUT_RUMBLE_PARAMS*>(params);
-        const auto motor = [](float f) {
-            return static_cast<uint16_t>(std::clamp(f, 0.0f, 1.0f) * 65535.0f + 0.5f);
-        };
-        v.low = motor(p->LowFrequency);
-        v.high = motor(p->HighFrequency);
-    }
+    v.low = static_cast<uint16_t>(clean.LowFrequency * 65535.0f + 0.5f);
+    v.high = static_cast<uint16_t>(clean.HighFrequency * 65535.0f + 0.5f);
     if (set_state) set_state(g_host_pad_slot.load(), &v);
-#else
-    (void)params;
 #endif
     return 0;
 }
@@ -1029,25 +1068,45 @@ intptr_t SCARLETTX_GI_CALL GiRegisterDeviceCallback(
     void* self, uintptr_t device, uintptr_t input_filter, uintptr_t status_filter,
     uintptr_t enum_kind, uintptr_t context, uintptr_t callback_fn, uintptr_t out_token_ptr) {
     auto* obj = static_cast<GameInputObject*>(self);
-    const uint64_t tok = obj ? obj->next_callback_token.fetch_add(1, std::memory_order_relaxed) : 1;
+    if (!obj || !callback_fn) {
+        if (out_token_ptr) {
+            *reinterpret_cast<uint64_t*>(out_token_ptr) = 0;
+        }
+        return kE_INVALIDARG;
+    }
+    const uint64_t tok = obj->next_callback_token.fetch_add(1, std::memory_order_relaxed);
     if (out_token_ptr) {
         *reinterpret_cast<uint64_t*>(out_token_ptr) = tok;
+    }
+    const uint32_t in_filter32 = static_cast<uint32_t>(input_filter);
+    const uint32_t st_filter32 = static_cast<uint32_t>(status_filter);
+    const uint32_t enum32 = static_cast<uint32_t>(enum_kind);
+    auto cb = reinterpret_cast<DeviceCallbackFn>(callback_fn);
+    {
+        std::lock_guard<std::mutex> lk(obj->mu);
+        obj->device_callbacks.push_back({
+            tok,
+            reinterpret_cast<void*>(device),
+            in_filter32,
+            st_filter32,
+            enum32,
+            reinterpret_cast<void*>(context),
+            cb,
+            true,
+        });
     }
     if (GameInputTraceEnabled()) {
         std::cerr << "[ScarlettX][GameInput] IGameInput::RegisterDeviceCallback(kind=0x"
                   << std::hex << input_filter << ", status=0x" << status_filter
-                  << ", enum=" << std::dec << static_cast<uint32_t>(enum_kind) << ", context=0x" << std::hex
+                  << ", enum=" << std::dec << enum32 << ", context=0x" << std::hex
                   << context << ", callback=0x" << callback_fn << std::dec << ") -> S_OK (tok=" << tok << ")\n";
     }
-    using DeviceCallback = void (SCARLETTX_GI_CALL*)(uint64_t token, void* context, void* device, uint64_t timestamp,
-                                                     uint32_t current_status, uint32_t previous_status);
     GiDeviceProxy& pad = VirtualGamepad();
     const bool matches = (device == 0 || device == reinterpret_cast<uintptr_t>(&pad)) &&
-                         (static_cast<uint32_t>(input_filter) & kPadSupportedInput) != 0 &&
-                         (static_cast<uint32_t>(status_filter) & kPadStatus) != 0;
-    if (callback_fn && static_cast<uint32_t>(enum_kind) != 0 && matches) {
-        reinterpret_cast<DeviceCallback>(callback_fn)(tok, reinterpret_cast<void*>(context), &pad,
-                                                      obj ? obj->NowUs() : 0, kPadStatus, 0);
+                         (in_filter32 & kPadSupportedInput) != 0 &&
+                         (st_filter32 & kPadStatus) != 0;
+    if (enum32 != 0 && matches) {
+        cb(tok, reinterpret_cast<void*>(context), &pad, obj->NowUs(), kPadStatus, 0);
     }
     return kS_OK;
 }
@@ -1056,6 +1115,9 @@ intptr_t SCARLETTX_GI_CALL GiStopCallback(void* self, uintptr_t tok, uintptr_t, 
     if (auto* obj = static_cast<GameInputObject*>(self)) {
         std::lock_guard<std::mutex> lk(obj->mu);
         for (auto& cb : obj->reading_callbacks) {
+            if (cb.token == static_cast<uint64_t>(tok)) cb.active = false;
+        }
+        for (auto& cb : obj->device_callbacks) {
             if (cb.token == static_cast<uint64_t>(tok)) cb.active = false;
         }
     }
@@ -1070,17 +1132,31 @@ intptr_t SCARLETTX_GI_CALL GiUnregisterCallback(void* self, uintptr_t tok, uintp
     if (!obj || tok == 0 || tok >= obj->next_callback_token.load(std::memory_order_relaxed)) {
         return 0;
     }
+    bool removed = false;
     {
         std::lock_guard<std::mutex> lk(obj->mu);
+        const size_t before_r = obj->reading_callbacks.size();
         obj->reading_callbacks.erase(
             std::remove_if(obj->reading_callbacks.begin(), obj->reading_callbacks.end(),
                            [tok](const ReadingCallbackRegistration& r) { return r.token == tok; }),
             obj->reading_callbacks.end());
+        if (obj->reading_callbacks.size() != before_r) {
+            removed = true;
+        }
+        const size_t before_d = obj->device_callbacks.size();
+        obj->device_callbacks.erase(
+            std::remove_if(obj->device_callbacks.begin(), obj->device_callbacks.end(),
+                           [tok](const DeviceCallbackRegistration& r) { return r.token == tok; }),
+            obj->device_callbacks.end());
+        if (obj->device_callbacks.size() != before_d) {
+            removed = true;
+        }
     }
     if (GameInputTraceEnabled()) {
-        std::cerr << "[ScarlettX][GameInput] IGameInput::UnregisterCallback(tok=" << tok << ") -> true\n";
+        std::cerr << "[ScarlettX][GameInput] IGameInput::UnregisterCallback(tok=" << tok << ") -> "
+                  << (removed ? "true" : "false") << "\n";
     }
-    return 1;
+    return removed ? 1 : 0;
 }
 
 // IGameInput::CreateDispatcher (slot 15)
@@ -1492,15 +1568,15 @@ int32_t GameInputSetRumbleState(
     const GAMEINPUT_RUMBLE_PARAMS* params) {
     auto obj = GetInstance(game_input);
     if (!obj) return kE_HANDLE;
-    std::lock_guard<std::mutex> lk(obj->mu);
-    GAMEINPUT_RUMBLE_PARAMS p{};
-    if (params) {
-        p.LowFrequency = std::clamp(params->LowFrequency, 0.0f, 1.0f);
-        p.HighFrequency = std::clamp(params->HighFrequency, 0.0f, 1.0f);
-        p.LeftTrigger = std::clamp(params->LeftTrigger, 0.0f, 1.0f);
-        p.RightTrigger = std::clamp(params->RightTrigger, 0.0f, 1.0f);
+    const uint64_t resolved_id = (device_id == 0) ? kVirtualGamepadId : device_id;
+    const GAMEINPUT_RUMBLE_PARAMS p = SanitizeRumbleParams(params);
+    {
+        std::lock_guard<std::mutex> lk(obj->mu);
+        obj->rumble[resolved_id] = p;
     }
-    obj->rumble[device_id] = p;
+    if (resolved_id == kVirtualGamepadId) {
+        DevSetRumbleState(&VirtualGamepad(), reinterpret_cast<uintptr_t>(&p), 0, 0);
+    }
     return kS_OK;
 }
 
@@ -1511,8 +1587,15 @@ int32_t GameInputGetRumbleState(
     if (!out_params) return kE_INVALIDARG;
     auto obj = GetInstance(game_input);
     if (!obj) return kE_HANDLE;
+    const uint64_t resolved_id = (device_id == 0) ? kVirtualGamepadId : device_id;
+    if (resolved_id == kVirtualGamepadId) {
+        GiDeviceProxy& pad = VirtualGamepad();
+        std::lock_guard<std::mutex> lk(pad.rumble_mu);
+        *out_params = pad.current_rumble;
+        return kS_OK;
+    }
     std::lock_guard<std::mutex> lk(obj->mu);
-    auto it = obj->rumble.find(device_id);
+    auto it = obj->rumble.find(resolved_id);
     if (it == obj->rumble.end()) {
         *out_params = {};
     } else {
