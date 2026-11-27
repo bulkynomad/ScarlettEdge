@@ -456,8 +456,33 @@ int main() {
         std::vector<uint8_t> enc_bin;
         SX_CHECK(!mp_xvd.ReadUserData(fs_md_bytes, 4096u, enc_bin).ok());
 
+        // Standard 48-byte binary .cik keyfile ([0..15]=GUID, [16..47]=32B AES-128-XTS key) + text GUID=HEXKEY keyring
+        const auto tmp_cik = std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_makepkg_v3.cik";
+        const auto tmp_txt_cik = std::filesystem::path(SCARLETTX_BINARY_DIR) / "test_makepkg_v3_keyring.txt";
+        {
+            uint8_t cik48[48] = {};
+            for (int i = 0; i < 48; ++i) cik48[i] = static_cast<uint8_t>(0x30 + i);
+            std::ofstream cofs(tmp_cik, std::ios::binary | std::ios::trunc);
+            cofs.write(reinterpret_cast<const char*>(cik48), sizeof(cik48));
+
+            std::ofstream tofs(tmp_txt_cik, std::ios::trunc);
+            tofs << "# Xbox CIK keyring\n";
+            tofs << "14F323CB-43D7-04BB-49F2-0AC835FFCBCC = 0123456789abcdef0123456789abcdeffedcba9876543210fedcba9876543210\n";
+        }
+        SX_CHECK(mp_xvd.LoadVolumeKeyFile(tmp_cik.string()).ok());
+        SX_CHECK(mp_xvd.HasVolumeKey());
+        SX_CHECK(mp_xvd.ReadUserData(fs_md_bytes, 4096u, enc_bin).ok());
+        SX_CHECK(enc_bin.size() == 4096u);
+
+        scarlettx::XvdContainer mp_xvd_txt;
+        SX_CHECK(mp_xvd_txt.OpenFile(tmp_msixvc.string()).ok());
+        SX_CHECK(mp_xvd_txt.LoadVolumeKeyFile(tmp_txt_cik.string()).ok());
+        SX_CHECK(mp_xvd_txt.ReadUserData(fs_md_bytes, 4096u, enc_bin).ok());
+
         std::error_code rm_ec;
         std::filesystem::remove(tmp_msixvc, rm_ec);
+        std::filesystem::remove(tmp_cik, rm_ec);
+        std::filesystem::remove(tmp_txt_cik, rm_ec);
     }
 
     std::cout << "[PASS] test_retail_parity (XVD v3/Merkle/NTFS + makepkg .msixvc + 32-lane GPU GDeflate + WMA-Pro XMA2 + RDNA2 CFG + AcpHal/PIX)\n";

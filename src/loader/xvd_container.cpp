@@ -766,7 +766,47 @@ Status XvdContainer::LoadVolumeKeyFile(const std::string& key_file_path) {
     if (raw.size() == 16 || raw.size() == 32 || raw.size() == 64) {
         return SetVolumeKey(raw.data(), raw.size());
     }
+    // Standard 48-byte binary .cik file: [0..15] = 16-byte KeyId GUID, [16..47] = 32-byte AES-128-XTS key.
+    if (raw.size() == 48) {
+        return SetVolumeKey(raw.data() + 16, 32);
+    }
+
     std::string text(reinterpret_cast<const char*>(raw.data()), raw.size());
+    // Support text .cik / keyring lines formatted as "<GUID> = <HEXKEY>", "<GUID>:<HEXKEY>", or multi-line key lists.
+    uint16_t slot_idx = 0;
+    bool loaded_any = false;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t eol = text.find_first_of("\r\n", pos);
+        std::string line = (eol == std::string::npos) ? text.substr(pos) : text.substr(pos, eol - pos);
+        pos = (eol == std::string::npos) ? text.size() : (eol + 1);
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(line.begin());
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+
+        const size_t eq_pos = line.find('=');
+        if (eq_pos != std::string::npos) {
+            line = line.substr(eq_pos + 1);
+        } else {
+            // Handle "<GUID>:<64-hex-key>" where GUID itself has no colons
+            const size_t colon_pos = line.rfind(':');
+            if (colon_pos != std::string::npos && colon_pos >= 32u) {
+                line = line.substr(colon_pos + 1);
+            }
+        }
+        std::vector<uint8_t> decoded;
+        if (DecodeHexKeyString(line, decoded).ok()) {
+            // If 48 bytes of hex (16B GUID + 32B key) were concatenated on one line, slice the 32B key.
+            const uint8_t* kptr = (decoded.size() == 48u) ? (decoded.data() + 16u) : decoded.data();
+            const size_t klen = (decoded.size() == 48u) ? 32u : decoded.size();
+            if (SetCikKey(slot_idx, kptr, klen).ok()) {
+                ++slot_idx;
+                loaded_any = true;
+            }
+        }
+    }
+    if (loaded_any) {
+        return Status::Ok();
+    }
     return SetVolumeKeyHex(text);
 }
 

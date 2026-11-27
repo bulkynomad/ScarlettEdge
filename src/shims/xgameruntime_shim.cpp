@@ -3374,8 +3374,14 @@ uint32_t SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Release(void* self_ptr) {
     return remaining;
 }
 
-XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Slot03(void* /*self_ptr*/) {
-    std::fprintf(stderr, "[ScarlettX][xgameruntime] ApiImpl{37E56907}::+0x18() -> S_OK\n");
+XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Slot03(
+    void* /*self_ptr*/,
+    uint16_t* out_port) {
+    if (out_port && reinterpret_cast<uintptr_t>(out_port) > 0x10000u) {
+        *out_port = 3074u;
+    }
+    std::fprintf(stderr, "[ScarlettX][xgameruntime] ApiImpl{37E56907}::+0x18(out=%p) -> S_OK (port=3074)\n",
+                 static_cast<void*>(out_port));
     std::fflush(stderr);
     return XGR_S_OK;
 }
@@ -3440,14 +3446,23 @@ XGameResult SCARLETTX_GDK_CALLBACK ApiImpl37E56907_Slot15(
     if (!out_state) {
         return XGR_E_POINTER;
     }
-    // XNetworkingConnectivityHint is 16 bytes; the caller polls the byte at
-    // +0x0c (networkInitialized) until non-zero (with 50ms Sleep). The other
-    // fields are reported as unknown rather than left uninitialised.
+    // XNetworkingConnectivityHint (16 bytes):
+    // +0x00: connectivityLevel (2=LocalAccess, 3=InternetAccess when SCARLETTX_LIVE_NETWORK=1)
+    // +0x04: connectivityCost  (1=Unrestricted)
+    // +0x08: ianaInterfaceType (6=Ethernet CSMACD)
+    // +0x0c: networkInitialized (1=true)
     std::memset(out_state, 0, 16);
+    const char* live_env = std::getenv("SCARLETTX_LIVE_NETWORK");
+    const uint32_t level = (live_env && live_env[0] == '1') ? 3u : 2u;
+    const uint32_t cost = 1u;
+    const uint32_t iana = 6u;
+    std::memcpy(static_cast<uint8_t*>(out_state) + 0x00, &level, sizeof(level));
+    std::memcpy(static_cast<uint8_t*>(out_state) + 0x04, &cost, sizeof(cost));
+    std::memcpy(static_cast<uint8_t*>(out_state) + 0x08, &iana, sizeof(iana));
     static_cast<uint8_t*>(out_state)[0x0c] = 1;
     std::fprintf(stderr,
-                 "[ScarlettX][xgameruntime] ApiImpl{37E56907}::+0x78(out=%p) -> S_OK (byte+0x0c=1)\n",
-                 out_state);
+                 "[ScarlettX][xgameruntime] ApiImpl{37E56907}::+0x78(out=%p) -> S_OK (level=%u, init=1)\n",
+                 out_state, level);
     std::fflush(stderr);
     return XGR_S_OK;
 }

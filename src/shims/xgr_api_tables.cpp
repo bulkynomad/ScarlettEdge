@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <new>
 #include <string>
 #include <utility>
@@ -66,6 +67,13 @@ constexpr Guid kApiStore = {0xCE8E7A26u, 0x2A0Eu, 0x4982u, {0xA2, 0x37, 0x71, 0x
 constexpr Guid kIidStore2025 = {0xD4B92E11u, 0x5C84u, 0x49A2u, {0x8E, 0x17, 0x63, 0xF0, 0xB8, 0xC9, 0x12, 0x45}};
 constexpr Guid kApiStoreReal = {0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}};
 constexpr Guid kIidStore2510 = {0xB09D803Cu, 0x2414u, 0x4A05u, {0x82, 0xC6, 0x66, 0xDF, 0xDC, 0x9E, 0x9A, 0x44}};
+// Official GDK 2510 XDisplay HDR ({03F0FE74} / {35F07670}), XDisplay Timeout Deferral ({1B339674}),
+// and XPersistentLocalStorage / PLS ({F4FAF4D4} / {41A4E10C}).
+constexpr Guid kApiDisplayHdr = {0x03F0FE74u, 0xFDD9u, 0x4E5Cu, {0xB6, 0x30, 0xF9, 0x33, 0x9C, 0x47, 0xAC, 0xC5}};
+constexpr Guid kIidDisplayHdr2510 = {0x35F07670u, 0x706Eu, 0x4BFBu, {0x94, 0x76, 0x09, 0x07, 0x98, 0xC5, 0xEB, 0xF3}};
+constexpr Guid kApiDisplayTimeout = {0x1B339674u, 0x328Du, 0x4283u, {0xA2, 0x00, 0x31, 0x71, 0xF1, 0x8D, 0x36, 0x39}};
+constexpr Guid kApiPls = {0xF4FAF4D4u, 0x2D04u, 0x4FCEu, {0xB3, 0xE0, 0x47, 0x4A, 0x71, 0x3A, 0x3E, 0x84}};
+constexpr Guid kIidPls2510 = {0x41A4E10Cu, 0x5A7Eu, 0x41D9u, {0x8C, 0x37, 0x37, 0xBD, 0xE6, 0x2A, 0x07, 0xD6}};
 
 constexpr XGameResult kNoInterface = static_cast<XGameResult>(0x80004002u);
 constexpr XGameResult kNotImplemented = static_cast<XGameResult>(0x80004001u);
@@ -938,13 +946,160 @@ XGameResult SCARLETTX_GDK_CALLBACK PackageRegisterPackageInstalled(void* /*self*
     return XGR_S_OK;
 }
 
+bool SCARLETTX_GDK_CALLBACK PackageUnregisterPackageInstalledSlot(void* /*self*/, uint64_t /*token*/, bool /*wait*/) {
+    return true;
+}
+
+// XPackage Intelligent Delivery (slots 3..19 in XPackage.h declaration order):
+struct PackageInstallMonitorObj {
+    uint64_t magic = 0x504B474D4F4E3031ull;
+};
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageGetCurrentProcessIdSlot(void* /*self*/, size_t size, char* buffer) {
+    if (!buffer) return XGR_E_POINTER;
+    if (size < 33u) return kInsufficientBuffer;
+    uint32_t tid = 0x5CA00001u;
+    (void)XGameGetXboxTitleId(&tid);
+    std::memset(buffer, 0, size);
+    std::snprintf(buffer, 33u, "SCARLETTX_PKG_00000000_%08X", static_cast<unsigned>(tid));
+    return XGR_S_OK;
+}
+
+bool SCARLETTX_GDK_CALLBACK PackageIsPackagedProcessSlot(void* /*self*/) {
+    return true;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageCreateInstallMonitorSlot(void* /*self*/, const char* /*pkg_id*/,
+                                                                   uint32_t /*sel_count*/, const void* /*selectors*/,
+                                                                   uint32_t /*interval_ms*/, XTaskQueueHandle /*queue*/,
+                                                                   void** out_mon) {
+    if (!out_mon) return XGR_E_POINTER;
+    auto* mon = new (std::nothrow) PackageInstallMonitorObj();
+    if (!mon) return XGR_E_OUTOFMEMORY;
+    *out_mon = mon;
+    return XGR_S_OK;
+}
+
+void SCARLETTX_GDK_CALLBACK PackageCloseInstallMonitorSlot(void* /*self*/, void* mon) {
+    delete static_cast<PackageInstallMonitorObj*>(mon);
+}
+
+struct PackageInstallProgressAbi {
+    uint64_t totalBytes;
+    uint64_t installedBytes;
+    uint64_t launchBytes;
+    bool launchable;
+    bool completed;
+};
+
+void SCARLETTX_GDK_CALLBACK PackageGetInstallProgressSlot(void* /*self*/, void* /*mon*/,
+                                                          PackageInstallProgressAbi* out_prog) {
+    if (!out_prog) return;
+    constexpr uint64_t kDefaultPkgBytes = 64ull * 1024ull * 1024ull;
+    out_prog->totalBytes = kDefaultPkgBytes;
+    out_prog->installedBytes = kDefaultPkgBytes;
+    out_prog->launchBytes = kDefaultPkgBytes;
+    out_prog->launchable = true;
+    out_prog->completed = true;
+}
+
+bool SCARLETTX_GDK_CALLBACK PackageUpdateInstallMonitorSlot(void* /*self*/, void* /*mon*/) {
+    return false;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageRegisterInstallProgressSlot(void* /*self*/, void* /*mon*/, void* /*ctx*/,
+                                                                      void* cb, XTaskQueueRegistrationToken* tok) {
+    if (!cb || !tok) return XGR_E_INVALIDARG;
+    tok->token = g_package_installed_tokens.fetch_add(1, std::memory_order_relaxed) + 1;
+    return XGR_S_OK;
+}
+
+bool SCARLETTX_GDK_CALLBACK PackageUnregisterInstallProgressSlot(void* /*self*/, void* /*mon*/,
+                                                                 uint64_t /*tok*/, bool /*wait*/) {
+    return true;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageFindChunkAvailabilitySlot(void* /*self*/, const char* /*pkg_id*/,
+                                                                    uint32_t /*sel_count*/, const void* /*selectors*/,
+                                                                    uint32_t* out_avail) {
+    if (!out_avail) return XGR_E_POINTER;
+    *out_avail = 0u;  // XPackageChunkAvailability::Ready
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageNoopChunkSlot(void* /*self*/, uintptr_t, uintptr_t, uintptr_t) {
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageInstallChunksSlot(void* self, const char* pkg_id, uint32_t sel_count,
+                                                            const void* selectors, uint32_t interval_ms,
+                                                            bool /*suppress_ui*/, XTaskQueueHandle queue,
+                                                            void** out_mon) {
+    return PackageCreateInstallMonitorSlot(self, pkg_id, sel_count, selectors, interval_ms, queue, out_mon);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK SimpleNoopAsyncProvider(XAsyncOp op, const XAsyncProviderData* data) {
+    if (op == XAsyncOp_DoWork) {
+        XAsyncComplete(data->async, XGR_S_OK, sizeof(void*));
+    }
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageInstallChunksAsyncSlot(void* /*self*/, const char* /*pkg_id*/,
+                                                                 uint32_t /*sel_count*/, const void* /*selectors*/,
+                                                                 uint32_t /*interval_ms*/, bool /*suppress_ui*/,
+                                                                 XAsyncBlock* async) {
+    if (!async) return XGR_E_INVALIDARG;
+    const XGameResult hr = XAsyncBegin(async, nullptr, reinterpret_cast<const void*>(&PackageInstallChunksAsyncSlot),
+                                       "XPackageInstallChunksAsync", &SimpleNoopAsyncProvider);
+    return hr == XGR_S_OK ? XAsyncSchedule(async, 0) : hr;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageInstallChunksResultSlot(void* /*self*/, XAsyncBlock* async, void** out_mon) {
+    if (!async || !out_mon) return XGR_E_POINTER;
+    *out_mon = nullptr;
+    void* dummy = nullptr;
+    const XGameResult hr = XAsyncGetResult(async, reinterpret_cast<const void*>(&PackageInstallChunksAsyncSlot),
+                                           sizeof(dummy), &dummy, nullptr);
+    if (hr != XGR_S_OK) return hr;
+    auto* mon = new (std::nothrow) PackageInstallMonitorObj();
+    if (!mon) return XGR_E_OUTOFMEMORY;
+    *out_mon = mon;
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PackageEstimateDownloadSizeSlot(void* /*self*/, const char* /*pkg_id*/,
+                                                                   uint32_t /*sel_count*/, const void* /*selectors*/,
+                                                                   uint64_t* out_size, bool* out_confirm) {
+    if (!out_size) return XGR_E_POINTER;
+    *out_size = 0ull;
+    if (out_confirm) *out_confirm = false;
+    return XGR_S_OK;
+}
+
 template <size_t... I>
 std::array<Slot, kPackageSlots> MakePackageVtbl(std::index_sequence<I...>) {
     std::array<Slot, kPackageSlots> vtbl = {reinterpret_cast<Slot>(&PackageUnimplemented<static_cast<int>(I)>)...};
     vtbl[0] = reinterpret_cast<Slot>(&TableQueryInterface);
     vtbl[1] = reinterpret_cast<Slot>(&TableAddRef);
     vtbl[2] = reinterpret_cast<Slot>(&TableRelease);
+    vtbl[3] = reinterpret_cast<Slot>(&PackageGetCurrentProcessIdSlot);
+    vtbl[4] = reinterpret_cast<Slot>(&PackageIsPackagedProcessSlot);
+    vtbl[5] = reinterpret_cast<Slot>(&PackageCreateInstallMonitorSlot);
+    vtbl[6] = reinterpret_cast<Slot>(&PackageCloseInstallMonitorSlot);
+    vtbl[7] = reinterpret_cast<Slot>(&PackageGetInstallProgressSlot);
+    vtbl[8] = reinterpret_cast<Slot>(&PackageUpdateInstallMonitorSlot);
+    vtbl[9] = reinterpret_cast<Slot>(&PackageRegisterInstallProgressSlot);
+    vtbl[10] = reinterpret_cast<Slot>(&PackageUnregisterInstallProgressSlot);
     vtbl[11] = reinterpret_cast<Slot>(&PackageGetUserLocale);
+    vtbl[12] = reinterpret_cast<Slot>(&PackageFindChunkAvailabilitySlot);
+    vtbl[13] = reinterpret_cast<Slot>(&PackageNoopChunkSlot);
+    vtbl[14] = reinterpret_cast<Slot>(&PackageNoopChunkSlot);
+    vtbl[15] = reinterpret_cast<Slot>(&PackageInstallChunksSlot);
+    vtbl[16] = reinterpret_cast<Slot>(&PackageInstallChunksAsyncSlot);
+    vtbl[17] = reinterpret_cast<Slot>(&PackageInstallChunksResultSlot);
+    vtbl[18] = reinterpret_cast<Slot>(&PackageEstimateDownloadSizeSlot);
+    vtbl[19] = reinterpret_cast<Slot>(&PackageNoopChunkSlot);
     for (int slot : {20, 28, 35, 39}) vtbl[slot] = reinterpret_cast<Slot>(&PackageEnumeratePackages);
     for (int slot : {21, 29, 36, 40}) vtbl[slot] = reinterpret_cast<Slot>(&PackageRegisterPackageInstalled);
     vtbl[22] = reinterpret_cast<Slot>(&PackageMountWithUiAsync);
@@ -952,9 +1107,207 @@ std::array<Slot, kPackageSlots> MakePackageVtbl(std::index_sequence<I...>) {
     vtbl[24] = reinterpret_cast<Slot>(&PackageGetMountPathSize);
     vtbl[25] = reinterpret_cast<Slot>(&PackageGetMountPath);
     vtbl[26] = reinterpret_cast<Slot>(&PackageCloseMountHandle);
+    vtbl[41] = reinterpret_cast<Slot>(&PackageUnregisterPackageInstalledSlot);
     return vtbl;
 }
 const std::array<Slot, kPackageSlots> kPackageVtbl = MakePackageVtbl(std::make_index_sequence<kPackageSlots>{});
+
+// Official GDK 2510 XDisplay HDR ({03F0FE74} / {35F07670}) & Timeout Deferral ({1B339674}).
+struct DisplayHdrModeInfoAbi {
+    float minToneMapLuminance;
+    float maxToneMapLuminance;
+    float maxFullFrameToneMapLuminance;
+};
+
+uint32_t SCARLETTX_GDK_CALLBACK DisplayTryEnableHdrModeSlot(void* /*self*/, uint32_t /*pref*/,
+                                                            DisplayHdrModeInfoAbi* out_info) {
+    const char* hdr_env = std::getenv("SCARLETTX_HDR");
+    const bool hdr_on = hdr_env && hdr_env[0] == '1';
+    if (out_info) {
+        out_info->minToneMapLuminance = 0.0f;
+        out_info->maxToneMapLuminance = hdr_on ? 1000.0f : 250.0f;
+        out_info->maxFullFrameToneMapLuminance = hdr_on ? 600.0f : 250.0f;
+    }
+    return hdr_on ? 1u /*Enabled*/ : 2u /*Disabled*/;
+}
+
+template <int Index>
+XGameResult SCARLETTX_GDK_CALLBACK DisplayHdrUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    return LogUnimplemented("XDisplayHdr", "03F0FE74", Index, a1, a2, a3);
+}
+
+const Slot kDisplayHdrVtbl[16] = {
+    reinterpret_cast<Slot>(&TableQueryInterface),
+    reinterpret_cast<Slot>(&TableAddRef),
+    reinterpret_cast<Slot>(&TableRelease),
+    reinterpret_cast<Slot>(&DisplayTryEnableHdrModeSlot),      // slot 3
+    reinterpret_cast<Slot>(&DisplayTryEnableHdrModeSlot),      // slot 4 (GDK 2510 {35F07670})
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<5>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<6>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<7>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<8>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<9>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<10>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<11>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<12>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<13>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<14>),
+    reinterpret_cast<Slot>(&DisplayHdrUnimplemented<15>),
+};
+
+struct DisplayDeferralObj {
+    uint32_t tag = 0x44454652u;
+};
+
+void SCARLETTX_GDK_CALLBACK DisplayCloseTimeoutDeferralSlot(void* /*self*/, void* handle) {
+    delete static_cast<DisplayDeferralObj*>(handle);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK DisplayAcquireTimeoutDeferralSlot(void* /*self*/, void** out_handle) {
+    if (!out_handle) return XGR_E_POINTER;
+    auto* d = new (std::nothrow) DisplayDeferralObj();
+    if (!d) return XGR_E_OUTOFMEMORY;
+    *out_handle = d;
+    return XGR_S_OK;
+}
+
+template <int Index>
+XGameResult SCARLETTX_GDK_CALLBACK DisplayTimeoutUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    return LogUnimplemented("XDisplayTimeout", "1B339674", Index, a1, a2, a3);
+}
+
+const Slot kDisplayTimeoutVtbl[16] = {
+    reinterpret_cast<Slot>(&TableQueryInterface),
+    reinterpret_cast<Slot>(&TableAddRef),
+    reinterpret_cast<Slot>(&TableRelease),
+    reinterpret_cast<Slot>(&DisplayCloseTimeoutDeferralSlot),    // slot 3 fallback
+    reinterpret_cast<Slot>(&DisplayAcquireTimeoutDeferralSlot),  // slot 4 (observed in GDK 2510)
+    reinterpret_cast<Slot>(&DisplayCloseTimeoutDeferralSlot),    // slot 5 (observed in GDK 2510)
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<6>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<7>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<8>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<9>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<10>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<11>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<12>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<13>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<14>),
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<15>),
+};
+
+// Official GDK 2510 XPersistentLocalStorage / PLS ({F4FAF4D4} / {41A4E10C}).
+struct PlsSpaceInfoAbi {
+    uint64_t availableFreeBytes;
+    uint64_t totalFreeBytes;
+    uint64_t usedBytes;
+    uint64_t totalBytes;
+};
+
+std::string ResolveHostPlsDirectory() {
+    uint32_t tid = 0x5CA00001u;
+    (void)XGameGetXboxTitleId(&tid);
+    char sub[32] = {};
+    std::snprintf(sub, sizeof(sub), "pls_%08X", static_cast<unsigned>(tid));
+    std::error_code ec;
+    const char* env_root = std::getenv("SCARLETTX_SAVE_ROOT");
+    std::filesystem::path base = (env_root && *env_root)
+                                     ? std::filesystem::path(env_root)
+                                     : (std::filesystem::temp_directory_path(ec) / "scarlettx_saves");
+    std::filesystem::path dir = base / sub;
+    std::filesystem::create_directories(dir, ec);
+    std::string s = dir.string();
+    while (s.size() > 3u && (s.back() == '\\' || s.back() == '/')) {
+        s.pop_back();
+    }
+    return s;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PlsGetPathSizeSlot(void* /*self*/, size_t* out_size) {
+    if (!out_size) return XGR_E_POINTER;
+    const std::string dir = ResolveHostPlsDirectory();
+    *out_size = dir.size() + 1u;
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PlsGetPathSlot(void* /*self*/, size_t size, char* path, size_t* out_used) {
+    if (!path) return XGR_E_POINTER;
+    const std::string dir = ResolveHostPlsDirectory();
+    const size_t need = dir.size() + 1u;
+    if (size < need) return kInsufficientBuffer;
+    std::memcpy(path, dir.c_str(), need);
+    if (out_used) *out_used = need;
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PlsGetSpaceInfoSlot(void* /*self*/, PlsSpaceInfoAbi* out_info) {
+    if (!out_info) return XGR_E_POINTER;
+    const std::string dir = ResolveHostPlsDirectory();
+    std::error_code ec;
+    uint64_t used = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, ec)) {
+        if (entry.is_regular_file(ec)) {
+            used += entry.file_size(ec);
+        }
+    }
+    constexpr uint64_t kPlsBudgetBytes = 4ull << 30;  // 4 GiB persistent local scratch storage
+    const uint64_t free_bytes = (used < kPlsBudgetBytes) ? (kPlsBudgetBytes - used) : 0ull;
+    out_info->availableFreeBytes = free_bytes;
+    out_info->totalFreeBytes = free_bytes;
+    out_info->usedBytes = used;
+    out_info->totalBytes = kPlsBudgetBytes;
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PlsPromptSpaceProvider(XAsyncOp op, const XAsyncProviderData* data) {
+    if (op == XAsyncOp_DoWork) {
+        XAsyncComplete(data->async, XGR_S_OK, 0);
+    }
+    return XGR_S_OK;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PlsPromptUserForSpaceAsyncSlot(void* /*self*/, uint64_t /*req_bytes*/,
+                                                                  XAsyncBlock* async) {
+    if (!async) return XGR_E_INVALIDARG;
+    const XGameResult hr = XAsyncBegin(async, nullptr, reinterpret_cast<const void*>(&PlsPromptUserForSpaceAsyncSlot),
+                                       "XPersistentLocalStoragePromptUserForSpaceAsync", &PlsPromptSpaceProvider);
+    return hr == XGR_S_OK ? XAsyncSchedule(async, 0) : hr;
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PlsPromptUserForSpaceResultSlot(void* /*self*/, XAsyncBlock* async) {
+    if (!async) return XGR_E_INVALIDARG;
+    return XAsyncGetResult(async, reinterpret_cast<const void*>(&PlsPromptUserForSpaceAsyncSlot), 0, nullptr, nullptr);
+}
+
+XGameResult SCARLETTX_GDK_CALLBACK PlsMountForPackageSlot(void* /*self*/, const char* pkg_id,
+                                                          XPackageMountHandle* out_mount) {
+    if (!pkg_id || !out_mount) return XGR_E_POINTER;
+    *out_mount = nullptr;
+    return XGR_S_OK;
+}
+
+template <int Index>
+XGameResult SCARLETTX_GDK_CALLBACK PlsUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    return LogUnimplemented("XPersistentLocalStorage", "F4FAF4D4", Index, a1, a2, a3);
+}
+
+const Slot kPlsVtbl[16] = {
+    reinterpret_cast<Slot>(&TableQueryInterface),
+    reinterpret_cast<Slot>(&TableAddRef),
+    reinterpret_cast<Slot>(&TableRelease),
+    reinterpret_cast<Slot>(&PlsGetPathSizeSlot),                // slot 3
+    reinterpret_cast<Slot>(&PlsGetPathSlot),                    // slot 4
+    reinterpret_cast<Slot>(&PlsGetSpaceInfoSlot),               // slot 5
+    reinterpret_cast<Slot>(&PlsPromptUserForSpaceAsyncSlot),    // slot 6
+    reinterpret_cast<Slot>(&PlsPromptUserForSpaceResultSlot),   // slot 7
+    reinterpret_cast<Slot>(&PlsMountForPackageSlot),            // slot 8
+    reinterpret_cast<Slot>(&PlsUnimplemented<9>),
+    reinterpret_cast<Slot>(&PlsUnimplemented<10>),
+    reinterpret_cast<Slot>(&PlsUnimplemented<11>),
+    reinterpret_cast<Slot>(&PlsUnimplemented<12>),
+    reinterpret_cast<Slot>(&PlsUnimplemented<13>),
+    reinterpret_cast<Slot>(&PlsUnimplemented<14>),
+    reinterpret_cast<Slot>(&PlsUnimplemented<15>),
+};
 
 // {CE8E7A26}: XStore (GDK 2022-2026 game license & DLC entitlement queries).
 XGameResult SCARLETTX_GDK_CALLBACK StoreCreateContext(void* /*self*/, XUserHandle user, XStoreContextHandle* out) {
@@ -1123,6 +1476,12 @@ const Slot* FindVtbl(const void* api_id, const void* riid, Guid* iid) {
         if (main || Equal(riid, kIidStore2025)) return kStoreVtbl.data();
     } else if (Equal(api_id, kApiStoreReal)) {
         if (main || Equal(riid, kIidStore2510)) return kRealStoreVtbl.data();
+    } else if (Equal(api_id, kApiDisplayHdr)) {
+        if (main || Equal(riid, kIidDisplayHdr2510)) return kDisplayHdrVtbl;
+    } else if (Equal(api_id, kApiDisplayTimeout)) {
+        if (main) return kDisplayTimeoutVtbl;
+    } else if (Equal(api_id, kApiPls)) {
+        if (main || Equal(riid, kIidPls2510)) return kPlsVtbl;
     }
     // An API or newer interface id nothing implements yet: fall back to discovery table if enabled.
     return DiscoveryEnabled() ? kDiscoveryVtbl.data() : nullptr;

@@ -717,7 +717,7 @@ int main() {
               XGR_E_INVALIDARG);
 
         // A slot nothing identifies is in the table and fails.
-        CHECK(LoadVtableSlot<FnOther>(package, 0x18)(package, 0, 0, 0) == kENotImpl);
+        CHECK(LoadVtableSlot<FnOther>(package, 37 * 8)(package, 0, 0, 0) == kENotImpl);
         CHECK(LoadVtableSlot<FnRelease>(package, 0x10)(package) == 0u);
 
         // GDK 2022-2026 XPackage ({A8C4234E}) + XStore ({CE8E7A26} / {D4B92E11}) + XNetworking ({BF2346B2})
@@ -820,9 +820,19 @@ int main() {
         CHECK(QueryApiImpl(&kGuid704C3F58, &kGuidSave2510, &gs2510) == XGR_S_OK && gs2510 != nullptr);
         CHECK(LoadVtableSlot<FnRelease>(gs2510, 0x10)(gs2510) == 0u);
 
-        // 4) XPackage 2510 ({E2A4734B}): slot 39 (+0x138) XPackageEnumeratePackages, slot 40 (+0x140) Register
+        // 4) XPackage 2510 ({E2A4734B}): Intelligent Delivery (slots 3, 4, 5..7, 12) + slot 39/40 Enumerate/Register
         void* pkg2510 = nullptr;
         CHECK(QueryApiImpl(&kGuidAF406016, &kGuidPkg2510, &pkg2510) == XGR_S_OK && pkg2510 != nullptr);
+        using FnPkgId = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, size_t, char*);
+        using FnIsPkg = bool (SCARLETTX_GDK_CALLBACK*)(void*);
+        using FnChunkAvail = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, const char*, uint32_t, const void*, uint32_t*);
+        char cur_pkg_id[36] = {};
+        CHECK(LoadVtableSlot<FnPkgId>(pkg2510, 3 * 8)(pkg2510, 33u, cur_pkg_id) == XGR_S_OK);
+        CHECK(std::strlen(cur_pkg_id) > 8u);
+        CHECK(LoadVtableSlot<FnIsPkg>(pkg2510, 4 * 8)(pkg2510) == true);
+        uint32_t chunk_avail = 99u;
+        CHECK(LoadVtableSlot<FnChunkAvail>(pkg2510, 12 * 8)(pkg2510, cur_pkg_id, 1u, nullptr, &chunk_avail) == XGR_S_OK);
+        CHECK(chunk_avail == 0u);  // Ready
         std::string found_2510_pkg;
         CHECK(LoadVtableSlot<FnEnumerate>(pkg2510, 39 * 8)(
                   pkg2510, 1u, 0u, &found_2510_pkg, reinterpret_cast<void*>(on_pkg)) == XGR_S_OK);
@@ -844,6 +854,45 @@ int main() {
         CHECK(rlic.isActive && !rlic.isTrial);
         LoadVtableSlot<FnStoreClose>(rstore, 4 * 8)(rstore, rs_ctx);
         CHECK(LoadVtableSlot<FnRelease>(rstore, 0x10)(rstore) == 0u);
+
+        // 6) Official GDK 2510 XDisplay HDR ({03F0FE74} / {35F07670}) + Timeout Deferral ({1B339674})
+        const TestGuid kGuidDispHdr = {0x03F0FE74u, 0xFDD9u, 0x4E5Cu, {0xB6, 0x30, 0xF9, 0x33, 0x9C, 0x47, 0xAC, 0xC5}};
+        const TestGuid kGuidDispHdr2510 = {0x35F07670u, 0x706Eu, 0x4BFBu, {0x94, 0x76, 0x09, 0x07, 0x98, 0xC5, 0xEB, 0xF3}};
+        const TestGuid kGuidDispTimeout = {0x1B339674u, 0x328Du, 0x4283u, {0xA2, 0x00, 0x31, 0x71, 0xF1, 0x8D, 0x36, 0x39}};
+        void* disp_hdr = nullptr;
+        CHECK(QueryApiImpl(&kGuidDispHdr, &kGuidDispHdr2510, &disp_hdr) == XGR_S_OK && disp_hdr != nullptr);
+        struct HdrInfoTest { float minNits, maxNits, fullNits; } hdr_info{};
+        using FnTryHdr = uint32_t (SCARLETTX_GDK_CALLBACK*)(void*, uint32_t, HdrInfoTest*);
+        CHECK(LoadVtableSlot<FnTryHdr>(disp_hdr, 4 * 8)(disp_hdr, 0u, &hdr_info) == 2u);
+        CHECK(hdr_info.maxNits > 0.0f);
+        CHECK(LoadVtableSlot<FnRelease>(disp_hdr, 0x10)(disp_hdr) == 0u);
+
+        void* disp_to = nullptr;
+        CHECK(QueryApiImpl(&kGuidDispTimeout, &kGuidDispTimeout, &disp_to) == XGR_S_OK && disp_to != nullptr);
+        using FnAcqDefer = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, void**);
+        using FnCloseDefer = void (SCARLETTX_GDK_CALLBACK*)(void*, void*);
+        void* defer_h = nullptr;
+        CHECK(LoadVtableSlot<FnAcqDefer>(disp_to, 4 * 8)(disp_to, &defer_h) == XGR_S_OK && defer_h != nullptr);
+        LoadVtableSlot<FnCloseDefer>(disp_to, 5 * 8)(disp_to, defer_h);
+        CHECK(LoadVtableSlot<FnRelease>(disp_to, 0x10)(disp_to) == 0u);
+
+        // 7) Official GDK 2510 XPersistentLocalStorage / PLS ({F4FAF4D4} / {41A4E10C})
+        const TestGuid kGuidPls = {0xF4FAF4D4u, 0x2D04u, 0x4FCEu, {0xB3, 0xE0, 0x47, 0x4A, 0x71, 0x3A, 0x3E, 0x84}};
+        const TestGuid kGuidPls2510 = {0x41A4E10Cu, 0x5A7Eu, 0x41D9u, {0x8C, 0x37, 0x37, 0xBD, 0xE6, 0x2A, 0x07, 0xD6}};
+        void* pls = nullptr;
+        CHECK(QueryApiImpl(&kGuidPls, &kGuidPls2510, &pls) == XGR_S_OK && pls != nullptr);
+        using FnPlsSize = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, size_t*);
+        using FnPlsPath = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, size_t, char*, size_t*);
+        struct PlsSpaceTest { uint64_t avail, totalFree, used, total; } pls_sp{};
+        using FnPlsSpace = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, PlsSpaceTest*);
+        size_t pls_sz = 0;
+        CHECK(LoadVtableSlot<FnPlsSize>(pls, 3 * 8)(pls, &pls_sz) == XGR_S_OK && pls_sz > 4u);
+        std::string pls_dir(pls_sz, '\0');
+        size_t pls_used = 0;
+        CHECK(LoadVtableSlot<FnPlsPath>(pls, 4 * 8)(pls, pls_dir.size(), pls_dir.data(), &pls_used) == XGR_S_OK);
+        CHECK(pls_used == pls_sz && std::filesystem::exists(pls_dir.c_str()));
+        CHECK(LoadVtableSlot<FnPlsSpace>(pls, 5 * 8)(pls, &pls_sp) == XGR_S_OK && pls_sp.total == (4ull << 30));
+        CHECK(LoadVtableSlot<FnRelease>(pls, 0x10)(pls) == 0u);
 
         set_env("SCARLETTX_PACKAGE_ROOT", "");
     }
