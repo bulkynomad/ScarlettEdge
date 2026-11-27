@@ -139,6 +139,11 @@ SCARLETTX_XS2_API int32_t SCARLETTX_XS2_CALL Xs2ShaderDestroyTranslationPipeline
 SCARLETTX_XS2_API int32_t SCARLETTX_XS2_CALL Xs2ShaderTranslateCached(
     XS2_PIPELINE_HANDLE pipeline, const void* microcode, size_t byteSize, void** outBytecode, size_t* outBytecodeSize);
 
+// Versioned shader cache lookup/translation keyed by microcode hash + rootSigHash.
+SCARLETTX_XS2_API int32_t SCARLETTX_XS2_CALL Xs2ShaderTranslateCachedEx(
+    XS2_PIPELINE_HANDLE pipeline, const void* microcode, size_t byteSize, uint64_t rootSigHash,
+    void** outBytecode, size_t* outBytecodeSize);
+
 SCARLETTX_XS2_API int32_t SCARLETTX_XS2_CALL Xs2ShaderClearPipelineCache(
     XS2_PIPELINE_HANDLE pipeline);
 

@@ -54,6 +54,11 @@ struct FlightTriageReport {
     uint64_t uptime_ms = 0;
     uint64_t total_events = 0;
     uint64_t heartbeats = 0;
+    uint64_t frames_recorded = 0;
+    uint64_t stutter_count = 0;
+    double p95_ms = 0.0;
+    double p99_ms = 0.0;
+    double max_ms = 0.0;
     bool has_summary = false;
 
     std::vector<TriageImportGap> missing_imports;

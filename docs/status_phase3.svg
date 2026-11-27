@@ -38,7 +38,7 @@
     <rect x="488" y="86" width="65" height="20" fill="#555555"/>
     <rect x="553" y="86" width="97" height="20" fill="#26a641"/>
     <text class="badge-txt" x="520.5" y="100" text-anchor="middle">CI tests</text>
-    <text class="badge-txt" x="601.5" y="100" text-anchor="middle">37/37 passing</text>
+    <text class="badge-txt" x="601.5" y="100" text-anchor="middle">38/38 passing</text>
   </g>
   <clipPath id="bclip3"><rect x="656" y="86" width="252" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip3)">

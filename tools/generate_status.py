@@ -809,9 +809,9 @@ def collect_phase4_metrics() -> list[Subsystem]:
             name="4E. Commercial Engine Hardening",
             short_name="EngineHard",
             category="Graphics",
-            implemented=0,
+            implemented=5,
             target=5,
-            notes="**Queued (0/5):** Versioned shader disk cache, multi-region .msixvc/.cik streaming, heap/alias churn telemetry, optional Media Foundation H.264/HEVC, p95/p99 stutter profiler",
+            notes="**Complete (5/5):** Versioned .sxc shader disk cache (rootSigHash + FNV-1a eviction), multi-entry .cik keyring + LoadKeyringDirectory, KernelXQueryAliasTelemetry, dynamic MF H.264/HEVC probe, lock-free p95/p99 stutter profiler in flight_summary.json & triage",
         ),
         Subsystem(
             name="4F. Compatibility Matrix & Dashboard",

@@ -24,28 +24,28 @@
     <rect x="36" y="86" width="129" height="20" fill="#555555"/>
     <rect x="165" y="86" width="110" height="20" fill="#a371f7"/>
     <text class="badge-txt" x="100.5" y="100" text-anchor="middle">upstream ScarlettX</text>
-    <text class="badge-txt-dark" x="220.0" y="100" text-anchor="middle">281/502 (56.0%)</text>
+    <text class="badge-txt-dark" x="220.0" y="100" text-anchor="middle">281/505 (55.6%)</text>
   </g>
   <clipPath id="bclip1"><rect x="281" y="86" width="220" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip1)">
     <rect x="281" y="86" width="123" height="20" fill="#555555"/>
     <rect x="404" y="86" width="97" height="20" fill="#39d353"/>
     <text class="badge-txt" x="342.5" y="100" text-anchor="middle">ScarlettEdge fork</text>
-    <text class="badge-txt-dark" x="452.5" y="100" text-anchor="middle">+221 (+44.0%)</text>
+    <text class="badge-txt-dark" x="452.5" y="100" text-anchor="middle">+224 (+44.4%)</text>
   </g>
   <clipPath id="bclip2"><rect x="507" y="86" width="92" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip2)">
     <rect x="507" y="86" width="59" height="20" fill="#555555"/>
     <rect x="566" y="86" width="33" height="20" fill="#007ec6"/>
     <text class="badge-txt" x="536.5" y="100" text-anchor="middle">exports</text>
-    <text class="badge-txt" x="582.5" y="100" text-anchor="middle">498</text>
+    <text class="badge-txt" x="582.5" y="100" text-anchor="middle">501</text>
   </g>
   <clipPath id="bclip3"><rect x="605" y="86" width="143" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip3)">
     <rect x="605" y="86" width="46" height="20" fill="#555555"/>
     <rect x="651" y="86" width="97" height="20" fill="#26a641"/>
     <text class="badge-txt" x="628.0" y="100" text-anchor="middle">tests</text>
-    <text class="badge-txt" x="699.5" y="100" text-anchor="middle">37/37 passing</text>
+    <text class="badge-txt" x="699.5" y="100" text-anchor="middle">38/38 passing</text>
   </g>
 
   <!-- 3. Contribution graph box -->
@@ -480,6 +480,7 @@
   <rect x="787.0" y="184.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="787.0" y="194.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="787.0" y="204.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="787.0" y="214.0" width="8" height="8" rx="3" fill="#39d353"/>
   <text class="g-label" x="803.0" y="160">XS2</text>
   <rect x="803.0" y="174.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="803.0" y="184.0" width="8" height="8" rx="3" fill="#39d353"/>
@@ -497,6 +498,7 @@
   <rect x="813.0" y="234.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="823.0" y="174.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="823.0" y="184.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="823.0" y="194.0" width="8" height="8" rx="3" fill="#39d353"/>
   <text class="g-label" x="835.0" y="160">Crypt</text>
   <rect x="835.0" y="174.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="835.0" y="184.0" width="8" height="8" rx="3" fill="#39d353"/>
@@ -529,6 +531,7 @@
   <rect x="898.0" y="184.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="898.0" y="194.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="898.0" y="204.0" width="8" height="8" rx="3" fill="#39d353"/>
+  <rect x="898.0" y="214.0" width="8" height="8" rx="3" fill="#39d353"/>
   <text class="g-label" x="921.0" y="160">Vulk</text>
   <rect x="921.0" y="174.0" width="8" height="8" rx="3" fill="#39d353"/>
   <rect x="921.0" y="184.0" width="8" height="8" rx="3" fill="#39d353"/>
@@ -640,12 +643,12 @@
   <line x1="540.0" y1="480" x2="1000.0" y2="480" stroke="#21262d" stroke-width="1"/>
   <rect x="40.0" y="489.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="61.0" y="499">Production Codecs (XMA2/GDeflate/Bink)</text>
-  <text class="r-count" x="452.0" y="499" text-anchor="end">18 of 18</text>
+  <text class="r-count" x="452.0" y="499" text-anchor="end">19 of 19</text>
   <text class="r-pct" x="500.0" y="499" text-anchor="end">100%</text>
   <line x1="40.0" y1="514" x2="500.0" y2="514" stroke="#21262d" stroke-width="1"/>
   <rect x="540.0" y="489.0" width="11" height="11" rx="2" fill="#39d353"/>
   <text class="r-name" x="561.0" y="499">Xbox Unified Memory &amp; KernelX</text>
-  <text class="r-count" x="952.0" y="499" text-anchor="end">18 of 18</text>
+  <text class="r-count" x="952.0" y="499" text-anchor="end">19 of 19</text>
   <text class="r-pct" x="1000.0" y="499" text-anchor="end">100%</text>
   <line x1="540.0" y1="514" x2="1000.0" y2="514" stroke="#21262d" stroke-width="1"/>
   <rect x="40.0" y="523.0" width="11" height="11" rx="2" fill="#39d353"/>
@@ -653,14 +656,14 @@
   <text class="r-count" x="452.0" y="533" text-anchor="end">17 of 17</text>
   <text class="r-pct" x="500.0" y="533" text-anchor="end">100%</text>
   <line x1="40.0" y1="548" x2="500.0" y2="548" stroke="#21262d" stroke-width="1"/>
-  <rect x="540.0" y="523.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
-  <rect x="545.5" y="523.0" width="5.5" height="11" rx="1" fill="#39d353"/>
-  <text class="r-name" x="561.0" y="533">Input (GameInput)</text>
-  <text class="r-count" x="952.0" y="533" text-anchor="end">16 of 16</text>
+  <rect x="540.0" y="523.0" width="11" height="11" rx="2" fill="#39d353"/>
+  <text class="r-name" x="561.0" y="533">RDNA2 XS2 Shader Lifting</text>
+  <text class="r-count" x="952.0" y="533" text-anchor="end">17 of 17</text>
   <text class="r-pct" x="1000.0" y="533" text-anchor="end">100%</text>
   <line x1="540.0" y1="548" x2="1000.0" y2="548" stroke="#21262d" stroke-width="1"/>
-  <rect x="40.0" y="557.0" width="11" height="11" rx="2" fill="#39d353"/>
-  <text class="r-name" x="61.0" y="567">RDNA2 XS2 Shader Lifting</text>
+  <rect x="40.0" y="557.0" width="5.5" height="11" rx="1" fill="#a371f7"/>
+  <rect x="45.5" y="557.0" width="5.5" height="11" rx="1" fill="#39d353"/>
+  <text class="r-name" x="61.0" y="567">Input (GameInput)</text>
   <text class="r-count" x="452.0" y="567" text-anchor="end">16 of 16</text>
   <text class="r-pct" x="500.0" y="567" text-anchor="end">100%</text>
   <line x1="40.0" y1="582" x2="500.0" y2="582" stroke="#21262d" stroke-width="1"/>
@@ -690,6 +693,6 @@
   <!-- 5. Status callout -->
   <rect x="36" y="670" width="4" height="46" fill="#39d353"/>
   <g transform="translate(56,680)"><circle cx="8" cy="8" r="6.5" fill="none" stroke="#39d353" stroke-width="1.5"/><path d="M5.2 8.2 7.1 10.1 11 6.1" fill="none" stroke="#39d353" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></g>
-  <text class="callout-txt" x="82" y="689"><tspan class="callout-lead">Attribution:</tspan> Purple = original Freminet/ScarlettX (281/502, 56.0%); Green = ScarlettEdge additions (+221, +44.0%).</text>
-  <text class="callout-txt" x="82" y="706">Combined 100% clean-room ABI coverage across all 19 tracked subsystems (37/37 passing CTest suites).</text>
+  <text class="callout-txt" x="82" y="689"><tspan class="callout-lead">Attribution:</tspan> Purple = original Freminet/ScarlettX (281/505, 55.6%); Green = ScarlettEdge additions (+224, +44.4%).</text>
+  <text class="callout-txt" x="82" y="706">Combined 100% clean-room ABI coverage across all 19 tracked subsystems (38/38 passing CTest suites).</text>
 </svg>

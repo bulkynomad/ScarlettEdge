@@ -572,3 +572,10 @@ target_link_libraries(test_flight_recorder PRIVATE
 add_dependencies(test_flight_recorder scarlettx hello_scarlett)
 
 scarlettx_add_test(test_triage_cli tests/test_triage_cli.cpp)
+
+scarlettx_add_test(test_engine_hardening tests/test_engine_hardening.cpp)
+target_link_libraries(test_engine_hardening PRIVATE
+    xs2_lifting
+    kernelx
+    xbox_codecs
+)

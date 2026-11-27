@@ -86,6 +86,18 @@ SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXProtectMemory(
 SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXQueryMemoryStatistics(
     KERNELX_MEMORY_STATS* outStats);
 
+typedef struct KERNELX_ALIAS_TELEMETRY {
+    uint64_t totalAliasesCreated;
+    uint64_t totalAliasesFreed;
+    uint32_t activeAliases;
+    uint32_t peakAliases;
+    uint64_t activeAliasedBytes;
+    uint64_t peakAliasedBytes;
+} KERNELX_ALIAS_TELEMETRY;
+
+SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXQueryAliasTelemetry(
+    KERNELX_ALIAS_TELEMETRY* outTelemetry);
+
 // Synchronization primitives
 SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXCreateSynchronizationEvent(
     int32_t manualReset, int32_t initialState, KERNELX_EVENT_HANDLE* outEvent);

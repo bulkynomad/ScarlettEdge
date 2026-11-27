@@ -16,13 +16,13 @@
 <!-- SCARLETTX_STATUS_START -->
 ## Status
 
-### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — 20/30)
+### Phase 4: Clean-Room Governance & Commercial Retail Bring-Up (In Progress — 25/30)
 
 Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder analysis, multi-sample GDK 2510 ATG validation, Wave 1 commercial retail bring-up, and the [Compatibility Matrix](docs/COMPATIBILITY.md):
 
 ![ScarlettEdge Phase 4: Clean-Room Governance & Retail Bring-Up](docs/status_phase4.svg)
 
-**Phase 4 Progress:** `66.7%` (20 of 30 milestones) · **Tests:** `37/37` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
+**Phase 4 Progress:** `83.3%` (25 of 30 milestones) · **Tests:** `38/38` passing · **Clean-Room Policy:** [CLEANROOM_POLICY.md](CLEANROOM_POLICY.md)
 
 | Phase 4 Track | Category | Progress | Readiness | Details |
 | :--- | :--- | :---: | :---: | :--- |
@@ -30,7 +30,7 @@ Tracks automated clean-room CI guardrails, `scarlettx triage` Flight-Recorder an
 | **4B. Flight-Recorder Triage CLI** | `Diagnostics` | `5 of 5` | `100%` | **Complete (5/5):** scarlettx triage <dir> [--emit-stubs] [--json] (src/core/flight_triage.cpp), null-vtable/crash/hang/DRED verdicts, hit-ranked gaps, stub skeleton emitter, test_triage_cli |
 | **4C. Multi-Sample GDK 2510 ATG** | `Platform` | `5 of 5` | `100%` | **Complete (5/5):** Verified live on RTX 5070 Ti (--debug-layer, 0 errors, triage CLEAN_RUN): DirectStorage, XGameSave round-trip + XGameSaveFiles + PLS, GameInput, XAudio2 PCM, SM 6.6 ResourceDescriptorHeap + 30/30 ExecuteIndirect GPU frames |
 | **4D. Retail Wave 1 Bring-Up** | `Retail` | `0 of 5` | `0%` | **Queued (0/5):** Flight-recorder bring-up of user-supplied legal dumps (Concept Destruction, Unicorn Overlord) through inspect, boot, menus/audio/input, gameplay, and save round-trip |
-| **4E. Commercial Engine Hardening** | `Graphics` | `0 of 5` | `0%` | **Queued (0/5):** Versioned shader disk cache, multi-region .msixvc/.cik streaming, heap/alias churn telemetry, optional Media Foundation H.264/HEVC, p95/p99 stutter profiler |
+| **4E. Commercial Engine Hardening** | `Graphics` | `5 of 5` | `100%` | **Complete (5/5):** Versioned .sxc shader disk cache (rootSigHash + FNV-1a eviction), multi-entry .cik keyring + LoadKeyringDirectory, KernelXQueryAliasTelemetry, dynamic MF H.264/HEVC probe, lock-free p95/p99 stutter profiler in flight_summary.json & triage |
 | **4F. Compatibility Matrix & Dashboard** | `Docs` | `5 of 5` | `100%` | **Complete (5/5):** docs/COMPATIBILITY.md tiered compatibility ledger, docs/status_phase4.svg, Phase 4 ROADMAP.md & generate_status.py live progress dashboard |
 
 ---
@@ -41,7 +41,7 @@ Tracks the shared `scarlettx_core.dll` unification, 4-Part Flight-Recorder Diagn
 
 ![ScarlettEdge Phase 3: Unification, Diagnostics & GDK 2510](docs/status_phase3.svg)
 
-**Phase 3 Milestones:** `100.0%` (30 of 30 milestones) · **Tests:** `37/37` passing · **Next Wave:** `Per-Title Commercial Retail Title Bring-Up`
+**Phase 3 Milestones:** `100.0%` (30 of 30 milestones) · **Tests:** `38/38` passing · **Next Wave:** `Per-Title Commercial Retail Title Bring-Up`
 
 | Phase 3 Track | Category | Progress | Readiness | Verified Capabilities |
 | :--- | :--- | :---: | :---: | :--- |
@@ -81,13 +81,13 @@ Tracks the runtime fidelity, cryptography, memory aliasing, and tooling foundati
 
 ![ScarlettEdge Runtime Optimization & Fidelity Status](docs/status_optimizations.svg)
 
-**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `498` · **Tests:** `37/37` passing · **Target:** `Xbox Series X|S (Gen9)`
+**Phase 1 Fork Foundations:** `100.0%` (44 of 44 milestones) · **Exports:** `501` · **Tests:** `38/38` passing · **Target:** `Xbox Series X|S (Gen9)`
 
 ---
 
 ### Upstream Foundation + Fork Expansion (Color-Differentiated)
 
-In the two charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`56.0%` ABI / `91.3%` Concept Destruction), while **emerald green (`#39d353`)** marks new functions and milestones added in **ScarlettEdge** (`+44.0%` ABI / `+8.7%` Concept Destruction):
+In the two charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`55.6%` ABI / `91.3%` Concept Destruction), while **emerald green (`#39d353`)** marks new functions and milestones added in **ScarlettEdge** (`+44.4%` ABI / `+8.7%` Concept Destruction):
 
 ![ABI Coverage: Upstream ScarlettX (Purple) vs ScarlettEdge Fork (Green)](docs/status.svg)
 
@@ -98,7 +98,7 @@ In the two charts below, **purple (`#a371f7`)** credits original work from **[Fr
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `56.0%` + `221` ScarlettEdge fork `+44.0%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `498` (`269` upstream + `229` fork) · **Tests:** `37/37` passing
+**Combined ABI Coverage:** `100.0%` (`281` upstream ScarlettX `55.6%` + `224` ScarlettEdge fork `+44.4%`) · **Concept Destruction:** `100.0%` (`42` upstream + `4` fork) · **Exports:** `501` (`269` upstream + `232` fork) · **Tests:** `38/38` passing
 
 | Subsystem | Category | Progress | Origin Split | Details |
 | :--- | :--- | :---: | :---: | :--- |
@@ -112,17 +112,17 @@ In the two charts below, **purple (`#a371f7`)** credits original work from **[Fr
 | **DirectStorage & XVD** | `Storage` | `26 of 26` (`100%`) | `23 upstream + 3 fork` | 25 DStorage exports + AES-XTS encrypted GDFX XVC/XVD extraction & PackageVfs file mounting; OVERLAPPED NVMe queues, HLSL cs_5_0 GPU GDeflate & CopyTextureRegion GPU upload |
 | **XTaskQueue & XAsync** | `xgameruntime` | `24 of 24` (`100%`) | `23 upstream + 1 fork` | 16 XTaskQueue + 8 XAsync exports (manual/threadpool/delayed/monitors/cancel) |
 | **Live Xbox Services (XSAPI/WinRT)** | `Platform` | `23 of 23` (`100%`) | `23 ScarlettEdge` | 23 exports; WinRT RoActivateInstance IInspectable broker, persistent XblTitleStorage, profiles, achievements, sessions |
-| **Production Codecs (XMA2/GDeflate/Bink)** | `Media` | `18 of 18` (`100%`) | `18 ScarlettEdge` | 18 exports; hardware GDeflate, BCPack, SHAPE XMA2 audio transform decoding, production Bink2 video & audio |
-| **Xbox Unified Memory & KernelX** | `Platform` | `18 of 18` (`100%`) | `18 ScarlettEdge` | 18 exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services |
+| **Production Codecs (XMA2/GDeflate/Bink)** | `Media` | `19 of 19` (`100%`) | `19 ScarlettEdge` | 19 exports; hardware GDeflate, BCPack, SHAPE XMA2 audio transform decoding, production Bink2 video & audio |
+| **Xbox Unified Memory & KernelX** | `Platform` | `19 of 19` (`100%`) | `19 ScarlettEdge` | 19 exports; MEM_GRAPHICS, 64 KB / 2 MB physical-virtual aliasing, sync events & Game OS kernel services |
 | **Hardware DXR & Vulkan Backend** | `Graphics` | `17 of 17` (`100%`) | `17 ScarlettEdge` | 17 exports; live Vulkan 1.3 VkComputePipeline + SSBO dispatch, timeline semaphores, Win32 VkSurfaceKHR, VK_KHR_acceleration_structure BLAS/TLAS & aligned SBT vkCmdTraceRaysKHR |
+| **RDNA2 XS2 Shader Lifting** | `Graphics` | `17 of 17` (`100%`) | `17 ScarlettEdge` | 17 exports; RDNA2/Scarlett GPU microcode disassembly, DXIL/SPIR-V lifting, chunk stripping, pipeline caching |
 | **Input (GameInput)** | `Input` | `16 of 16` (`100%`) | `15 upstream + 1 fork` | 16 exports; virtual Xbox Series controller & keyboard, reading history (Current/Next/Previous), state injection, rumble forwarded to the host controller's two main motors |
-| **RDNA2 XS2 Shader Lifting** | `Graphics` | `16 of 16` (`100%`) | `16 ScarlettEdge` | 16 exports; RDNA2/Scarlett GPU microcode disassembly, DXIL/SPIR-V lifting, chunk stripping, pipeline caching |
 | **XMem & Threading** | `xgameruntime` | `16 of 16` (`100%`) | `11 upstream + 5 fork` | 16 exports; default/custom alloc hooks, VirtualAlloc/Free, time-sensitive thread state |
 | **DXR / XboxBvhBuilder** | `Graphics` | `15 of 15` (`100%`) | `12 upstream + 3 fork` | 11 BVH exports + DXR AS prebuild/build/destroy, BLAS update, single-ray trace, deterministic software BVH fallback (hardware DXR requires capable GPU) |
 | **Retail XVC/XVD Crypto** | `Storage` | `12 of 12` (`100%`) | `12 ScarlettEdge` | 12 exports; AES-XTS/AES-CBC sector decryption, SHA-256 block hashing, integrity table verification |
 | **PE64 Loader & Auto-Stubs** | `Core` | `6 of 6` (`100%`) | `6 upstream` | PE32+ mapping, DIR64/HIGHLOW relocs, named/ordinal IAT, API-set redirection, x64 auto-stub thunks |
 
-> **100% ABI Surface Coverage:** All 19 subsystems (502/502 functions) have verified implementations across graphics, compute, audio, networking, storage, kernel, and services. Passing synthetic tests do not imply commercial retail title execution.
+> **100% ABI Surface Coverage:** All 19 subsystems (505/505 functions) have verified implementations across graphics, compute, audio, networking, storage, kernel, and services. Passing synthetic tests do not imply commercial retail title execution.
 
 _Regenerate with `python tools/generate_status.py --build-dir <build tree>` after adding new HLE APIs or subsystems; the test numbers are read from that tree's last `ctest` run._
 <!-- SCARLETTX_STATUS_END -->

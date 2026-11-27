@@ -98,6 +98,8 @@ public:
     // Multi-key CIK ring slot management for retail XVC regions (KeyId != 0xFFFF).
     Status SetCikKey(uint16_t slot, const uint8_t* key, size_t key_len);
     Status SetCikKeyHex(uint16_t slot, const std::string& hex_key);
+    Status LoadKeyringDirectory(const std::string& dir_path, size_t* out_keys_loaded = nullptr);
+    size_t CikKeyCount() const { return cik_keys_.size(); }
 
     bool HasVolumeKey() const { return has_volume_key_ || !cik_keys_.empty(); }
 

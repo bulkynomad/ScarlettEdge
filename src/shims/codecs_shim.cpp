@@ -1254,10 +1254,39 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecHardwareAccelSupported(uint32_t /*codecId*
 int32_t SCARLETTX_CODEC_CALL XboxCodecGetVersion(CODEC_VERSION_INFO* outVersion) {
     if (!outVersion) return kInvalidArg;
     outVersion->major = 2;
-    outVersion->minor = 1;
+    outVersion->minor = 2;
     outVersion->patch = 0;
-    std::strncpy(outVersion->description, "ScarlettX Unified Production Codecs (32-Lane GDeflate/BCPack/XMA2/Bink2)", sizeof(outVersion->description) - 1);
+    std::strncpy(outVersion->description, "ScarlettX Unified Production Codecs (32-Lane GDeflate/BCPack/XMA2/Bink2/MF)", sizeof(outVersion->description) - 1);
     outVersion->description[sizeof(outVersion->description) - 1] = '\0';
+    return kSuccess;
+}
+
+int32_t SCARLETTX_CODEC_CALL XboxCodecProbeMediaFoundation(MF_MEDIA_CAPABILITIES* outCaps) {
+    if (!outCaps) return kInvalidArg;
+    std::memset(outCaps, 0, sizeof(*outCaps));
+#if defined(_WIN32)
+    HMODULE hMfPlat = LoadLibraryA("mfplat.dll");
+    HMODULE hMfRw = LoadLibraryA("mfreadwrite.dll");
+    const bool has_plat = (hMfPlat != nullptr) &&
+        (GetProcAddress(hMfPlat, "MFStartup") != nullptr) &&
+        (GetProcAddress(hMfPlat, "MFShutdown") != nullptr);
+    const bool has_rw = (hMfRw != nullptr) &&
+        (GetProcAddress(hMfRw, "MFCreateSourceReaderFromURL") != nullptr);
+    outCaps->mfPlatAvailable = has_plat ? 1 : 0;
+    outCaps->mfReadWriteAvailable = has_rw ? 1 : 0;
+    outCaps->h264Supported = (has_plat && has_rw) ? 1 : 0;
+    // Probe Windows HEVC Video Extension / MFT presence via msmpeg2vdec/hevcdecoder
+    HMODULE hHevc = LoadLibraryA("hevcdecoder.dll");
+    outCaps->hevcSupported = (has_plat && has_rw && hHevc != nullptr) ? 1 : 0;
+    if (hHevc) FreeLibrary(hHevc);
+    if (hMfRw) FreeLibrary(hMfRw);
+    if (hMfPlat) FreeLibrary(hMfPlat);
+    std::strncpy(outCaps->backendName,
+                 (has_plat && has_rw) ? "Win32 MediaFoundation (IMFSourceReader)" : "Fallback (MF unavailable)",
+                 sizeof(outCaps->backendName) - 1);
+#else
+    std::strncpy(outCaps->backendName, "Non-Windows Fallback", sizeof(outCaps->backendName) - 1);
+#endif
     return kSuccess;
 }
 

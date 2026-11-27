@@ -766,9 +766,23 @@ Status XvdContainer::LoadVolumeKeyFile(const std::string& key_file_path) {
     if (raw.size() == 16 || raw.size() == 32 || raw.size() == 64) {
         return SetVolumeKey(raw.data(), raw.size());
     }
-    // Standard 48-byte binary .cik file: [0..15] = 16-byte KeyId GUID, [16..47] = 32-byte AES-128-XTS key.
-    if (raw.size() == 48) {
-        return SetVolumeKey(raw.data() + 16, 32);
+    // Standard 48-byte binary .cik file or concatenated multi-entry binary keyring:
+    // each 48-byte record = [0..15] 16-byte KeyId GUID, [16..47] 32-byte AES-128-XTS key.
+    if (raw.size() >= 48 && (raw.size() % 48) == 0) {
+        const size_t count = raw.size() / 48;
+        if (count == 1) {
+            return SetVolumeKey(raw.data() + 16, 32);
+        }
+        bool loaded_bin = false;
+        for (size_t i = 0; i < count && i < 0xFFFEu; ++i) {
+            const uint8_t* kptr = raw.data() + i * 48 + 16;
+            if (SetCikKey(static_cast<uint16_t>(i), kptr, 32).ok()) {
+                loaded_bin = true;
+            }
+        }
+        if (loaded_bin) {
+            return Status::Ok();
+        }
     }
 
     std::string text(reinterpret_cast<const char*>(raw.data()), raw.size());
@@ -839,6 +853,52 @@ Status XvdContainer::SetCikKeyHex(uint16_t slot, const std::string& hex_key) {
     Status st = DecodeHexKeyString(hex_key, bytes);
     if (!st.ok()) return st;
     return SetCikKey(slot, bytes.data(), bytes.size());
+}
+
+Status XvdContainer::LoadKeyringDirectory(const std::string& dir_path, size_t* out_keys_loaded) {
+    if (out_keys_loaded) *out_keys_loaded = 0;
+    std::error_code ec;
+    const std::filesystem::path root(dir_path);
+    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
+        return Status::Error(StatusCode::NotFound, "Keyring directory not found: " + dir_path);
+    }
+    std::vector<std::filesystem::path> key_files;
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        std::string ext = entry.path().extension().string();
+        for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (ext == ".cik" || ext == ".key") {
+            key_files.push_back(entry.path());
+        }
+    }
+    std::sort(key_files.begin(), key_files.end());
+
+    uint16_t slot = static_cast<uint16_t>(cik_keys_.size());
+    size_t loaded = 0;
+    for (const auto& kf : key_files) {
+        std::ifstream ifs(kf, std::ios::binary);
+        if (!ifs) continue;
+        std::vector<uint8_t> raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        if (raw.size() >= 48 && (raw.size() % 48) == 0) {
+            const size_t n = raw.size() / 48;
+            for (size_t i = 0; i < n && slot < 0xFFFEu; ++i) {
+                if (SetCikKey(slot, raw.data() + i * 48 + 16, 32).ok()) {
+                    ++slot;
+                    ++loaded;
+                }
+            }
+        } else if (raw.size() == 16 || raw.size() == 32 || raw.size() == 64) {
+            if (slot < 0xFFFEu && SetCikKey(slot, raw.data(), raw.size()).ok()) {
+                ++slot;
+                ++loaded;
+            }
+        }
+    }
+    if (out_keys_loaded) *out_keys_loaded = loaded;
+    if (loaded == 0) {
+        return Status::Error(StatusCode::NotFound, "No valid .cik/.key files found in: " + dir_path);
+    }
+    return Status::Ok();
 }
 
 // ---------------------------------------------------------------------------

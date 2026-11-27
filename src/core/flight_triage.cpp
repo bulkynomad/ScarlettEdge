@@ -140,6 +140,28 @@ bool ExtractI32Field(const std::string& obj, const std::string& key, int32_t& ou
     return endp != (obj.c_str() + pos);
 }
 
+bool ExtractDoubleField(const std::string& obj, const std::string& key, double& out) {
+    const std::string needle = "\"" + key + "\"";
+    size_t pos = obj.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos += needle.size();
+    SkipWs(obj, pos);
+    if (pos >= obj.size() || obj[pos] != ':') {
+        return false;
+    }
+    ++pos;
+    SkipWs(obj, pos);
+    if (pos >= obj.size() ||
+        (!std::isdigit(static_cast<unsigned char>(obj[pos])) && obj[pos] != '-')) {
+        return false;
+    }
+    char* endp = nullptr;
+    out = std::strtod(obj.c_str() + pos, &endp);
+    return endp != (obj.c_str() + pos);
+}
+
 bool ExtractBoolField(const std::string& obj, const std::string& key, bool& out) {
     const std::string needle = "\"" + key + "\"";
     size_t pos = obj.find(needle);
@@ -299,6 +321,11 @@ Status TriageFlightDirectory(const std::string& directory, FlightTriageReport& o
         ExtractU64Field(summary_text, "uptime_ms", out_report.uptime_ms);
         ExtractU64Field(summary_text, "total_events", out_report.total_events);
         ExtractU64Field(summary_text, "heartbeats", out_report.heartbeats);
+        ExtractU64Field(summary_text, "frames", out_report.frames_recorded);
+        ExtractU64Field(summary_text, "stutters_gt_33ms", out_report.stutter_count);
+        ExtractDoubleField(summary_text, "p95_ms", out_report.p95_ms);
+        ExtractDoubleField(summary_text, "p99_ms", out_report.p99_ms);
+        ExtractDoubleField(summary_text, "max_ms", out_report.max_ms);
 
         for (const auto& obj : ExtractObjectArray(summary_text, "missing_imports")) {
             TriageImportGap gap;
@@ -483,6 +510,11 @@ std::string FormatFlightTriageText(const FlightTriageReport& r, bool emit_stubs)
         os << "Title ID:         " << (r.title_id.empty() ? "(unknown)" : r.title_id) << "\n"
            << "Uptime / Phase:   " << r.uptime_ms << " ms (" << r.last_phase << ")\n"
            << "Events / Beats:   " << r.total_events << " events, " << r.heartbeats << " heartbeats\n";
+        if (r.frames_recorded > 0) {
+            os << "Frame Pacing:     " << r.frames_recorded << " frames (p95=" << r.p95_ms
+               << " ms, p99=" << r.p99_ms << " ms, max=" << r.max_ms
+               << " ms, stutters=" << r.stutter_count << ")\n";
+        }
     }
     os << "Artifacts:        " << r.crashes.size() << " crash(es), "
        << r.hang_files.size() << " hang(s), "

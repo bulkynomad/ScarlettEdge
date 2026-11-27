@@ -126,6 +126,11 @@ struct KernelXState {
     std::unordered_map<uint64_t, uintptr_t> by_gpu_va;
 #if defined(_WIN32)
     std::unordered_map<uintptr_t, AliasBlock> aliases;
+    uint64_t total_aliases_created = 0;
+    uint64_t total_aliases_freed = 0;
+    uint32_t peak_aliases = 0;
+    uint64_t active_aliased_bytes = 0;
+    uint64_t peak_aliased_bytes = 0;
 #endif
 };
 
@@ -393,6 +398,15 @@ int32_t SCARLETTX_KERNELX_CALL KernelXCreateMemoryAlias(
         std::lock_guard<std::mutex> lk(State().mu);
         State().aliases[reinterpret_cast<uintptr_t>(alias_va)] =
             AliasBlock{alias_va, dup_section, parent_va, offset, alias_gpu_va, size};
+        State().total_aliases_created++;
+        State().active_aliased_bytes += size;
+        if (State().active_aliased_bytes > State().peak_aliased_bytes) {
+            State().peak_aliased_bytes = State().active_aliased_bytes;
+        }
+        const uint32_t cur_aliases = static_cast<uint32_t>(State().aliases.size());
+        if (cur_aliases > State().peak_aliases) {
+            State().peak_aliases = cur_aliases;
+        }
     }
     *outAliasVirtualAddress = alias_va;
     return kSuccess;
@@ -408,9 +422,13 @@ int32_t SCARLETTX_KERNELX_CALL KernelXFreeMemoryAlias(void* aliasVirtualAddress)
     std::lock_guard<std::mutex> lk(State().mu);
     auto it = State().aliases.find(reinterpret_cast<uintptr_t>(aliasVirtualAddress));
     if (it == State().aliases.end()) return kInvalidArg;
+    const uint64_t sz = it->second.size;
     UnmapViewOfFile(aliasVirtualAddress);
     if (it->second.section) CloseHandle(it->second.section);
     State().aliases.erase(it);
+    State().total_aliases_freed++;
+    State().active_aliased_bytes = (State().active_aliased_bytes >= sz)
+        ? (State().active_aliased_bytes - sz) : 0ull;
     return kSuccess;
 #else
     return kInvalidArg;
@@ -440,6 +458,21 @@ int32_t SCARLETTX_KERNELX_CALL KernelXQueryMemoryStatistics(KERNELX_MEMORY_STATS
         (total_bytes > State().total_allocated) ? (total_bytes - State().total_allocated) : 0;
     outStats->peakAllocatedBytes = State().peak_allocated;
     outStats->activeAllocations = static_cast<uint32_t>(State().by_va.size());
+    return kSuccess;
+}
+
+int32_t SCARLETTX_KERNELX_CALL KernelXQueryAliasTelemetry(KERNELX_ALIAS_TELEMETRY* outTelemetry) {
+    if (!outTelemetry) return kInvalidArg;
+    std::memset(outTelemetry, 0, sizeof(*outTelemetry));
+#if defined(_WIN32)
+    std::lock_guard<std::mutex> lk(State().mu);
+    outTelemetry->totalAliasesCreated = State().total_aliases_created;
+    outTelemetry->totalAliasesFreed = State().total_aliases_freed;
+    outTelemetry->activeAliases = static_cast<uint32_t>(State().aliases.size());
+    outTelemetry->peakAliases = State().peak_aliases;
+    outTelemetry->activeAliasedBytes = State().active_aliased_bytes;
+    outTelemetry->peakAliasedBytes = State().peak_aliased_bytes;
+#endif
     return kSuccess;
 }
 

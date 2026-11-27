@@ -2613,12 +2613,32 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderDestroyTranslationPipeline(XS2_PIPELINE_HAND
 
 int32_t SCARLETTX_XS2_CALL Xs2ShaderTranslateCached(
     XS2_PIPELINE_HANDLE pipeline, const void* microcode, size_t byteSize, void** outBytecode, size_t* outBytecodeSize) {
+    return Xs2ShaderTranslateCachedEx(pipeline, microcode, byteSize, 0ull, outBytecode, outBytecodeSize);
+}
+
+int32_t SCARLETTX_XS2_CALL Xs2ShaderTranslateCachedEx(
+    XS2_PIPELINE_HANDLE pipeline, const void* microcode, size_t byteSize, uint64_t rootSigHash,
+    void** outBytecode, size_t* outBytecodeSize) {
     if (!pipeline || !microcode || byteSize == 0 || !outBytecode || !outBytecodeSize) return kInvalidArg;
     *outBytecode = nullptr;
     *outBytecodeSize = 0;
 
+    static constexpr uint32_t kDiskCacheMagic = 0x43535853u;        // 'SXSC'
+    static constexpr uint32_t kDiskCacheVersion = 4u;
+    static constexpr uint32_t kCompilerRevision = 0x040E0001u;      // Phase 4E rev 1
+    struct DiskCacheHeader {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t compiler_rev;
+        uint32_t payload_size;
+        uint64_t payload_hash;
+    };
+
     auto* p = static_cast<PipelineState*>(pipeline);
-    const uint64_t h = SimpleHash(static_cast<const uint8_t*>(microcode), byteSize);
+    uint64_t h = SimpleHash(static_cast<const uint8_t*>(microcode), byteSize);
+    if (rootSigHash != 0ull) {
+        h ^= rootSigHash + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    }
 
     std::lock_guard<std::mutex> lk(p->mu);
     auto it = p->cache.find(h);
@@ -2634,23 +2654,39 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderTranslateCached(
         p->cache.erase(it);
     }
 
-    // Optional persistent on-disk shader cache when SCARLETTX_SHADER_CACHE_DIR is set
+    // Optional versioned persistent on-disk shader cache when SCARLETTX_SHADER_CACHE_DIR is set
     std::filesystem::path disk_cache_path;
     if (const char* cache_dir = std::getenv("SCARLETTX_SHADER_CACHE_DIR"); cache_dir && cache_dir[0] != '\0') {
         std::ostringstream fname;
-        fname << std::hex << std::setw(16) << std::setfill('0') << h << ".dxil";
+        fname << std::hex << std::setw(16) << std::setfill('0') << h
+              << "_v" << std::dec << kDiskCacheVersion << ".sxc";
         disk_cache_path = std::filesystem::path(cache_dir) / fname.str();
         std::error_code ec;
         if (std::filesystem::exists(disk_cache_path, ec)) {
-            std::vector<uint8_t> cached;
+            std::vector<uint8_t> raw_file;
             {
                 std::ifstream ifs(disk_cache_path, std::ios::binary);
                 if (ifs) {
-                    cached.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+                    raw_file.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
                 }
             }
-            if (cached.empty()) {
-                // Evict corrupt 0-byte disk cache artifact and proceed to re-translate
+            bool valid_disk_entry = false;
+            std::vector<uint8_t> cached;
+            if (raw_file.size() > sizeof(DiskCacheHeader)) {
+                DiskCacheHeader hdr{};
+                std::memcpy(&hdr, raw_file.data(), sizeof(hdr));
+                const size_t body_len = raw_file.size() - sizeof(DiskCacheHeader);
+                if (hdr.magic == kDiskCacheMagic &&
+                    hdr.version == kDiskCacheVersion &&
+                    hdr.compiler_rev == kCompilerRevision &&
+                    hdr.payload_size == body_len &&
+                    SimpleHash(raw_file.data() + sizeof(DiskCacheHeader), body_len) == hdr.payload_hash) {
+                    cached.assign(raw_file.begin() + sizeof(DiskCacheHeader), raw_file.end());
+                    valid_disk_entry = true;
+                }
+            }
+            if (!valid_disk_entry) {
+                // Evict corrupt, truncated, or stale-revision disk cache artifact and re-translate
                 std::filesystem::remove(disk_cache_path, ec);
             } else {
                 p->stats.cacheHits++;
@@ -2695,6 +2731,13 @@ int32_t SCARLETTX_XS2_CALL Xs2ShaderTranslateCached(
         std::filesystem::create_directories(disk_cache_path.parent_path(), ec);
         std::ofstream ofs(disk_cache_path, std::ios::binary | std::ios::trunc);
         if (ofs) {
+            DiskCacheHeader hdr{};
+            hdr.magic = kDiskCacheMagic;
+            hdr.version = kDiskCacheVersion;
+            hdr.compiler_rev = kCompilerRevision;
+            hdr.payload_size = static_cast<uint32_t>(lifted.size());
+            hdr.payload_hash = SimpleHash(lifted.data(), lifted.size());
+            ofs.write(reinterpret_cast<const char*>(&hdr), static_cast<std::streamsize>(sizeof(hdr)));
             ofs.write(reinterpret_cast<const char*>(lifted.data()), static_cast<std::streamsize>(lifted.size()));
         }
     }

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -490,6 +491,11 @@ void FlightRecorder::ResetSession() noexcept {
         shader_artifacts_.clear();
         dumped_shader_hash_count_ = 0;
     }
+    frame_time_count_.store(0, std::memory_order_relaxed);
+    frame_stutter_count_.store(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < kFrameTimeRingCap; ++i) {
+        frame_times_us_[i].store(0, std::memory_order_relaxed);
+    }
 }
 
 void FlightRecorder::Enable(const FlightRecorderOptions& opts) {
@@ -938,6 +944,48 @@ std::vector<FlightEvent> FlightRecorder::SnapshotRecentEvents(size_t max_events)
             out.push_back(copy);
         }
     }
+    return out;
+}
+
+void FlightRecorder::RecordFrameTimeUs(uint64_t frame_us) noexcept {
+    if (!IsEnabled()) return;
+    const uint64_t idx = frame_time_count_.fetch_add(1, std::memory_order_relaxed);
+    frame_times_us_[idx % kFrameTimeRingCap].store(frame_us, std::memory_order_relaxed);
+    if (frame_us > 33333ull) {
+        frame_stutter_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    BeatProgress("PresentFrame");
+}
+
+FlightFramePacingSummary FlightRecorder::GetFramePacingSummary() const noexcept {
+    FlightFramePacingSummary out;
+    const uint64_t total = frame_time_count_.load(std::memory_order_relaxed);
+    out.frames_recorded = total;
+    out.stutter_count = frame_stutter_count_.load(std::memory_order_relaxed);
+    if (total == 0) {
+        return out;
+    }
+    const size_t n = static_cast<size_t>((std::min)(total, static_cast<uint64_t>(kFrameTimeRingCap)));
+    std::vector<uint64_t> samples;
+    samples.reserve(n);
+    uint64_t sum = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t v = frame_times_us_[i].load(std::memory_order_relaxed);
+        samples.push_back(v);
+        sum += v;
+    }
+    std::sort(samples.begin(), samples.end());
+    auto pct = [&](double p) -> double {
+        const size_t pos = static_cast<size_t>((std::min)(
+            static_cast<double>(samples.size() - 1),
+            std::floor(p * static_cast<double>(samples.size() - 1))));
+        return static_cast<double>(samples[pos]) / 1000.0;
+    };
+    out.avg_ms = (static_cast<double>(sum) / static_cast<double>(n)) / 1000.0;
+    out.p50_ms = pct(0.50);
+    out.p95_ms = pct(0.95);
+    out.p99_ms = pct(0.99);
+    out.max_ms = static_cast<double>(samples.back()) / 1000.0;
     return out;
 }
 
@@ -1725,7 +1773,19 @@ bool FlightRecorder::WriteSummaryReport(std::string* out_json_path,
                << "  \"uptime_ms\": " << uptime_ms << ",\n"
                << "  \"last_phase\": \"" << JsonEscape(phase_copy) << "\",\n"
                << "  \"total_events\": " << st.total_events << ",\n"
-               << "  \"heartbeats\": " << st.heartbeats << ",\n"
+               << "  \"heartbeats\": " << st.heartbeats << ",\n";
+            const auto fp = GetFramePacingSummary();
+            jf << "  \"frame_pacing\": {\n"
+               << "    \"frames\": " << fp.frames_recorded << ",\n"
+               << "    \"stutters_gt_33ms\": " << fp.stutter_count << ",\n"
+               << std::fixed << std::setprecision(2)
+               << "    \"avg_ms\": " << fp.avg_ms << ",\n"
+               << "    \"p50_ms\": " << fp.p50_ms << ",\n"
+               << "    \"p95_ms\": " << fp.p95_ms << ",\n"
+               << "    \"p99_ms\": " << fp.p99_ms << ",\n"
+               << "    \"max_ms\": " << fp.max_ms << "\n"
+               << std::defaultfloat
+               << "  },\n"
                << "  \"category_counts\": {\n";
             for (size_t i = 0; i < static_cast<size_t>(FlightEventCategory::Count); ++i) {
                 jf << "    \"" << FlightEventCategoryName(static_cast<FlightEventCategory>(i)) << "\": "

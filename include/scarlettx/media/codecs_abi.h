@@ -103,6 +103,18 @@ SCARLETTX_CODEC_API int32_t SCARLETTX_CODEC_CALL XboxCodecHardwareAccelSupported
 SCARLETTX_CODEC_API int32_t SCARLETTX_CODEC_CALL XboxCodecGetVersion(
     CODEC_VERSION_INFO* outVersion);
 
+// Optional Windows Media Foundation (H.264/HEVC) cutscene decode probe
+typedef struct MF_MEDIA_CAPABILITIES {
+    int32_t mfPlatAvailable;
+    int32_t mfReadWriteAvailable;
+    int32_t h264Supported;
+    int32_t hevcSupported;
+    char backendName[64];
+} MF_MEDIA_CAPABILITIES;
+
+SCARLETTX_CODEC_API int32_t SCARLETTX_CODEC_CALL XboxCodecProbeMediaFoundation(
+    MF_MEDIA_CAPABILITIES* outCaps);
+
 #ifdef __cplusplus
 }
 #endif

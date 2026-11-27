@@ -123,6 +123,16 @@ struct FlightVfsMissRecord {
     uint64_t first_caller_rip = 0;
 };
 
+struct FlightFramePacingSummary {
+    uint64_t frames_recorded = 0;
+    uint64_t stutter_count = 0;  // frames > 33.33 ms
+    double avg_ms = 0.0;
+    double p50_ms = 0.0;
+    double p95_ms = 0.0;
+    double p99_ms = 0.0;
+    double max_ms = 0.0;
+};
+
 struct FlightRecorderStats {
     uint64_t total_events = 0;
     uint64_t heartbeats = 0;
@@ -202,6 +212,10 @@ public:
                              const char* tag) noexcept;
 
     void BeatProgress(const char* phase) noexcept;
+
+    // Lock-free frame-time recorder for p50/p95/p99 & stutter profiling.
+    void RecordFrameTimeUs(uint64_t frame_us) noexcept;
+    FlightFramePacingSummary GetFramePacingSummary() const noexcept;
 
     // -----------------------------------------------------------------------
     // Part 2: Crash handler (VEH / SEH) + x64 RVA stack-walk dumper
@@ -308,6 +322,12 @@ private:
     mutable std::atomic_flag gpu_bc_lock_ = ATOMIC_FLAG_INIT;
     FlightGpuBreadcrumb recent_gpu_breadcrumbs_[64];
     uint64_t total_gpu_breadcrumbs_ = 0;
+
+    // Lock-free frame-time ring buffer (1024 recent frame durations in microseconds)
+    static constexpr size_t kFrameTimeRingCap = 1024;
+    std::atomic<uint64_t> frame_times_us_[kFrameTimeRingCap] = {};
+    std::atomic<uint64_t> frame_time_count_{0};
+    std::atomic<uint64_t> frame_stutter_count_{0};
 
     // Crash/artifact counters & deduplication
     std::atomic<uint32_t> crash_seq_{0};
