@@ -216,8 +216,8 @@ int main() {
                      stored_raw.data(), stored_raw.size(), stored_comp.data(), stored_comp.size(), &stored_comp_sz) == 0);
         stored_comp.resize(stored_comp_sz);
         SX_CHECK(stored_comp[0] == 0x04u && stored_comp[1] == 0xFBu);
-        // 3 tiles: table_end = 8 + 3 * 4 = 20; lane 0 word 0 low 3 bits = 0b001 (BFINAL=1, BTYPE=0)
-        SX_CHECK((read_le32(stored_comp.data() + 20u) & 0x7u) == 0x1u);
+        // 3 tiles: table_end = 8 + 3 * 4 = 20; tile 0 is 65536 B (two 32768 B stored blocks: BFINAL=0, BTYPE=0 -> 0b000)
+        SX_CHECK((read_le32(stored_comp.data() + 20u) & 0x6u) == 0x0u);
 
         std::vector<uint8_t> stored_out(stored_raw.size(), 0);
         size_t stored_written = 0;
@@ -327,30 +327,30 @@ int main() {
         for (auto& th : callers) th.join();
         SX_CHECK(stress_ok.load(std::memory_order_acquire));
 
-        // 6e. Fail-closed (< 0) rejection of corrupt Huffman tables, bad NLEN, BTYPE=3, and truncated bitstreams
+        // 6e. Fail-closed (< 0) rejection of corrupt Huffman tables, bad stored LEN, BTYPE=3, and truncated bitstreams
         std::vector<uint8_t> reject_dst(dyn_raw.size(), 0xCCu);
         size_t reject_written = 0;
 
-        // (i) Reserved BTYPE=3 in lane headers
+        // (i) Reserved BTYPE=3 on Lane 0 header (draft-uralsky-gdeflate)
         {
             std::vector<uint8_t> bad_btype3 = dyn_comp;
-            for (uint32_t l = 0; l < 32u; ++l) {
-                const uint32_t w = (read_le32(bad_btype3.data() + 20u + l * 4u) & ~0x7u) | 0x7u;
-                write_le32(bad_btype3.data() + 20u + l * 4u, w);
-            }
+            const uint32_t w0 = (read_le32(bad_btype3.data() + 20u) & ~0x7u) | 0x7u;
+            write_le32(bad_btype3.data() + 20u, w0);
             SX_CHECK(XboxCodecGDeflateDecompress(
                          bad_btype3.data(), bad_btype3.size(), reject_dst.data(), reject_dst.size(), &reject_written) < 0);
         }
 
-        // (ii) Corrupt BTYPE=0 ~LEN complement mismatch (flip bit in word 0 byte-aligned LEN/NLEN)
+        // (ii) Corrupt BTYPE=0 LEN in Lane 0 header (LEN mismatch vs tile output capacity)
         {
             std::vector<uint8_t> bad_stored = stored_comp;
-            bad_stored[20u + 3u] ^= 0x80u;  // Corrupt NLEN upper byte on lane 0
+            // Tile 0 starts with BFINAL=1, BTYPE=0, LEN=16 (underruns 65536 B tile capacity -> fail-closed!)
+            const uint32_t forged_hdr = 0x1u | (16u << 3u);
+            write_le32(bad_stored.data() + 20u, forged_hdr);
             SX_CHECK(XboxCodecGDeflateDecompress(
                          bad_stored.data(), bad_stored.size(), reject_dst.data(), stored_raw.size(), &reject_written) < 0);
         }
 
-        // Helper to build a single-tile 268-byte 0x04 0xFB container with custom lane words[0..63]
+        // Helper to build a single-tile 0x04 0xFB container with custom 32-bit interleaved words
         auto make_custom_single_tile = [&](uint32_t uncomp_len, const std::vector<uint32_t>& words) {
             std::vector<uint8_t> buf(12u + words.size() * 4u, 0);
             buf[0] = 0x04u;
@@ -365,16 +365,15 @@ int main() {
             return buf;
         };
 
-        // (iii) Oversubscribed BTYPE=2 cl_tree: HCLEN=4 (0), 4 code-length symbols all given length 1 (Kraft = 4 * 1/2 = 2 > 1)
+        // (iii) Oversubscribed BTYPE=2 cl_tree (draft-uralsky-gdeflate Lane-0 header):
+        //       Lane 0: bits 0..2 = 0x5 (BFINAL=1,BTYPE=2), bits 3..16 = 0 (HLIT=257,HDIST=1,HCLEN=4), bits 17..19 = cl[0]=1;
+        //       Lanes 1..3 (no 3-bit block header on lanes 1..31!): bits 0..2 = cl[i] = 1 -> Kraft = 4 * 1/2 = 2 > 1!
         {
-            std::vector<uint32_t> words(64, 0u);
-            for (uint32_t l = 0; l < 32u; ++l) words[l] = 0x5u;  // BFINAL=1, BTYPE=2
-            // Lane 0: bits 0..2 = 5; bits 3..16 = HLIT=0, HDIST=0, HCLEN=0 (4 cllens); bits 17..19 = cl_len[0] = 1
+            std::vector<uint32_t> words(33, 0u);
             words[0] = 0x5u | (1u << 17u);
-            // Lanes 1..3: bits 0..2 = 5; bits 3..5 = cl_len[i] = 1
-            words[1] = 0x5u | (1u << 3u);
-            words[2] = 0x5u | (1u << 3u);
-            words[3] = 0x5u | (1u << 3u);
+            words[1] = 1u;
+            words[2] = 1u;
+            words[3] = 1u;
             const auto oversub = make_custom_single_tile(64u, words);
             SX_CHECK(XboxCodecGDeflateDecompress(
                          oversub.data(), oversub.size(), reject_dst.data(), 64u, &reject_written) < 0);
@@ -382,12 +381,11 @@ int main() {
 
         // (iv) Incomplete / under-subscribed BTYPE=2 cl_tree: 2 symbols given length 2, rest 0 (Kraft = 2 * 1/4 = 1/2 < 1)
         {
-            std::vector<uint32_t> words(64, 0u);
-            for (uint32_t l = 0; l < 32u; ++l) words[l] = 0x5u;
+            std::vector<uint32_t> words(33, 0u);
             words[0] = 0x5u | (2u << 17u);
-            words[1] = 0x5u | (2u << 3u);
-            words[2] = 0x5u;  // cl_len = 0
-            words[3] = 0x5u;  // cl_len = 0
+            words[1] = 2u;
+            words[2] = 0u;
+            words[3] = 0u;
             const auto incomp = make_custom_single_tile(64u, words);
             SX_CHECK(XboxCodecGDeflateDecompress(
                          incomp.data(), incomp.size(), reject_dst.data(), 64u, &reject_written) < 0);
@@ -406,28 +404,46 @@ int main() {
                          forged_trunc.data(), forged_trunc.size(), reject_dst.data(), dyn_raw.size(), &reject_written) < 0);
         }
 
-        // (vi) Independent hand-assembled BTYPE=0 & BTYPE=2 bitstreams (not produced by Compress32Lane*):
-        //      Verifies GDeflate32LaneDecompressTile against raw bit-level encodings directly.
+        // (vi) Independent hand-assembled IETF draft-uralsky-gdeflate BTYPE=0 & BTYPE=1 bitstreams
+        //      (constructed directly from spec bit positions without calling any encoder):
         {
-            // Hand-assembled BTYPE=0 32-byte payload ("0123456789ABCDEFGHIJKLMNOPQRSTUV", 1 byte per lane):
-            // Per lane l: bits 0..2 = 0b001 (BFINAL=1, BTYPE=0), bits 3..7 = 0 (byte align),
-            // word[l] bits 8..23 = LEN=1 (0x0001), bits 24..31 = NLEN_lo (0xFE);
-            // word[32+l] bits 0..7 = NLEN_hi (0xFF), bits 8..15 = payload[l].
-            // Two refill crossings occur per lane (after 32-bit LEN/NLEN at bit_off=40, no crossing on 8-bit data at bit_off=16):
-            // 1 refill word (0u) per lane -> 64 + 32 = 96 words total.
+            // 1. Hand-assembled draft-uralsky-gdeflate BTYPE=0 32-byte payload ("0123456789ABCDEFGHIJKLMNOPQRSTUV"):
+            //    Round 0: Refill loads words[0..31]; Lane 0 reads 3-bit BFINAL=1, BTYPE=00 (0x1 at bits 0..2).
+            //    Round 1: Lane 0 (bitcnt=29<32) refills words[32]=0; Lane 0 reads unaligned 16-bit LEN=32 at bits 3..18 (no NLEN!).
+            //    Round 2: All 32 lanes have bitcnt>=32; Lane 0 reads byte[0] at bits 19..26, Lanes 1..31 read byte[l] at bits 0..7!
             const char expected32[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
-            std::vector<uint32_t> raw_b0_words(96, 0u);
-            for (uint32_t l = 0; l < 32u; ++l) {
-                raw_b0_words[l] = 0x01u | (0x0001u << 8u) | (0xFEu << 24u);
-                raw_b0_words[32u + l] = 0xFFu | (static_cast<uint32_t>(static_cast<uint8_t>(expected32[l])) << 8u);
+            std::vector<uint32_t> spec_b0_words(33, 0u);
+            spec_b0_words[0] = 0x1u | (32u << 3u) | (static_cast<uint32_t>(static_cast<uint8_t>(expected32[0])) << 19u);
+            for (uint32_t l = 1u; l < 32u; ++l) {
+                spec_b0_words[l] = static_cast<uint32_t>(static_cast<uint8_t>(expected32[l]));
             }
-            const auto indep_b0 = make_custom_single_tile(32u, raw_b0_words);
+            spec_b0_words[32] = 0u;
+            const auto indep_b0 = make_custom_single_tile(32u, spec_b0_words);
             std::vector<uint8_t> indep_b0_out(32u, 0);
             size_t indep_b0_written = 0;
             SX_CHECK(XboxCodecGDeflateDecompress(
                          indep_b0.data(), indep_b0.size(), indep_b0_out.data(), 32u, &indep_b0_written) == 0);
             SX_CHECK(indep_b0_written == 32u);
             SX_CHECK(std::memcmp(indep_b0_out.data(), expected32, 32u) == 0);
+
+            // 2. Hand-assembled draft-uralsky-gdeflate BTYPE=1 4-byte LZ77 payload ("AAAA"):
+            //    Round 0: Lane 0 reads 3-bit BFINAL=1, BTYPE=01 (0x3 at bits 0..2); refills words[32] before Round 1.
+            //    Round 1: Lane 0 reads Lit('A'=65 -> Fixed 0x71 reversed 8b = 0x8E) at bits 3..10;
+            //             Lane 1 reads Match(sym=257 len=3 -> Fixed 0x01 reversed 7b = 0x40) at bits 0..6 (schedules dist in Round 2);
+            //             Lane 2 reads EOB(sym=256 -> Fixed 0x00 reversed 7b = 0x00) at bits 0..6 (lanes 3..31 frozen!).
+            //    Round 2 (Trailing Distance Round): Lanes 1 & 2 (bitcnt=25<32) refill words[33..34]=0;
+            //             Lane 1 reads Dist(sym=0 dist=1 -> 5b 0x00) at bits 7..11 -> copies 3 'A's -> "AAAA"!
+            std::vector<uint32_t> spec_b1_words(35, 0u);
+            spec_b1_words[0] = 0x3u | (0x8Eu << 3u);
+            spec_b1_words[1] = 0x40u;  // bits 0..6 = sym 257 (len=3), bits 7..11 = dist_sym 0 (dist=1)
+            spec_b1_words[2] = 0x00u;  // bits 0..6 = sym 256 (EOB)
+            const auto indep_b1 = make_custom_single_tile(4u, spec_b1_words);
+            std::vector<uint8_t> indep_b1_out(4u, 0);
+            size_t indep_b1_written = 0;
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         indep_b1.data(), indep_b1.size(), indep_b1_out.data(), 4u, &indep_b1_written) == 0);
+            SX_CHECK(indep_b1_written == 4u);
+            SX_CHECK(std::memcmp(indep_b1_out.data(), "AAAA", 4u) == 0);
         }
     }
 
