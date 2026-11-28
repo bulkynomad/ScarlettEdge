@@ -4,7 +4,9 @@
 // object forwards to the host's XAudio2 2.9 engine or voice. Voices handed
 // back in send lists are translated to host voices, and the title's callback
 // objects are called through bridges owned by this module.
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -87,43 +89,37 @@ const Guid kIidXAudio2 = {0x2B02E3CF, 0x2E0B, 0x4EC3, {0xBE, 0x45, 0x1B, 0x2A, 0
 
 // ---- bridges: host -> title callback objects --------------------------------
 
+#pragma pack(push, 1)
+struct XAudio2BufRaw {
+    uint32_t flags;
+    uint32_t audio_bytes;
+    const uint8_t* audio_data;
+    uint32_t play_begin;
+    uint32_t play_length;
+    uint32_t loop_begin;
+    uint32_t loop_length;
+    uint32_t loop_count;
+    void* context;
+};
+struct HostVoiceStateRaw {
+    void* current_context;
+    uint32_t buffers_queued;
+    uint64_t samples_played;
+};
+#pragma pack(pop)
+
+struct BufferSubmission {
+    std::atomic<void*> guest_context{nullptr};
+    std::vector<int16_t> decoded_pcm;
+    bool in_use = false;
+};
+
+struct VoiceProxy;
+
 struct CallbackBridge {
     void* const* vtbl;  // what the host calls
-    void* guest;        // the title's callback object
-};
-
-void WINAPI VoiceCbPassStart(CallbackBridge* b, uint32_t bytes) {
-    XA2_TRACE(4, "voice callback %p: processing pass start, %u bytes required", b->guest, bytes);
-    VCall<void>(b->guest, 0, bytes);
-}
-void WINAPI VoiceCbPassEnd(CallbackBridge* b) { VCall<void>(b->guest, 1); }
-void WINAPI VoiceCbStreamEnd(CallbackBridge* b) {
-    XA2_TRACE(4, "voice callback %p: stream end", b->guest);
-    VCall<void>(b->guest, 2);
-}
-void WINAPI VoiceCbBufferStart(CallbackBridge* b, void* ctx) {
-    XA2_TRACE(4, "voice callback %p: buffer start, context %p", b->guest, ctx);
-    VCall<void>(b->guest, 3, ctx);
-}
-void WINAPI VoiceCbBufferEnd(CallbackBridge* b, void* ctx) {
-    XA2_TRACE(4, "voice callback %p: buffer end, context %p", b->guest, ctx);
-    VCall<void>(b->guest, 4, ctx);
-}
-void WINAPI VoiceCbLoopEnd(CallbackBridge* b, void* ctx) { VCall<void>(b->guest, 5, ctx); }
-void WINAPI VoiceCbError(CallbackBridge* b, void* ctx, int32_t hr) { VCall<void>(b->guest, 6, ctx, hr); }
-void* const kVoiceCallbackVtbl[] = {
-    reinterpret_cast<void*>(&VoiceCbPassStart), reinterpret_cast<void*>(&VoiceCbPassEnd),
-    reinterpret_cast<void*>(&VoiceCbStreamEnd), reinterpret_cast<void*>(&VoiceCbBufferStart),
-    reinterpret_cast<void*>(&VoiceCbBufferEnd), reinterpret_cast<void*>(&VoiceCbLoopEnd),
-    reinterpret_cast<void*>(&VoiceCbError),
-};
-
-void WINAPI EngineCbPassStart(CallbackBridge* b) { VCall<void>(b->guest, 0); }
-void WINAPI EngineCbPassEnd(CallbackBridge* b) { VCall<void>(b->guest, 1); }
-void WINAPI EngineCbCriticalError(CallbackBridge* b, int32_t hr) { VCall<void>(b->guest, 2, hr); }
-void* const kEngineCallbackVtbl[] = {
-    reinterpret_cast<void*>(&EngineCbPassStart), reinterpret_cast<void*>(&EngineCbPassEnd),
-    reinterpret_cast<void*>(&EngineCbCriticalError),
+    void* guest;        // the title's callback object (may be null for source voices)
+    std::atomic<VoiceProxy*> voice{nullptr};
 };
 
 // ---- objects -----------------------------------------------------------------
@@ -151,18 +147,89 @@ struct VoiceProxy {
     uint32_t xma2_rate = 48000;
     std::mutex xma2_mu;
     std::unique_ptr<scarlettx::audio::Xma2StreamDecoder> xma2_decoder;
-    std::deque<std::vector<int16_t>> xma2_pcm_ring;
+    std::mutex sub_mu;
+    std::deque<BufferSubmission> slots;
+    std::deque<BufferSubmission*> free_slots;
 };
 
 struct EngineProxy {
     void* const* vtbl;
     std::atomic<uint32_t> refs{1};
     std::atomic<void*> host{nullptr};  // host IXAudio2, or the silent engine
-    bool silent = false;
+    std::atomic<bool> silent{false};
     std::mutex mu;
     std::vector<CallbackBridge*> callbacks;
     std::vector<VoiceProxy*> voices;  // not yet destroyed by the title
     std::vector<void*> retired_hosts;  // kept until release: voices may still use them
+};
+
+void* UnwrapBufferContext(void* ctx) {
+    if (!ctx) return nullptr;
+    return static_cast<BufferSubmission*>(ctx)->guest_context.load(std::memory_order_acquire);
+}
+
+void WINAPI VoiceCbPassStart(CallbackBridge* b, uint32_t bytes) {
+    if (!b->guest) return;
+    XA2_TRACE(4, "voice callback %p: processing pass start, %u bytes required", b->guest, bytes);
+    VCall<void>(b->guest, 0, bytes);
+}
+void WINAPI VoiceCbPassEnd(CallbackBridge* b) {
+    if (b->guest) VCall<void>(b->guest, 1);
+}
+void WINAPI VoiceCbStreamEnd(CallbackBridge* b) {
+    if (!b->guest) return;
+    XA2_TRACE(4, "voice callback %p: stream end", b->guest);
+    VCall<void>(b->guest, 2);
+}
+void WINAPI VoiceCbBufferStart(CallbackBridge* b, void* ctx) {
+    void* guest_ctx = UnwrapBufferContext(ctx);
+    if (!b->guest) return;
+    XA2_TRACE(4, "voice callback %p: buffer start, context %p", b->guest, guest_ctx);
+    VCall<void>(b->guest, 3, guest_ctx);
+}
+void WINAPI VoiceCbBufferEnd(CallbackBridge* b, void* ctx) {
+    auto* slot = static_cast<BufferSubmission*>(ctx);
+    void* guest_ctx = nullptr;
+    std::vector<int16_t> retired_pcm;
+    if (slot) {
+        guest_ctx = slot->guest_context.load(std::memory_order_acquire);
+        if (VoiceProxy* vp = b->voice.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lk(vp->sub_mu);
+            if (slot->in_use) {
+                retired_pcm.swap(slot->decoded_pcm);
+                slot->in_use = false;
+                vp->free_slots.push_back(slot);
+            }
+        }
+    }
+    // Release decoded PCM outside sub_mu after the underlying voice has finished reading it.
+    retired_pcm.clear();
+    retired_pcm.shrink_to_fit();
+    if (!b->guest) return;
+    XA2_TRACE(4, "voice callback %p: buffer end, context %p", b->guest, guest_ctx);
+    VCall<void>(b->guest, 4, guest_ctx);
+}
+void WINAPI VoiceCbLoopEnd(CallbackBridge* b, void* ctx) {
+    void* guest_ctx = UnwrapBufferContext(ctx);
+    if (b->guest) VCall<void>(b->guest, 5, guest_ctx);
+}
+void WINAPI VoiceCbError(CallbackBridge* b, void* ctx, int32_t hr) {
+    void* guest_ctx = UnwrapBufferContext(ctx);
+    if (b->guest) VCall<void>(b->guest, 6, guest_ctx, hr);
+}
+void* const kVoiceCallbackVtbl[] = {
+    reinterpret_cast<void*>(&VoiceCbPassStart), reinterpret_cast<void*>(&VoiceCbPassEnd),
+    reinterpret_cast<void*>(&VoiceCbStreamEnd), reinterpret_cast<void*>(&VoiceCbBufferStart),
+    reinterpret_cast<void*>(&VoiceCbBufferEnd), reinterpret_cast<void*>(&VoiceCbLoopEnd),
+    reinterpret_cast<void*>(&VoiceCbError),
+};
+
+void WINAPI EngineCbPassStart(CallbackBridge* b) { VCall<void>(b->guest, 0); }
+void WINAPI EngineCbPassEnd(CallbackBridge* b) { VCall<void>(b->guest, 1); }
+void WINAPI EngineCbCriticalError(CallbackBridge* b, int32_t hr) { VCall<void>(b->guest, 2, hr); }
+void* const kEngineCallbackVtbl[] = {
+    reinterpret_cast<void*>(&EngineCbPassStart), reinterpret_cast<void*>(&EngineCbPassEnd),
+    reinterpret_cast<void*>(&EngineCbCriticalError),
 };
 
 // xaudio2_null_output.cpp
@@ -270,7 +337,7 @@ int32_t WINAPI VoiceSetEffectChain(VoiceProxy* v, const EffectChain* chain) {
     if (!ValidateAndCopyEffectChain(chain, &host_chain, &storage, &emulated)) {
         return kInvalidArg;
     }
-    if (!v->engine->silent) {
+    if (!v->engine->silent.load(std::memory_order_acquire)) {
         const int32_t hr = VCall<int32_t, const EffectChain*>(v->host, 2, &host_chain);
         if (hr >= 0) {
             v->host_effects_active = true;
@@ -389,29 +456,49 @@ int32_t WINAPI SourceStart(VoiceProxy* v, uint32_t flags, uint32_t op_set) {
     return hr;
 }
 
-int32_t WINAPI SourceSubmitBuffer(VoiceProxy* v, const void* buffer, const void* buffer_wma) {
-    if (buffer && v->is_xma2_voice) {
-        #pragma pack(push, 1)
-        struct XAudio2BufRaw {
-            uint32_t flags;
-            uint32_t audio_bytes;
-            const uint8_t* audio_data;
-            uint32_t play_begin;
-            uint32_t play_length;
-            uint32_t loop_begin;
-            uint32_t loop_length;
-            uint32_t loop_count;
-            void* context;
-        };
-        struct HostVoiceStateRaw {
-            void* current_context;
-            uint32_t buffers_queued;
-            uint64_t samples_played;
-        };
-        #pragma pack(pop)
-        const auto* in_buf = static_cast<const XAudio2BufRaw*>(buffer);
-        if (!in_buf->audio_data || in_buf->audio_bytes == 0) return kInvalidArg;
+BufferSubmission* AcquireSubmissionSlot(VoiceProxy* v, void* guest_ctx, std::vector<int16_t>&& pcm) {
+    constexpr size_t kSlotQuarantine = 64u;
+    std::lock_guard<std::mutex> lk(v->sub_mu);
+    BufferSubmission* slot = nullptr;
+    if (v->free_slots.size() > kSlotQuarantine) {
+        slot = v->free_slots.front();
+        v->free_slots.pop_front();
+    } else {
+        v->slots.emplace_back();
+        slot = &v->slots.back();
+    }
+    slot->guest_context.store(guest_ctx, std::memory_order_release);
+    slot->decoded_pcm = std::move(pcm);
+    slot->in_use = true;
+    return slot;
+}
 
+void ReleaseFailedSubmissionSlot(VoiceProxy* v, BufferSubmission* slot) {
+    if (!slot) return;
+    std::vector<int16_t> discard;
+    {
+        std::lock_guard<std::mutex> lk(v->sub_mu);
+        if (slot->in_use) {
+            discard.swap(slot->decoded_pcm);
+            slot->in_use = false;
+            v->free_slots.push_back(slot);
+        }
+    }
+}
+
+int32_t WINAPI SourceSubmitBuffer(VoiceProxy* v, const void* buffer, const void* buffer_wma) {
+    if (!buffer) {
+        return VCall<int32_t, const void*, const void*>(v->host, 21, nullptr, buffer_wma);
+    }
+    const auto* in_buf = static_cast<const XAudio2BufRaw*>(buffer);
+    if (!in_buf->audio_data || in_buf->audio_bytes == 0) {
+        return kInvalidArg;
+    }
+
+    XAudio2BufRaw host_buf = *in_buf;
+    std::vector<int16_t> pcm16;
+
+    if (v->is_xma2_voice) {
         std::vector<float> decoded_f32;
         {
             std::lock_guard<std::mutex> lk(v->xma2_mu);
@@ -423,94 +510,78 @@ int32_t WINAPI SourceSubmitBuffer(VoiceProxy* v, const void* buffer, const void*
                     in_buf->audio_data, in_buf->audio_bytes, decoded_f32, 0u)) {
                 return kInvalidArg;
             }
-            const uint32_t ch = std::max<uint32_t>(1u, v->xma2_channels);
-            const uint32_t decoded_frames = static_cast<uint32_t>(decoded_f32.size() / ch);
-            if (decoded_frames == 0u) return kInvalidArg;
+        }
+        const uint32_t ch = std::max<uint32_t>(1u, v->xma2_channels);
+        const uint32_t decoded_frames = static_cast<uint32_t>(decoded_f32.size() / ch);
+        if (decoded_frames == 0u) return kInvalidArg;
 
-            std::vector<int16_t> pcm16(decoded_f32.size());
-            for (size_t i = 0; i < decoded_f32.size(); ++i) {
-                const float clamped = std::clamp(decoded_f32[i], -1.0f, 1.0f);
-                pcm16[i] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
-            }
+        pcm16.resize(decoded_f32.size());
+        for (size_t i = 0; i < decoded_f32.size(); ++i) {
+            const float clamped = std::clamp(decoded_f32[i], -1.0f, 1.0f);
+            pcm16[i] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
+        }
 
-            // Query host GetState(XAUDIO2_VOICE_NOSAMPLESPLAYED = 0x0100) before retiring ring entries
-            // so buffers still queued/playing on the realtime audio thread are NEVER freed early!
-            HostVoiceStateRaw host_state{};
-            VCall<void, void*, uint32_t>(v->host, 25, &host_state, 0x0100u);
-            const size_t min_keep = static_cast<size_t>(host_state.buffers_queued) + 1u;
-            while (v->xma2_pcm_ring.size() > min_keep && v->xma2_pcm_ring.size() >= 64u) {
-                v->xma2_pcm_ring.pop_front();
-            }
-            v->xma2_pcm_ring.push_back(std::move(pcm16));
-
-            XAudio2BufRaw host_buf{};
-            host_buf.flags = in_buf->flags;
-            host_buf.audio_bytes = static_cast<uint32_t>(v->xma2_pcm_ring.back().size() * sizeof(int16_t));
-            host_buf.audio_data = reinterpret_cast<const uint8_t*>(v->xma2_pcm_ring.back().data());
-            host_buf.play_begin = (in_buf->play_begin < decoded_frames) ? in_buf->play_begin : 0u;
-            const uint32_t avail_frames = decoded_frames - host_buf.play_begin;
-            host_buf.play_length = (in_buf->play_length > 0u)
-                                       ? std::min<uint32_t>(in_buf->play_length, avail_frames)
+        host_buf.play_begin = (in_buf->play_begin < decoded_frames) ? in_buf->play_begin : 0u;
+        const uint32_t avail_frames = decoded_frames - host_buf.play_begin;
+        host_buf.play_length = (in_buf->play_length > 0u)
+                                   ? std::min<uint32_t>(in_buf->play_length, avail_frames)
+                                   : 0u;
+        const uint32_t play_end =
+            host_buf.play_begin + (host_buf.play_length > 0u ? host_buf.play_length : avail_frames);
+        host_buf.loop_begin = 0u;
+        host_buf.loop_length = 0u;
+        host_buf.loop_count = 0u;
+        if (in_buf->loop_count > 0u && play_end > host_buf.play_begin) {
+            host_buf.loop_count = std::min<uint32_t>(in_buf->loop_count, 255u);
+            host_buf.loop_begin = std::clamp<uint32_t>(in_buf->loop_begin, host_buf.play_begin, play_end - 1u);
+            host_buf.loop_length = (in_buf->loop_length > 0u)
+                                       ? std::min<uint32_t>(in_buf->loop_length, play_end - host_buf.loop_begin)
                                        : 0u;
-            const uint32_t play_end =
-                host_buf.play_begin + (host_buf.play_length > 0u ? host_buf.play_length : avail_frames);
-            if (in_buf->loop_count > 0u && play_end > host_buf.play_begin) {
-                host_buf.loop_count = std::min<uint32_t>(in_buf->loop_count, 255u);
-                host_buf.loop_begin = std::clamp<uint32_t>(in_buf->loop_begin, host_buf.play_begin, play_end - 1u);
-                host_buf.loop_length = (in_buf->loop_length > 0u)
-                                           ? std::min<uint32_t>(in_buf->loop_length, play_end - host_buf.loop_begin)
-                                           : 0u;
-            }
-            host_buf.context = in_buf->context;
-            return VCall<int32_t, const void*, const void*>(v->host, 21, &host_buf, nullptr);
         }
     }
-    const int32_t hr = VCall<int32_t, const void*, const void*>(v->host, 21, buffer, buffer_wma);
-    if (buffer) {
-        // XAUDIO2_BUFFER: Flags, AudioBytes, ..., LoopCount at +32.
-        uint32_t flags, bytes, loops;
-        std::memcpy(&flags, buffer, 4);
-        std::memcpy(&bytes, static_cast<const uint8_t*>(buffer) + 4, 4);
-        std::memcpy(&loops, static_cast<const uint8_t*>(buffer) + 32, 4);
-        XA2_TRACE(8, "source voice %p SubmitSourceBuffer(flags=0x%x, bytes=%u, loops=%u, wma=%p) -> 0x%08x",
-                  static_cast<void*>(v), flags, bytes, loops, buffer_wma, static_cast<uint32_t>(hr));
+
+    BufferSubmission* slot = AcquireSubmissionSlot(v, in_buf->context, std::move(pcm16));
+    if (v->is_xma2_voice) {
+        host_buf.audio_bytes = static_cast<uint32_t>(slot->decoded_pcm.size() * sizeof(int16_t));
+        host_buf.audio_data = reinterpret_cast<const uint8_t*>(slot->decoded_pcm.data());
     }
+    host_buf.context = slot;
+
+    const int32_t hr = VCall<int32_t, const void*, const void*>(
+        v->host, 21, &host_buf, v->is_xma2_voice ? nullptr : buffer_wma);
+    if (hr < 0) {
+        ReleaseFailedSubmissionSlot(v, slot);
+    }
+    XA2_TRACE(8, "source voice %p SubmitSourceBuffer(flags=0x%x, bytes=%u, loops=%u, wma=%p) -> 0x%08x",
+              static_cast<void*>(v), in_buf->flags, in_buf->audio_bytes, in_buf->loop_count, buffer_wma,
+              static_cast<uint32_t>(hr));
     return hr;
 }
 
 int32_t WINAPI SourceFlushBuffers(VoiceProxy* v) {
-    const int32_t hr = VCall<int32_t>(v->host, 22);
     if (v->is_xma2_voice) {
         std::lock_guard<std::mutex> lk(v->xma2_mu);
         if (v->xma2_decoder) {
             v->xma2_decoder->Reset();
         }
-        #pragma pack(push, 1)
-        struct HostVoiceStateRaw {
-            void* current_context;
-            uint32_t buffers_queued;
-            uint64_t samples_played;
-        };
-        #pragma pack(pop)
-        HostVoiceStateRaw host_state{};
-        VCall<void, void*, uint32_t>(v->host, 25, &host_state, 0x0100u);
-        while (v->xma2_pcm_ring.size() > static_cast<size_t>(host_state.buffers_queued)) {
-            v->xma2_pcm_ring.pop_front();
-        }
     }
-    return hr;
+    // When a voice is started, XAudio2 keeps the currently playing front buffer active on the
+    // realtime mixing thread until OnBufferEnd completes while cancelling subsequent queued buffers.
+    // Owned PCM buffers are tied to their BufferSubmission slot and retired only in VoiceCbBufferEnd
+    // (or after DestroyVoice / EngineRelease stops the voice).
+    return VCall<int32_t>(v->host, 22);
 }
 
 void WINAPI SourceGetState(VoiceProxy* v, void* state, uint32_t flags) {
     VCall<void, void*, uint32_t>(v->host, 25, state, flags);
     if (state) {
-        // XAUDIO2_VOICE_STATE: current buffer context, BuffersQueued, SamplesPlayed.
-        uint32_t queued;
-        uint64_t played;
-        std::memcpy(&queued, static_cast<const uint8_t*>(state) + 8, 4);
-        std::memcpy(&played, static_cast<const uint8_t*>(state) + 12, 8);
+        auto* raw = static_cast<HostVoiceStateRaw*>(state);
+        if (raw->current_context) {
+            raw->current_context = UnwrapBufferContext(raw->current_context);
+        }
         XA2_TRACE(6, "source voice %p GetState(flags=0x%x): %u queued, %llu samples played",
-                  static_cast<void*>(v), flags, queued, static_cast<unsigned long long>(played));
+                  static_cast<void*>(v), flags, raw->buffers_queued,
+                  static_cast<unsigned long long>(raw->samples_played));
     }
 }
 
@@ -572,8 +643,9 @@ uint32_t WINAPI EngineRelease(EngineProxy* e) {
     const uint32_t remaining = e->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (remaining == 0) {
         XA2_TRACE(8, "IXAudio2 %p released", static_cast<void*>(e));
-        for (CallbackBridge* bridge : e->callbacks) VCall<void, void*>(e->host, 4, bridge);
-        VCall<uint32_t>(e->host, 2);
+        void* cur_host = e->host.load(std::memory_order_acquire);
+        for (CallbackBridge* bridge : e->callbacks) VCall<void, void*>(cur_host, 4, bridge);
+        VCall<uint32_t>(cur_host, 2);
         for (void* retired : e->retired_hosts) VCall<uint32_t>(retired, 2);
         // Releasing the engine destroyed the voices the title left behind.
         for (VoiceProxy* voice : e->voices) {
@@ -589,21 +661,24 @@ uint32_t WINAPI EngineRelease(EngineProxy* e) {
 int32_t WINAPI EngineRegisterForCallbacks(EngineProxy* e, void* guest_callback) {
     if (!guest_callback) return kInvalidArg;
     auto* bridge = new CallbackBridge{kEngineCallbackVtbl, guest_callback};
-    const int32_t hr = VCall<int32_t, void*>(e->host, 3, bridge);
+    std::lock_guard<std::mutex> lock(e->mu);
+    void* cur_host = e->host.load(std::memory_order_acquire);
+    const int32_t hr = VCall<int32_t, void*>(cur_host, 3, bridge);
     XA2_TRACE(8, "IXAudio2::RegisterForCallbacks(%p) -> 0x%08x", guest_callback, static_cast<uint32_t>(hr));
     if (hr < 0) {
         delete bridge;
         return hr;
     }
-    std::lock_guard<std::mutex> lock(e->mu);
     e->callbacks.push_back(bridge);
     return hr;
 }
 
 void WINAPI EngineUnregisterForCallbacks(EngineProxy* e, void* guest_callback) {
     CallbackBridge* bridge = nullptr;
+    void* cur_host = nullptr;
     {
         std::lock_guard<std::mutex> lock(e->mu);
+        cur_host = e->host.load(std::memory_order_acquire);
         for (auto it = e->callbacks.begin(); it != e->callbacks.end(); ++it) {
             if ((*it)->guest == guest_callback) {
                 bridge = *it;
@@ -613,7 +688,7 @@ void WINAPI EngineUnregisterForCallbacks(EngineProxy* e, void* guest_callback) {
         }
     }
     if (!bridge) return;
-    VCall<void, void*>(e->host, 4, bridge);  // returns once the callback is no longer in use
+    VCall<void, void*>(cur_host, 4, bridge);  // returns once the callback is no longer in use
     delete bridge;
 }
 
@@ -626,6 +701,9 @@ int32_t FinishVoice(EngineProxy* e, int32_t hr, void* host_voice, VoiceKind kind
         return hr < 0 ? hr : static_cast<int32_t>(0x80004005u);
     }
     auto* voice = new VoiceProxy{vtbl, host_voice, kind, bridge, e};
+    if (bridge) {
+        bridge->voice.store(voice, std::memory_order_release);
+    }
     {
         std::lock_guard<std::mutex> lock(e->mu);
         e->voices.push_back(voice);
@@ -685,19 +763,22 @@ int32_t WINAPI EngineCreateSourceVoice(EngineProxy* e, void** out, const void* f
         host_format = &pcm_fmt;
     }
 
-    CallbackBridge* bridge = guest_callback ? new CallbackBridge{kVoiceCallbackVtbl, guest_callback} : nullptr;
+    // Always install a CallbackBridge on source voices so VoiceCbBufferEnd retires BufferSubmission
+    // slots even when the title passes a null IXAudio2VoiceCallback pointer.
+    CallbackBridge* bridge = new CallbackBridge{kVoiceCallbackVtbl, guest_callback};
+    void* cur_host = e->host.load(std::memory_order_acquire);
     void* host_voice = nullptr;
     bool host_fx_ok = false;
     int32_t hr = static_cast<int32_t>(0x80004005u);
-    if (has_chain && !e->silent) {
+    if (has_chain && !e->silent.load(std::memory_order_acquire)) {
         hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const EffectChain*>(
-            e->host, 5, &host_voice, host_format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
+            cur_host, 5, &host_voice, host_format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
             &host_chain);
         host_fx_ok = (hr >= 0 && host_voice != nullptr);
     }
     if (!host_fx_ok) {
         hr = VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const void*>(
-            e->host, 5, &host_voice, host_format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
+            cur_host, 5, &host_voice, host_format, flags, max_frequency_ratio, bridge, sends ? &host_sends : nullptr,
             nullptr);
     }
     XA2_TRACE(32, "IXAudio2::CreateSourceVoice(tag=0x%x, ch=%u, rate=%u, bits=%u, flags=0x%x, ratio=%g, "
@@ -737,17 +818,18 @@ int32_t WINAPI EngineCreateSubmixVoice(EngineProxy* e, void** out, uint32_t chan
     if (has_chain && !ValidateAndCopyEffectChain(chain, &host_chain, &fx_storage, &fx_emulated)) {
         return kInvalidArg;
     }
+    void* cur_host = e->host.load(std::memory_order_acquire);
     void* host_voice = nullptr;
     bool host_fx_ok = false;
     int32_t hr = static_cast<int32_t>(0x80004005u);
-    if (has_chain && !e->silent) {
+    if (has_chain && !e->silent.load(std::memory_order_acquire)) {
         hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, uint32_t, const VoiceSends*, const EffectChain*>(
-            e->host, 6, &host_voice, channels, rate, flags, stage, sends ? &host_sends : nullptr, &host_chain);
+            cur_host, 6, &host_voice, channels, rate, flags, stage, sends ? &host_sends : nullptr, &host_chain);
         host_fx_ok = (hr >= 0 && host_voice != nullptr);
     }
     if (!host_fx_ok) {
         hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, uint32_t, const VoiceSends*, const void*>(
-            e->host, 6, &host_voice, channels, rate, flags, stage, sends ? &host_sends : nullptr, nullptr);
+            cur_host, 6, &host_voice, channels, rate, flags, stage, sends ? &host_sends : nullptr, nullptr);
     }
     XA2_TRACE(16, "IXAudio2::CreateSubmixVoice(ch=%u, rate=%u, flags=0x%x, stage=%u, fx=%u) -> 0x%08x", channels, rate,
               flags, stage, has_chain ? host_chain.effect_count : 0u, static_cast<uint32_t>(hr));
@@ -769,26 +851,34 @@ int32_t WINAPI EngineCreateMasteringVoice(EngineProxy* e, void** out, uint32_t c
         XA2_TRACE(8, "IXAudio2::CreateMasteringVoice: %u effects not passed to the host", chain->effect_count);
     }
     // A console device id means nothing here: always the host's default device.
+    void* cur_host = e->host.load(std::memory_order_acquire);
     void* host_voice = nullptr;
     int32_t hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, const wchar_t*, const void*, uint32_t>(
-        e->host, 7, &host_voice, channels, rate, flags, nullptr, nullptr, category);
-    if (hr < 0 && !IsCallError(hr) && !e->silent) {
+        cur_host, 7, &host_voice, channels, rate, flags, nullptr, nullptr, category);
+    if (hr < 0 && !IsCallError(hr) && !e->silent.load(std::memory_order_acquire)) {
         // No usable audio device: keep the title's audio code running, silently.
         if (void* silent_host = ScarlettXCreateNullXAudio2()) {
-            std::fprintf(stderr,
-                         "[ScarlettX][xaudio2_9] CreateMasteringVoice failed on the host (0x%08x): "
-                         "no audio device, using silent output\n", static_cast<uint32_t>(hr));
             std::lock_guard<std::mutex> lock(e->mu);
-            void* old_host = e->host;
-            for (CallbackBridge* bridge : e->callbacks) {
-                VCall<void, void*>(old_host, 4, bridge);
-                VCall<int32_t, void*>(silent_host, 3, bridge);
+            if (!e->silent.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "[ScarlettX][xaudio2_9] CreateMasteringVoice failed on the host (0x%08x): "
+                             "no audio device, using silent output\n", static_cast<uint32_t>(hr));
+                void* old_host = e->host.load(std::memory_order_relaxed);
+                for (CallbackBridge* bridge : e->callbacks) {
+                    VCall<void, void*>(old_host, 4, bridge);
+                    VCall<int32_t, void*>(silent_host, 3, bridge);
+                }
+                e->retired_hosts.push_back(old_host);
+                e->host.store(silent_host, std::memory_order_release);
+                e->silent.store(true, std::memory_order_release);
+                hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, const wchar_t*, const void*, uint32_t>(
+                    silent_host, 7, &host_voice, channels, rate, flags, nullptr, nullptr, category);
+            } else {
+                VCall<uint32_t>(silent_host, 2);
+                void* active_host = e->host.load(std::memory_order_acquire);
+                hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, const wchar_t*, const void*, uint32_t>(
+                    active_host, 7, &host_voice, channels, rate, flags, nullptr, nullptr, category);
             }
-            e->retired_hosts.push_back(old_host);
-            e->host = silent_host;
-            e->silent = true;
-            hr = VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, const wchar_t*, const void*, uint32_t>(
-                silent_host, 7, &host_voice, channels, rate, flags, nullptr, nullptr, category);
         }
     }
     XA2_TRACE(8, "IXAudio2::CreateMasteringVoice(ch=%u, rate=%u, flags=0x%x, device=%p, category=%u) -> 0x%08x",
@@ -799,7 +889,7 @@ int32_t WINAPI EngineCreateMasteringVoice(EngineProxy* e, void** out, uint32_t c
 template <int Slot, typename Ret, typename... Args>
 Ret WINAPI EngineForward(EngineProxy* e, Args... args) {
     XA2_TRACE(1, "IXAudio2 slot %d first used", Slot);
-    return VCall<Ret, Args...>(e->host, Slot, args...);
+    return VCall<Ret, Args...>(e->host.load(std::memory_order_acquire), Slot, args...);
 }
 
 void* const kEngineVtbl[13] = {
@@ -862,8 +952,8 @@ extern "C" int32_t ScarlettXGuestXAudio2Create(void** out, uint32_t flags, uint3
               static_cast<uint32_t>(hr), silent ? " (silent output)" : "");
     auto* engine = new EngineProxy;
     engine->vtbl = kEngineVtbl;
-    engine->host = host;
-    engine->silent = silent;
+    engine->host.store(host, std::memory_order_release);
+    engine->silent.store(silent, std::memory_order_release);
     *out = engine;
     return hr;
 }

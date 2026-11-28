@@ -15,8 +15,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <new>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace scarlettx::xgr {
@@ -185,11 +187,20 @@ XGameResult SCARLETTX_GDK_CALLBACK SystemHandleTrackSlot(void* /*self*/, void* /
     return XGR_S_OK;
 }
 
+uint32_t SCARLETTX_GDK_CALLBACK SystemGetDeviceTypeSlot(void* /*self*/) {
+    return XSystemGetDeviceType();
+}
+
 XGameResult LogUnimplemented(const char* name, const char* api, int slot, uintptr_t a1, uintptr_t a2, uintptr_t a3);
 
 template <int Index>
 XGameResult SCARLETTX_GDK_CALLBACK SystemUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
     return LogUnimplemented("XSystem", "E349BD1A", Index, a1, a2, a3);
+}
+
+template <int Index>
+XGameResult SCARLETTX_GDK_CALLBACK AnalyticsUnimplemented(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    return LogUnimplemented("XSystemAnalytics", "B884675D", Index, a1, a2, a3);
 }
 
 const Slot kGameVtbl[] = {
@@ -209,20 +220,16 @@ const Slot kSystemVtbl[] = {
     reinterpret_cast<Slot>(&SystemHandleTrackSlot),
     reinterpret_cast<Slot>(&SystemIsHandleValidSlot),
     reinterpret_cast<Slot>(&SystemAllowFullDownloadBandwidth),
-    reinterpret_cast<Slot>(&SystemUnimplemented<9>),
+    reinterpret_cast<Slot>(&SystemGetDeviceTypeSlot),
     reinterpret_cast<Slot>(&SystemUnimplemented<10>),
     reinterpret_cast<Slot>(&SystemUnimplemented<11>),
 };
 
 // {B884675D} slot 3: XSystemGetAnalyticsInfo (x64 struct-by-value sret in RDX, returned in RAX).
+// Slot 4: XSystemGetDeviceType.
 XSystemAnalyticsInfo* SCARLETTX_GDK_CALLBACK AnalyticsGetInfo(void* /*self*/, XSystemAnalyticsInfo* out_sret) {
     if (!out_sret) return nullptr;
     *out_sret = XSystemGetAnalyticsInfo();
-    const char* lockhart = std::getenv("SCARLETTX_LOCKHART");
-    if (lockhart && lockhart[0] == '1') {
-        std::memset(out_sret->form, 0, sizeof(out_sret->form));
-        std::strncpy(out_sret->form, "Xbox Series S", sizeof(out_sret->form) - 1);
-    }
     return out_sret;
 }
 
@@ -231,6 +238,10 @@ const Slot kAnalyticsVtbl[] = {
     reinterpret_cast<Slot>(&TableAddRef),
     reinterpret_cast<Slot>(&TableRelease),
     reinterpret_cast<Slot>(&AnalyticsGetInfo),
+    reinterpret_cast<Slot>(&SystemGetDeviceTypeSlot),
+    reinterpret_cast<Slot>(&AnalyticsUnimplemented<5>),
+    reinterpret_cast<Slot>(&AnalyticsUnimplemented<6>),
+    reinterpret_cast<Slot>(&AnalyticsUnimplemented<7>),
 };
 
 // {01ACD177}: XUser, in the declaration order of the public XUser.h. The
@@ -1161,16 +1172,33 @@ struct DisplayDeferralObj {
     uint32_t tag = 0x44454652u;
 };
 
-void SCARLETTX_GDK_CALLBACK DisplayCloseTimeoutDeferralSlot(void* /*self*/, void* handle) {
-    delete static_cast<DisplayDeferralObj*>(handle);
-}
+std::mutex g_display_deferral_mutex;
+std::unordered_set<DisplayDeferralObj*> g_live_display_deferrals;
 
 XGameResult SCARLETTX_GDK_CALLBACK DisplayAcquireTimeoutDeferralSlot(void* /*self*/, void** out_handle) {
     if (!out_handle) return XGR_E_POINTER;
+    *out_handle = nullptr;
     auto* d = new (std::nothrow) DisplayDeferralObj();
     if (!d) return XGR_E_OUTOFMEMORY;
+    {
+        std::lock_guard<std::mutex> lock(g_display_deferral_mutex);
+        g_live_display_deferrals.insert(d);
+    }
     *out_handle = d;
     return XGR_S_OK;
+}
+
+void SCARLETTX_GDK_CALLBACK DisplayCloseTimeoutDeferralSlot(void* /*self*/, void* handle) {
+    if (!handle) return;
+    auto* obj = static_cast<DisplayDeferralObj*>(handle);
+    bool live = false;
+    {
+        std::lock_guard<std::mutex> lock(g_display_deferral_mutex);
+        live = g_live_display_deferrals.erase(obj) > 0u;
+    }
+    if (live) {
+        delete obj;
+    }
 }
 
 template <int Index>
@@ -1182,9 +1210,9 @@ const Slot kDisplayTimeoutVtbl[16] = {
     reinterpret_cast<Slot>(&TableQueryInterface),
     reinterpret_cast<Slot>(&TableAddRef),
     reinterpret_cast<Slot>(&TableRelease),
-    reinterpret_cast<Slot>(&DisplayCloseTimeoutDeferralSlot),    // slot 3 fallback
-    reinterpret_cast<Slot>(&DisplayAcquireTimeoutDeferralSlot),  // slot 4 (observed in GDK 2510)
-    reinterpret_cast<Slot>(&DisplayCloseTimeoutDeferralSlot),    // slot 5 (observed in GDK 2510)
+    reinterpret_cast<Slot>(&DisplayAcquireTimeoutDeferralSlot),  // slot 3: XDisplayAcquireTimeoutDeferral
+    reinterpret_cast<Slot>(&DisplayCloseTimeoutDeferralSlot),    // slot 4: XDisplayCloseTimeoutDeferralHandle
+    reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<5>),
     reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<6>),
     reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<7>),
     reinterpret_cast<Slot>(&DisplayTimeoutUnimplemented<8>),
@@ -1313,6 +1341,7 @@ const Slot kPlsVtbl[16] = {
 
 // {CE8E7A26}: XStore (GDK 2022-2026 game license & DLC entitlement queries).
 XGameResult SCARLETTX_GDK_CALLBACK StoreCreateContext(void* /*self*/, XUserHandle user, XStoreContextHandle* out) {
+    if (out) *out = nullptr;
     return XStoreCreateContext(user, out);
 }
 void SCARLETTX_GDK_CALLBACK StoreCloseContextHandle(void* /*self*/, XStoreContextHandle ctx) {
@@ -1324,6 +1353,7 @@ XGameResult SCARLETTX_GDK_CALLBACK StoreQueryGameLicenseAsync(void* /*self*/, XS
 }
 XGameResult SCARLETTX_GDK_CALLBACK StoreQueryGameLicenseResult(void* /*self*/, XAsyncBlock* async,
                                                                XStoreGameLicense* lic) {
+    if (lic) std::memset(lic, 0, sizeof(*lic));
     return XStoreQueryGameLicenseResult(async, lic);
 }
 XGameResult SCARLETTX_GDK_CALLBACK StoreQueryEntitledProductsAsync(void* /*self*/, XStoreContextHandle ctx,
@@ -1333,6 +1363,7 @@ XGameResult SCARLETTX_GDK_CALLBACK StoreQueryEntitledProductsAsync(void* /*self*
 }
 XGameResult SCARLETTX_GDK_CALLBACK StoreQueryEntitledProductsResult(void* /*self*/, XAsyncBlock* async,
                                                                     XStoreProductQueryHandle* out) {
+    if (out) *out = nullptr;
     return XStoreQueryEntitledProductsResult(async, out);
 }
 XGameResult SCARLETTX_GDK_CALLBACK StoreEnumerateProductsQuery(void* /*self*/, XStoreProductQueryHandle q,
@@ -1380,19 +1411,29 @@ XGameResult SCARLETTX_GDK_CALLBACK StoreQueryCurrentGameAsyncSlot(void* /*self*/
     return XStoreQueryEntitledProductsAsync(ctx, 0xFFFFFFFFu, 25u, async);
 }
 
-XGameResult SCARLETTX_GDK_CALLBACK StoreSlot66SafeOffline(void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+// XStore2510 slot 66: XStoreRegisterGameLicenseChanged / XStoreRegisterPackageLicenseLost
+// Exact 5-guest-arg Win64 COM signature (self, handle, queue, context, callback, token).
+XGameResult SCARLETTX_GDK_CALLBACK StoreSlot66SafeOffline(
+    void* /*self*/,
+    void* handle,
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    void* callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!token) return XGR_E_POINTER;
+    token->token = 0;
+    if (!callback) return XGR_E_INVALIDARG;
     if (Trace()) {
         std::fprintf(stderr,
-                     "[ScarlettX][xgameruntime] XStore2510 (ApiImpl{0DD112AC} slot 66)(0x%llx, 0x%llx, 0x%llx) -> S_OK\n",
-                     static_cast<unsigned long long>(a1),
-                     static_cast<unsigned long long>(a2),
-                     static_cast<unsigned long long>(a3));
+                     "[ScarlettX][xgameruntime] XStore2510 (ApiImpl{0DD112AC} slot 66)(handle=%p, cb=%p) -> S_OK\n",
+                     handle, callback);
     }
-    // If caller passes an output token/result pointer in a3 and it is writable, write a non-zero handle/token.
-    (void)a1;
-    (void)a2;
-    (void)a3;
     return XGR_S_OK;
+}
+
+bool SCARLETTX_GDK_CALLBACK StoreSlot67UnregisterSafeOffline(
+    void* /*self*/, void* /*handle*/, XTaskQueueRegistrationToken /*token*/, bool /*wait*/) {
+    return true;
 }
 
 template <int Index>
@@ -1421,6 +1462,7 @@ std::array<Slot, kRealStoreSlots> MakeRealStoreVtbl(std::index_sequence<I...>) {
     vtbl[28] = reinterpret_cast<Slot>(&StoreQueryGameLicenseAsync);        // XStoreQueryGameLicenseAsync
     vtbl[29] = reinterpret_cast<Slot>(&StoreQueryGameLicenseResult);       // XStoreQueryGameLicenseResult
     vtbl[66] = reinterpret_cast<Slot>(&StoreSlot66SafeOffline);            // GDK 2510/260x license/store callback slot
+    vtbl[67] = reinterpret_cast<Slot>(&StoreSlot67UnregisterSafeOffline);  // GDK 2510/260x unregister callback slot
     return vtbl;
 }
 const std::array<Slot, kRealStoreSlots> kRealStoreVtbl =

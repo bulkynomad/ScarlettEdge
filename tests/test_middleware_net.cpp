@@ -122,14 +122,34 @@ int main() {
 
     // 2. amd_fidelityfx_loader_xbox.dll -> amd_fidelityfx_upscaler_xbox.dll
     {
+        // Verify official AMD FidelityFX API header type IDs (zero enum shift)
+        SX_CHECK(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE == 0x00010000u);
+        SX_CHECK(FFX_API_DISPATCH_DESC_TYPE_UPSCALE == 0x00010001u);
+        SX_CHECK(FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE == 0x00010002u);
+        SX_CHECK(FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE == 0x00010003u);
+        SX_CHECK(FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT == 0x00010004u);
+        SX_CHECK(FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET == 0x00010005u);
+
         ffxQueryDescGetProviderVersion ver{};
         ver.header.type = FFX_API_DESC_TYPE_GET_PROVIDER_VERSION;
         SX_CHECK(ffxQuery(nullptr, &ver.header) == FFX_API_RETURN_OK);
         SX_CHECK(ver.versionId != 0 && ver.versionName != nullptr);
 
+        // 0x00010001 (DISPATCH) is NOT a query type; 0x00010002 is GETUPSCALERATIOFROMQUALITYMODE
+        ffxApiHeader wrong_query{0x00010001u, nullptr};
+        SX_CHECK(ffxQuery(nullptr, &wrong_query) == FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE);
+
+        float ratio = 0.0f;
+        ffxQueryDescUpscaleGetUpscaleRatioFromQualityMode ratio_q{};
+        ratio_q.header.type = 0x00010002u;
+        ratio_q.qualityMode = FFX_UPSCALE_QUALITY_MODE_PERFORMANCE;
+        ratio_q.pOutUpscaleRatio = &ratio;
+        SX_CHECK(ffxQuery(nullptr, &ratio_q.header) == FFX_API_RETURN_OK);
+        SX_CHECK(std::fabs(ratio - 2.0f) < 1e-5f);
+
         uint32_t rw = 0, rh = 0;
         ffxQueryDescUpscaleGetRenderResolutionFromQualityMode res_q{};
-        res_q.header.type = FFX_API_DESC_TYPE_UPSCALE_GET_RENDERRESOLUTION;
+        res_q.header.type = 0x00010003u;
         res_q.displayWidth = 3840;
         res_q.displayHeight = 2160;
         res_q.qualityMode = FFX_UPSCALE_QUALITY_MODE_PERFORMANCE;  // 2.0x
@@ -138,24 +158,64 @@ int main() {
         SX_CHECK(ffxQuery(nullptr, &res_q.header) == FFX_API_RETURN_OK);
         SX_CHECK(rw == 1920 && rh == 1080);
 
-        int32_t phases = 0;
-        ffxQueryDescUpscaleGetJitterPhaseCount jp{};
-        jp.header.type = FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_PHASE_COUNT;
-        jp.renderWidth = 1920;
-        jp.displayWidth = 3840;
-        jp.pOutPhaseCount = &phases;
-        SX_CHECK(ffxQuery(nullptr, &jp.header) == FFX_API_RETURN_OK);
-        SX_CHECK(phases == 32);
+        // Stack canary guards around 0x00010004 (GET_JITTER_PHASE_COUNT, 32B) and 0x00010005 (GET_JITTER_OFFSET, 40B)
+        constexpr uint32_t kCanary32 = 0xDEADBEEFu;
+        struct GuardedJitterPhaseFrame {
+            uint32_t pre_desc[8];
+            ffxQueryDescUpscaleGetJitterPhaseCount desc;
+            uint32_t post_desc[8];
+            int32_t phases;
+            uint32_t post_out[8];
+        } jpf{};
+        for (int i = 0; i < 8; ++i) {
+            jpf.pre_desc[i] = kCanary32;
+            jpf.post_desc[i] = kCanary32;
+            jpf.post_out[i] = kCanary32;
+        }
+        jpf.desc.header.type = 0x00010004u;
+        jpf.desc.renderWidth = 1920u;
+        jpf.desc.displayWidth = 3840u;
+        jpf.desc.pOutPhaseCount = &jpf.phases;
+        SX_CHECK(ffxQuery(nullptr, &jpf.desc.header) == FFX_API_RETURN_OK);
+        SX_CHECK(jpf.phases == 32);
+        for (int i = 0; i < 8; ++i) {
+            SX_CHECK(jpf.pre_desc[i] == kCanary32 && jpf.post_desc[i] == kCanary32 &&
+                     jpf.post_out[i] == kCanary32);
+        }
 
-        float jx = 0.0f, jy = 0.0f;
-        ffxQueryDescUpscaleGetJitterOffset jo{};
-        jo.header.type = FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_OFFSET;
-        jo.index = 0;
-        jo.phaseCount = phases;
-        jo.pOutX = &jx;
-        jo.pOutY = &jy;
-        SX_CHECK(ffxQuery(nullptr, &jo.header) == FFX_API_RETURN_OK);
-        SX_CHECK(std::fabs(jx) <= 0.5f && std::fabs(jy) <= 0.5f);
+        struct GuardedJitterOffsetFrame {
+            uint32_t pre_desc[8];
+            ffxQueryDescUpscaleGetJitterOffset desc;
+            uint32_t post_desc[8];
+            float jx;
+            uint32_t mid_out[4];
+            float jy;
+            uint32_t post_out[8];
+        } jof{};
+        for (int i = 0; i < 8; ++i) {
+            jof.pre_desc[i] = kCanary32;
+            jof.post_desc[i] = kCanary32;
+            jof.post_out[i] = kCanary32;
+        }
+        for (int i = 0; i < 4; ++i) {
+            jof.mid_out[i] = kCanary32;
+        }
+        jof.jx = 99.0f;
+        jof.jy = 99.0f;
+        jof.desc.header.type = 0x00010005u;
+        jof.desc.index = 0;
+        jof.desc.phaseCount = jpf.phases;
+        jof.desc.pOutX = &jof.jx;
+        jof.desc.pOutY = &jof.jy;
+        SX_CHECK(ffxQuery(nullptr, &jof.desc.header) == FFX_API_RETURN_OK);
+        SX_CHECK(std::fabs(jof.jx) <= 0.5f && std::fabs(jof.jy) <= 0.5f);
+        for (int i = 0; i < 8; ++i) {
+            SX_CHECK(jof.pre_desc[i] == kCanary32 && jof.post_desc[i] == kCanary32 &&
+                     jof.post_out[i] == kCanary32);
+        }
+        for (int i = 0; i < 4; ++i) {
+            SX_CHECK(jof.mid_out[i] == kCanary32);
+        }
 
         ffxContext ctx = nullptr;
         ffxCreateContextDescUpscale cdesc{};
@@ -167,11 +227,41 @@ int main() {
         SX_CHECK(ffxCreateContext(&ctx, &cdesc.header, nullptr) == FFX_API_RETURN_OK);
         SX_CHECK(ctx != nullptr);
 
-        ffxConfigureDescUpscale cfg{};
-        cfg.header.type = FFX_API_DESC_TYPE_UPSCALE_CONFIGURE;
-        cfg.sharpness = 0.75f;
-        cfg.enableSharpening = 1;
-        SX_CHECK(ffxConfigure(&ctx, &cfg.header) == FFX_API_RETURN_OK);
+        // Configure via official ffxConfigureDescUpscaleKeyValue (0x00010007): keys 0..4 via float* ptr
+        for (uint64_t key = 0; key <= 4u; ++key) {
+            float kv_val = 0.75f;
+            ffxConfigureDescUpscaleKeyValue kv{};
+            kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+            kv.key = key;
+            kv.ptr = &kv_val;
+            SX_CHECK(ffxConfigure(&ctx, &kv.header) == FFX_API_RETURN_OK);
+        }
+        {
+            float kv_val = 0.5f;
+            ffxConfigureDescUpscaleKeyValue bad_kv{};
+            bad_kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+            bad_kv.key = 0u;
+            bad_kv.ptr = nullptr;
+            SX_CHECK(ffxConfigure(&ctx, &bad_kv.header) == FFX_API_RETURN_ERROR_PARAMETER);
+            bad_kv.key = 99u;
+            bad_kv.ptr = &kv_val;
+            SX_CHECK(ffxConfigure(&ctx, &bad_kv.header) == FFX_API_RETURN_ERROR_PARAMETER);
+        }
+
+        // Unimplemented descriptors (0x00010006 GENERATEREACTIVEMASK, 0x00010008 GPU_MEMORY_USAGE)
+        // must honestly return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE (never silent no-op / fabricated numbers)
+        {
+            ffxApiHeader reactive_hdr{FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK, nullptr};
+            SX_CHECK(ffxDispatch(&ctx, &reactive_hdr) == FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE);
+
+            FfxApiEffectMemoryUsage mem_usage{0xAAAAAAAAull, 0xBBBBBBBBull};
+            ffxQueryDescUpscaleGetGPUMemoryUsage mem_q{};
+            mem_q.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
+            mem_q.gpuMemoryUsageUpscaler = &mem_usage;
+            SX_CHECK(ffxQuery(&ctx, &mem_q.header) == FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE);
+            SX_CHECK(mem_usage.totalUsageInBytes == 0xAAAAAAAAull &&
+                     mem_usage.aliasableUsageInBytes == 0xBBBBBBBBull);
+        }
 
         std::vector<uint8_t> src(32 * 32 * 4, 0);
         for (uint32_t y = 0; y < 32; ++y) {

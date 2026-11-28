@@ -28,6 +28,12 @@
 #include <vector>
 
 #if defined(_WIN32)
+#if !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <winioctl.h>
 
@@ -40,6 +46,7 @@ constexpr int32_t kPointer = static_cast<int32_t>(0x80004003u);
 constexpr int32_t kAbort = static_cast<int32_t>(0x80004004u);
 constexpr int32_t kPending = static_cast<int32_t>(0x8000000Au);
 constexpr int32_t kOutOfMemory = static_cast<int32_t>(0x8007000Eu);
+constexpr int32_t kStagingBufferTooSmall = static_cast<int32_t>(0x89240007u);
 
 constexpr uint16_t kMinQueueCapacity = 0x80;
 constexpr uint16_t kMaxQueueCapacity = 0x2000;
@@ -51,6 +58,9 @@ constexpr uint64_t kOptSwizzle = 0xFFFFull << 5;
 constexpr uint64_t kOptDestinationPhysical = 1ull << 21;
 constexpr uint64_t kOptSourceMemory = 1ull << 22;
 constexpr uint64_t kOptSourcePhysical = 1ull << 23;
+constexpr uint64_t kOptCompressionFormatMask = 0xFFull << 24;
+constexpr uint8_t kCompressionFormatNone = 0u;
+constexpr uint8_t kCompressionFormatGDeflate = 1u;
 constexpr uint64_t kOptUnsupported = kOptDestinationPhysical | kOptSourcePhysical;
 
 bool TraceEnabled() {
@@ -182,6 +192,8 @@ const char* const kInterfaceNames[] = {"IDStorageFactoryX", "IDStorageQueueX", "
 
 template <int Interface, int Slot>
 intptr_t WINAPI UnnamedSlot(Object* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    scarlettx::FlightRecorder::Instance().RecordVtableSlotMiss(
+        kInterfaceNames[Interface], Slot, static_cast<uint64_t>(a1), SCARLETTX_CALLER_RIP());
     static std::atomic<int> calls{0};
     if (calls.fetch_add(1) < 4) {
         DS_LOG("%s slot %d is not implemented (0x%llx, 0x%llx, 0x%llx)", kInterfaceNames[Interface], Slot,
@@ -359,6 +371,8 @@ struct Queue : Object {
     GuestErrorRecord error_record{0u, {kOk, -1, {}}};
 };
 
+std::atomic<uint32_t> g_staging_buffer_size{32u * 1024u * 1024u};
+
 int32_t RunRequest(const Queue* queue, const Entry& entry) {
     const Request& r = entry.request;
     if (r.options & kOptUnsupported) return kNotImpl;
@@ -366,11 +380,32 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
     if (from_memory != (queue->source_type == 1)) return kInvalidArg;
     if (r.source_size == 0) return kOk;
     const bool is_zlib = (r.options & kOptZlib) != 0;
+    const uint8_t comp_fmt = static_cast<uint8_t>((r.options & kOptCompressionFormatMask) >> 24);
+    if (comp_fmt != kCompressionFormatNone && comp_fmt != kCompressionFormatGDeflate) {
+        return kNotImpl;
+    }
+    const bool is_gdeflate = (comp_fmt == kCompressionFormatGDeflate);
     const uint32_t bcpack_fmt = static_cast<uint32_t>((r.options & kOptBcpack) >> 1);
     const uint32_t swizzle_opt = static_cast<uint32_t>((r.options & kOptSwizzle) >> 5);
-    const bool compressed = is_zlib || (bcpack_fmt != 0);
+    const bool compressed = is_zlib || is_gdeflate || (bcpack_fmt != 0);
     if (!r.destination || !r.source || (!compressed && swizzle_opt == 0 && r.destination_size < r.source_size)) {
         return kInvalidArg;
+    }
+
+    const uint32_t staging_limit = g_staging_buffer_size.load(std::memory_order_acquire);
+    if (!from_memory) {
+        if (staging_limit == 0u) {
+            return kStagingBufferTooSmall;
+        }
+        if (compressed || swizzle_opt != 0) {
+            const uint32_t needed_intermediate =
+                (bcpack_fmt != 0u && (is_gdeflate || is_zlib))
+                    ? ((r.intermediate_size != 0u) ? r.intermediate_size : r.destination_size)
+                    : 0u;
+            if (r.source_size > staging_limit || needed_intermediate > staging_limit) {
+                return kStagingBufferTooSmall;
+            }
+        }
     }
 
     // Only apply destination_page_offset when DestinationIsPhysicalPages is set;
@@ -422,50 +457,90 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
                 return HresultFromWin32(ERROR_HANDLE_EOF);
             }
             std::vector<uint8_t> vfs_slice;
-            auto st = scarlettx::PackageVfs::Global().ReadFileRange(vfs_path, r.file_offset, r.source_size, vfs_slice);
-            if (!st.ok()) return HresultFromWin32(ERROR_READ_FAULT);
-            if (vfs_slice.size() != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
-            std::memcpy(io_target, vfs_slice.data(), r.source_size);
-        } else {
-            OVERLAPPED at{};
-            at.Offset = static_cast<DWORD>(r.file_offset);
-            at.OffsetHigh = static_cast<DWORD>(r.file_offset >> 32);
-            at.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            DWORD read = 0;
-            BOOL ok = ReadFile(dup_handle, io_target, r.source_size, &read, &at);
-            if (!ok) {
-                const DWORD err = GetLastError();
-                if (err == ERROR_IO_PENDING) {
-                    ok = GetOverlappedResult(dup_handle, &at, &read, TRUE);
-                }
+            uint32_t done = 0u;
+            while (done < r.source_size) {
+                const uint32_t chunk = std::min<uint32_t>(r.source_size - done, staging_limit);
+                auto st = scarlettx::PackageVfs::Global().ReadFileRange(
+                    vfs_path, r.file_offset + done, chunk, vfs_slice);
+                if (!st.ok()) return HresultFromWin32(ERROR_READ_FAULT);
+                if (vfs_slice.size() != chunk) return HresultFromWin32(ERROR_HANDLE_EOF);
+                std::memcpy(io_target + done, vfs_slice.data(), chunk);
+                done += chunk;
             }
-            const DWORD final_err = ok ? 0 : GetLastError();
-            if (at.hEvent) CloseHandle(at.hEvent);
+        } else {
+            HANDLE io_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            uint32_t done = 0u;
+            int32_t read_hr = kOk;
+            while (done < r.source_size) {
+                const uint32_t chunk = std::min<uint32_t>(r.source_size - done, staging_limit);
+                const uint64_t cur_off = r.file_offset + done;
+                if (io_ev) ResetEvent(io_ev);
+                OVERLAPPED at{};
+                at.Offset = static_cast<DWORD>(cur_off);
+                at.OffsetHigh = static_cast<DWORD>(cur_off >> 32);
+                at.hEvent = io_ev;
+                DWORD read = 0;
+                BOOL ok = ReadFile(dup_handle, io_target + done, chunk, &read, &at);
+                if (!ok) {
+                    const DWORD err = GetLastError();
+                    if (err == ERROR_IO_PENDING) {
+                        ok = GetOverlappedResult(dup_handle, &at, &read, TRUE);
+                    }
+                }
+                if (!ok) {
+                    const DWORD final_err = GetLastError();
+                    read_hr = HresultFromWin32(final_err != 0 ? final_err : ERROR_READ_FAULT);
+                    break;
+                }
+                if (read != chunk) {
+                    read_hr = HresultFromWin32(ERROR_HANDLE_EOF);
+                    break;
+                }
+                done += chunk;
+            }
+            if (io_ev) CloseHandle(io_ev);
             CloseHandle(dup_handle);
-            if (!ok) return HresultFromWin32(final_err);
-            if (read != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
+            if (read_hr < 0) return read_hr;
         }
     }
 
     size_t decoded_bytes = r.source_size;
-    if (is_zlib) {
-        if (raw_buf.size() >= 8 && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu) {
+    if (is_gdeflate || is_zlib) {
+        const bool is_gdeflate_magic =
+            raw_buf.size() >= 12u && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu;
+        const bool is_rfc1950_zlib =
+            scarlettx::io::LooksLikeRfc1950ZlibHeader(raw_buf.data(), raw_buf.size());
+
+        std::vector<uint8_t> intermediate_buf;
+        uint8_t* stage_dst = decode_dst;
+        uint32_t stage_cap = decode_cap;
+        if (bcpack_fmt != 0) {
+            stage_cap = (r.intermediate_size != 0u) ? r.intermediate_size : decode_cap;
+            intermediate_buf.assign(stage_cap, 0u);
+            stage_dst = intermediate_buf.data();
+        }
+
+        if (is_gdeflate || is_gdeflate_magic) {
             size_t written = 0;
             const int32_t gd_hr = XboxCodecGDeflateDecompress(
-                raw_buf.data(), raw_buf.size(), decode_dst, decode_cap, &written);
+                raw_buf.data(), raw_buf.size(), stage_dst, stage_cap, &written);
             if (gd_hr < 0) return gd_hr;
             decoded_bytes = written;
-        } else if (scarlettx::io::LooksLikeRfc1950ZlibHeader(raw_buf.data(), raw_buf.size())) {
-            std::vector<uint8_t> staged(decode_cap, 0u);
+        } else if (is_rfc1950_zlib) {
             size_t written = 0;
-            if (!scarlettx::io::InflateZlibRfc1950(
-                    raw_buf.data(), raw_buf.size(), staged.data(), staged.size(), written)) {
-                return kNotImpl;
-            }
-            decoded_bytes = std::min<size_t>(written, decode_cap);
-            std::memcpy(decode_dst, staged.data(), decoded_bytes);
+            const int32_t zl_hr = XboxCodecGDeflateDecompress(
+                raw_buf.data(), raw_buf.size(), stage_dst, stage_cap, &written);
+            if (zl_hr < 0) return kNotImpl;
+            decoded_bytes = std::min<size_t>(written, stage_cap);
         } else {
             return kNotImpl;
+        }
+
+        if (bcpack_fmt != 0) {
+            const int32_t bc_hr = XboxCodecBcPackDecompress(
+                stage_dst, decoded_bytes, decode_dst, decode_cap, bcpack_fmt);
+            if (bc_hr < 0) return bc_hr;
+            decoded_bytes = decode_cap;
         }
     } else if (bcpack_fmt != 0) {
         const bool is_framed_bcpack =
@@ -837,12 +912,23 @@ int32_t WINAPI FactoryCreateStatusArray(Object* /*self*/, uint32_t capacity, con
     return kOk;
 }
 
+int32_t WINAPI FactorySetStagingBufferSize(Object* /*self*/, uint32_t size) {
+    if (size == 0u) return kInvalidArg;
+    g_staging_buffer_size.store(size, std::memory_order_release);
+    DS_TRACE(8, "SetStagingBufferSize size=%u", size);
+    return kOk;
+}
+
 void* const kFactoryVtbl[] = {
-    DS_SLOT(ObjectQueryInterface), DS_SLOT(ObjectAddRef), DS_SLOT(ObjectRelease),
-    DS_SLOT(FactoryCreateQueue),        // 3, confirmed
-    DS_SLOT(FactoryOpenFile),           // 4, confirmed
-    DS_SLOT(FactoryCreateStatusArray),  // 5, confirmed
-    DS_SLOT((UnnamedSlot<0, 6>)),  DS_SLOT((UnnamedSlot<0, 7>)),  DS_SLOT((UnnamedSlot<0, 8>)),
+    DS_SLOT(ObjectQueryInterface),
+    DS_SLOT(ObjectAddRef),
+    DS_SLOT(ObjectRelease),
+    DS_SLOT(FactoryCreateQueue),           // 3, confirmed
+    DS_SLOT(FactoryOpenFile),              // 4, confirmed
+    DS_SLOT(FactoryCreateStatusArray),     // 5, confirmed
+    DS_SLOT((UnnamedSlot<0, 6>)),          // 6, SetDebugFlags
+    DS_SLOT(FactorySetStagingBufferSize),  // 7, SetStagingBufferSize
+    DS_SLOT((UnnamedSlot<0, 8>)),
     DS_SLOT((UnnamedSlot<0, 9>)),  DS_SLOT((UnnamedSlot<0, 10>)), DS_SLOT((UnnamedSlot<0, 11>)),
 };
 

@@ -1,17 +1,19 @@
 #include "scarlettx/gdk/xgameruntime_abi.h"
+#include "sx_check.h"
 
 #include <cstdlib>
+#include <cstddef>
 #include <filesystem>
 #include <system_error>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #define CHECK(cond)                                                              \
     do {                                                                         \
@@ -115,10 +117,9 @@ void SCARLETTX_GDK_CALLBACK SampleAsyncCompletion(XAsyncBlock* /*async*/) {
 }  // namespace
 
 int main() {
-    // Keep save data written by this test in its own directory.
-    std::error_code save_ec;
-    const std::filesystem::path save_root = std::filesystem::temp_directory_path() / "scarlettx_test_query_api_impl";
-    std::filesystem::remove_all(save_root, save_ec);
+    // Keep save data written by this test in its own isolated ScopedTempDir.
+    sx_test::ScopedTempDir save_sandbox("test_query_api_impl");
+    const std::filesystem::path& save_root = save_sandbox.path();
 #if defined(_WIN32)
     _putenv_s("SCARLETTX_SAVE_ROOT", save_root.string().c_str());
 #else
@@ -734,15 +735,44 @@ int main() {
 
         void* pkg25 = nullptr;
         CHECK(QueryApiImpl(&kGuidAF406016, &kGuidPkg2025, &pkg25) == XGR_S_OK && pkg25 != nullptr);
-        std::string found_pkg_id;
+        static_assert(sizeof(XPackageDetails) == 0x50, "XPackageDetails must be 0x50 bytes");
+        static_assert(offsetof(XPackageDetails, titleId) == 0x48, "XPackageDetails::titleId must be at +0x48");
+        struct PkgEnumCheck {
+            std::string pkg_id;
+            std::string title_id;
+            const char* raw_title_ptr = nullptr;
+            uint32_t count = 0;
+        } pkg_check;
+        set_env("SCARLETTX_TITLE_ID", "4D530ABC");
         XPackageEnumerationCallback* on_pkg = [](void* ctx, const XPackageDetails* det) -> bool {
+            auto* out_c = static_cast<PkgEnumCheck*>(ctx);
             if (det && det->packageIdentifier) {
-                *static_cast<std::string*>(ctx) = det->packageIdentifier;
+                out_c->pkg_id = det->packageIdentifier;
+                out_c->raw_title_ptr = det->titleId;
+                if (det->titleId) {
+                    out_c->title_id = det->titleId;
+                }
+                out_c->count = det->count;
             }
             return true;
         };
-        CHECK(LoadVtableSlot<FnEnumerate>(pkg25, 0x118)(pkg25, 1u, 1u, &found_pkg_id, reinterpret_cast<void*>(on_pkg)) == XGR_S_OK);
+        CHECK(LoadVtableSlot<FnEnumerate>(pkg25, 0x118)(pkg25, 1u, 1u, &pkg_check, reinterpret_cast<void*>(on_pkg)) == XGR_S_OK);
+        const std::string found_pkg_id = pkg_check.pkg_id;
         CHECK(!found_pkg_id.empty());
+        CHECK(pkg_check.raw_title_ptr != nullptr);
+        CHECK(pkg_check.title_id == "4D530ABC");
+        CHECK(std::strcmp(pkg_check.raw_title_ptr, "4D530ABC") == 0);
+        CHECK(pkg_check.count >= 1u);
+
+        // Also verify XPackageKind_Game (0) populates non-null persistent titleId
+        PkgEnumCheck game_pkg_check;
+        set_env("SCARLETTX_TITLE_ID", "");
+        CHECK(LoadVtableSlot<FnEnumerate>(pkg25, 0x118)(pkg25, 0u, 0u, &game_pkg_check, reinterpret_cast<void*>(on_pkg)) == XGR_S_OK);
+        CHECK(game_pkg_check.pkg_id == "SCARLETTEDGE.GAME.MAIN");
+        CHECK(game_pkg_check.raw_title_ptr != nullptr);
+        CHECK(game_pkg_check.title_id == "5CA00001");
+        CHECK(std::strcmp(game_pkg_check.raw_title_ptr, "5CA00001") == 0);
+        CHECK(game_pkg_check.count == 1u);
 
         using FnMountAsync = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, const char*, XAsyncBlock*);
         using FnMountResult = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, XAsyncBlock*, XPackageMountHandle*);
@@ -855,16 +885,18 @@ int main() {
         uint32_t chunk_avail = 99u;
         CHECK(LoadVtableSlot<FnChunkAvail>(pkg2510, 12 * 8)(pkg2510, cur_pkg_id, 1u, nullptr, &chunk_avail) == XGR_S_OK);
         CHECK(chunk_avail == 0u);  // Ready
-        std::string found_2510_pkg;
+        PkgEnumCheck found_2510_pkg;
         CHECK(LoadVtableSlot<FnEnumerate>(pkg2510, 39 * 8)(
                   pkg2510, 1u, 0u, &found_2510_pkg, reinterpret_cast<void*>(on_pkg)) == XGR_S_OK);
-        CHECK(!found_2510_pkg.empty());
+        CHECK(!found_2510_pkg.pkg_id.empty());
+        CHECK(found_2510_pkg.raw_title_ptr != nullptr && found_2510_pkg.title_id == "5CA00001");
         uint64_t tok2510 = 0;
         CHECK(LoadVtableSlot<FnRegister>(pkg2510, 40 * 8)(
                   pkg2510, nullptr, nullptr, &dummy_callback, &tok2510) == XGR_S_OK && tok2510 != 0);
         CHECK(LoadVtableSlot<FnRelease>(pkg2510, 0x10)(pkg2510) == 0u);
 
-        // 5) Real XStore 2510 ({0DD112AC} / {B09D803C}): slot 3 CreateContext, slot 28/29 QueryGameLicense, slot 4 Close
+        // 5) Real XStore 2510 ({0DD112AC} / {B09D803C}): slot 3 CreateContext, slot 28/29 QueryGameLicense,
+        //    slot 66 StoreSlot66SafeOffline out-token zeroing (5-guest-arg registration signature), slot 4 Close
         void* rstore = nullptr;
         CHECK(QueryApiImpl(&kGuidStoreReal, &kGuidStore2510, &rstore) == XGR_S_OK && rstore != nullptr);
         XStoreContextHandle rs_ctx = nullptr;
@@ -874,10 +906,62 @@ int main() {
         XStoreGameLicense rlic{};
         CHECK(LoadVtableSlot<FnLicResult>(rstore, 29 * 8)(rstore, &rlic_ab, &rlic) == XGR_S_OK);
         CHECK(rlic.isActive && !rlic.isTrial);
+
+        {
+            constexpr uint64_t kCanary64 = 0xDEADBEEFCAFEBABEull;
+            struct GuardedStoreToken {
+                uint64_t pre[4];
+                XTaskQueueRegistrationToken token;
+                uint64_t post[4];
+            };
+            using FnStoreSlot66 = XGameResult (SCARLETTX_GDK_CALLBACK*)(
+                void*, XStoreContextHandle, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+            using FnStoreSlot67_Unreg = bool (SCARLETTX_GDK_CALLBACK*)(
+                void*, XStoreContextHandle, XTaskQueueRegistrationToken, bool);
+
+            uint64_t cb_ctx_sentinel[2] = {0xA5A5A5A55A5A5A5Aull, 0x1122334455667788ull};
+
+            // Null out-token -> E_POINTER without touching cb_ctx
+            CHECK(LoadVtableSlot<FnStoreSlot66>(rstore, 66 * 8)(
+                      rstore, rs_ctx, nullptr, cb_ctx_sentinel,
+                      reinterpret_cast<void*>(&SampleAsyncCompletion), nullptr) == XGR_E_POINTER);
+            CHECK(cb_ctx_sentinel[0] == 0xA5A5A5A55A5A5A5Aull && cb_ctx_sentinel[1] == 0x1122334455667788ull);
+
+            // Null callback -> E_INVALIDARG and still zeros *token
+            GuardedStoreToken st_bad_cb{};
+            for (int i = 0; i < 4; ++i) {
+                st_bad_cb.pre[i] = kCanary64;
+                st_bad_cb.post[i] = kCanary64;
+            }
+            st_bad_cb.token.token = 0xCCCCCCCCCCCCCCCCull;
+            CHECK(LoadVtableSlot<FnStoreSlot66>(rstore, 66 * 8)(
+                      rstore, rs_ctx, nullptr, cb_ctx_sentinel, nullptr, &st_bad_cb.token) == XGR_E_INVALIDARG);
+            CHECK(st_bad_cb.token.token == 0ull);
+            CHECK(cb_ctx_sentinel[0] == 0xA5A5A5A55A5A5A5Aull && cb_ctx_sentinel[1] == 0x1122334455667788ull);
+
+            // Valid 5-arg call -> S_OK, *token zeroed, cb_ctx and stack canaries intact
+            GuardedStoreToken st5{};
+            for (int i = 0; i < 4; ++i) {
+                st5.pre[i] = kCanary64;
+                st5.post[i] = kCanary64;
+            }
+            st5.token.token = 0xBADC0FFEE0DDF00Dull;
+            CHECK(LoadVtableSlot<FnStoreSlot66>(rstore, 66 * 8)(
+                      rstore, rs_ctx, nullptr, cb_ctx_sentinel,
+                      reinterpret_cast<void*>(&SampleAsyncCompletion), &st5.token) == XGR_S_OK);
+            CHECK(st5.token.token == 0ull);
+            CHECK(cb_ctx_sentinel[0] == 0xA5A5A5A55A5A5A5Aull && cb_ctx_sentinel[1] == 0x1122334455667788ull);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(st5.pre[i] == kCanary64 && st5.post[i] == kCanary64);
+            }
+            CHECK(LoadVtableSlot<FnStoreSlot67_Unreg>(rstore, 67 * 8)(rstore, rs_ctx, st5.token, true) == true);
+        }
+
         LoadVtableSlot<FnStoreClose>(rstore, 4 * 8)(rstore, rs_ctx);
         CHECK(LoadVtableSlot<FnRelease>(rstore, 0x10)(rstore) == 0u);
 
         // 6) Official GDK 2510 XDisplay HDR ({03F0FE74} / {35F07670}) + Timeout Deferral ({1B339674})
+        //    Verify slot 3 = Acquire and slot 4 = Close with stack guard canaries!
         const TestGuid kGuidDispHdr = {0x03F0FE74u, 0xFDD9u, 0x4E5Cu, {0xB6, 0x30, 0xF9, 0x33, 0x9C, 0x47, 0xAC, 0xC5}};
         const TestGuid kGuidDispHdr2510 = {0x35F07670u, 0x706Eu, 0x4BFBu, {0x94, 0x76, 0x09, 0x07, 0x98, 0xC5, 0xEB, 0xF3}};
         const TestGuid kGuidDispTimeout = {0x1B339674u, 0x328Du, 0x4283u, {0xA2, 0x00, 0x31, 0x71, 0xF1, 0x8D, 0x36, 0x39}};
@@ -893,10 +977,81 @@ int main() {
         CHECK(QueryApiImpl(&kGuidDispTimeout, &kGuidDispTimeout, &disp_to) == XGR_S_OK && disp_to != nullptr);
         using FnAcqDefer = XGameResult (SCARLETTX_GDK_CALLBACK*)(void*, void**);
         using FnCloseDefer = void (SCARLETTX_GDK_CALLBACK*)(void*, void*);
-        void* defer_h = nullptr;
-        CHECK(LoadVtableSlot<FnAcqDefer>(disp_to, 4 * 8)(disp_to, &defer_h) == XGR_S_OK && defer_h != nullptr);
-        LoadVtableSlot<FnCloseDefer>(disp_to, 5 * 8)(disp_to, defer_h);
+        {
+            constexpr uint64_t kDeferCanary = 0xDEADBEEFCAFEBABEull;
+            struct GuardedDeferralStack {
+                uint64_t pre[4];
+                void* handle_a;
+                uint64_t mid[4];
+                void* handle_b;
+                uint64_t post[4];
+            } guard{};
+            for (int i = 0; i < 4; ++i) {
+                guard.pre[i] = kDeferCanary;
+                guard.mid[i] = kDeferCanary;
+                guard.post[i] = kDeferCanary;
+            }
+            CHECK(LoadVtableSlot<FnAcqDefer>(disp_to, 3 * 8)(disp_to, nullptr) == XGR_E_POINTER);
+            CHECK(LoadVtableSlot<FnAcqDefer>(disp_to, 3 * 8)(disp_to, &guard.handle_a) == XGR_S_OK &&
+                  guard.handle_a != nullptr);
+            CHECK(LoadVtableSlot<FnAcqDefer>(disp_to, 3 * 8)(disp_to, &guard.handle_b) == XGR_S_OK &&
+                  guard.handle_b != nullptr && guard.handle_b != guard.handle_a);
+
+            // Close valid handles at slot 4, plus verify null/duplicate/stack pointers are safe no-ops
+            void* saved_a = guard.handle_a;
+            LoadVtableSlot<FnCloseDefer>(disp_to, 4 * 8)(disp_to, nullptr);
+            LoadVtableSlot<FnCloseDefer>(disp_to, 4 * 8)(disp_to, &guard.handle_a);
+            LoadVtableSlot<FnCloseDefer>(disp_to, 4 * 8)(disp_to, guard.handle_a);
+            LoadVtableSlot<FnCloseDefer>(disp_to, 4 * 8)(disp_to, saved_a);  // duplicate close safe
+            LoadVtableSlot<FnCloseDefer>(disp_to, 4 * 8)(disp_to, guard.handle_b);
+            for (int i = 0; i < 4; ++i) {
+                CHECK(guard.pre[i] == kDeferCanary && guard.mid[i] == kDeferCanary &&
+                      guard.post[i] == kDeferCanary);
+            }
+            CHECK(LoadVtableSlot<FnOther>(disp_to, 5 * 8)(disp_to, 0, 0, 0) == kENotImpl);
+        }
         CHECK(LoadVtableSlot<FnRelease>(disp_to, 0x10)(disp_to) == 0u);
+
+        // 8) SCARLETTX_LOCKHART=1 vs "0" across UninitializeApiImpl -> InitializeApiImplEx2 cycles
+        {
+            using FnGetDevType = uint32_t (SCARLETTX_GDK_CALLBACK*)(void*);
+            UninitializeApiImpl();
+            set_env("SCARLETTX_LOCKHART", "1");
+            CHECK(InitializeApiImplEx2(10002, 6322, 0x2, nullptr) == XGR_S_OK);
+            CHECK(XSystemGetDeviceType() == XSystemDeviceType_XboxScarlettLockhart);
+
+            void* an_s = nullptr;
+            CHECK(QueryApiImpl(&kGuidAnalytics, &kGuidAnalytics, &an_s) == XGR_S_OK && an_s != nullptr);
+            XSystemAnalyticsInfo ainfo_s{};
+            CHECK(LoadVtableSlot<FnAnalyticsInfo>(an_s, 0x18)(an_s, &ainfo_s) == &ainfo_s);
+            CHECK(std::strcmp(ainfo_s.form, "Xbox Series S") == 0);
+            CHECK(LoadVtableSlot<FnGetDevType>(an_s, 0x20)(an_s) == XSystemDeviceType_XboxScarlettLockhart);
+            CHECK(LoadVtableSlot<FnRelease>(an_s, 0x10)(an_s) == 0u);
+
+            void* sys_s = nullptr;
+            CHECK(QueryApiImpl(&kGuidE349BD1A, &kGuidSys2510, &sys_s) == XGR_S_OK && sys_s != nullptr);
+            char dev_id_s[64] = {};
+            size_t dev_id_s_used = 0;
+            CHECK(LoadVtableSlot<FnGetSysStr>(sys_s, 0x28)(sys_s, sizeof(dev_id_s), dev_id_s, &dev_id_s_used) == XGR_S_OK);
+            CHECK(std::strstr(dev_id_s, "LOCKHART") != nullptr);
+            CHECK(LoadVtableSlot<FnGetDevType>(sys_s, 9 * 8)(sys_s) == XSystemDeviceType_XboxScarlettLockhart);
+            CHECK(LoadVtableSlot<FnRelease>(sys_s, 0x10)(sys_s) == 0u);
+
+            // Switch back to "0" (Anaconda / Series X) and verify dynamic re-evaluation
+            UninitializeApiImpl();
+            set_env("SCARLETTX_LOCKHART", "0");
+            CHECK(InitializeApiImplEx2(10002, 6322, 0x2, nullptr) == XGR_S_OK);
+            CHECK(XSystemGetDeviceType() == XSystemDeviceType_XboxScarlettAnaconda);
+
+            void* an_x = nullptr;
+            CHECK(QueryApiImpl(&kGuidAnalytics, &kGuidAnalytics, &an_x) == XGR_S_OK && an_x != nullptr);
+            XSystemAnalyticsInfo ainfo_x{};
+            CHECK(LoadVtableSlot<FnAnalyticsInfo>(an_x, 0x18)(an_x, &ainfo_x) == &ainfo_x);
+            CHECK(std::strcmp(ainfo_x.form, "Xbox Series X") == 0);
+            CHECK(LoadVtableSlot<FnGetDevType>(an_x, 0x20)(an_x) == XSystemDeviceType_XboxScarlettAnaconda);
+            CHECK(LoadVtableSlot<FnRelease>(an_x, 0x10)(an_x) == 0u);
+            set_env("SCARLETTX_LOCKHART", "");
+        }
 
         // 7) Official GDK 2510 XPersistentLocalStorage / PLS ({F4FAF4D4} / {41A4E10C})
         const TestGuid kGuidPls = {0xF4FAF4D4u, 0x2D04u, 0x4FCEu, {0xB3, 0xE0, 0x47, 0x4A, 0x71, 0x3A, 0x3E, 0x84}};

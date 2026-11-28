@@ -1,9 +1,11 @@
 #include "scarlettx/media/codecs_abi.h"
 #include "sx_check.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 int main() {
@@ -186,6 +188,265 @@ int main() {
     SX_CHECK(XboxCodecGetVersion(&ver) == 0);
     SX_CHECK(ver.major == 2);
 
-    std::cout << "[test_codecs] All 16 XboxCodec APIs verified successfully!\n";
+    // 6. Spec-Complete 32-Lane GDeflate BTYPE=0 (Stored), BTYPE=1 (Fixed), & Multi-Tile BTYPE=2 (Dynamic > 64 KiB)
+    {
+        auto write_le32 = [](uint8_t* p, uint32_t v) {
+            p[0] = static_cast<uint8_t>(v & 0xFFu);
+            p[1] = static_cast<uint8_t>((v >> 8) & 0xFFu);
+            p[2] = static_cast<uint8_t>((v >> 16) & 0xFFu);
+            p[3] = static_cast<uint8_t>((v >> 24) & 0xFFu);
+        };
+        auto read_le32 = [](const uint8_t* p) -> uint32_t {
+            return static_cast<uint32_t>(p[0]) |
+                   (static_cast<uint32_t>(p[1]) << 8) |
+                   (static_cast<uint32_t>(p[2]) << 16) |
+                   (static_cast<uint32_t>(p[3]) << 24);
+        };
+
+        // 6a. BTYPE=0 (Uncompressed/Stored) single-tile odd length + multi-tile (> 64 KiB) round-trip
+        std::vector<uint8_t> stored_raw(140000);
+        uint32_t lcg = 0x9E3779B9u;
+        for (size_t i = 0; i < stored_raw.size(); ++i) {
+            lcg = lcg * 1664525u + 1013904223u;
+            stored_raw[i] = static_cast<uint8_t>(lcg >> 24);
+        }
+        std::vector<uint8_t> stored_comp(stored_raw.size() + 4096, 0);
+        size_t stored_comp_sz = 0;
+        SX_CHECK(XboxCodecGDeflateCompress32LaneStored(
+                     stored_raw.data(), stored_raw.size(), stored_comp.data(), stored_comp.size(), &stored_comp_sz) == 0);
+        stored_comp.resize(stored_comp_sz);
+        SX_CHECK(stored_comp[0] == 0x04u && stored_comp[1] == 0xFBu);
+        // 3 tiles: table_end = 8 + 3 * 4 = 20; tile 0 is 65536 B (two 32768 B stored blocks: BFINAL=0, BTYPE=0 -> 0b000)
+        SX_CHECK((read_le32(stored_comp.data() + 20u) & 0x6u) == 0x0u);
+
+        std::vector<uint8_t> stored_out(stored_raw.size(), 0);
+        size_t stored_written = 0;
+        SX_CHECK(XboxCodecGDeflateDecompress(
+                     stored_comp.data(), stored_comp.size(), stored_out.data(), stored_out.size(), &stored_written) == 0);
+        SX_CHECK(stored_written == stored_raw.size());
+        SX_CHECK(stored_out == stored_raw);
+
+        // 6b. BTYPE=1 (Fixed Huffman) multi-tile (> 64 KiB) round-trip
+        std::vector<uint8_t> fixed_raw(105000);
+        for (size_t i = 0; i < fixed_raw.size(); ++i) {
+            fixed_raw[i] = static_cast<uint8_t>((i % 37 < 24) ? ((i / 37) & 0x7Fu) : ((i * 19u) & 0xFFu));
+        }
+        std::vector<uint8_t> fixed_comp(fixed_raw.size() + 8192, 0);
+        size_t fixed_comp_sz = 0;
+        SX_CHECK(XboxCodecGDeflateCompress32Lane(
+                     fixed_raw.data(), fixed_raw.size(), fixed_comp.data(), fixed_comp.size(), &fixed_comp_sz) == 0);
+        fixed_comp.resize(fixed_comp_sz);
+        SX_CHECK((read_le32(fixed_comp.data() + 16u) & 0x7u) == 0x3u);  // 2 tiles: table_end = 16, BTYPE=1
+
+        std::vector<uint8_t> fixed_out(fixed_raw.size(), 0);
+        size_t fixed_written = 0;
+        SX_CHECK(XboxCodecGDeflateDecompress(
+                     fixed_comp.data(), fixed_comp.size(), fixed_out.data(), fixed_out.size(), &fixed_written) == 0);
+        SX_CHECK(fixed_written == fixed_raw.size());
+        SX_CHECK(fixed_out == fixed_raw);
+
+        // 6c. BTYPE=2 (Dynamic Huffman) multi-tile (> 64 KiB, 3 tiles: skewed symbols + LZ77 + literal-heavy)
+        std::vector<uint8_t> dyn_raw(180000);
+        for (size_t i = 0; i < dyn_raw.size(); ++i) {
+            if (i < 65536u) {
+                // Tile 0: heavily skewed power-law symbol distribution + long LZ77 matches (exercises >15b length clamping)
+                const size_t mod = i % 96u;
+                dyn_raw[i] = (mod < 56u) ? static_cast<uint8_t>('A' + (mod & 3u))
+                           : (mod < 84u) ? static_cast<uint8_t>('0' + (mod % 10u))
+                                         : static_cast<uint8_t>((i * 31u + (i >> 8)) & 0xFFu);
+            } else if (i < 131072u) {
+                // Tile 1: non-repeating 2-byte Permuted LCG (exercises empty/minimal distance tree + Dynamic Lit tree)
+                const uint32_t v = static_cast<uint32_t>(i - 65536u);
+                dyn_raw[i] = static_cast<uint8_t>(((v * 73u) ^ (v >> 5)) & 0x3Fu);
+            } else {
+                // Tile 2: structured mesh/shader record stream with varying match distances up to 32 KiB
+                const size_t local = i - 131072u;
+                dyn_raw[i] = (local % 48u < 36u) ? static_cast<uint8_t>((local / 256u) ^ (local % 12u))
+                                                 : static_cast<uint8_t>((local * 13u + 0x5Au) & 0xFFu);
+            }
+        }
+
+        size_t dyn_needed = 0;
+        SX_CHECK(XboxCodecGDeflateCompress32LaneDynamic(dyn_raw.data(), dyn_raw.size(), nullptr, 0, &dyn_needed) < 0);
+        SX_CHECK(dyn_needed > 20u);
+        std::vector<uint8_t> dyn_comp(dyn_needed, 0);
+        size_t dyn_comp_sz = 0;
+        SX_CHECK(XboxCodecGDeflateCompress32LaneDynamic(
+                     dyn_raw.data(), dyn_raw.size(), dyn_comp.data(), dyn_comp.size(), &dyn_comp_sz) == 0);
+        SX_CHECK(dyn_comp_sz == dyn_needed && dyn_comp_sz < dyn_raw.size() / 2u);
+        SX_CHECK(dyn_comp[0] == 0x04u && dyn_comp[1] == 0xFBu);
+        // 3 tiles: table_end = 20; lane 0 word 0 low 3 bits = 0b101 (BFINAL=1, BTYPE=2)
+        SX_CHECK((read_le32(dyn_comp.data() + 20u) & 0x7u) == 0x5u);
+
+        std::vector<uint8_t> dyn_decomp(dyn_raw.size(), 0);
+        size_t dyn_written = 0;
+        SX_CHECK(XboxCodecGDeflateDecompress(
+                     dyn_comp.data(), dyn_comp.size(), dyn_decomp.data(), dyn_decomp.size(), &dyn_written) == 0);
+        SX_CHECK(dyn_written == dyn_raw.size());
+        SX_CHECK(dyn_decomp == dyn_raw);
+
+        // 6d. Concurrent multi-tile stress on the persistent Win32 Threadpool worker pool
+        std::atomic<bool> stress_ok{true};
+        std::vector<std::thread> callers;
+        constexpr size_t kThreads = 8u;
+        callers.reserve(kThreads);
+        for (size_t tid = 0; tid < kThreads; ++tid) {
+            callers.emplace_back([&, tid]() {
+                std::vector<uint8_t> local_out(dyn_raw.size(), 0);
+                for (size_t iter = 0; iter < 16u; ++iter) {
+                    const size_t mode = (tid + iter) % 3u;
+                    size_t got = 0;
+                    if (mode == 0u) {
+                        if (XboxCodecGDeflateDecompress(
+                                dyn_comp.data(), dyn_comp.size(), local_out.data(), dyn_raw.size(), &got) != 0 ||
+                            got != dyn_raw.size() ||
+                            std::memcmp(local_out.data(), dyn_raw.data(), dyn_raw.size()) != 0) {
+                            stress_ok.store(false, std::memory_order_release);
+                            return;
+                        }
+                    } else if (mode == 1u) {
+                        if (XboxCodecGDeflateDecompress(
+                                fixed_comp.data(), fixed_comp.size(), local_out.data(), fixed_raw.size(), &got) != 0 ||
+                            got != fixed_raw.size() ||
+                            std::memcmp(local_out.data(), fixed_raw.data(), fixed_raw.size()) != 0) {
+                            stress_ok.store(false, std::memory_order_release);
+                            return;
+                        }
+                    } else {
+                        if (XboxCodecGDeflateDecompress(
+                                stored_comp.data(), stored_comp.size(), local_out.data(), stored_raw.size(), &got) != 0 ||
+                            got != stored_raw.size() ||
+                            std::memcmp(local_out.data(), stored_raw.data(), stored_raw.size()) != 0) {
+                            stress_ok.store(false, std::memory_order_release);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& th : callers) th.join();
+        SX_CHECK(stress_ok.load(std::memory_order_acquire));
+
+        // 6e. Fail-closed (< 0) rejection of corrupt Huffman tables, bad stored LEN, BTYPE=3, and truncated bitstreams
+        std::vector<uint8_t> reject_dst(dyn_raw.size(), 0xCCu);
+        size_t reject_written = 0;
+
+        // (i) Reserved BTYPE=3 on Lane 0 header (draft-uralsky-gdeflate)
+        {
+            std::vector<uint8_t> bad_btype3 = dyn_comp;
+            const uint32_t w0 = (read_le32(bad_btype3.data() + 20u) & ~0x7u) | 0x7u;
+            write_le32(bad_btype3.data() + 20u, w0);
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         bad_btype3.data(), bad_btype3.size(), reject_dst.data(), reject_dst.size(), &reject_written) < 0);
+        }
+
+        // (ii) Corrupt BTYPE=0 LEN in Lane 0 header (LEN mismatch vs tile output capacity)
+        {
+            std::vector<uint8_t> bad_stored = stored_comp;
+            // Tile 0 starts with BFINAL=1, BTYPE=0, LEN=16 (underruns 65536 B tile capacity -> fail-closed!)
+            const uint32_t forged_hdr = 0x1u | (16u << 3u);
+            write_le32(bad_stored.data() + 20u, forged_hdr);
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         bad_stored.data(), bad_stored.size(), reject_dst.data(), stored_raw.size(), &reject_written) < 0);
+        }
+
+        // Helper to build a single-tile 0x04 0xFB container with custom 32-bit interleaved words
+        auto make_custom_single_tile = [&](uint32_t uncomp_len, const std::vector<uint32_t>& words) {
+            std::vector<uint8_t> buf(12u + words.size() * 4u, 0);
+            buf[0] = 0x04u;
+            buf[1] = 0xFBu;
+            buf[2] = 1u;
+            buf[3] = 0u;
+            write_le32(buf.data() + 4u, 1u | (uncomp_len << 2u));
+            write_le32(buf.data() + 8u, static_cast<uint32_t>(words.size() * 4u));
+            for (size_t i = 0; i < words.size(); ++i) {
+                write_le32(buf.data() + 12u + i * 4u, words[i]);
+            }
+            return buf;
+        };
+
+        // (iii) Oversubscribed BTYPE=2 cl_tree (draft-uralsky-gdeflate Lane-0 header):
+        //       Lane 0: bits 0..2 = 0x5 (BFINAL=1,BTYPE=2), bits 3..16 = 0 (HLIT=257,HDIST=1,HCLEN=4), bits 17..19 = cl[0]=1;
+        //       Lanes 1..3 (no 3-bit block header on lanes 1..31!): bits 0..2 = cl[i] = 1 -> Kraft = 4 * 1/2 = 2 > 1!
+        {
+            std::vector<uint32_t> words(33, 0u);
+            words[0] = 0x5u | (1u << 17u);
+            words[1] = 1u;
+            words[2] = 1u;
+            words[3] = 1u;
+            const auto oversub = make_custom_single_tile(64u, words);
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         oversub.data(), oversub.size(), reject_dst.data(), 64u, &reject_written) < 0);
+        }
+
+        // (iv) Incomplete / under-subscribed BTYPE=2 cl_tree: 2 symbols given length 2, rest 0 (Kraft = 2 * 1/4 = 1/2 < 1)
+        {
+            std::vector<uint32_t> words(33, 0u);
+            words[0] = 0x5u | (2u << 17u);
+            words[1] = 2u;
+            words[2] = 0u;
+            words[3] = 0u;
+            const auto incomp = make_custom_single_tile(64u, words);
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         incomp.data(), incomp.size(), reject_dst.data(), 64u, &reject_written) < 0);
+        }
+
+        // (v) Truncated BTYPE=2 bitstream: both raw cut AND forged-header tile missing trailing refill words
+        {
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         dyn_comp.data(), dyn_comp.size() - 16u, reject_dst.data(), dyn_raw.size(), &reject_written) < 0);
+
+            // Forge lastTileCompSize in tileOffsets[0] to match a 16-byte truncated last tile payload
+            std::vector<uint8_t> forged_trunc(dyn_comp.begin(), dyn_comp.end() - 16);
+            const uint32_t orig_last_sz = read_le32(dyn_comp.data() + 8u);
+            write_le32(forged_trunc.data() + 8u, orig_last_sz - 16u);
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         forged_trunc.data(), forged_trunc.size(), reject_dst.data(), dyn_raw.size(), &reject_written) < 0);
+        }
+
+        // (vi) Independent hand-assembled IETF draft-uralsky-gdeflate BTYPE=0 & BTYPE=1 bitstreams
+        //      (constructed directly from spec bit positions without calling any encoder):
+        {
+            // 1. Hand-assembled draft-uralsky-gdeflate BTYPE=0 32-byte payload ("0123456789ABCDEFGHIJKLMNOPQRSTUV"):
+            //    Round 0: Refill loads words[0..31]; Lane 0 reads 3-bit BFINAL=1, BTYPE=00 (0x1 at bits 0..2).
+            //    Round 1: Lane 0 (bitcnt=29<32) refills words[32]=0; Lane 0 reads unaligned 16-bit LEN=32 at bits 3..18 (no NLEN!).
+            //    Round 2: All 32 lanes have bitcnt>=32; Lane 0 reads byte[0] at bits 19..26, Lanes 1..31 read byte[l] at bits 0..7!
+            const char expected32[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+            std::vector<uint32_t> spec_b0_words(33, 0u);
+            spec_b0_words[0] = 0x1u | (32u << 3u) | (static_cast<uint32_t>(static_cast<uint8_t>(expected32[0])) << 19u);
+            for (uint32_t l = 1u; l < 32u; ++l) {
+                spec_b0_words[l] = static_cast<uint32_t>(static_cast<uint8_t>(expected32[l]));
+            }
+            spec_b0_words[32] = 0u;
+            const auto indep_b0 = make_custom_single_tile(32u, spec_b0_words);
+            std::vector<uint8_t> indep_b0_out(32u, 0);
+            size_t indep_b0_written = 0;
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         indep_b0.data(), indep_b0.size(), indep_b0_out.data(), 32u, &indep_b0_written) == 0);
+            SX_CHECK(indep_b0_written == 32u);
+            SX_CHECK(std::memcmp(indep_b0_out.data(), expected32, 32u) == 0);
+
+            // 2. Hand-assembled draft-uralsky-gdeflate BTYPE=1 4-byte LZ77 payload ("AAAA"):
+            //    Round 0: Lane 0 reads 3-bit BFINAL=1, BTYPE=01 (0x3 at bits 0..2); refills words[32] before Round 1.
+            //    Round 1: Lane 0 reads Lit('A'=65 -> Fixed 0x71 reversed 8b = 0x8E) at bits 3..10;
+            //             Lane 1 reads Match(sym=257 len=3 -> Fixed 0x01 reversed 7b = 0x40) at bits 0..6 (schedules dist in Round 2);
+            //             Lane 2 reads EOB(sym=256 -> Fixed 0x00 reversed 7b = 0x00) at bits 0..6 (lanes 3..31 frozen!).
+            //    Round 2 (Trailing Distance Round): Lanes 1 & 2 (bitcnt=25<32) refill words[33..34]=0;
+            //             Lane 1 reads Dist(sym=0 dist=1 -> 5b 0x00) at bits 7..11 -> copies 3 'A's -> "AAAA"!
+            std::vector<uint32_t> spec_b1_words(35, 0u);
+            spec_b1_words[0] = 0x3u | (0x8Eu << 3u);
+            spec_b1_words[1] = 0x40u;  // bits 0..6 = sym 257 (len=3), bits 7..11 = dist_sym 0 (dist=1)
+            spec_b1_words[2] = 0x00u;  // bits 0..6 = sym 256 (EOB)
+            const auto indep_b1 = make_custom_single_tile(4u, spec_b1_words);
+            std::vector<uint8_t> indep_b1_out(4u, 0);
+            size_t indep_b1_written = 0;
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         indep_b1.data(), indep_b1.size(), indep_b1_out.data(), 4u, &indep_b1_written) == 0);
+            SX_CHECK(indep_b1_written == 4u);
+            SX_CHECK(std::memcmp(indep_b1_out.data(), "AAAA", 4u) == 0);
+        }
+    }
+
+    std::cout << "[test_codecs] All XboxCodec APIs + 32-lane BTYPE=0/1/2 GDeflate & persistent pool verified!\n";
     return 0;
 }

@@ -1,12 +1,19 @@
 // Drives the guest-facing XAudio2 objects the way a title does: through raw
 // vtable slots, with callback objects implemented here.
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <thread>
 #include <vector>
 
+#include "scarlettx/audio/acphal_abi.h"
 #include "scarlettx/audio/xaudio2_abi.h"
 
 #if defined(_WIN32)
@@ -401,13 +408,499 @@ int RunSilentQueue() {
     return 0;
 }
 
+// Concurrent realtime SubmitSourceBuffer + FlushSourceBuffers churn on both XMA2 (0x0166)
+// and PCM16 voices while actively playing (zero Sleep(), pure Win32 event synchronization).
+struct ChurnCallback {
+    static constexpr uintptr_t kContextTag = 0x5CA20000ull;
+    static constexpr size_t kMaxBuffers = 512;
+
+    void* const* vtbl = nullptr;
+    std::atomic<uint32_t> buffer_starts{0};
+    std::atomic<uint32_t> buffer_ends{0};
+    std::atomic<bool> invalid_context{false};
+    std::array<std::atomic<uint32_t>, kMaxBuffers> end_seen{};
+    HANDLE wake = nullptr;
+
+    explicit ChurnCallback(void* const* v)
+        : vtbl(v), wake(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
+        for (auto& c : end_seen) c.store(0u, std::memory_order_relaxed);
+    }
+    ~ChurnCallback() {
+        if (wake) CloseHandle(wake);
+    }
+    ChurnCallback(const ChurnCallback&) = delete;
+    ChurnCallback& operator=(const ChurnCallback&) = delete;
+
+    static uint32_t DecodeId(void* ctx, bool* ok) {
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(ctx);
+        if ((raw & ~uintptr_t{0xFFFFu}) != kContextTag) {
+            *ok = false;
+            return 0u;
+        }
+        const uint32_t id = static_cast<uint32_t>(raw & 0xFFFFu);
+        if (id == 0u || id >= kMaxBuffers) {
+            *ok = false;
+            return 0u;
+        }
+        *ok = true;
+        return id;
+    }
+};
+
+void WINAPI ChurnPassStart(ChurnCallback*, uint32_t) {}
+void WINAPI ChurnPassEnd(ChurnCallback*) {}
+void WINAPI ChurnStreamEnd(ChurnCallback* c) {
+    if (c->wake) SetEvent(c->wake);
+}
+void WINAPI ChurnBufferStart(ChurnCallback* c, void* ctx) {
+    bool ok = false;
+    (void)ChurnCallback::DecodeId(ctx, &ok);
+    if (!ok) c->invalid_context.store(true, std::memory_order_release);
+    c->buffer_starts.fetch_add(1u, std::memory_order_acq_rel);
+    if (c->wake) SetEvent(c->wake);
+}
+void WINAPI ChurnBufferEnd(ChurnCallback* c, void* ctx) {
+    bool ok = false;
+    const uint32_t id = ChurnCallback::DecodeId(ctx, &ok);
+    if (!ok || c->end_seen[id].fetch_add(1u, std::memory_order_acq_rel) != 0u) {
+        c->invalid_context.store(true, std::memory_order_release);
+    }
+    c->buffer_ends.fetch_add(1u, std::memory_order_acq_rel);
+    if (c->wake) SetEvent(c->wake);
+}
+void WINAPI ChurnLoopEnd(ChurnCallback* c, void* ctx) {
+    bool ok = false;
+    (void)ChurnCallback::DecodeId(ctx, &ok);
+    if (!ok) c->invalid_context.store(true, std::memory_order_release);
+    if (c->wake) SetEvent(c->wake);
+}
+void WINAPI ChurnVoiceError(ChurnCallback* c, void* ctx, int32_t) {
+    bool ok = false;
+    (void)ChurnCallback::DecodeId(ctx, &ok);
+    if (!ok) c->invalid_context.store(true, std::memory_order_release);
+}
+void* const kChurnCallbackVtbl[] = {
+    reinterpret_cast<void*>(&ChurnPassStart),
+    reinterpret_cast<void*>(&ChurnPassEnd),
+    reinterpret_cast<void*>(&ChurnStreamEnd),
+    reinterpret_cast<void*>(&ChurnBufferStart),
+    reinterpret_cast<void*>(&ChurnBufferEnd),
+    reinterpret_cast<void*>(&ChurnLoopEnd),
+    reinterpret_cast<void*>(&ChurnVoiceError),
+};
+
+int RunRealtimeFlushChurn(bool force_silent) {
+    _putenv_s("SCARLETTX_XAUDIO2_SILENT", force_silent ? "1" : "0");
+
+    void* engine = nullptr;
+    SX_CHECK(XAudio2Create(&engine, 0, 0) == 0 && engine != nullptr);
+
+    void* mastering = nullptr;
+    SX_CHECK(VCall<int32_t, void**, uint32_t, uint32_t, uint32_t, const wchar_t*, const void*, uint32_t>(
+                 engine, 7, &mastering, 2u, 48000u, 0u, nullptr, nullptr, 6u) == 0);
+
+    #pragma pack(push, 1)
+    struct GuestXma2Fmt {
+        uint16_t tag;
+        uint16_t channels;
+        uint32_t rate;
+        uint32_t avg_bytes;
+        uint16_t block_align;
+        uint16_t bits;
+        uint16_t cb_size;
+        uint16_t num_streams;
+        uint32_t channel_mask;
+        uint32_t samples_encoded;
+        uint32_t bytes_per_block;
+        uint32_t play_begin, play_length, loop_begin, loop_length;
+        uint8_t loop_count, encoder_ver;
+        uint16_t block_count;
+    };
+    #pragma pack(pop)
+
+    GuestXma2Fmt xfmt{};
+    xfmt.tag = 0x0166u;
+    xfmt.channels = 2;
+    xfmt.rate = 48000;
+    xfmt.bits = 16;
+    xfmt.cb_size = 34;
+    xfmt.num_streams = 1;
+    xfmt.bytes_per_block = 2048;
+    xfmt.encoder_ver = 4;
+    xfmt.block_count = 1;
+
+    const WaveFormat pfmt = {1, 2, 48000, 48000 * 4, 4, 16, 0};
+
+    ChurnCallback xma_cb{kChurnCallbackVtbl};
+    ChurnCallback pcm_cb{kChurnCallbackVtbl};
+    void* xma_voice = nullptr;
+    void* pcm_voice = nullptr;
+    void* xma_nocb_voice = nullptr;
+
+    SX_CHECK(VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const void*>(
+                 engine, 5, &xma_voice, &xfmt, 0u, 2.0f, &xma_cb, nullptr, nullptr) == 0);
+    SX_CHECK(VCall<int32_t, void**, const WaveFormat*, uint32_t, float, void*, const VoiceSends*, const void*>(
+                 engine, 5, &pcm_voice, &pfmt, 0u, 2.0f, &pcm_cb, nullptr, nullptr) == 0);
+    // Also exercise an XMA2 voice without a guest callback to verify internal slot retirement.
+    SX_CHECK(VCall<int32_t, void**, const void*, uint32_t, float, void*, const VoiceSends*, const void*>(
+                 engine, 5, &xma_nocb_voice, &xfmt, 0u, 2.0f, nullptr, nullptr, nullptr) == 0);
+
+    // ~42.6 ms (2048 stereo frames at 48 kHz) per buffer so the front buffer remains actively
+    // playing on the mixing thread while subsequent queued buffers are flushed!
+    constexpr uint32_t kBufFrames = 2048;
+    std::vector<float> src_wave(kBufFrames * 2);
+    for (uint32_t i = 0; i < kBufFrames; ++i) {
+        const float t = static_cast<float>(i) / 48000.0f;
+        src_wave[i * 2 + 0] = 0.25f * std::sin(2.0f * 3.14159265f * 330.0f * t);
+        src_wave[i * 2 + 1] = 0.25f * std::cos(2.0f * 3.14159265f * 440.0f * t);
+    }
+    uint32_t xma_bytes = 0;
+    (void)Xma2EncodeMdctBlock(src_wave.data(), kBufFrames, 2, nullptr, 0, &xma_bytes);
+    std::vector<uint8_t> xma_pkt(xma_bytes, 0);
+    SX_CHECK(Xma2EncodeMdctBlock(src_wave.data(), kBufFrames, 2, xma_pkt.data(), xma_bytes, &xma_bytes) == 0);
+    std::vector<int16_t> pcm_pkt(kBufFrames * 2, 1024);
+
+    SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(xma_voice, 19, 0u, 0u) == 0);
+    SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(pcm_voice, 19, 0u, 0u) == 0);
+    SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(xma_nocb_voice, 19, 0u, 0u) == 0);
+
+    HANDLE req_flush_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE ack_flush_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    SX_CHECK(req_flush_ev != nullptr && ack_flush_ev != nullptr);
+
+    std::atomic<bool> stop_worker{false};
+    std::atomic<bool> worker_failed{false};
+
+    // Dedicated flusher thread racing FlushSourceBuffers + GetState against realtime playback & submission.
+    std::thread flusher([&] {
+        for (;;) {
+            if (WaitForSingleObject(req_flush_ev, 5000) != WAIT_OBJECT_0) {
+                worker_failed.store(true, std::memory_order_release);
+                break;
+            }
+            if (stop_worker.load(std::memory_order_acquire)) break;
+
+            VoiceState st{};
+            VCall<void, VoiceState*, uint32_t>(xma_voice, 25, &st, 0x0100u);
+            if (st.context != nullptr) {
+                bool ok = false;
+                (void)ChurnCallback::DecodeId(st.context, &ok);
+                if (!ok) worker_failed.store(true, std::memory_order_release);
+            }
+            if (VCall<int32_t>(xma_voice, 22) < 0 ||
+                VCall<int32_t>(pcm_voice, 22) < 0 ||
+                VCall<int32_t>(xma_nocb_voice, 22) < 0) {
+                worker_failed.store(true, std::memory_order_release);
+            }
+            VCall<void, VoiceState*, uint32_t>(pcm_voice, 25, &st, 0x0100u);
+            if (st.context != nullptr) {
+                bool ok = false;
+                (void)ChurnCallback::DecodeId(st.context, &ok);
+                if (!ok) worker_failed.store(true, std::memory_order_release);
+            }
+            SetEvent(ack_flush_ev);
+        }
+    });
+
+    constexpr uint32_t kRounds = 20u;
+    constexpr uint32_t kBatchSize = 6u;
+    uint32_t xma_submitted = 0u;
+    uint32_t pcm_submitted = 0u;
+
+    for (uint32_t round = 0; round < kRounds; ++round) {
+        for (uint32_t j = 0; j < kBatchSize; ++j) {
+            ++xma_submitted;
+            Buffer xb{};
+            xb.audio_bytes = xma_bytes;
+            xb.audio_data = xma_pkt.data();
+            xb.context = reinterpret_cast<void*>(ChurnCallback::kContextTag | xma_submitted);
+            SX_CHECK(VCall<int32_t, const Buffer*, const void*>(xma_voice, 21, &xb, nullptr) == 0);
+            SX_CHECK(VCall<int32_t, const Buffer*, const void*>(xma_nocb_voice, 21, &xb, nullptr) == 0);
+
+            ++pcm_submitted;
+            Buffer pb{};
+            pb.audio_bytes = static_cast<uint32_t>(pcm_pkt.size() * sizeof(int16_t));
+            pb.audio_data = reinterpret_cast<const uint8_t*>(pcm_pkt.data());
+            pb.context = reinterpret_cast<void*>(ChurnCallback::kContextTag | pcm_submitted);
+            SX_CHECK(VCall<int32_t, const Buffer*, const void*>(pcm_voice, 21, &pb, nullptr) == 0);
+        }
+
+        if (round == 0u) {
+            // Ensure realtime mixing has actively started reading the front buffer before flushing!
+            SX_CHECK(WaitForEvent(xma_cb.wake, [&] { return xma_cb.buffer_starts.load() >= 1u; }));
+            SX_CHECK(WaitForEvent(pcm_cb.wake, [&] { return pcm_cb.buffer_starts.load() >= 1u; }));
+        }
+
+        SetEvent(req_flush_ev);
+        // Submit one more buffer concurrently with the in-flight FlushSourceBuffers call!
+        {
+            ++xma_submitted;
+            Buffer xb{};
+            xb.audio_bytes = xma_bytes;
+            xb.audio_data = xma_pkt.data();
+            xb.context = reinterpret_cast<void*>(ChurnCallback::kContextTag | xma_submitted);
+            SX_CHECK(VCall<int32_t, const Buffer*, const void*>(xma_voice, 21, &xb, nullptr) == 0);
+
+            ++pcm_submitted;
+            Buffer pb{};
+            pb.audio_bytes = static_cast<uint32_t>(pcm_pkt.size() * sizeof(int16_t));
+            pb.audio_data = reinterpret_cast<const uint8_t*>(pcm_pkt.data());
+            pb.context = reinterpret_cast<void*>(ChurnCallback::kContextTag | pcm_submitted);
+            SX_CHECK(VCall<int32_t, const Buffer*, const void*>(pcm_voice, 21, &pb, nullptr) == 0);
+        }
+        SX_CHECK(WaitForSingleObject(ack_flush_ev, 5000) == WAIT_OBJECT_0);
+        // Wait until flushed buffers have drained down so queue never exceeds XAUDIO2_MAX_QUEUED_BUFFERS (64).
+        SX_CHECK(WaitForEvent(xma_cb.wake, [&] { return xma_submitted - xma_cb.buffer_ends.load() <= 8u; }));
+        SX_CHECK(WaitForEvent(pcm_cb.wake, [&] { return pcm_submitted - pcm_cb.buffer_ends.load() <= 8u; }));
+    }
+
+    stop_worker.store(true, std::memory_order_release);
+    SetEvent(req_flush_ev);
+    flusher.join();
+    CloseHandle(req_flush_ev);
+    CloseHandle(ack_flush_ev);
+    SX_CHECK(!worker_failed.load(std::memory_order_acquire));
+
+    // Stop and flush remaining active front buffers; every submitted buffer must fire OnBufferEnd exactly once.
+    SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(xma_voice, 20, 0u, 0u) == 0);
+    SX_CHECK(VCall<int32_t>(xma_voice, 22) == 0);
+    SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(pcm_voice, 20, 0u, 0u) == 0);
+    SX_CHECK(VCall<int32_t>(pcm_voice, 22) == 0);
+    SX_CHECK(VCall<int32_t, uint32_t, uint32_t>(xma_nocb_voice, 20, 0u, 0u) == 0);
+    SX_CHECK(VCall<int32_t>(xma_nocb_voice, 22) == 0);
+
+    SX_CHECK(WaitForEvent(xma_cb.wake, [&] { return xma_cb.buffer_ends.load() == xma_submitted; }));
+    SX_CHECK(WaitForEvent(pcm_cb.wake, [&] { return pcm_cb.buffer_ends.load() == pcm_submitted; }));
+    SX_CHECK(!xma_cb.invalid_context.load(std::memory_order_acquire));
+    SX_CHECK(!pcm_cb.invalid_context.load(std::memory_order_acquire));
+
+    for (uint32_t id = 1u; id <= xma_submitted; ++id) {
+        SX_CHECK(xma_cb.end_seen[id].load(std::memory_order_acquire) == 1u);
+    }
+    for (uint32_t id = 1u; id <= pcm_submitted; ++id) {
+        SX_CHECK(pcm_cb.end_seen[id].load(std::memory_order_acquire) == 1u);
+    }
+
+    VoiceState final_state{};
+    VCall<void, VoiceState*, uint32_t>(xma_voice, 25, &final_state, 0u);
+    SX_CHECK(final_state.queued == 0u && final_state.context == nullptr);
+    VCall<void, VoiceState*, uint32_t>(pcm_voice, 25, &final_state, 0u);
+    SX_CHECK(final_state.queued == 0u && final_state.context == nullptr);
+
+    VCall<void>(xma_nocb_voice, 18);
+    VCall<void>(pcm_voice, 18);
+    VCall<void>(xma_voice, 18);
+    VCall<void>(mastering, 18);
+    SX_CHECK(VCall<uint32_t>(engine, 2) == 0u);
+    return 0;
+}
+
+// Dynamically loads AcpHal.dll from SCARLETTX_BINARY_DIR and stresses ApuCreateHeap(1 MB)
+// with > 200 ApuAlloc/ApuFree iterations (> 12 MB cumulative) plus fragmentation + coalescing.
+int RunAcpHalHeapChurn() {
+    const auto dll_path = std::filesystem::path(SCARLETTX_BINARY_DIR) / "AcpHal.dll";
+    HMODULE mod = LoadLibraryW(dll_path.c_str());
+    SX_CHECK(mod != nullptr);
+
+    struct ModGuard {
+        HMODULE m;
+        ~ModGuard() {
+            if (m) FreeLibrary(m);
+        }
+    } guard{mod};
+
+    using FnCreateHeap = int32_t(SCARLETTX_ACP_CALL*)(uint32_t, uint32_t);
+    using FnAlloc = int32_t(SCARLETTX_ACP_CALL*)(void**, uint32_t*, uint32_t, uint32_t, uint32_t);
+    using FnFree = int32_t(SCARLETTX_ACP_CALL*)(void*);
+    using FnGetState = int32_t(SCARLETTX_ACP_CALL*)(APU_HEAP_STATE*, uint32_t);
+    using FnIsValid = int32_t(SCARLETTX_ACP_CALL*)(const void*, uint32_t);
+    using FnMapPa = void*(SCARLETTX_ACP_CALL*)(uint32_t);
+    using FnMapVa = uint32_t(SCARLETTX_ACP_CALL*)(const void*);
+    using FnAllocShape = int32_t(SCARLETTX_ACP_CALL*)(ACP_SHAPE_CONTEXT_COUNTS*);
+    using FnReleaseShape = int32_t(SCARLETTX_ACP_CALL*)(void);
+
+    const auto pCreateHeap =
+        reinterpret_cast<FnCreateHeap>(reinterpret_cast<void*>(GetProcAddress(mod, "ApuCreateHeap")));
+    const auto pAlloc =
+        reinterpret_cast<FnAlloc>(reinterpret_cast<void*>(GetProcAddress(mod, "ApuAlloc")));
+    const auto pFree =
+        reinterpret_cast<FnFree>(reinterpret_cast<void*>(GetProcAddress(mod, "ApuFree")));
+    const auto pGetState =
+        reinterpret_cast<FnGetState>(reinterpret_cast<void*>(GetProcAddress(mod, "ApuHeapGetState")));
+    const auto pIsValid =
+        reinterpret_cast<FnIsValid>(reinterpret_cast<void*>(GetProcAddress(mod, "ApuIsVirtualAddressValid")));
+    const auto pMapPa =
+        reinterpret_cast<FnMapPa>(reinterpret_cast<void*>(GetProcAddress(mod, "ApuMapApuAddress")));
+    const auto pMapVa =
+        reinterpret_cast<FnMapVa>(reinterpret_cast<void*>(GetProcAddress(mod, "ApuMapVirtualAddress")));
+    const auto pAllocShape =
+        reinterpret_cast<FnAllocShape>(reinterpret_cast<void*>(GetProcAddress(mod, "AcpHalAllocateShapeContexts")));
+    const auto pReleaseShape =
+        reinterpret_cast<FnReleaseShape>(reinterpret_cast<void*>(GetProcAddress(mod, "AcpHalReleaseShapeContexts")));
+
+    SX_CHECK(pCreateHeap && pAlloc && pFree && pGetState && pIsValid && pMapPa && pMapVa &&
+             pAllocShape && pReleaseShape);
+
+    constexpr uint32_t kOneMb = 1024u * 1024u;
+    SX_CHECK(pCreateHeap(kOneMb, 0u) == 0);
+
+    APU_HEAP_STATE hstate{};
+    SX_CHECK(pGetState(&hstate, 0u) == 0);
+    SX_CHECK(hstate.bytesAllocated == 0u);
+    SX_CHECK(hstate.bytesFree == kOneMb);
+    SX_CHECK(hstate.maximumBlockSizeAvailable == kOneMb);
+    SX_CHECK(hstate.allocationCount == 0u);
+
+    struct LiveSlot {
+        void* va = nullptr;
+        uint32_t pa = 0;
+        uint32_t size = 0;
+    };
+    constexpr size_t kWindow = 4;
+    std::array<LiveSlot, kWindow> live{};
+
+    const uint32_t kSizes[] = {65536u, 49152u, 98304u, 73728u, 81920u, 57344u};
+    const uint32_t kAligns[] = {64u, 96u, 65536u, 192u, 4096u, 1000u, 32768u, 300u};
+
+    uint64_t cumulative_bytes = 0;
+    constexpr uint32_t kIterations = 240u;
+    for (uint32_t i = 0; i < kIterations; ++i) {
+        LiveSlot& slot = live[i % kWindow];
+        if (slot.va != nullptr) {
+            void* old_va = slot.va;
+            const uint32_t old_pa = slot.pa;
+            SX_CHECK(pFree(old_va) == 0);
+            // Freed virtual and physical addresses must immediately stop validating and mapping!
+            SX_CHECK(pIsValid(old_va, 1u) == 0);
+            SX_CHECK(pMapVa(old_va) == 0u);
+            SX_CHECK(pMapPa(old_pa) == nullptr);
+            // Double-free must fail cleanly with E_INVALIDARG.
+            SX_CHECK(pFree(old_va) < 0);
+            slot = LiveSlot{};
+        }
+
+        const uint32_t req_size = kSizes[i % (sizeof(kSizes) / sizeof(kSizes[0]))];
+        const uint32_t req_align = kAligns[i % (sizeof(kAligns) / sizeof(kAligns[0]))];
+        const uint32_t exp_align = std::bit_ceil(std::max<uint32_t>(64u, req_align));
+
+        void* va = nullptr;
+        uint32_t pa = 0u;
+        SX_CHECK(pAlloc(&va, &pa, req_size, req_align, 0u) == 0);
+        SX_CHECK(va != nullptr && pa != 0u);
+        SX_CHECK((reinterpret_cast<uintptr_t>(va) % exp_align) == 0u);
+        SX_CHECK((pa % exp_align) == 0u);
+        // Every physical span must stay inside the 1 MB [0x10000000, 0x10100000) heap!
+        SX_CHECK(pa >= 0x10000000u && (pa - 0x10000000u) + req_size <= kOneMb);
+
+        std::memset(va, static_cast<int>(i & 0xFFu), req_size);
+        SX_CHECK(pIsValid(va, req_size) == 1);
+        SX_CHECK(pIsValid(va, req_size + 1u) == 0);
+        SX_CHECK(pIsValid(static_cast<const uint8_t*>(va) + req_size, 1u) == 0);
+        SX_CHECK(pMapVa(va) == pa);
+        SX_CHECK(pMapVa(static_cast<const uint8_t*>(va) + (req_size / 2u)) == pa + (req_size / 2u));
+        SX_CHECK(pMapPa(pa) == va);
+        SX_CHECK(pMapPa(pa + (req_size / 2u)) == static_cast<uint8_t*>(va) + (req_size / 2u));
+
+        slot = LiveSlot{va, pa, req_size};
+        cumulative_bytes += req_size;
+    }
+
+    // Verify > 200 iterations allocated > 12 MB across the 1 MB heap.
+    SX_CHECK(cumulative_bytes > 12ull * 1024ull * 1024ull);
+
+    for (LiveSlot& slot : live) {
+        if (slot.va != nullptr) {
+            void* old_va = slot.va;
+            const uint32_t old_pa = slot.pa;
+            SX_CHECK(pFree(old_va) == 0);
+            SX_CHECK(pIsValid(old_va, 1u) == 0);
+            SX_CHECK(pMapVa(old_va) == 0u);
+            SX_CHECK(pMapPa(old_pa) == nullptr);
+            slot = LiveSlot{};
+        }
+    }
+
+    SX_CHECK(pGetState(&hstate, 0u) == 0);
+    SX_CHECK(hstate.bytesAllocated == 0u);
+    SX_CHECK(hstate.bytesFree == kOneMb);
+    SX_CHECK(hstate.maximumBlockSizeAvailable == kOneMb);
+    SX_CHECK(hstate.allocationCount == 0u);
+
+    // Fragmentation + adjacent span coalescing proof:
+    // Carve 4 x 256 KB blocks filling 100% of the 1 MB heap.
+    constexpr uint32_t kQuarterMb = 256u * 1024u;
+    void* b[4] = {};
+    uint32_t b_pa[4] = {};
+    for (int i = 0; i < 4; ++i) {
+        SX_CHECK(pAlloc(&b[i], &b_pa[i], kQuarterMb, 4096u, 0u) == 0 && b[i] != nullptr);
+    }
+    void* extra = nullptr;
+    SX_CHECK(pAlloc(&extra, nullptr, 64u, 64u, 0u) < 0 && extra == nullptr);
+
+    // Free non-adjacent b[1] and b[3]: 512 KB free total, but max contiguous block is 256 KB!
+    SX_CHECK(pFree(b[1]) == 0);
+    SX_CHECK(pFree(b[3]) == 0);
+    SX_CHECK(pGetState(&hstate, 0u) == 0);
+    SX_CHECK(hstate.bytesFree == 2u * kQuarterMb);
+    SX_CHECK(hstate.maximumBlockSizeAvailable == kQuarterMb);
+    void* too_big_frag = nullptr;
+    SX_CHECK(pAlloc(&too_big_frag, nullptr, 384u * 1024u, 4096u, 0u) < 0);
+
+    // Free b[2] between b[1] and b[3]: b[1]+b[2]+b[3] must coalesce into a single 768 KB free block!
+    SX_CHECK(pFree(b[2]) == 0);
+    SX_CHECK(pGetState(&hstate, 0u) == 0);
+    SX_CHECK(hstate.bytesFree == 3u * kQuarterMb);
+    SX_CHECK(hstate.maximumBlockSizeAvailable == 3u * kQuarterMb);
+
+    void* coalesced_700k = nullptr;
+    uint32_t coalesced_pa = 0u;
+    SX_CHECK(pAlloc(&coalesced_700k, &coalesced_pa, 700u * 1024u, 65536u, 0u) == 0 && coalesced_700k != nullptr);
+    SX_CHECK((coalesced_pa % 65536u) == 0u);
+    SX_CHECK(pFree(coalesced_700k) == 0);
+    SX_CHECK(pFree(b[0]) == 0);
+
+    // Full 1 MB contiguous allocation must now succeed at the base of the fully coalesced heap!
+    void* full_mb = nullptr;
+    uint32_t full_pa = 0u;
+    SX_CHECK(pAlloc(&full_mb, &full_pa, kOneMb, 65536u, 0u) == 0 && full_mb != nullptr);
+    SX_CHECK(full_pa == 0x10000000u);
+    SX_CHECK(pFree(full_mb) == 0);
+
+    // Verify AcpHalAllocateShapeContexts + AcpHalReleaseShapeContexts reclaim physical spans cleanly.
+    ACP_SHAPE_CONTEXT_COUNTS shape{};
+    shape.numSrcContexts = 16;
+    shape.numEqCompContexts = 8;
+    shape.numFiltVolContexts = 8;
+    shape.numDmaContexts = 16;
+    shape.numXmaContexts = 8;
+    shape.numPcmContexts = 8;
+    SX_CHECK(pAllocShape(&shape) == 0 && shape.srcContexts != nullptr);
+    void* saved_src = shape.srcContexts;
+    const uint32_t saved_src_pa = pMapVa(saved_src);
+    SX_CHECK(saved_src_pa != 0u && pIsValid(saved_src, 32u) == 1);
+    SX_CHECK(pReleaseShape() == 0);
+    SX_CHECK(pIsValid(saved_src, 1u) == 0);
+    SX_CHECK(pMapVa(saved_src) == 0u);
+    SX_CHECK(pMapPa(saved_src_pa) == nullptr);
+
+    SX_CHECK(pGetState(&hstate, 0u) == 0);
+    SX_CHECK(hstate.bytesAllocated == 0u && hstate.maximumBlockSizeAvailable == kOneMb);
+
+    // Restore default 64 MB capacity before unloading.
+    SX_CHECK(pCreateHeap(64u * 1024u * 1024u, 0u) == 0);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     if (RunSilentQueue() != 0) return 1;
     if (RunEngine(false) != 0) return 1;  // host output if there is a device, else the fallback
     if (RunEngine(true) != 0) return 1;   // silent output
-    std::cout << "[test_xaudio2_guest] All guest-facing XAudio2 checks passed.\n";
+    if (RunRealtimeFlushChurn(true) != 0) return 1;
+    if (RunRealtimeFlushChurn(false) != 0) return 1;
+    if (RunAcpHalHeapChurn() != 0) return 1;
+    std::cout << "[test_xaudio2_guest] All guest-facing XAudio2 + AcpHal APU reclamation checks passed.\n";
     return 0;
 }
 
