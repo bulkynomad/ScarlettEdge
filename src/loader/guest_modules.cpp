@@ -1,4 +1,5 @@
 #include "guest_modules.h"
+#include "scarlettx/loader/pe_mapper.h"
 
 #include <algorithm>
 #include <atomic>
@@ -959,14 +960,8 @@ std::wstring GetHostModulePathWide(HMODULE mod) {
     return {};
 }
 
-// True for a host-loaded DLL that lives in the guest executable's directory
-// tree, i.e. one that shipped with the title.
-bool IsPackageModule(void* host_module) {
-    Module exe;
-    if (!FindPrimaryExe(&exe)) {
-        return false;
-    }
-    std::wstring dir = LowerWideNormalized(exe.wide_path);
+std::wstring ExtractDirPrefixLower(const std::wstring& raw_path) {
+    std::wstring dir = LowerWideNormalized(raw_path);
     size_t cut = std::wstring::npos;
     for (size_t i = 0; i < dir.size(); ++i) {
         if (dir[i] == static_cast<wchar_t>(kBackslash)) {
@@ -974,22 +969,145 @@ bool IsPackageModule(void* host_module) {
         }
     }
     if (cut == std::wstring::npos) {
-        return false;
+        return {};
     }
     dir.resize(cut + 1);
-    const std::wstring mod_path = GetHostModulePathWide(static_cast<HMODULE>(host_module));
-    if (mod_path.empty()) {
+    return dir;
+}
+
+std::wstring EnsureTrailingBackslashLower(const std::wstring& raw_dir) {
+    if (raw_dir.empty()) {
+        return {};
+    }
+    std::wstring dir = LowerWideNormalized(raw_dir);
+    if (dir.back() != static_cast<wchar_t>(kBackslash)) {
+        dir.push_back(static_cast<wchar_t>(kBackslash));
+    }
+    return dir;
+}
+
+bool IsSystem32OrShimModule(const std::wstring& mod_path_lower) {
+    if (mod_path_lower.empty()) {
+        return true;
+    }
+    wchar_t sys_buf[MAX_PATH + 1] = {};
+    const UINT sys_len = GetSystemDirectoryW(sys_buf, MAX_PATH);
+    if (sys_len > 0 && sys_len <= MAX_PATH) {
+        const std::wstring sys_dir = EnsureTrailingBackslashLower(std::wstring(sys_buf, sys_len));
+        if (!sys_dir.empty() && mod_path_lower.compare(0, sys_dir.size(), sys_dir) == 0) {
+            return true;
+        }
+    }
+    wchar_t win_buf[MAX_PATH + 1] = {};
+    const UINT win_len = GetWindowsDirectoryW(win_buf, MAX_PATH);
+    if (win_len > 0 && win_len <= MAX_PATH) {
+        const std::wstring win_dir = EnsureTrailingBackslashLower(std::wstring(win_buf, win_len));
+        if (!win_dir.empty() && mod_path_lower.compare(0, win_dir.size(), win_dir) == 0) {
+            return true;
+        }
+    }
+    const std::string shim_utf8 = GetGuestShimDirectoryForPatch();
+    const std::string pkg_utf8 = GetGuestPackageDirectoryForPatch();
+    if (!shim_utf8.empty()) {
+        const std::wstring shim_dir = EnsureTrailingBackslashLower(Widen(shim_utf8));
+        const std::wstring pkg_dir = EnsureTrailingBackslashLower(Widen(pkg_utf8));
+        if (!shim_dir.empty() && shim_dir != pkg_dir &&
+            mod_path_lower.compare(0, shim_dir.size(), shim_dir) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True for a host-loaded DLL that lives in the guest executable's or configured
+// guest package's directory tree, i.e. one that shipped with the title.
+bool IsPackageModule(const std::wstring& mod_path_lower) {
+    if (mod_path_lower.empty() || IsSystem32OrShimModule(mod_path_lower)) {
         return false;
     }
-    return LowerWideNormalized(mod_path).compare(0, dir.size(), dir) == 0;
+    const std::string pkg_utf8 = GetGuestPackageDirectoryForPatch();
+    if (!pkg_utf8.empty()) {
+        const std::wstring pkg_dir = EnsureTrailingBackslashLower(Widen(pkg_utf8));
+        if (!pkg_dir.empty() && pkg_dir.size() > 3 &&
+            mod_path_lower.compare(0, pkg_dir.size(), pkg_dir) == 0) {
+            return true;
+        }
+    }
+    Module exe;
+    if (FindPrimaryExe(&exe)) {
+        const std::wstring exe_dir = ExtractDirPrefixLower(exe.wide_path);
+        if (!exe_dir.empty() && exe_dir.size() > 3 &&
+            mod_path_lower.compare(0, exe_dir.size(), exe_dir) == 0) {
+            return true;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_modules_mutex);
+    for (const auto& m : g_modules) {
+        const std::wstring m_dir = ExtractDirPrefixLower(m.wide_path);
+        if (!m_dir.empty() && m_dir.size() > 3 &&
+            mod_path_lower.compare(0, m_dir.size(), m_dir) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void PatchThunkArray(uint8_t* base,
+                     uint32_t size_of_image,
+                     const std::string& raw_dll_name,
+                     uint32_t orig_rva,
+                     uint32_t iat_rva,
+                     bool package_module) {
+    if (orig_rva == 0 || iat_rva == 0 ||
+        orig_rva >= size_of_image || iat_rva >= size_of_image) {
+        return;
+    }
+    const std::string resolved_dll_lower = BaseNameLower(ResolveApiSetDll(raw_dll_name));
+    const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + orig_rva);
+    auto* iat = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + iat_rva);
+    for (; reinterpret_cast<const uint8_t*>(names + 1) <= base + size_of_image &&
+           reinterpret_cast<const uint8_t*>(iat + 1) <= base + size_of_image &&
+           names->u1.AddressOfData != 0;
+         ++names, ++iat) {
+        if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) {
+            continue;
+        }
+        const uint64_t hint_rva = names->u1.AddressOfData;
+        if (hint_rva + 3 > size_of_image) {
+            continue;
+        }
+        const auto* by_name = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + hint_rva);
+        const char* symbol = reinterpret_cast<const char*>(by_name->Name);
+        void* replacement = nullptr;
+        if (std::strcmp(symbol, "RtlPcToFileHeader") == 0) {
+            replacement = reinterpret_cast<void*>(&GuestRtlPcToFileHeader);
+        } else if (package_module) {
+            replacement = LookupGuestDllRuntimeHook(resolved_dll_lower, symbol);
+            if (!replacement) {
+                replacement = LookupImportOverride(resolved_dll_lower, symbol);
+            }
+        }
+        if (!replacement || iat->u1.Function == reinterpret_cast<ULONGLONG>(replacement)) {
+            continue;
+        }
+        DWORD old_protect = 0;
+        if (VirtualProtect(&iat->u1.Function, sizeof(ULONGLONG), PAGE_READWRITE, &old_protect)) {
+            iat->u1.Function = reinterpret_cast<ULONGLONG>(replacement);
+            VirtualProtect(&iat->u1.Function, sizeof(ULONGLONG), old_protect, &old_protect);
+        }
+    }
 }
 
 }  // namespace
 
-void PatchHostModuleForGuests(void* host_module) {
+void PatchHostModuleForGuests(void* host_module, bool force_package_module) {
     auto* base = static_cast<uint8_t*>(host_module);
     // Low bits are set on data-file and image-resource handles.
     if (!base || (reinterpret_cast<uintptr_t>(base) & 0xFFFF) != 0) {
+        return;
+    }
+    // If host_module is actually a manually mapped guest PE image, its IAT was already bound.
+    if (FindModuleBase(host_module) == host_module) {
         return;
     }
     // The overrides fall back to the real functions through this module's own
@@ -1001,57 +1119,65 @@ void PatchHostModuleForGuests(void* host_module) {
         self == host_module) {
         return;
     }
-    // Only two kinds of host-loaded module are touched: the C++ runtime, whose
-    // throw looks up the image that owns the exception's type data, and DLLs
-    // that shipped with the title. System DLLs keep their imports.
-    const bool package_module = IsPackageModule(host_module);
     const std::wstring module_path = GetHostModulePathWide(static_cast<HMODULE>(host_module));
+    const std::wstring mod_path_lower = LowerWideNormalized(module_path);
+    const std::string mod_base_lower =
+        module_path.empty() ? std::string{} : BaseNameLower(Narrow(module_path.c_str()));
     const bool runtime_module =
-        !module_path.empty() &&
-        BaseNameLower(Narrow(module_path.c_str())).compare(0, 9, "vcruntime") == 0;
+        !mod_base_lower.empty() && mod_base_lower.compare(0, 9, "vcruntime") == 0;
+
+    // Never hook OS system DLLs (except vcruntime's RtlPcToFileHeader) or ScarlettEdge HLE shims.
+    const bool package_module =
+        !IsSystem32OrShimModule(mod_path_lower) &&
+        (force_package_module || IsPackageModule(mod_path_lower));
     if (!package_module && !runtime_module) {
         return;
     }
+
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
         return;
     }
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IMPORT) {
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
         return;
     }
-    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (dir.VirtualAddress == 0) {
-        return;
-    }
-    for (const auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
-         desc->Name != 0; ++desc) {
-        if (desc->OriginalFirstThunk == 0) {
-            continue;
+    const uint32_t size_of_image = nt->OptionalHeader.SizeOfImage;
+
+    if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
+        const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (dir.VirtualAddress != 0 && dir.VirtualAddress < size_of_image) {
+            for (const auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+                 reinterpret_cast<const uint8_t*>(desc + 1) <= base + size_of_image && desc->Name != 0;
+                 ++desc) {
+                if (desc->Name >= size_of_image || desc->FirstThunk == 0) {
+                    continue;
+                }
+                const uint32_t orig_rva =
+                    desc->OriginalFirstThunk != 0 ? desc->OriginalFirstThunk : desc->FirstThunk;
+                const std::string dll_name(reinterpret_cast<const char*>(base + desc->Name));
+                PatchThunkArray(base, size_of_image, dll_name, orig_rva, desc->FirstThunk, package_module);
+            }
         }
-        const auto* names = reinterpret_cast<const IMAGE_THUNK_DATA64*>(base + desc->OriginalFirstThunk);
-        auto* iat = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + desc->FirstThunk);
-        for (; names->u1.AddressOfData != 0; ++names, ++iat) {
-            if (IMAGE_SNAP_BY_ORDINAL64(names->u1.Ordinal)) {
-                continue;
-            }
-            const auto* by_name =
-                reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
-            const char* symbol = reinterpret_cast<const char*>(by_name->Name);
-            void* replacement = nullptr;
-            if (std::strcmp(symbol, "RtlPcToFileHeader") == 0) {
-                replacement = reinterpret_cast<void*>(&GuestRtlPcToFileHeader);
-            } else if (package_module) {
-                replacement = LookupImportOverride("kernel32.dll", symbol);
-            }
-            if (!replacement) {
-                continue;
-            }
-            DWORD old_protect = 0;
-            if (VirtualProtect(&iat->u1.Function, sizeof(ULONGLONG), PAGE_READWRITE, &old_protect)) {
-                iat->u1.Function = reinterpret_cast<ULONGLONG>(replacement);
-                VirtualProtect(&iat->u1.Function, sizeof(ULONGLONG), old_protect, &old_protect);
+    }
+
+    if (package_module &&
+        nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) {
+        const auto& ddir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+        if (ddir.VirtualAddress != 0 && ddir.VirtualAddress < size_of_image) {
+            for (const auto* ddesc = reinterpret_cast<const IMAGE_DELAYLOAD_DESCRIPTOR*>(base + ddir.VirtualAddress);
+                 reinterpret_cast<const uint8_t*>(ddesc + 1) <= base + size_of_image && ddesc->DllNameRVA != 0;
+                 ++ddesc) {
+                if ((ddesc->Attributes.AllAttributes & 1u) == 0 ||
+                    ddesc->DllNameRVA >= size_of_image ||
+                    ddesc->ImportNameTableRVA == 0 ||
+                    ddesc->ImportAddressTableRVA == 0) {
+                    continue;
+                }
+                const std::string dll_name(reinterpret_cast<const char*>(base + ddesc->DllNameRVA));
+                PatchThunkArray(base, size_of_image, dll_name,
+                                ddesc->ImportNameTableRVA, ddesc->ImportAddressTableRVA, true);
             }
         }
     }
@@ -1069,7 +1195,7 @@ void UnregisterModule(uint8_t*) {}
 void* FindModuleBase(const void*) { return nullptr; }
 bool TryResolveGuestAddressLockFree(uint64_t, GuestModuleAddrInfo*) noexcept { return false; }
 void* LookupImportOverride(const std::string&, const std::string&) { return nullptr; }
-void PatchHostModuleForGuests(void*) {}
+void PatchHostModuleForGuests(void*, bool) {}
 
 #endif
 

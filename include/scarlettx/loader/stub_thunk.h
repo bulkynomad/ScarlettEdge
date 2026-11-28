@@ -23,9 +23,15 @@ struct StubCallRecord {
 
 // Allocates executable x86-64 Windows-ABI trampolines for unresolved guest
 // imports so Scarlett binaries can continue executing while recording exact
-// missing-import telemetry.
+// missing-import telemetry, with full x64 .pdata unwind registration and W^X
+// PAGE_EXECUTE_READ code protection.
 class StubThunkTable {
 public:
+    using InterceptCallback = uint64_t (*)(uint32_t stub_id,
+                                           const uint64_t* args4,
+                                           uint64_t caller_rip,
+                                           void* user_ctx);
+
     explicit StubThunkTable(size_t max_stubs = 2048);
     ~StubThunkTable();
 
@@ -33,7 +39,9 @@ public:
     StubThunkTable& operator=(const StubThunkTable&) = delete;
 
     Status Initialize();
+    void Reset();
     void SetVerboseLogging(bool verbose) noexcept { verbose_logging_ = verbose; }
+    void SetInterceptCallback(InterceptCallback cb, void* user_ctx = nullptr) noexcept;
 
     // Allocates a new x86-64 trampoline for an unresolved import and returns
     // its executable function pointer address in out_thunk_address.
@@ -57,8 +65,13 @@ private:
 
     size_t max_stubs_ = 2048;
     uint8_t* code_buffer_ = nullptr;
+    size_t code_region_size_ = 0;
     size_t code_buffer_size_ = 0;
+    void* pdata_table_ = nullptr;
+    bool pdata_registered_ = false;
     bool verbose_logging_ = false;
+    InterceptCallback intercept_cb_ = nullptr;
+    void* intercept_ctx_ = nullptr;
 
     mutable std::mutex mutex_;
     std::vector<StubCallRecord> records_;

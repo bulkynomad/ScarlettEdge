@@ -13,9 +13,21 @@ namespace scarlettx {
 
 namespace {
 
-extern "C" uint64_t ScarlettxStubDispatchEntry(void* table_ptr,
-                                               uint32_t stub_id,
-                                               const uint64_t* args4) {
+constexpr size_t kPageSize = 0x1000u;
+
+size_t AlignUpPage(size_t v) {
+    return (v + kPageSize - 1u) & ~(kPageSize - 1u);
+}
+
+size_t AlignUp16(size_t v) {
+    return (v + 15u) & ~size_t{15u};
+}
+
+// Keep C++ linkage (never extern "C" or noexcept) so MSVC /EHsc emits unwind
+// metadata permitting C++ and SEH exceptions to propagate across StubThunk frames.
+uint64_t ScarlettxStubDispatchEntry(void* table_ptr,
+                                    uint32_t stub_id,
+                                    const uint64_t* args4) {
     auto* table = static_cast<StubThunkTable*>(table_ptr);
     if (!table) {
         return 0;
@@ -39,32 +51,106 @@ void WriteU64LE(uint8_t* dst, uint64_t v) {
 StubThunkTable::StubThunkTable(size_t max_stubs) : max_stubs_(max_stubs) {}
 
 StubThunkTable::~StubThunkTable() {
+    Reset();
+}
+
+void StubThunkTable::Reset() {
+    std::lock_guard<std::mutex> lock(mutex_);
 #if defined(_WIN32)
+    if (pdata_registered_ && pdata_table_) {
+        RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(pdata_table_));
+    }
     if (code_buffer_) {
         VirtualFree(code_buffer_, 0, MEM_RELEASE);
-        code_buffer_ = nullptr;
-        code_buffer_size_ = 0;
     }
 #endif
+    code_buffer_ = nullptr;
+    code_region_size_ = 0;
+    code_buffer_size_ = 0;
+    pdata_table_ = nullptr;
+    pdata_registered_ = false;
+    records_.clear();
+}
+
+void StubThunkTable::SetInterceptCallback(InterceptCallback cb, void* user_ctx) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    intercept_cb_ = cb;
+    intercept_ctx_ = user_ctx;
 }
 
 Status StubThunkTable::Initialize() {
 #if defined(_WIN32)
+    std::lock_guard<std::mutex> lock(mutex_);
     if (code_buffer_) {
         return Status::Ok();
     }
-    if (max_stubs_ == 0) {
-        return Status::Error(StatusCode::InvalidArgument, "max_stubs must be > 0");
+    if (max_stubs_ == 0 || max_stubs_ > 0x100000u) {
+        return Status::Error(StatusCode::InvalidArgument, "max_stubs must be in 1..1048576");
     }
-    code_buffer_size_ = max_stubs_ * kSlotSize;
-    void* mem = VirtualAlloc(nullptr, code_buffer_size_, MEM_COMMIT | MEM_RESERVE,
-                             PAGE_EXECUTE_READWRITE);
+
+    // Slab layout within a single contiguous VirtualAlloc reservation (< 4 GiB RVA span):
+    //   [0 .. code_region_size_)                  -> 64B x64 trampolines (PAGE_EXECUTE_READ)
+    //   [code_region_size_ .. +8)                 -> shared x64 UNWIND_INFO (UWOP_ALLOC_SMALL 0x48)
+    //   [code_region_size_ + 16 .. total_size)    -> sorted RUNTIME_FUNCTION[max_stubs_] (.pdata)
+    code_region_size_ = AlignUpPage(max_stubs_ * kSlotSize);
+    const size_t xdata_size = 16u;
+    const size_t pdata_bytes = max_stubs_ * sizeof(RUNTIME_FUNCTION);
+    const size_t meta_region_size = AlignUpPage(AlignUp16(xdata_size + pdata_bytes));
+    code_buffer_size_ = code_region_size_ + meta_region_size;
+
+    void* mem = VirtualAlloc(nullptr, code_buffer_size_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!mem) {
+        code_region_size_ = 0;
         code_buffer_size_ = 0;
         return Status::Error(StatusCode::OutOfMemory, "VirtualAlloc failed for StubThunkTable");
     }
     code_buffer_ = static_cast<uint8_t*>(mem);
-    std::memset(code_buffer_, 0xCC, code_buffer_size_);
+    std::memset(code_buffer_, 0xCC, code_region_size_);
+
+    // Emit shared x64 UNWIND_INFO matching `sub rsp, 0x48` (4-byte prologue at +0..+4):
+    //   Version = 1, Flags = 0 (UNW_FLAG_NHANDLER)
+    //   SizeOfProlog = 4
+    //   CountOfCodes = 1
+    //   FrameRegister = 0, FrameOffset = 0
+    //   UNWIND_CODE[0]: CodeOffset = 4, UnwindOp = UWOP_ALLOC_SMALL (2), OpInfo = 8 ((0x48 - 8) / 8)
+    static constexpr uint8_t kUnwindInfo[8] = {
+        0x01u, 0x04u, 0x01u, 0x00u,
+        0x04u, static_cast<uint8_t>((8u << 4) | 2u), 0x00u, 0x00u,
+    };
+    const DWORD unwind_info_rva = static_cast<DWORD>(code_region_size_);
+    std::memcpy(code_buffer_ + unwind_info_rva, kUnwindInfo, sizeof(kUnwindInfo));
+
+    auto* pdata = reinterpret_cast<PRUNTIME_FUNCTION>(code_buffer_ + code_region_size_ + xdata_size);
+    for (size_t i = 0; i < max_stubs_; ++i) {
+        const DWORD begin_rva = static_cast<DWORD>(i * kSlotSize);
+        pdata[i].BeginAddress = begin_rva;
+        pdata[i].EndAddress = begin_rva + static_cast<DWORD>(kSlotSize);
+        pdata[i].UnwindData = unwind_info_rva;
+    }
+
+    DWORD old_prot = 0;
+    if (!VirtualProtect(code_buffer_ + code_region_size_, meta_region_size, PAGE_READONLY, &old_prot) ||
+        !VirtualProtect(code_buffer_, code_region_size_, PAGE_EXECUTE_READ, &old_prot)) {
+        VirtualFree(code_buffer_, 0, MEM_RELEASE);
+        code_buffer_ = nullptr;
+        code_region_size_ = 0;
+        code_buffer_size_ = 0;
+        return Status::Error(StatusCode::DeviceError,
+                             "VirtualProtect failed for StubThunkTable W^X pages");
+    }
+    FlushInstructionCache(GetCurrentProcess(), code_buffer_, code_region_size_);
+
+    if (!RtlAddFunctionTable(pdata, static_cast<DWORD>(max_stubs_),
+                             reinterpret_cast<DWORD64>(code_buffer_))) {
+        VirtualFree(code_buffer_, 0, MEM_RELEASE);
+        code_buffer_ = nullptr;
+        code_region_size_ = 0;
+        code_buffer_size_ = 0;
+        return Status::Error(StatusCode::DeviceError,
+                             "RtlAddFunctionTable failed for StubThunkTable .pdata");
+    }
+    pdata_table_ = pdata;
+    pdata_registered_ = true;
     return Status::Ok();
 #else
     return Status::Error(StatusCode::NotImplemented,
@@ -89,24 +175,24 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    if (records_.size() >= max_stubs_) {
+    if (!code_buffer_ || records_.size() >= max_stubs_) {
         return Status::Error(StatusCode::OutOfMemory, "StubThunkTable capacity exhausted");
     }
 
     const uint32_t stub_id = static_cast<uint32_t>(records_.size());
-    StubCallRecord rec;
-    rec.stub_id = stub_id;
-    rec.dll_name = dll_name;
-    rec.symbol_name = symbol_name;
-    rec.by_ordinal = by_ordinal;
-    rec.ordinal = ordinal;
-    rec.return_value = return_value;
-    records_.push_back(std::move(rec));
-
     uint8_t* slot = code_buffer_ + static_cast<size_t>(stub_id) * kSlotSize;
+    uint8_t* page_base = reinterpret_cast<uint8_t*>(
+        reinterpret_cast<uintptr_t>(slot) & ~(kPageSize - 1u));
+
+    DWORD old_prot = 0;
+    if (!VirtualProtect(page_base, kPageSize, PAGE_READWRITE, &old_prot)) {
+        return Status::Error(StatusCode::DeviceError,
+                             "VirtualProtect(PAGE_READWRITE) failed while emitting StubThunk");
+    }
+
     uint8_t* p = slot;
 
-    // Windows x64 ABI trampoline (64 bytes):
+    // Windows x64 ABI trampoline (64 bytes, canonical prologue + epilogue):
     //   sub rsp, 0x48              ; 32B shadow + 32B saved args + 8B alignment
     //   mov [rsp+0x20], rcx
     //   mov [rsp+0x28], rdx
@@ -117,8 +203,8 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
     //   lea r8, [rsp+0x20]
     //   mov rax, <&ScarlettxStubDispatchEntry>
     //   call rax
-    //   add rsp, 0x48
     //   xorps xmm0, xmm0           ; deterministic 0.0f/0.0 for float/double stubs
+    //   add rsp, 0x48              ; canonical x64 epilogue immediately preceding ret
     //   ret
     static constexpr uint8_t kPrologue[] = {
         0x48, 0x83, 0xEC, 0x48,              // sub rsp, 0x48
@@ -150,8 +236,8 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
 
     static constexpr uint8_t kEpilogue[] = {
         0xFF, 0xD0,              // call rax
-        0x48, 0x83, 0xC4, 0x48,  // add rsp, 0x48
         0x0F, 0x57, 0xC0,        // xorps xmm0, xmm0
+        0x48, 0x83, 0xC4, 0x48,  // add rsp, 0x48
         0xC3,                    // ret
     };
     static_assert(sizeof(kPrologue) + 10 + 5 + sizeof(kLeaR8) + 10 + sizeof(kEpilogue) <= kSlotSize,
@@ -160,6 +246,20 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
     p += sizeof(kEpilogue);
 
     FlushInstructionCache(GetCurrentProcess(), slot, kSlotSize);
+    DWORD rx_prot = 0;
+    if (!VirtualProtect(page_base, kPageSize, PAGE_EXECUTE_READ, &rx_prot)) {
+        return Status::Error(StatusCode::DeviceError,
+                             "VirtualProtect(PAGE_EXECUTE_READ) failed after emitting StubThunk");
+    }
+
+    StubCallRecord rec;
+    rec.stub_id = stub_id;
+    rec.dll_name = dll_name;
+    rec.symbol_name = symbol_name;
+    rec.by_ordinal = by_ordinal;
+    rec.ordinal = ordinal;
+    rec.return_value = return_value;
+    records_.push_back(std::move(rec));
 
     out_thunk_address = slot;
     if (out_stub_id) {
@@ -185,6 +285,8 @@ uint64_t StubThunkTable::Dispatch(uint32_t stub_id, const uint64_t* args4, uint6
     bool by_ord = false;
     uint64_t ret = 0;
     uint64_t hits = 0;
+    InterceptCallback intercept = nullptr;
+    void* intercept_ctx = nullptr;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -207,6 +309,8 @@ uint64_t StubThunkTable::Dispatch(uint32_t stub_id, const uint64_t* args4, uint6
         ord = rec.ordinal;
         by_ord = rec.by_ordinal;
         ret = rec.return_value;
+        intercept = intercept_cb_;
+        intercept_ctx = intercept_ctx_;
     }
 
     FlightRecorder::Instance().RecordStubHit(
@@ -220,6 +324,10 @@ uint64_t StubThunkTable::Dispatch(uint32_t stub_id, const uint64_t* args4, uint6
             std::cout << sym;
         }
         std::cout << " (hit #" << hits << ") -> returning 0x" << std::hex << ret << std::dec << "\n";
+    }
+
+    if (intercept) {
+        return intercept(stub_id, args4, caller_rip, intercept_ctx);
     }
     return ret;
 }

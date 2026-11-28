@@ -2,10 +2,12 @@
 
 #include <array>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "scarlettx/core/status.h"
@@ -35,6 +37,7 @@ struct XvdHeaderInfo {
     bool is_retail_v3_layout = false;
     uint64_t xvc_data_length = 0;
     uint64_t mutable_data_length = 0;
+    uint32_t odk_key_slot = 0xFFFFFFFFu;
     std::array<uint8_t, 32> top_hash_block_hash{};
     std::array<uint8_t, 32> original_xvc_data_hash{};
 };
@@ -73,6 +76,7 @@ public:
     static constexpr const char* kGdfxMagic = "MICROSOFT*XBOX*MEDIA";
     static constexpr const char* kNtfsOemMagic = "NTFS    ";
     static constexpr uint16_t kUnencryptedKeyId = 0xFFFFu;
+    static constexpr size_t kMaxCachedSectors = 1024;  // Bounded 4 MiB LRU decrypted-sector cache
 
     // Volume flag bits (publicly documented XVD header flags).
     static constexpr uint32_t kFlagReadOnly = 1u << 0;
@@ -95,18 +99,25 @@ public:
     Status SetVolumeKeyHex(const std::string& hex_key);
     Status LoadVolumeKeyFile(const std::string& key_file_path);
 
-    // Multi-key CIK ring slot management for retail XVC regions (KeyId != 0xFFFF).
+    // Multi-key CIK ring slot & 16-byte KeyId GUID management for retail XVC regions (KeyId != 0xFFFF).
     Status SetCikKey(uint16_t slot, const uint8_t* key, size_t key_len);
     Status SetCikKeyHex(uint16_t slot, const std::string& hex_key);
+    Status SetCikKeyByGuid(const uint8_t key_guid[16], const uint8_t* key, size_t key_len);
     Status LoadKeyringDirectory(const std::string& dir_path, size_t* out_keys_loaded = nullptr);
-    size_t CikKeyCount() const { return cik_keys_.size(); }
+    size_t CikKeyCount() const {
+        return cik_keys_.size() >= guid_key_entries_.size() ? cik_keys_.size()
+                                                            : guid_key_entries_.size();
+    }
 
-    bool HasVolumeKey() const { return has_volume_key_ || !cik_keys_.empty(); }
+    bool HasVolumeKey() const {
+        return has_volume_key_ || !cik_keys_.empty() || !guid_key_entries_.empty();
+    }
 
     bool IsOpen() const { return header_.valid; }
     const XvdHeaderInfo& Header() const { return header_; }
     const std::string& Path() const { return path_; }
     const std::vector<XvcRegionInfo>& Regions() const { return regions_; }
+    const std::vector<std::array<uint8_t, 16>>& KeyGuids() const { return xvc_key_guids_; }
 
     // Merkle hash tree translation & optional page integrity verification.
     uint64_t LogicalUserPageToPhysicalOffset(uint64_t user_page_idx) const;
@@ -114,7 +125,7 @@ public:
     void SetVerifyIntegrityOnRead(bool enable) { verify_integrity_on_read_ = enable; }
 
     // Reads bytes from the user-data region of the XVD (automatically de-interleaving
-    // Merkle hash blocks and decrypting 4 KiB sectors via XTS when encrypted).
+    // Merkle hash blocks, decrypting 4 KiB sectors via single-call CNG XTS, and caching in LRU).
     Status ReadUserData(uint64_t offset, uint64_t size, std::vector<uint8_t>& out_data) const;
 
     // Embedded Xbox NTFS (Gen9 .xvc / .msixvc) & GDFX ("MICROSOFT*XBOX*MEDIA") filesystem
@@ -167,6 +178,13 @@ public:
         bool enable_merkle_tree = true,
         uint32_t content_type = 1);
 
+    static std::vector<uint8_t> BuildRetailV3XvcMultiKeyWithGuids(
+        const std::vector<uint8_t>& user_data,
+        const std::vector<std::pair<std::array<uint8_t, 16>, std::vector<uint8_t>>>& cik_guid_keys,
+        const std::vector<XvcRegionInfo>& regions,
+        bool enable_merkle_tree = true,
+        uint32_t content_type = 1);
+
     // Builds a clean-room NTFS 3.1 user partition and a retail-v3 Merkle + NTFS .xvc container.
     static std::vector<uint8_t> BuildNtfsVolumeBytes(const std::vector<XvdInputFile>& files);
     static std::vector<uint8_t> BuildSyntheticNtfsXvc(
@@ -190,8 +208,26 @@ private:
         std::vector<FileExtent> extents;
     };
 
+    struct GuidKeyEntry {
+        std::array<uint8_t, 16> raw_guid{};
+        std::array<uint8_t, 16> swapped_guid{};
+        std::shared_ptr<crypto::AesXtsPreparedKey> key;
+    };
+
+    struct CachedSectorEntry {
+        uint64_t sector_idx = 0;
+        bool integrity_verified = false;
+        std::array<uint8_t, kSectorSize> plain{};
+    };
+
     void CloseFileHandle() noexcept;
     void ResetFsCache() const;
+    void ClearSectorCache() const;
+    void RebindKeyringToXvcSlots();
+    Status ParseKeyBytesOrText(const std::vector<uint8_t>& raw,
+                               bool allow_single_raw_volume_key,
+                               size_t* out_loaded);
+    const crypto::AesXtsPreparedKey* LookupGuidKey(const std::array<uint8_t, 16>& target_guid) const;
     Status ReadRawContainerBytes(uint64_t abs_offset, uint8_t* dst, size_t len) const;
     Status ParseHeaderFromBytes(const uint8_t* data, size_t size, uint64_t total_container_size);
     Status FinalizeOpenMetadata();
@@ -216,12 +252,19 @@ private:
     uint64_t xvc_info_offset_ = 0;
     bool verify_integrity_on_read_ = false;
     std::vector<XvcRegionInfo> regions_;
+    std::vector<std::array<uint8_t, 16>> xvc_key_guids_;
 
     std::array<uint8_t, 64> volume_key_{};
     uint32_t volume_key_len_ = 0;
     bool has_volume_key_ = false;
     std::shared_ptr<crypto::AesXtsPreparedKey> prepared_key_;
     std::unordered_map<uint16_t, std::shared_ptr<crypto::AesXtsPreparedKey>> cik_keys_;
+    std::unordered_map<uint16_t, std::shared_ptr<crypto::AesXtsPreparedKey>> explicit_slot_keys_;
+    std::vector<GuidKeyEntry> guid_key_entries_;
+
+    mutable std::mutex sector_cache_mu_;
+    mutable std::list<CachedSectorEntry> sector_lru_;
+    mutable std::unordered_map<uint64_t, std::list<CachedSectorEntry>::iterator> sector_map_;
 
     mutable std::mutex fs_cache_mu_;
     mutable bool fs_cached_ = false;

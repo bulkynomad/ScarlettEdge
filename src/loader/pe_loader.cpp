@@ -16,6 +16,52 @@ std::string ToLowerAscii(std::string s) {
     return s;
 }
 
+struct DllTargetMapping {
+    const char* guest;
+    const char* target;
+};
+
+// OS / hardware system DLLs: always prioritize ScarlettEdge HLE shims.
+constexpr DllTargetMapping kSystemShimTable[] = {
+    {"xgameruntime.dll", "xgameruntime.dll"},
+    {"xmem.dll", "xgameruntime.dll"},
+    {"d3d12_xs.dll", "d3d12_xs.dll"},
+    {"xg_xs.dll", "xg_xs.dll"},
+    {"acphal.dll", "AcpHal.dll"},
+    {"gameinput.dll", "GameInput.dll"},
+    {"xaudio2_9.dll", "xaudio2_9.dll"},
+    {"xaudio2_9redist.dll", "xaudio2_9.dll"},
+    {"x3daudio1_7.dll", "xaudio2_9.dll"},
+    {"xapofx1_5.dll", "xaudio2_9.dll"},
+    {"xcrdapi.dll", "xcrdapi.dll"},
+    {"xboxbvhbuilder.dll", "XboxBvhBuilder.dll"},
+    {"dstorage_xs.dll", "dstorage_xs.dll"},
+    {"dstorage.dll", "dstorage_xs.dll"},
+    {"dstoragecore.dll", "dstorage_xs.dll"},
+    {"kernelx.dll", "kernelx.dll"},
+    {"xvc_crypto.dll", "xvc_crypto.dll"},
+    {"xbox_codecs.dll", "xbox_codecs.dll"},
+    {"xsapi.dll", "xsapi.dll"},
+    {"xs2_lifting.dll", "xs2_lifting.dll"},
+    {"vulkan_backend.dll", "vulkan_backend.dll"},
+    {"pixevt.dll", "pixevt_stub.dll"},
+    {"pixevt_stub.dll", "pixevt_stub.dll"},
+};
+
+// Title-shipped middleware & GDK C thunk DLLs: prioritize the real DLL inside
+// the game package/VFS when present, falling back to ScarlettEdge HLE shims only when absent.
+constexpr DllTargetMapping kFallbackMiddlewareTable[] = {
+    {"bink2scarlett.dll", "Bink2Scarlett.dll"},
+    {"amd_fidelityfx_loader_xbox.dll", "amd_fidelityfx_loader_xbox.dll"},
+    {"amd_fidelityfx_upscaler_xbox.dll", "amd_fidelityfx_upscaler_xbox.dll"},
+    {"libhttpclient.gdk.dll", "libHttpClient.GDK.dll"},
+    {"xcurl.dll", "XCurl.dll"},
+    {"microsoft.xbox.services.c.thunks.dll", "xsapi.dll"},
+    {"microsoft.xbox.services.140.gdk.c.thunks.dll", "xsapi.dll"},
+    {"microsoft.xbox.services.141.gdk.c.thunks.dll", "xsapi.dll"},
+    {"microsoft.xbox.services.142.gdk.c.thunks.dll", "xsapi.dll"},
+};
+
 template <typename T>
 bool ReadAt(const std::vector<uint8_t>& buf, size_t offset, T& out) {
     if (offset + sizeof(T) > buf.size()) {
@@ -91,41 +137,49 @@ struct PeImportDescriptorRaw {
 };
 #pragma pack(pop)
 
+bool EqualsIgnoreCaseAscii(const std::string& a, const char* b_lower) noexcept {
+    const size_t n = std::strlen(b_lower);
+    if (a.size() != n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const auto ca = static_cast<unsigned char>(a[i]);
+        const char la = (ca >= 'A' && ca <= 'Z') ? static_cast<char>(ca + ('a' - 'A'))
+                                                 : static_cast<char>(ca);
+        if (la != b_lower[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
+const char* LookupSystemShimTarget(const std::string& lower_dll_name) noexcept {
+    for (const auto& m : kSystemShimTable) {
+        if (EqualsIgnoreCaseAscii(lower_dll_name, m.guest)) {
+            return m.target;
+        }
+    }
+    return nullptr;
+}
+
+const char* LookupFallbackMiddlewareTarget(const std::string& lower_dll_name) noexcept {
+    for (const auto& m : kFallbackMiddlewareTable) {
+        if (EqualsIgnoreCaseAscii(lower_dll_name, m.guest)) {
+            return m.target;
+        }
+    }
+    return nullptr;
+}
+
 DllRedirectionTable::DllRedirectionTable() {
-    // Core Xbox Series X|S (Scarlett / Game Core) HLE system DLLs.
-    RegisterRedirect("d3d12_xs.dll", "d3d12_xs.dll", true);
-    RegisterRedirect("xg_xs.dll", "xg_xs.dll", true);
-    RegisterRedirect("acphal.dll", "AcpHal.dll", true);
-    RegisterRedirect("xgameruntime.dll", "xgameruntime.dll", true);
-    RegisterRedirect("xmem.dll", "xgameruntime.dll", true);
-    RegisterRedirect("xcrdapi.dll", "xcrdapi.dll", true);
-    RegisterRedirect("xboxbvhbuilder.dll", "XboxBvhBuilder.dll", true);
-    RegisterRedirect("dstorage_xs.dll", "dstorage_xs.dll", true);
-    RegisterRedirect("dstorage.dll", "dstorage_xs.dll", true);
-    RegisterRedirect("dstoragecore.dll", "dstorage_xs.dll", true);
-    RegisterRedirect("xaudio2_9.dll", "xaudio2_9.dll", true);
-    RegisterRedirect("xaudio2_9redist.dll", "xaudio2_9.dll", true);
-    RegisterRedirect("x3daudio1_7.dll", "xaudio2_9.dll", true);
-    RegisterRedirect("xapofx1_5.dll", "xaudio2_9.dll", true);
-    RegisterRedirect("gameinput.dll", "GameInput.dll", true);
-    RegisterRedirect("xcurl.dll", "XCurl.dll", true);
-    RegisterRedirect("libhttpclient.gdk.dll", "libHttpClient.GDK.dll", true);
-    RegisterRedirect("bink2scarlett.dll", "Bink2Scarlett.dll", true);
-    RegisterRedirect("amd_fidelityfx_loader_xbox.dll", "amd_fidelityfx_loader_xbox.dll", true);
-    RegisterRedirect("amd_fidelityfx_upscaler_xbox.dll", "amd_fidelityfx_upscaler_xbox.dll", true);
-    RegisterRedirect("kernelx.dll", "kernelx.dll", true);
-    RegisterRedirect("xvc_crypto.dll", "xvc_crypto.dll", true);
-    RegisterRedirect("xbox_codecs.dll", "xbox_codecs.dll", true);
-    RegisterRedirect("xsapi.dll", "xsapi.dll", true);
-    RegisterRedirect("microsoft.xbox.services.c.thunks.dll", "xsapi.dll", true);
-    RegisterRedirect("microsoft.xbox.services.140.gdk.c.thunks.dll", "xsapi.dll", true);
-    RegisterRedirect("microsoft.xbox.services.141.gdk.c.thunks.dll", "xsapi.dll", true);
-    RegisterRedirect("microsoft.xbox.services.142.gdk.c.thunks.dll", "xsapi.dll", true);
-    RegisterRedirect("xs2_lifting.dll", "xs2_lifting.dll", true);
-    RegisterRedirect("vulkan_backend.dll", "vulkan_backend.dll", true);
-    RegisterRedirect("pixevt.dll", "pixevt_stub.dll", true);
+    for (const auto& m : kSystemShimTable) {
+        RegisterRedirect(m.guest, m.target, true);
+    }
+    for (const auto& m : kFallbackMiddlewareTable) {
+        RegisterRedirect(m.guest, m.target, true);
+    }
 }
 
 void DllRedirectionTable::RegisterRedirect(const std::string& guest_dll,
@@ -146,18 +200,12 @@ bool DllRedirectionTable::Resolve(const std::string& guest_dll,
     return true;
 }
 
-Status InspectPeFile(const std::string& pe_path,
-                     const DllRedirectionTable& redirects,
-                     PeImageInfo& out_info) {
+Status InspectPeBytes(const std::vector<uint8_t>& data,
+                      const std::string& display_path,
+                      const DllRedirectionTable& redirects,
+                      PeImageInfo& out_info) {
     out_info = PeImageInfo{};
-    out_info.file_path = pe_path;
-
-    std::ifstream ifs(pe_path, std::ios::binary);
-    if (!ifs) {
-        return Status::Error(StatusCode::NotFound, "Cannot open PE image: " + pe_path);
-    }
-    std::vector<uint8_t> data((std::istreambuf_iterator<char>(ifs)),
-                              std::istreambuf_iterator<char>());
+    out_info.file_path = display_path;
 
     uint16_t mz = 0;
     if (!ReadAt(data, 0, mz) || mz != 0x5A4D) {
@@ -288,6 +336,20 @@ Status InspectPeFile(const std::string& pe_path,
     }
 
     return Status::Ok();
+}
+
+Status InspectPeFile(const std::string& pe_path,
+                     const DllRedirectionTable& redirects,
+                     PeImageInfo& out_info) {
+    std::ifstream ifs(pe_path, std::ios::binary);
+    if (!ifs) {
+        out_info = PeImageInfo{};
+        out_info.file_path = pe_path;
+        return Status::Error(StatusCode::NotFound, "Cannot open PE image: " + pe_path);
+    }
+    std::vector<uint8_t> data((std::istreambuf_iterator<char>(ifs)),
+                              std::istreambuf_iterator<char>());
+    return InspectPeBytes(data, pe_path, redirects, out_info);
 }
 
 }  // namespace scarlettx

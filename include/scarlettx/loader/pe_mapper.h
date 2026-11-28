@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -49,6 +51,7 @@ struct PeMapOptions {
     bool run_tls_callbacks = true;
     bool verbose_stub_logging = false;
     std::string shim_directory;
+    std::string package_directory_override;
 };
 
 // Maps a PE32+ (x86-64) image directly into the current process, applies base
@@ -62,6 +65,12 @@ public:
 
     MappedPeImage(const MappedPeImage&) = delete;
     MappedPeImage& operator=(const MappedPeImage&) = delete;
+
+    Status MapBytes(const std::vector<uint8_t>& raw,
+                    const std::string& display_path,
+                    const DllRedirectionTable& redirects,
+                    const HleSymbolRegistry& hle_registry,
+                    const PeMapOptions& options = {});
 
     Status MapFile(const std::string& pe_path,
                    const DllRedirectionTable& redirects,
@@ -102,6 +111,7 @@ private:
     bool dll_attached_ = false;
 
     std::vector<void*> loaded_modules_;
+    std::vector<std::shared_ptr<MappedPeImage>> mapped_guest_dlls_;
     void* loader_state_ = nullptr;  // TLS binding, unwind table and module registration
     std::vector<PeImportResolution> resolutions_;
     StubThunkTable stubs_;
@@ -111,7 +121,10 @@ private:
 // (api-ms-win-core-*, api-ms-win-crt-*, ext-ms-win-*) to concrete host DLLs.
 std::string ResolveApiSetDll(const std::string& dll_name);
 
-// Aborts an active in-process guest call via longjmp if executing on the guest entry thread.
+// Queries whether an address lies inside a guest VirtualAlloc(..., MEM_GRAPHICS, ...) region.
+bool IsGuestGraphicsAllocation(const void* address, size_t* out_size = nullptr) noexcept;
+
+// Aborts an active in-process guest call via SEH unwind if executing on the guest entry thread.
 void TryAbortActiveInProcessGuest(uint32_t exit_code) noexcept;
 
 }  // namespace scarlettx

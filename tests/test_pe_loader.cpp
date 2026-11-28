@@ -1,8 +1,13 @@
 #include <algorithm>
 #include "sx_check.h"
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <string>
+#include <vector>
 
 #include "scarlettx/loader/pe_loader.h"
 
@@ -67,6 +72,40 @@ int main() {
     check_redirect("xsapi.dll", "xsapi.dll");
     check_redirect("xs2_lifting.dll", "xs2_lifting.dll");
     check_redirect("vulkan_backend.dll", "vulkan_backend.dll");
+
+    // VerifyInspectPeBytes parity with InspectPeFile (used by zero-staging InspectPackage).
+    {
+        std::ifstream ifs(rt_exe, std::ios::binary);
+        SX_REQUIRE(ifs.good());
+        const std::vector<uint8_t> raw_pe(
+            (std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        scarlettx::PeImageInfo mem_info;
+        SX_REQUIRE(
+            scarlettx::InspectPeBytes(raw_pe, "G:\\rt_showcase.exe", redirects, mem_info).ok());
+        SX_REQUIRE(mem_info.is_pe64);
+        SX_REQUIRE(mem_info.sections.size() == info.sections.size());
+        SX_REQUIRE(mem_info.imports.size() == info.imports.size());
+    }
+
+    // Verify Microsoft.Xbox.Services.*.GDK.C.Thunks.dll and unversioned c.thunks.dll
+    // are classified as package-first fallback middleware (-> xsapi.dll) and NEVER
+    // hijacked by system-shim-first routing.
+    for (const char* thunks_dll : {
+             "microsoft.xbox.services.140.gdk.c.thunks.dll",
+             "microsoft.xbox.services.141.gdk.c.thunks.dll",
+             "microsoft.xbox.services.142.gdk.c.thunks.dll",
+             "microsoft.xbox.services.c.thunks.dll",
+             "Microsoft.Xbox.Services.142.GDK.C.Thunks.dll",
+             "Microsoft.Xbox.Services.C.Thunks.dll",
+         }) {
+        SX_REQUIRE(scarlettx::LookupSystemShimTarget(thunks_dll) == nullptr);
+        const char* fb = scarlettx::LookupFallbackMiddlewareTarget(thunks_dll);
+        SX_REQUIRE(fb != nullptr && std::string(fb) == "xsapi.dll");
+        check_redirect(thunks_dll, "xsapi.dll");
+    }
+    SX_REQUIRE(scarlettx::LookupSystemShimTarget("xgameruntime.dll") != nullptr);
+    SX_REQUIRE(std::string(scarlettx::LookupSystemShimTarget("xgameruntime.dll")) ==
+               "xgameruntime.dll");
 
     std::cout << "[test_pe_loader] PASSED (imports=" << info.imports.size() << ")\n";
     return 0;

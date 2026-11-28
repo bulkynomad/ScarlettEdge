@@ -5,6 +5,7 @@
 #include "scarlettx/loader/package_vfs.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -192,6 +194,164 @@ BOOL WINAPI GuestFlsFree(DWORD dwFlsIndex) {
     return ::FlsFree(dwFlsIndex);
 }
 
+PVOID WINAPI GuestFlsGetValue(DWORD dwFlsIndex) {
+    return ::FlsGetValue(dwFlsIndex);
+}
+
+BOOL WINAPI GuestFlsSetValue(DWORD dwFlsIndex, PVOID lpFlsData) {
+    return ::FlsSetValue(dwFlsIndex, lpFlsData);
+}
+
+struct GuestGraphicsRegion {
+    uintptr_t base = 0;
+    size_t size = 0;
+    DWORD raw_flags = 0;
+};
+
+std::shared_mutex& GuestGraphicsMutex() {
+    static std::shared_mutex m;
+    return m;
+}
+
+std::unordered_map<uintptr_t, GuestGraphicsRegion>& GuestGraphicsTable() {
+    static std::unordered_map<uintptr_t, GuestGraphicsRegion> t;
+    return t;
+}
+
+void NotifyKernelXExternalAlloc(void* va, size_t size, bool register_alloc) {
+    if (!va) return;
+    HMODULE kx = ::GetModuleHandleW(L"kernelx.dll");
+    if (!kx) return;
+    if (register_alloc) {
+        if (size == 0) return;
+        FARPROC proc = ::GetProcAddress(kx, "KernelXRegisterExternalAllocation");
+        if (!proc) return;
+        using RegFn = int32_t(__stdcall*)(void*, uint64_t, uint64_t*);
+        uint64_t gpu_va = 0;
+        (void)reinterpret_cast<RegFn>(reinterpret_cast<void*>(proc))(
+            va, static_cast<uint64_t>(size), &gpu_va);
+    } else {
+        FARPROC proc = ::GetProcAddress(kx, "KernelXUnregisterExternalAllocation");
+        if (!proc) return;
+        using UnregFn = int32_t(__stdcall*)(void*, uint64_t);
+        (void)reinterpret_cast<UnregFn>(reinterpret_cast<void*>(proc))(
+            va, static_cast<uint64_t>(size));
+    }
+}
+
+LPVOID WINAPI GuestVirtualAllocEx(HANDLE hProcess,
+                                  LPVOID lpAddress,
+                                  SIZE_T dwSize,
+                                  DWORD flAllocationType,
+                                  DWORD flProtect) {
+    constexpr DWORD kXboxMemGraphics = 0x04000000u;
+    constexpr DWORD kXboxPage64kMask = 0x20400000u;
+    constexpr DWORD kXboxConsoleBits = kXboxMemGraphics | 0x00400000u | 0x20000000u | 0x40000000u;
+
+    if ((flAllocationType & kXboxConsoleBits) == 0u) {
+        return ::VirtualAllocEx(hProcess, lpAddress, dwSize, flAllocationType, flProtect);
+    }
+    if (dwSize == 0) {
+        ::SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    size_t page = 0x1000u;
+    if ((flAllocationType & kXboxPage64kMask) == kXboxPage64kMask ||
+        (flAllocationType & 0x00400000u) != 0u) {
+        page = 0x10000u;
+    } else if ((flAllocationType & 0x20000000u) != 0u ||
+               (flAllocationType & 0x40000000u) != 0u) {
+        page = 0x200000u;
+    }
+
+    constexpr DWORD kValidWin32AllocFlags =
+        MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET_UNDO;
+    DWORD clean_alloc = flAllocationType & kValidWin32AllocFlags;
+    if (clean_alloc == 0u) {
+        clean_alloc = MEM_RESERVE | MEM_COMMIT;
+    }
+    if (!lpAddress && (clean_alloc & MEM_COMMIT) != 0u) {
+        clean_alloc |= MEM_RESERVE;
+    }
+
+    DWORD clean_protect = flProtect & 0x7FFu;
+    if ((clean_protect & 0xFFu) == 0u) {
+        clean_protect = (clean_alloc == MEM_RESERVE) ? PAGE_NOACCESS : PAGE_READWRITE;
+    }
+
+    const size_t aligned_size = (static_cast<size_t>(dwSize) + page - 1u) & ~(page - 1u);
+    void* result = nullptr;
+    if (!lpAddress && page > 0x10000u &&
+        (hProcess == ::GetCurrentProcess() || hProcess == reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1)))) {
+        struct Win32AddrReq {
+            PVOID lowest;
+            PVOID highest;
+            SIZE_T alignment;
+        };
+        struct alignas(8) Win32ExtParam {
+            ULONG64 type;
+            PVOID ptr;
+        };
+        using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+        static const VirtualAlloc2Fn va2 = []() -> VirtualAlloc2Fn {
+            HMODULE kb = ::GetModuleHandleW(L"kernelbase.dll");
+            return kb ? reinterpret_cast<VirtualAlloc2Fn>(
+                            reinterpret_cast<void*>(::GetProcAddress(kb, "VirtualAlloc2")))
+                      : nullptr;
+        }();
+        if (va2) {
+            Win32AddrReq req{nullptr, nullptr, static_cast<SIZE_T>(page)};
+            Win32ExtParam ext{1ull, &req};
+            result = va2(hProcess, nullptr, aligned_size, clean_alloc, clean_protect, &ext, 1u);
+        }
+    }
+    if (!result) {
+        result = ::VirtualAllocEx(hProcess, lpAddress, aligned_size, clean_alloc, clean_protect);
+    }
+    if (result && (flAllocationType & kXboxMemGraphics) != 0u && (clean_alloc & MEM_RESERVE) != 0u) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(result);
+        {
+            std::unique_lock<std::shared_mutex> lk(GuestGraphicsMutex());
+            GuestGraphicsTable()[base] = GuestGraphicsRegion{base, aligned_size, flAllocationType};
+        }
+        NotifyKernelXExternalAlloc(result, aligned_size, true);
+    }
+    return result;
+}
+
+LPVOID WINAPI GuestVirtualAlloc(LPVOID lpAddress,
+                                SIZE_T dwSize,
+                                DWORD flAllocationType,
+                                DWORD flProtect) {
+    return GuestVirtualAllocEx(::GetCurrentProcess(), lpAddress, dwSize, flAllocationType, flProtect);
+}
+
+BOOL WINAPI GuestVirtualFreeEx(HANDLE hProcess,
+                               LPVOID lpAddress,
+                               SIZE_T dwSize,
+                               DWORD dwFreeType) {
+    size_t tracked_size = 0;
+    if (lpAddress && (dwFreeType & MEM_RELEASE) != 0u) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(lpAddress);
+        std::unique_lock<std::shared_mutex> lk(GuestGraphicsMutex());
+        auto it = GuestGraphicsTable().find(base);
+        if (it != GuestGraphicsTable().end()) {
+            tracked_size = it->second.size;
+            GuestGraphicsTable().erase(it);
+        }
+    }
+    const BOOL ok = ::VirtualFreeEx(hProcess, lpAddress, (dwFreeType & MEM_RELEASE) ? 0 : dwSize, dwFreeType);
+    if (ok && tracked_size > 0) {
+        NotifyKernelXExternalAlloc(lpAddress, tracked_size, false);
+    }
+    return ok;
+}
+
+BOOL WINAPI GuestVirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType) {
+    return GuestVirtualFreeEx(::GetCurrentProcess(), lpAddress, dwSize, dwFreeType);
+}
+
 void FreeGuestFlsInRange(const uint8_t* base, size_t size) {
     if (!base || size == 0) {
         return;
@@ -349,62 +509,13 @@ int InvokeGuestEntryGuarded(int (*fn)()) {
 // OS / hardware system DLLs: always prioritize ScarlettEdge HLE shims over
 // anything in the title directory or Windows System32.
 const char* ResolveSystemShimTarget(const std::string& lower_name) {
-    struct Mapping {
-        const char* guest;
-        const char* target;
-    };
-    static constexpr Mapping kSystemShims[] = {
-        {"xgameruntime.dll", "xgameruntime.dll"},
-        {"xmem.dll", "xgameruntime.dll"},
-        {"d3d12_xs.dll", "d3d12_xs.dll"},
-        {"xg_xs.dll", "xg_xs.dll"},
-        {"acphal.dll", "AcpHal.dll"},
-        {"gameinput.dll", "GameInput.dll"},
-        {"xaudio2_9.dll", "xaudio2_9.dll"},
-        {"xaudio2_9redist.dll", "xaudio2_9.dll"},
-        {"x3daudio1_7.dll", "xaudio2_9.dll"},
-        {"xapofx1_5.dll", "xaudio2_9.dll"},
-        {"xcrdapi.dll", "xcrdapi.dll"},
-        {"xboxbvhbuilder.dll", "XboxBvhBuilder.dll"},
-        {"dstorage_xs.dll", "dstorage_xs.dll"},
-        {"dstorage.dll", "dstorage_xs.dll"},
-        {"dstoragecore.dll", "dstorage_xs.dll"},
-        {"kernelx.dll", "kernelx.dll"},
-        {"xvc_crypto.dll", "xvc_crypto.dll"},
-        {"xbox_codecs.dll", "xbox_codecs.dll"},
-        {"xsapi.dll", "xsapi.dll"},
-        {"microsoft.xbox.services.140.gdk.c.thunks.dll", "xsapi.dll"},
-        {"microsoft.xbox.services.141.gdk.c.thunks.dll", "xsapi.dll"},
-        {"microsoft.xbox.services.142.gdk.c.thunks.dll", "xsapi.dll"},
-        {"xs2_lifting.dll", "xs2_lifting.dll"},
-        {"vulkan_backend.dll", "vulkan_backend.dll"},
-        {"pixevt.dll", "pixevt_stub.dll"},
-        {"pixevt_stub.dll", "pixevt_stub.dll"},
-    };
-    for (const auto& m : kSystemShims) {
-        if (lower_name == m.guest) return m.target;
-    }
-    return nullptr;
+    return LookupSystemShimTarget(lower_name);
 }
 
-// Title-shipped middleware DLLs: prioritize the real DLL inside the game package
-// directory when present, falling back to ScarlettEdge HLE shims only when absent.
+// Title-shipped middleware & GDK C thunk DLLs: prioritize the real DLL inside the game
+// package/VFS when present, falling back to ScarlettEdge HLE shims only when absent.
 const char* ResolveFallbackMiddlewareTarget(const std::string& lower_name) {
-    struct Mapping {
-        const char* guest;
-        const char* target;
-    };
-    static constexpr Mapping kMiddlewareShims[] = {
-        {"bink2scarlett.dll", "Bink2Scarlett.dll"},
-        {"amd_fidelityfx_loader_xbox.dll", "amd_fidelityfx_loader_xbox.dll"},
-        {"amd_fidelityfx_upscaler_xbox.dll", "amd_fidelityfx_upscaler_xbox.dll"},
-        {"libhttpclient.gdk.dll", "libHttpClient.GDK.dll"},
-        {"xcurl.dll", "XCurl.dll"},
-    };
-    for (const auto& m : kMiddlewareShims) {
-        if (lower_name == m.guest) return m.target;
-    }
-    return nullptr;
+    return LookupFallbackMiddlewareTarget(lower_name);
 }
 
 bool IsCoreHostWindowsDll(const std::string& lower_base) {
@@ -450,18 +561,37 @@ bool HasDotDotSegment(const std::string& path) {
     return false;
 }
 
-// Intercepts guest G:\ or G:/ (including \\?\G:\) paths and resolves them via
-// PackageVfs::Global() first (falling back to GuestPackageDirectory if VFS was
-// not mounted), ensuring guest I/O never touches a host G:\ drive (e.g. Google Drive).
+// Intercepts guest G:\ / D:\ / T:\ (and relative paths when package root is virtual G:\)
+// and resolves them via PackageVfs::Global() first (streaming directly from mounted XvdContainers
+// without %TEMP% extraction, or resolving to host mount / GuestPackageDirectory when directory-backed).
 enum class GuestPathResult {
     NotGuestDrive,
-    Resolved,
+    ResolvedHost,
+    ResolvedXvdVfs,
     Blocked,
 };
 
-GuestPathResult RedirectGuestPackagePath(const std::string& raw_path, std::string& out_host_path) {
+struct GuestResolvedPath {
+    GuestPathResult kind = GuestPathResult::NotGuestDrive;
+    std::string host_path;
+    std::string vfs_path;
+    VfsEntryInfo vfs_info{};
+};
+
+bool IsVirtualGDriveRoot(const std::string& dir) {
+    if (dir.size() < 2 || dir[1] != ':') return false;
+    const char d = static_cast<char>(std::toupper(static_cast<unsigned char>(dir[0])));
+    if (d != 'G' && d != 'D') return false;
+    for (size_t i = 2; i < dir.size(); ++i) {
+        if (dir[i] != '\\' && dir[i] != '/') return false;
+    }
+    return true;
+}
+
+GuestResolvedPath ClassifyGuestPackagePath(const std::string& raw_path) {
+    GuestResolvedPath res{};
     if (raw_path.empty()) {
-        return GuestPathResult::NotGuestDrive;
+        return res;
     }
     size_t prefix = 0;
     if (raw_path.size() >= 6 &&
@@ -471,22 +601,48 @@ GuestPathResult RedirectGuestPackagePath(const std::string& raw_path, std::strin
         (raw_path[3] == '\\' || raw_path[3] == '/')) {
         prefix = 4;
     }
-    if (raw_path.size() < prefix + 2) {
-        return GuestPathResult::NotGuestDrive;
-    }
-    const char drive = raw_path[prefix];
-    const char drive_upper = static_cast<char>(std::toupper(static_cast<unsigned char>(drive)));
-    if ((drive_upper != 'G' && drive_upper != 'T' && drive_upper != 'D') || raw_path[prefix + 1] != ':') {
-        return GuestPathResult::NotGuestDrive;
-    }
-    if (raw_path.size() > prefix + 2 &&
-        raw_path[prefix + 2] != '\\' && raw_path[prefix + 2] != '/') {
-        return GuestPathResult::NotGuestDrive;
+
+    bool explicit_guest_drive = false;
+    char drive_upper = '\0';
+    std::string vpath;
+    if (raw_path.size() >= prefix + 2 && raw_path[prefix + 1] == ':') {
+        const char drive = raw_path[prefix];
+        drive_upper = static_cast<char>(std::toupper(static_cast<unsigned char>(drive)));
+        if ((drive_upper == 'G' || drive_upper == 'T' || drive_upper == 'D') &&
+            (raw_path.size() == prefix + 2 ||
+             raw_path[prefix + 2] == '\\' || raw_path[prefix + 2] == '/')) {
+            explicit_guest_drive = true;
+            vpath = raw_path.substr(prefix);
+        } else {
+            return res;
+        }
+    } else if (prefix == 0 && raw_path[0] != '\\' && raw_path[0] != '/' &&
+               raw_path.find(':') == std::string::npos &&
+               IsVirtualGDriveRoot(GetGuestPackageDirectory())) {
+        // In zero-staging XVD mode (GuestPackageDirectory == "G:\"), relative paths
+        // resolve against G:\ in PackageVfs if present there!
+        if (HasDotDotSegment(raw_path)) {
+            return res;
+        }
+        const std::string cand_vpath = "G:\\" + raw_path;
+        VfsEntryInfo vinfo{};
+        if (PackageVfs::Global().Stat(cand_vpath, vinfo) && vinfo.exists && vinfo.is_xvd_backed) {
+            res.kind = GuestPathResult::ResolvedXvdVfs;
+            res.vfs_path = cand_vpath;
+            res.vfs_info = std::move(vinfo);
+            return res;
+        }
+        return res;
+    } else {
+        return res;
     }
 
-    const std::string vpath = raw_path.substr(prefix);
+    if (!explicit_guest_drive) {
+        return res;
+    }
     if (HasDotDotSegment(vpath)) {
-        return GuestPathResult::Blocked;
+        res.kind = GuestPathResult::Blocked;
+        return res;
     }
 
     size_t rel_pos = 2;
@@ -510,25 +666,54 @@ GuestPathResult RedirectGuestPackagePath(const std::string& raw_path, std::strin
         const std::filesystem::path dir = scratch_root / sub;
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
-        out_host_path = rel.empty() ? dir.string() : (dir / rel).string();
-        return GuestPathResult::Resolved;
+        res.kind = GuestPathResult::ResolvedHost;
+        res.host_path = rel.empty() ? dir.string() : (dir / rel).string();
+        return res;
     }
 
-    // G:\ and D:\ -> PackageVfs / Package Root
-    const std::string g_vpath = (drive_upper == 'D') ? ("G:\\" + rel) : vpath;
-    Status st = PackageVfs::Global().ResolvePath(g_vpath, out_host_path);
+    // G:\ and D:\ -> PackageVfs (XVD streaming first, then host directory mount, then GuestPackageDirectory)
+    const std::string g_vpath = rel.empty() ? std::string("G:") : ("G:\\" + rel);
+    res.vfs_path = g_vpath;
+    if (PackageVfs::Global().Stat(g_vpath, res.vfs_info) && res.vfs_info.exists) {
+        if (res.vfs_info.is_xvd_backed) {
+            res.kind = GuestPathResult::ResolvedXvdVfs;
+            return res;
+        }
+        if (!res.vfs_info.host_path.empty()) {
+            res.kind = GuestPathResult::ResolvedHost;
+            res.host_path = res.vfs_info.host_path;
+            return res;
+        }
+    }
+
+    Status st = PackageVfs::Global().ResolvePath(g_vpath, res.host_path);
     if (st.ok()) {
-        return GuestPathResult::Resolved;
+        res.kind = GuestPathResult::ResolvedHost;
+        return res;
     }
     if (st.code == StatusCode::InvalidArgument) {
-        return GuestPathResult::Blocked;
+        res.kind = GuestPathResult::Blocked;
+        return res;
     }
+
     const std::string pkg_dir = GetGuestPackageDirectory();
-    if (!pkg_dir.empty()) {
-        out_host_path = rel.empty() ? pkg_dir : (std::filesystem::path(pkg_dir) / rel).string();
-        return GuestPathResult::Resolved;
+    if (!pkg_dir.empty() && !IsVirtualGDriveRoot(pkg_dir)) {
+        res.kind = GuestPathResult::ResolvedHost;
+        res.host_path = rel.empty() ? pkg_dir : (std::filesystem::path(pkg_dir) / rel).string();
+        return res;
     }
-    return GuestPathResult::Blocked;
+
+    res.kind = GuestPathResult::Blocked;
+    return res;
+}
+
+GuestPathResult RedirectGuestPackagePath(const std::string& raw_path, std::string& out_host_path) {
+    out_host_path.clear();
+    const GuestResolvedPath r = ClassifyGuestPackagePath(raw_path);
+    if (r.kind == GuestPathResult::ResolvedHost) {
+        out_host_path = r.host_path;
+    }
+    return r.kind;
 }
 
 void RecordGuestVfsResultPreservingLastError(const std::string& raw_vpath,
@@ -543,6 +728,273 @@ void RecordGuestVfsResultPreservingLastError(const std::string& raw_vpath,
     ::SetLastError(saved_err);
 }
 
+// ---------------------------------------------------------------------------
+// Zero-Staging Win32 VFS Streaming Handles & Directory Enumeration State
+// ---------------------------------------------------------------------------
+struct GuestVfsFileState {
+    std::string vfs_path;
+    uint64_t size = 0;
+    bool is_directory = false;
+    std::mutex pos_mu;
+    uint64_t position = 0;
+};
+
+struct GuestVfsFindState {
+    std::mutex mu;
+    std::vector<VfsDirEntry> matches;
+    size_t cursor = 0;
+};
+
+std::atomic<size_t> g_active_vfs_files{0};
+std::atomic<size_t> g_active_vfs_finds{0};
+
+std::shared_mutex& GuestVfsHandlesMutex() {
+    static std::shared_mutex m;
+    return m;
+}
+
+std::unordered_map<HANDLE, std::shared_ptr<GuestVfsFileState>>& GuestVfsFileMap() {
+    static std::unordered_map<HANDLE, std::shared_ptr<GuestVfsFileState>> m;
+    return m;
+}
+
+std::unordered_map<HANDLE, std::shared_ptr<GuestVfsFindState>>& GuestVfsFindMap() {
+    static std::unordered_map<HANDLE, std::shared_ptr<GuestVfsFindState>> m;
+    return m;
+}
+
+std::shared_ptr<GuestVfsFileState> LookupVfsFileHandle(HANDLE h) {
+    if (!h || h == INVALID_HANDLE_VALUE || g_active_vfs_files.load(std::memory_order_acquire) == 0) {
+        return nullptr;
+    }
+    std::shared_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+    auto it = GuestVfsFileMap().find(h);
+    return it == GuestVfsFileMap().end() ? nullptr : it->second;
+}
+
+std::shared_ptr<GuestVfsFindState> LookupVfsFindHandle(HANDLE h) {
+    if (!h || h == INVALID_HANDLE_VALUE || g_active_vfs_finds.load(std::memory_order_acquire) == 0) {
+        return nullptr;
+    }
+    std::shared_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+    auto it = GuestVfsFindMap().find(h);
+    return it == GuestVfsFindMap().end() ? nullptr : it->second;
+}
+
+HANDLE OpenVirtualXvdFileHandle(const GuestResolvedPath& resolved,
+                                DWORD dwDesiredAccess,
+                                DWORD dwCreationDisposition,
+                                DWORD dwFlagsAndAttributes) {
+    constexpr DWORD kWriteAccessMask =
+        GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER;
+    if ((dwDesiredAccess & kWriteAccessMask) != 0u) {
+        ::SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (dwCreationDisposition == CREATE_NEW ||
+        dwCreationDisposition == CREATE_ALWAYS ||
+        dwCreationDisposition == TRUNCATE_EXISTING) {
+        ::SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (resolved.vfs_info.is_directory &&
+        (dwFlagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) == 0u) {
+        ::SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE tok = ::CreateEventW(nullptr, TRUE, TRUE, nullptr);
+    if (!tok) {
+        ::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return INVALID_HANDLE_VALUE;
+    }
+    auto st = std::make_shared<GuestVfsFileState>();
+    st->vfs_path = resolved.vfs_path;
+    st->size = resolved.vfs_info.size_bytes;
+    st->is_directory = resolved.vfs_info.is_directory;
+    {
+        std::unique_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+        GuestVfsFileMap()[tok] = std::move(st);
+        g_active_vfs_files.fetch_add(1, std::memory_order_release);
+    }
+    ::SetLastError(dwCreationDisposition == OPEN_ALWAYS ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
+    return tok;
+}
+
+uint64_t HashVfsPath64(const std::string& p) {
+    uint64_t h = 14695981039346656037ull;
+    for (unsigned char c : p) {
+        const unsigned char lc = static_cast<unsigned char>(std::tolower(c == '/' ? '\\' : c));
+        h ^= lc;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+FILETIME DefaultVfsFileTime() {
+    FILETIME ft{};
+    ft.dwLowDateTime = 0x00000000u;
+    ft.dwHighDateTime = 0x01DA0000u;
+    return ft;
+}
+
+bool WildcardMatchCaseInsensitive(const std::string& pattern, const std::string& candidate) {
+    if (pattern.empty() || pattern == "*" || pattern == "*.*") {
+        return true;
+    }
+    size_t p = 0;
+    size_t s = 0;
+    size_t star_idx = std::string::npos;
+    size_t match_idx = 0;
+    while (s < candidate.size()) {
+        if (p < pattern.size() &&
+            (pattern[p] == '?' ||
+             std::tolower(static_cast<unsigned char>(pattern[p])) ==
+                 std::tolower(static_cast<unsigned char>(candidate[s])))) {
+            ++p;
+            ++s;
+        } else if (p < pattern.size() && pattern[p] == '*') {
+            star_idx = p++;
+            match_idx = s;
+        } else if (star_idx != std::string::npos) {
+            p = star_idx + 1;
+            s = ++match_idx;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.size() &&
+           (pattern[p] == '*' ||
+            (p + 1 < pattern.size() && pattern[p] == '.' && pattern[p + 1] == '*'))) {
+        if (pattern[p] == '.') p += 2;
+        else ++p;
+    }
+    return p == pattern.size();
+}
+
+void FillFindDataA(const VfsDirEntry& ent, LPWIN32_FIND_DATAA out) {
+    if (!out) return;
+    std::memset(out, 0, sizeof(*out));
+    out->dwFileAttributes = ent.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
+    const FILETIME ft = DefaultVfsFileTime();
+    out->ftCreationTime = ft;
+    out->ftLastAccessTime = ft;
+    out->ftLastWriteTime = ft;
+    out->nFileSizeHigh = static_cast<DWORD>((ent.size_bytes >> 32) & 0xFFFFFFFFull);
+    out->nFileSizeLow = static_cast<DWORD>(ent.size_bytes & 0xFFFFFFFFull);
+    const size_t copy_len = (std::min)(ent.name.size(), static_cast<size_t>(MAX_PATH - 1));
+    std::memcpy(out->cFileName, ent.name.data(), copy_len);
+    out->cFileName[copy_len] = '\0';
+}
+
+void FillFindDataW(const VfsDirEntry& ent, LPWIN32_FIND_DATAW out) {
+    if (!out) return;
+    std::memset(out, 0, sizeof(*out));
+    out->dwFileAttributes = ent.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
+    const FILETIME ft = DefaultVfsFileTime();
+    out->ftCreationTime = ft;
+    out->ftLastAccessTime = ft;
+    out->ftLastWriteTime = ft;
+    out->nFileSizeHigh = static_cast<DWORD>((ent.size_bytes >> 32) & 0xFFFFFFFFull);
+    out->nFileSizeLow = static_cast<DWORD>(ent.size_bytes & 0xFFFFFFFFull);
+    const std::wstring wname = Utf8ToWide(ent.name);
+    const size_t copy_len = (std::min)(wname.size(), static_cast<size_t>(MAX_PATH - 1));
+    if (copy_len > 0) {
+        std::memcpy(out->cFileName, wname.data(), copy_len * sizeof(wchar_t));
+    }
+    out->cFileName[copy_len] = L'\0';
+}
+
+bool TryOpenVfsFindHandle(const std::string& raw_search_path,
+                          HANDLE& out_handle,
+                          VfsDirEntry& out_first,
+                          bool& out_handled) {
+    out_handle = INVALID_HANDLE_VALUE;
+    out_handled = false;
+    if (raw_search_path.empty()) return false;
+
+    // Extract drive and parent directory vs leaf pattern (before ClassifyGuestPackagePath,
+    // because '*' / '?' are valid in FindFirstFile patterns).
+    std::string s = raw_search_path;
+    if (s.size() >= 6 && (s[0] == '\\' || s[0] == '/') && (s[1] == '\\' || s[1] == '/') &&
+        (s[2] == '?' || s[2] == '.') && (s[3] == '\\' || s[3] == '/')) {
+        s.erase(0, 4);
+    }
+    if (s.size() < 2 || s[1] != ':') {
+        return false;
+    }
+    const char drv = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+    if (drv != 'G' && drv != 'D') {
+        return false;
+    }
+    if (HasDotDotSegment(s)) {
+        out_handled = true;
+        ::SetLastError(ERROR_ACCESS_DENIED);
+        return false;
+    }
+
+    std::replace(s.begin(), s.end(), '/', '\\');
+    while (s.size() > 2 && s.back() == '\\') {
+        s.pop_back();
+    }
+    std::string parent_vdir = "G:";
+    std::string pattern = "*";
+    const size_t sep = s.find_last_of('\\');
+    if (sep != std::string::npos) {
+        const std::string dir_part = s.substr(2, sep - 2);
+        parent_vdir = dir_part.empty() ? std::string("G:") : ("G:" + dir_part);
+        pattern = s.substr(sep + 1);
+    } else if (s.size() > 2) {
+        pattern = s.substr(2);
+    }
+
+    VfsEntryInfo pinfo{};
+    if (!PackageVfs::Global().Stat(parent_vdir, pinfo) || !pinfo.exists || !pinfo.is_xvd_backed) {
+        return false;
+    }
+
+    out_handled = true;
+    std::vector<VfsDirEntry> all_entries;
+    if (!PackageVfs::Global().ListDirectory(parent_vdir, all_entries).ok()) {
+        ::SetLastError(ERROR_PATH_NOT_FOUND);
+        return false;
+    }
+
+    std::vector<VfsDirEntry> matched;
+    const bool is_sub = (parent_vdir.size() > 3);
+    if (is_sub && (pattern == "*" || pattern == "*.*")) {
+        matched.push_back(VfsDirEntry{".", 0, true});
+        matched.push_back(VfsDirEntry{"..", 0, true});
+    }
+    for (const auto& ent : all_entries) {
+        if (WildcardMatchCaseInsensitive(pattern, ent.name)) {
+            matched.push_back(ent);
+        }
+    }
+    if (matched.empty()) {
+        ::SetLastError(ERROR_FILE_NOT_FOUND);
+        return false;
+    }
+
+    HANDLE tok = ::CreateEventW(nullptr, TRUE, TRUE, nullptr);
+    if (!tok) {
+        ::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+    out_first = matched.front();
+    auto st = std::make_shared<GuestVfsFindState>();
+    st->matches = std::move(matched);
+    st->cursor = 1;
+    {
+        std::unique_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+        GuestVfsFindMap()[tok] = std::move(st);
+        g_active_vfs_finds.fetch_add(1, std::memory_order_release);
+    }
+    out_handle = tok;
+    ::SetLastError(ERROR_SUCCESS);
+    return true;
+}
+
 HANDLE WINAPI GuestCreateFileA(LPCSTR lpFileName,
                                DWORD dwDesiredAccess,
                                DWORD dwShareMode,
@@ -553,20 +1005,25 @@ HANDLE WINAPI GuestCreateFileA(LPCSTR lpFileName,
     const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
     if (lpFileName) {
         const std::string raw_vpath(lpFileName);
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(raw_vpath, host_path);
-        if (r == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(raw_vpath);
+        if (r.kind == GuestPathResult::Blocked) {
             SetLastError(ERROR_PATH_NOT_FOUND);
             RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
             return INVALID_HANDLE_VALUE;
         }
-        if (r == GuestPathResult::Resolved) {
-            const std::wstring wide = Utf8ToWide(host_path);
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            HANDLE h = OpenVirtualXvdFileHandle(
+                r, dwDesiredAccess, dwCreationDisposition, dwFlagsAndAttributes);
+            RecordGuestVfsResultPreservingLastError(raw_vpath, h != INVALID_HANDLE_VALUE, caller_rip);
+            return h;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
             HANDLE h = !wide.empty()
                 ? ::CreateFileW(wide.c_str(), dwDesiredAccess, dwShareMode,
                                 lpSecurityAttributes, dwCreationDisposition,
                                 dwFlagsAndAttributes, hTemplateFile)
-                : ::CreateFileA(host_path.c_str(), dwDesiredAccess, dwShareMode,
+                : ::CreateFileA(r.host_path.c_str(), dwDesiredAccess, dwShareMode,
                                 lpSecurityAttributes, dwCreationDisposition,
                                 dwFlagsAndAttributes, hTemplateFile);
             RecordGuestVfsResultPreservingLastError(raw_vpath, h != INVALID_HANDLE_VALUE, caller_rip);
@@ -587,15 +1044,20 @@ HANDLE WINAPI GuestCreateFileW(LPCWSTR lpFileName,
     const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
     if (lpFileName) {
         const std::string raw_vpath = WideToUtf8(lpFileName);
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(raw_vpath, host_path);
-        if (r == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(raw_vpath);
+        if (r.kind == GuestPathResult::Blocked) {
             SetLastError(ERROR_PATH_NOT_FOUND);
             RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
             return INVALID_HANDLE_VALUE;
         }
-        if (r == GuestPathResult::Resolved) {
-            const std::wstring wide = Utf8ToWide(host_path);
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            HANDLE h = OpenVirtualXvdFileHandle(
+                r, dwDesiredAccess, dwCreationDisposition, dwFlagsAndAttributes);
+            RecordGuestVfsResultPreservingLastError(raw_vpath, h != INVALID_HANDLE_VALUE, caller_rip);
+            return h;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
             if (wide.empty()) {
                 SetLastError(ERROR_INVALID_NAME);
                 RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
@@ -619,15 +1081,20 @@ HANDLE WINAPI GuestCreateFile2(LPCWSTR lpFileName,
     const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
     if (lpFileName) {
         const std::string raw_vpath = WideToUtf8(lpFileName);
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(raw_vpath, host_path);
-        if (r == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(raw_vpath);
+        if (r.kind == GuestPathResult::Blocked) {
             SetLastError(ERROR_PATH_NOT_FOUND);
             RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
             return INVALID_HANDLE_VALUE;
         }
-        if (r == GuestPathResult::Resolved) {
-            const std::wstring wide = Utf8ToWide(host_path);
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            const DWORD flags = pCreateExParams ? pCreateExParams->dwFileFlags : 0u;
+            HANDLE h = OpenVirtualXvdFileHandle(r, dwDesiredAccess, dwCreationDisposition, flags);
+            RecordGuestVfsResultPreservingLastError(raw_vpath, h != INVALID_HANDLE_VALUE, caller_rip);
+            return h;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
             if (wide.empty()) {
                 SetLastError(ERROR_INVALID_NAME);
                 RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
@@ -643,20 +1110,334 @@ HANDLE WINAPI GuestCreateFile2(LPCWSTR lpFileName,
                          pCreateExParams);
 }
 
+BOOL WINAPI GuestReadFile(HANDLE hFile,
+                          LPVOID lpBuffer,
+                          DWORD nNumberOfBytesToRead,
+                          LPDWORD lpNumberOfBytesRead,
+                          LPOVERLAPPED lpOverlapped) {
+    if (auto vf = LookupVfsFileHandle(hFile)) {
+        if (lpNumberOfBytesRead) *lpNumberOfBytesRead = 0;
+        if (vf->is_directory || (nNumberOfBytesToRead > 0 && !lpBuffer)) {
+            ::SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        auto signal_ov_event = [&]() {
+            if (lpOverlapped && lpOverlapped->hEvent) {
+                HANDLE ev = reinterpret_cast<HANDLE>(
+                    reinterpret_cast<uintptr_t>(lpOverlapped->hEvent) & ~uintptr_t{1});
+                if (ev) ::SetEvent(ev);
+            }
+        };
+        uint64_t read_off = 0;
+        std::unique_lock<std::mutex> pos_lk(vf->pos_mu, std::defer_lock);
+        if (lpOverlapped) {
+            read_off = (static_cast<uint64_t>(lpOverlapped->OffsetHigh) << 32) |
+                       static_cast<uint64_t>(lpOverlapped->Offset);
+        } else {
+            pos_lk.lock();
+            read_off = vf->position;
+        }
+        if (nNumberOfBytesToRead == 0) {
+            if (lpOverlapped) {
+                lpOverlapped->Internal = 0;
+                lpOverlapped->InternalHigh = 0;
+                signal_ov_event();
+            }
+            ::SetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+        if (read_off >= vf->size) {
+            if (lpOverlapped) {
+                lpOverlapped->Internal = static_cast<ULONG_PTR>(0xC0000011ull);  // STATUS_END_OF_FILE
+                lpOverlapped->InternalHigh = 0;
+                signal_ov_event();
+                ::SetLastError(ERROR_HANDLE_EOF);
+                return FALSE;
+            }
+            ::SetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+        const size_t to_read = static_cast<size_t>(
+            (std::min)(static_cast<uint64_t>(nNumberOfBytesToRead), vf->size - read_off));
+        size_t got = 0;
+        Status st = PackageVfs::Global().ReadFileRangeToBuffer(
+            vf->vfs_path, read_off, to_read, lpBuffer, got);
+        if (!st.ok()) {
+            if (lpOverlapped) {
+                lpOverlapped->Internal = static_cast<ULONG_PTR>(0xC0000185ull);
+                lpOverlapped->InternalHigh = 0;
+            }
+            ::SetLastError(ERROR_READ_FAULT);
+            return FALSE;
+        }
+        if (!lpOverlapped) {
+            vf->position = read_off + got;
+        } else {
+            lpOverlapped->Internal = 0;
+            lpOverlapped->InternalHigh = got;
+            signal_ov_event();
+        }
+        if (lpNumberOfBytesRead) {
+            *lpNumberOfBytesRead = static_cast<DWORD>(got);
+        }
+        ::SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    return ::ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped);
+}
+
+BOOL WINAPI GuestGetOverlappedResult(HANDLE hFile,
+                                     LPOVERLAPPED lpOverlapped,
+                                     LPDWORD lpNumberOfBytesTransferred,
+                                     BOOL bWait) {
+    if (LookupVfsFileHandle(hFile)) {
+        if (!lpOverlapped || !lpNumberOfBytesTransferred) {
+            ::SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        *lpNumberOfBytesTransferred = static_cast<DWORD>(lpOverlapped->InternalHigh);
+        if (lpOverlapped->Internal == static_cast<ULONG_PTR>(0xC0000011ull)) {
+            ::SetLastError(ERROR_HANDLE_EOF);
+            return FALSE;
+        }
+        if (static_cast<intptr_t>(lpOverlapped->Internal) < 0) {
+            ::SetLastError(ERROR_READ_FAULT);
+            return FALSE;
+        }
+        ::SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    return ::GetOverlappedResult(hFile, lpOverlapped, lpNumberOfBytesTransferred, bWait);
+}
+
+BOOL WINAPI GuestGetOverlappedResultEx(HANDLE hFile,
+                                       LPOVERLAPPED lpOverlapped,
+                                       LPDWORD lpNumberOfBytesTransferred,
+                                       DWORD dwMilliseconds,
+                                       BOOL bAlertable) {
+    if (LookupVfsFileHandle(hFile)) {
+        return GuestGetOverlappedResult(hFile, lpOverlapped, lpNumberOfBytesTransferred,
+                                        dwMilliseconds != 0 ? TRUE : FALSE);
+    }
+    return ::GetOverlappedResultEx(hFile, lpOverlapped, lpNumberOfBytesTransferred,
+                                   dwMilliseconds, bAlertable);
+}
+
+BOOL WINAPI GuestSetFilePointerEx(HANDLE hFile,
+                                  LARGE_INTEGER liDistanceToMove,
+                                  PLARGE_INTEGER lpNewFilePointer,
+                                  DWORD dwMoveMethod) {
+    if (auto vf = LookupVfsFileHandle(hFile)) {
+        std::lock_guard<std::mutex> lk(vf->pos_mu);
+        int64_t base = 0;
+        if (dwMoveMethod == FILE_BEGIN) {
+            base = 0;
+        } else if (dwMoveMethod == FILE_CURRENT) {
+            base = static_cast<int64_t>(vf->position);
+        } else if (dwMoveMethod == FILE_END) {
+            base = static_cast<int64_t>(vf->size);
+        } else {
+            ::SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        const int64_t next = base + liDistanceToMove.QuadPart;
+        if (next < 0) {
+            ::SetLastError(ERROR_NEGATIVE_SEEK);
+            return FALSE;
+        }
+        vf->position = static_cast<uint64_t>(next);
+        if (lpNewFilePointer) {
+            lpNewFilePointer->QuadPart = next;
+        }
+        ::SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    return ::SetFilePointerEx(hFile, liDistanceToMove, lpNewFilePointer, dwMoveMethod);
+}
+
+DWORD WINAPI GuestSetFilePointer(HANDLE hFile,
+                                 LONG lDistanceToMove,
+                                 PLONG lpDistanceToMoveHigh,
+                                 DWORD dwMoveMethod) {
+    if (LookupVfsFileHandle(hFile)) {
+        LARGE_INTEGER dist{};
+        if (lpDistanceToMoveHigh) {
+            dist.LowPart = static_cast<DWORD>(lDistanceToMove);
+            dist.HighPart = *lpDistanceToMoveHigh;
+        } else {
+            dist.QuadPart = static_cast<LONGLONG>(lDistanceToMove);
+        }
+        LARGE_INTEGER out_pos{};
+        if (!GuestSetFilePointerEx(hFile, dist, &out_pos, dwMoveMethod)) {
+            return INVALID_SET_FILE_POINTER;
+        }
+        if (lpDistanceToMoveHigh) {
+            *lpDistanceToMoveHigh = out_pos.HighPart;
+        }
+        ::SetLastError(ERROR_SUCCESS);
+        return out_pos.LowPart;
+    }
+    return ::SetFilePointer(hFile, lDistanceToMove, lpDistanceToMoveHigh, dwMoveMethod);
+}
+
+BOOL WINAPI GuestGetFileSizeEx(HANDLE hFile, PLARGE_INTEGER lpFileSize) {
+    if (auto vf = LookupVfsFileHandle(hFile)) {
+        if (!lpFileSize) {
+            ::SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        lpFileSize->QuadPart = static_cast<LONGLONG>(vf->size);
+        ::SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    return ::GetFileSizeEx(hFile, lpFileSize);
+}
+
+DWORD WINAPI GuestGetFileSize(HANDLE hFile, LPDWORD lpFileSizeHigh) {
+    if (auto vf = LookupVfsFileHandle(hFile)) {
+        if (lpFileSizeHigh) {
+            *lpFileSizeHigh = static_cast<DWORD>((vf->size >> 32) & 0xFFFFFFFFull);
+        }
+        ::SetLastError(ERROR_SUCCESS);
+        return static_cast<DWORD>(vf->size & 0xFFFFFFFFull);
+    }
+    return ::GetFileSize(hFile, lpFileSizeHigh);
+}
+
+BOOL WINAPI GuestGetFileInformationByHandle(HANDLE hFile,
+                                            LPBY_HANDLE_FILE_INFORMATION lpFileInformation) {
+    if (auto vf = LookupVfsFileHandle(hFile)) {
+        if (!lpFileInformation) {
+            ::SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        std::memset(lpFileInformation, 0, sizeof(*lpFileInformation));
+        lpFileInformation->dwFileAttributes =
+            vf->is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
+        const FILETIME ft = DefaultVfsFileTime();
+        lpFileInformation->ftCreationTime = ft;
+        lpFileInformation->ftLastAccessTime = ft;
+        lpFileInformation->ftLastWriteTime = ft;
+        lpFileInformation->dwVolumeSerialNumber = 0x5CA81E77u;
+        lpFileInformation->nFileSizeHigh = static_cast<DWORD>((vf->size >> 32) & 0xFFFFFFFFull);
+        lpFileInformation->nFileSizeLow = static_cast<DWORD>(vf->size & 0xFFFFFFFFull);
+        lpFileInformation->nNumberOfLinks = 1;
+        const uint64_t fidx = HashVfsPath64(vf->vfs_path);
+        lpFileInformation->nFileIndexHigh = static_cast<DWORD>((fidx >> 32) & 0xFFFFFFFFull);
+        lpFileInformation->nFileIndexLow = static_cast<DWORD>(fidx & 0xFFFFFFFFull);
+        ::SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    return ::GetFileInformationByHandle(hFile, lpFileInformation);
+}
+
+BOOL WINAPI GuestGetFileInformationByHandleEx(HANDLE hFile,
+                                              FILE_INFO_BY_HANDLE_CLASS FileInformationClass,
+                                              LPVOID lpFileInformation,
+                                              DWORD dwBufferSize) {
+    if (auto vf = LookupVfsFileHandle(hFile)) {
+        if (!lpFileInformation) {
+            ::SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        if (FileInformationClass == FileBasicInfo) {
+            if (dwBufferSize < sizeof(FILE_BASIC_INFO)) {
+                ::SetLastError(ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            auto* info = static_cast<FILE_BASIC_INFO*>(lpFileInformation);
+            std::memset(info, 0, sizeof(*info));
+            info->FileAttributes =
+                vf->is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
+            ::SetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+        if (FileInformationClass == FileStandardInfo) {
+            if (dwBufferSize < sizeof(FILE_STANDARD_INFO)) {
+                ::SetLastError(ERROR_BAD_LENGTH);
+                return FALSE;
+            }
+            auto* info = static_cast<FILE_STANDARD_INFO*>(lpFileInformation);
+            std::memset(info, 0, sizeof(*info));
+            info->AllocationSize.QuadPart = static_cast<LONGLONG>((vf->size + 4095ull) & ~4095ull);
+            info->EndOfFile.QuadPart = static_cast<LONGLONG>(vf->size);
+            info->NumberOfLinks = 1;
+            info->Directory = vf->is_directory ? TRUE : FALSE;
+            ::SetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+        ::SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return ::GetFileInformationByHandleEx(
+        hFile, FileInformationClass, lpFileInformation, dwBufferSize);
+}
+
+DWORD WINAPI GuestGetFileType(HANDLE hFile) {
+    if (LookupVfsFileHandle(hFile)) {
+        ::SetLastError(ERROR_SUCCESS);
+        return FILE_TYPE_DISK;
+    }
+    return ::GetFileType(hFile);
+}
+
+BOOL WINAPI GuestDuplicateHandle(HANDLE hSourceProcessHandle,
+                                 HANDLE hSourceHandle,
+                                 HANDLE hTargetProcessHandle,
+                                 LPHANDLE lpTargetHandle,
+                                 DWORD dwDesiredAccess,
+                                 BOOL bInheritHandle,
+                                 DWORD dwOptions) {
+    const BOOL ok = ::DuplicateHandle(hSourceProcessHandle, hSourceHandle, hTargetProcessHandle,
+                                      lpTargetHandle, dwDesiredAccess, bInheritHandle, dwOptions);
+    if (ok && lpTargetHandle && *lpTargetHandle) {
+        if (auto vf = LookupVfsFileHandle(hSourceHandle)) {
+            std::unique_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+            GuestVfsFileMap()[*lpTargetHandle] = vf;
+            g_active_vfs_files.fetch_add(1, std::memory_order_release);
+        }
+    }
+    return ok;
+}
+
+BOOL WINAPI GuestCloseHandle(HANDLE hObject) {
+    if (hObject && hObject != INVALID_HANDLE_VALUE &&
+        g_active_vfs_files.load(std::memory_order_acquire) > 0) {
+        bool was_vfs = false;
+        {
+            std::unique_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+            auto it = GuestVfsFileMap().find(hObject);
+            if (it != GuestVfsFileMap().end()) {
+                GuestVfsFileMap().erase(it);
+                g_active_vfs_files.fetch_sub(1, std::memory_order_release);
+                was_vfs = true;
+            }
+        }
+        if (was_vfs) {
+            return ::CloseHandle(hObject);
+        }
+    }
+    return ::CloseHandle(hObject);
+}
+
 DWORD WINAPI GuestGetFileAttributesA(LPCSTR lpFileName) {
     const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
     if (lpFileName) {
         const std::string raw_vpath(lpFileName);
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(raw_vpath, host_path);
-        if (r == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(raw_vpath);
+        if (r.kind == GuestPathResult::Blocked) {
             SetLastError(ERROR_PATH_NOT_FOUND);
             RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
             return INVALID_FILE_ATTRIBUTES;
         }
-        if (r == GuestPathResult::Resolved) {
-            const std::wstring wide = Utf8ToWide(host_path);
-            const DWORD attr = wide.empty() ? ::GetFileAttributesA(host_path.c_str())
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            ::SetLastError(ERROR_SUCCESS);
+            RecordGuestVfsResultPreservingLastError(raw_vpath, true, caller_rip);
+            return r.vfs_info.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
+            const DWORD attr = wide.empty() ? ::GetFileAttributesA(r.host_path.c_str())
                                             : ::GetFileAttributesW(wide.c_str());
             RecordGuestVfsResultPreservingLastError(raw_vpath, attr != INVALID_FILE_ATTRIBUTES, caller_rip);
             return attr;
@@ -669,15 +1450,19 @@ DWORD WINAPI GuestGetFileAttributesW(LPCWSTR lpFileName) {
     const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
     if (lpFileName) {
         const std::string raw_vpath = WideToUtf8(lpFileName);
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(raw_vpath, host_path);
-        if (r == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(raw_vpath);
+        if (r.kind == GuestPathResult::Blocked) {
             SetLastError(ERROR_PATH_NOT_FOUND);
             RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
             return INVALID_FILE_ATTRIBUTES;
         }
-        if (r == GuestPathResult::Resolved) {
-            const std::wstring wide = Utf8ToWide(host_path);
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            ::SetLastError(ERROR_SUCCESS);
+            RecordGuestVfsResultPreservingLastError(raw_vpath, true, caller_rip);
+            return r.vfs_info.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
             if (wide.empty()) {
                 SetLastError(ERROR_INVALID_NAME);
                 RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
@@ -691,23 +1476,47 @@ DWORD WINAPI GuestGetFileAttributesW(LPCWSTR lpFileName) {
     return ::GetFileAttributesW(lpFileName);
 }
 
+BOOL FillXvdAttributeData(const VfsEntryInfo& vinfo,
+                          GET_FILEEX_INFO_LEVELS fInfoLevelId,
+                          LPVOID lpFileInformation) {
+    if (fInfoLevelId != GetFileExInfoStandard || !lpFileInformation) {
+        ::SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    auto* data = static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(lpFileInformation);
+    std::memset(data, 0, sizeof(*data));
+    data->dwFileAttributes = vinfo.is_directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_READONLY;
+    const FILETIME ft = DefaultVfsFileTime();
+    data->ftCreationTime = ft;
+    data->ftLastAccessTime = ft;
+    data->ftLastWriteTime = ft;
+    data->nFileSizeHigh = static_cast<DWORD>((vinfo.size_bytes >> 32) & 0xFFFFFFFFull);
+    data->nFileSizeLow = static_cast<DWORD>(vinfo.size_bytes & 0xFFFFFFFFull);
+    ::SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
 BOOL WINAPI GuestGetFileAttributesExA(LPCSTR lpFileName,
                                       GET_FILEEX_INFO_LEVELS fInfoLevelId,
                                       LPVOID lpFileInformation) {
     const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
     if (lpFileName) {
         const std::string raw_vpath(lpFileName);
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(raw_vpath, host_path);
-        if (r == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(raw_vpath);
+        if (r.kind == GuestPathResult::Blocked) {
             SetLastError(ERROR_PATH_NOT_FOUND);
             RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
             return FALSE;
         }
-        if (r == GuestPathResult::Resolved) {
-            const std::wstring wide = Utf8ToWide(host_path);
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            const BOOL ok = FillXvdAttributeData(r.vfs_info, fInfoLevelId, lpFileInformation);
+            RecordGuestVfsResultPreservingLastError(raw_vpath, ok != FALSE, caller_rip);
+            return ok;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
             const BOOL ok = wide.empty()
-                ? ::GetFileAttributesExA(host_path.c_str(), fInfoLevelId, lpFileInformation)
+                ? ::GetFileAttributesExA(r.host_path.c_str(), fInfoLevelId, lpFileInformation)
                 : ::GetFileAttributesExW(wide.c_str(), fInfoLevelId, lpFileInformation);
             RecordGuestVfsResultPreservingLastError(raw_vpath, ok != FALSE, caller_rip);
             return ok;
@@ -722,15 +1531,19 @@ BOOL WINAPI GuestGetFileAttributesExW(LPCWSTR lpFileName,
     const uint64_t caller_rip = SCARLETTX_CALLER_RIP();
     if (lpFileName) {
         const std::string raw_vpath = WideToUtf8(lpFileName);
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(raw_vpath, host_path);
-        if (r == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(raw_vpath);
+        if (r.kind == GuestPathResult::Blocked) {
             SetLastError(ERROR_PATH_NOT_FOUND);
             RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
             return FALSE;
         }
-        if (r == GuestPathResult::Resolved) {
-            const std::wstring wide = Utf8ToWide(host_path);
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            const BOOL ok = FillXvdAttributeData(r.vfs_info, fInfoLevelId, lpFileInformation);
+            RecordGuestVfsResultPreservingLastError(raw_vpath, ok != FALSE, caller_rip);
+            return ok;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
             if (wide.empty()) {
                 SetLastError(ERROR_INVALID_NAME);
                 RecordGuestVfsResultPreservingLastError(raw_vpath, false, caller_rip);
@@ -746,13 +1559,23 @@ BOOL WINAPI GuestGetFileAttributesExW(LPCWSTR lpFileName,
 
 HANDLE WINAPI GuestFindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData) {
     if (lpFileName) {
+        HANDLE vfs_h = INVALID_HANDLE_VALUE;
+        VfsDirEntry first{};
+        bool handled = false;
+        if (TryOpenVfsFindHandle(lpFileName, vfs_h, first, handled)) {
+            FillFindDataA(first, lpFindFileData);
+            return vfs_h;
+        }
+        if (handled) {
+            return INVALID_HANDLE_VALUE;
+        }
         std::string host_path;
         const GuestPathResult r = RedirectGuestPackagePath(lpFileName, host_path);
         if (r == GuestPathResult::Blocked) {
             ::SetLastError(ERROR_ACCESS_DENIED);
             return INVALID_HANDLE_VALUE;
         }
-        if (r == GuestPathResult::Resolved) {
+        if (r == GuestPathResult::ResolvedHost) {
             return ::FindFirstFileA(host_path.c_str(), lpFindFileData);
         }
     }
@@ -761,14 +1584,24 @@ HANDLE WINAPI GuestFindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFi
 
 HANDLE WINAPI GuestFindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData) {
     if (lpFileName) {
-        std::string utf8 = WideToUtf8(lpFileName);
+        const std::string utf8 = WideToUtf8(lpFileName);
+        HANDLE vfs_h = INVALID_HANDLE_VALUE;
+        VfsDirEntry first{};
+        bool handled = false;
+        if (TryOpenVfsFindHandle(utf8, vfs_h, first, handled)) {
+            FillFindDataW(first, lpFindFileData);
+            return vfs_h;
+        }
+        if (handled) {
+            return INVALID_HANDLE_VALUE;
+        }
         std::string host_path;
         const GuestPathResult r = RedirectGuestPackagePath(utf8, host_path);
         if (r == GuestPathResult::Blocked) {
             ::SetLastError(ERROR_ACCESS_DENIED);
             return INVALID_HANDLE_VALUE;
         }
-        if (r == GuestPathResult::Resolved) {
+        if (r == GuestPathResult::ResolvedHost) {
             const std::wstring wide = Utf8ToWide(host_path);
             if (!wide.empty()) {
                 return ::FindFirstFileW(wide.c_str(), lpFindFileData);
@@ -782,13 +1615,23 @@ HANDLE WINAPI GuestFindFirstFileExA(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoL
                                     LPVOID lpFindFileData, FINDEX_SEARCH_OPS fSearchOp,
                                     LPVOID lpSearchFilter, DWORD dwAdditionalFlags) {
     if (lpFileName) {
+        HANDLE vfs_h = INVALID_HANDLE_VALUE;
+        VfsDirEntry first{};
+        bool handled = false;
+        if (TryOpenVfsFindHandle(lpFileName, vfs_h, first, handled)) {
+            FillFindDataA(first, static_cast<LPWIN32_FIND_DATAA>(lpFindFileData));
+            return vfs_h;
+        }
+        if (handled) {
+            return INVALID_HANDLE_VALUE;
+        }
         std::string host_path;
         const GuestPathResult r = RedirectGuestPackagePath(lpFileName, host_path);
         if (r == GuestPathResult::Blocked) {
             ::SetLastError(ERROR_ACCESS_DENIED);
             return INVALID_HANDLE_VALUE;
         }
-        if (r == GuestPathResult::Resolved) {
+        if (r == GuestPathResult::ResolvedHost) {
             return ::FindFirstFileExA(host_path.c_str(), fInfoLevelId, lpFindFileData,
                                       fSearchOp, lpSearchFilter, dwAdditionalFlags);
         }
@@ -801,14 +1644,24 @@ HANDLE WINAPI GuestFindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfo
                                     LPVOID lpFindFileData, FINDEX_SEARCH_OPS fSearchOp,
                                     LPVOID lpSearchFilter, DWORD dwAdditionalFlags) {
     if (lpFileName) {
-        std::string utf8 = WideToUtf8(lpFileName);
+        const std::string utf8 = WideToUtf8(lpFileName);
+        HANDLE vfs_h = INVALID_HANDLE_VALUE;
+        VfsDirEntry first{};
+        bool handled = false;
+        if (TryOpenVfsFindHandle(utf8, vfs_h, first, handled)) {
+            FillFindDataW(first, static_cast<LPWIN32_FIND_DATAW>(lpFindFileData));
+            return vfs_h;
+        }
+        if (handled) {
+            return INVALID_HANDLE_VALUE;
+        }
         std::string host_path;
         const GuestPathResult r = RedirectGuestPackagePath(utf8, host_path);
         if (r == GuestPathResult::Blocked) {
             ::SetLastError(ERROR_ACCESS_DENIED);
             return INVALID_HANDLE_VALUE;
         }
-        if (r == GuestPathResult::Resolved) {
+        if (r == GuestPathResult::ResolvedHost) {
             const std::wstring wide = Utf8ToWide(host_path);
             if (!wide.empty()) {
                 return ::FindFirstFileExW(wide.c_str(), fInfoLevelId, lpFindFileData,
@@ -820,15 +1673,74 @@ HANDLE WINAPI GuestFindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfo
                               fSearchOp, lpSearchFilter, dwAdditionalFlags);
 }
 
+BOOL WINAPI GuestFindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData) {
+    if (auto vf = LookupVfsFindHandle(hFindFile)) {
+        std::lock_guard<std::mutex> lk(vf->mu);
+        if (vf->cursor >= vf->matches.size()) {
+            ::SetLastError(ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        FillFindDataA(vf->matches[vf->cursor++], lpFindFileData);
+        ::SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    return ::FindNextFileA(hFindFile, lpFindFileData);
+}
+
+BOOL WINAPI GuestFindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData) {
+    if (auto vf = LookupVfsFindHandle(hFindFile)) {
+        std::lock_guard<std::mutex> lk(vf->mu);
+        if (vf->cursor >= vf->matches.size()) {
+            ::SetLastError(ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        FillFindDataW(vf->matches[vf->cursor++], lpFindFileData);
+        ::SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+    return ::FindNextFileW(hFindFile, lpFindFileData);
+}
+
+BOOL WINAPI GuestFindClose(HANDLE hFindFile) {
+    if (hFindFile && hFindFile != INVALID_HANDLE_VALUE &&
+        g_active_vfs_finds.load(std::memory_order_acquire) > 0) {
+        bool was_vfs = false;
+        {
+            std::unique_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+            auto it = GuestVfsFindMap().find(hFindFile);
+            if (it != GuestVfsFindMap().end()) {
+                GuestVfsFindMap().erase(it);
+                g_active_vfs_finds.fetch_sub(1, std::memory_order_release);
+                was_vfs = true;
+            }
+        }
+        if (was_vfs) {
+            return ::CloseHandle(hFindFile);
+        }
+    }
+    return ::FindClose(hFindFile);
+}
+
 BOOL WINAPI GuestGetDiskFreeSpaceExA(LPCSTR lpDirectoryName,
                                      PULARGE_INTEGER lpFreeBytesAvailableToCaller,
                                      PULARGE_INTEGER lpTotalNumberOfBytes,
                                      PULARGE_INTEGER lpTotalNumberOfFreeBytes) {
     if (lpDirectoryName) {
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(lpDirectoryName, host_path);
-        if (r == GuestPathResult::Resolved) {
-            return ::GetDiskFreeSpaceExA(host_path.c_str(), lpFreeBytesAvailableToCaller,
+        const GuestResolvedPath r = ClassifyGuestPackagePath(lpDirectoryName);
+        if (r.kind == GuestPathResult::Blocked) {
+            ::SetLastError(ERROR_PATH_NOT_FOUND);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            constexpr ULONGLONG kReadOnlyVolTotal = 100ull << 30;  // 100 GiB read-only XVC volume
+            if (lpFreeBytesAvailableToCaller) lpFreeBytesAvailableToCaller->QuadPart = 0;
+            if (lpTotalNumberOfBytes) lpTotalNumberOfBytes->QuadPart = kReadOnlyVolTotal;
+            if (lpTotalNumberOfFreeBytes) lpTotalNumberOfFreeBytes->QuadPart = 0;
+            ::SetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            return ::GetDiskFreeSpaceExA(r.host_path.c_str(), lpFreeBytesAvailableToCaller,
                                          lpTotalNumberOfBytes, lpTotalNumberOfFreeBytes);
         }
     }
@@ -841,11 +1753,22 @@ BOOL WINAPI GuestGetDiskFreeSpaceExW(LPCWSTR lpDirectoryName,
                                      PULARGE_INTEGER lpTotalNumberOfBytes,
                                      PULARGE_INTEGER lpTotalNumberOfFreeBytes) {
     if (lpDirectoryName) {
-        std::string utf8 = WideToUtf8(lpDirectoryName);
-        std::string host_path;
-        const GuestPathResult r = RedirectGuestPackagePath(utf8, host_path);
-        if (r == GuestPathResult::Resolved) {
-            const std::wstring wide = Utf8ToWide(host_path);
+        const std::string utf8 = WideToUtf8(lpDirectoryName);
+        const GuestResolvedPath r = ClassifyGuestPackagePath(utf8);
+        if (r.kind == GuestPathResult::Blocked) {
+            ::SetLastError(ERROR_PATH_NOT_FOUND);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            constexpr ULONGLONG kReadOnlyVolTotal = 100ull << 30;
+            if (lpFreeBytesAvailableToCaller) lpFreeBytesAvailableToCaller->QuadPart = 0;
+            if (lpTotalNumberOfBytes) lpTotalNumberOfBytes->QuadPart = kReadOnlyVolTotal;
+            if (lpTotalNumberOfFreeBytes) lpTotalNumberOfFreeBytes->QuadPart = 0;
+            ::SetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
             if (!wide.empty()) {
                 return ::GetDiskFreeSpaceExW(wide.c_str(), lpFreeBytesAvailableToCaller,
                                              lpTotalNumberOfBytes, lpTotalNumberOfFreeBytes);
@@ -854,6 +1777,107 @@ BOOL WINAPI GuestGetDiskFreeSpaceExW(LPCWSTR lpDirectoryName,
     }
     return ::GetDiskFreeSpaceExW(lpDirectoryName, lpFreeBytesAvailableToCaller,
                                  lpTotalNumberOfBytes, lpTotalNumberOfFreeBytes);
+}
+
+BOOL WINAPI GuestDeleteFileA(LPCSTR lpFileName) {
+    if (lpFileName) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(lpFileName);
+        if (r.kind == GuestPathResult::Blocked || r.kind == GuestPathResult::ResolvedXvdVfs) {
+            ::SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
+            return wide.empty() ? ::DeleteFileA(r.host_path.c_str()) : ::DeleteFileW(wide.c_str());
+        }
+    }
+    return ::DeleteFileA(lpFileName);
+}
+
+BOOL WINAPI GuestDeleteFileW(LPCWSTR lpFileName) {
+    if (lpFileName) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(WideToUtf8(lpFileName));
+        if (r.kind == GuestPathResult::Blocked || r.kind == GuestPathResult::ResolvedXvdVfs) {
+            ::SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
+            return wide.empty() ? FALSE : ::DeleteFileW(wide.c_str());
+        }
+    }
+    return ::DeleteFileW(lpFileName);
+}
+
+BOOL WINAPI GuestCreateDirectoryA(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes) {
+    if (lpPathName) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(lpPathName);
+        if (r.kind == GuestPathResult::Blocked) {
+            ::SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            ::SetLastError(r.vfs_info.is_directory ? ERROR_ALREADY_EXISTS : ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
+            return wide.empty()
+                       ? ::CreateDirectoryA(r.host_path.c_str(), lpSecurityAttributes)
+                       : ::CreateDirectoryW(wide.c_str(), lpSecurityAttributes);
+        }
+    }
+    return ::CreateDirectoryA(lpPathName, lpSecurityAttributes);
+}
+
+BOOL WINAPI GuestCreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes) {
+    if (lpPathName) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(WideToUtf8(lpPathName));
+        if (r.kind == GuestPathResult::Blocked) {
+            ::SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedXvdVfs) {
+            ::SetLastError(r.vfs_info.is_directory ? ERROR_ALREADY_EXISTS : ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
+            return wide.empty() ? FALSE : ::CreateDirectoryW(wide.c_str(), lpSecurityAttributes);
+        }
+    }
+    return ::CreateDirectoryW(lpPathName, lpSecurityAttributes);
+}
+
+BOOL WINAPI GuestRemoveDirectoryA(LPCSTR lpPathName) {
+    if (lpPathName) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(lpPathName);
+        if (r.kind == GuestPathResult::Blocked || r.kind == GuestPathResult::ResolvedXvdVfs) {
+            ::SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
+            return wide.empty() ? ::RemoveDirectoryA(r.host_path.c_str())
+                                : ::RemoveDirectoryW(wide.c_str());
+        }
+    }
+    return ::RemoveDirectoryA(lpPathName);
+}
+
+BOOL WINAPI GuestRemoveDirectoryW(LPCWSTR lpPathName) {
+    if (lpPathName) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(WideToUtf8(lpPathName));
+        if (r.kind == GuestPathResult::Blocked || r.kind == GuestPathResult::ResolvedXvdVfs) {
+            ::SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (r.kind == GuestPathResult::ResolvedHost) {
+            const std::wstring wide = Utf8ToWide(r.host_path);
+            return wide.empty() ? FALSE : ::RemoveDirectoryW(wide.c_str());
+        }
+    }
+    return ::RemoveDirectoryW(lpPathName);
 }
 
 // Zen 2 Xbox Series X|S CPU topology (8 logical cores / 0xFF mask) & safe thread affinity clamping
@@ -891,15 +1915,74 @@ DWORD_PTR WINAPI GuestSetThreadAffinityMask(HANDLE hThread, DWORD_PTR dwThreadAf
     return ::SetThreadAffinityMask(hThread, dwThreadAffinityMask);
 }
 
-// A title DLL loaded by the host loader still has to see the guest image when
-// it asks which module it runs in.
-HMODULE AdoptHostModule(HMODULE mod) {
+// A title DLL loaded by the host loader receives the full guest IAT hook table.
+HMODULE AdoptHostModule(HMODULE mod, bool force_package_module = false) {
     if (mod) {
         const DWORD saved_error = GetLastError();
-        guest::PatchHostModuleForGuests(mod);
+        guest::PatchHostModuleForGuests(mod, force_package_module);
         SetLastError(saved_error);
     }
     return mod;
+}
+
+std::mutex& DynamicVfsDllMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::unordered_map<HMODULE, std::shared_ptr<MappedPeImage>>& DynamicVfsDllTable() {
+    static std::unordered_map<HMODULE, std::shared_ptr<MappedPeImage>> t;
+    return t;
+}
+
+void ClearDynamicVfsDlls() {
+    std::unordered_map<HMODULE, std::shared_ptr<MappedPeImage>> local;
+    {
+        std::lock_guard<std::mutex> lk(DynamicVfsDllMutex());
+        local.swap(DynamicVfsDllTable());
+    }
+    local.clear();
+}
+
+// Loads/maps a guest DLL directly from PackageVfs (zero-staging XVD/MSIXVC streaming!).
+HMODULE TryMapGuestDllFromPackageVfs(const std::string& vfs_path,
+                                     std::shared_ptr<MappedPeImage>* out_owned = nullptr) {
+    if (vfs_path.empty()) return nullptr;
+    using GetModHandleAFn = HMODULE(WINAPI*)(LPCSTR);
+    const auto guest_gmh = reinterpret_cast<GetModHandleAFn>(
+        guest::LookupImportOverride("kernel32.dll", "GetModuleHandleA"));
+    if (guest_gmh) {
+        const std::string base = ExtractBasenameLower(vfs_path);
+        if (HMODULE already = guest_gmh(base.c_str())) {
+            if (guest::FindModuleBase(already) == reinterpret_cast<void*>(already)) {
+                return already;
+            }
+        }
+    }
+
+    std::vector<uint8_t> dll_bytes;
+    if (!PackageVfs::Global().ReadFileBytes(vfs_path, dll_bytes).ok() || dll_bytes.empty()) {
+        return nullptr;
+    }
+
+    auto img = std::make_shared<MappedPeImage>();
+    DllRedirectionTable redirects;
+    HleSymbolRegistry empty_reg;
+    PeMapOptions opts;
+    opts.auto_stub_missing = true;
+    opts.shim_directory = GetGuestShimDirectory();
+    opts.package_directory_override = GetGuestPackageDirectory();
+    if (!img->MapBytes(dll_bytes, vfs_path, redirects, empty_reg, opts).ok()) {
+        return nullptr;
+    }
+    HMODULE hmod = reinterpret_cast<HMODULE>(img->MappedBase());
+    if (out_owned) {
+        *out_owned = std::move(img);
+    } else {
+        std::lock_guard<std::mutex> lk(DynamicVfsDllMutex());
+        DynamicVfsDllTable()[hmod] = std::move(img);
+    }
+    return hmod;
 }
 
 HMODULE TryLoadSystemShimA(const char* name) {
@@ -931,7 +2014,10 @@ HMODULE TryLoadSystemShimA(const char* name) {
 HMODULE TryLoadPackageOrFallbackMiddlewareA(const char* name, DWORD dwFlags = 0) {
     if (!name || !*name) return nullptr;
     const std::string raw(name);
-    const std::string base = ExtractBasenameLower(raw);
+    std::string base = ExtractBasenameLower(raw);
+    if (base.find('.') == std::string::npos) {
+        base += ".dll";
+    }
     if (ResolveSystemShimTarget(base) != nullptr) {
         return nullptr;
     }
@@ -940,38 +2026,63 @@ HMODULE TryLoadPackageOrFallbackMiddlewareA(const char* name, DWORD dwFlags = 0)
     const std::string pkg_dir = GetGuestPackageDirectory();
     std::error_code ec;
 
-    // 1. Check G:\ virtual package path if explicitly specified.
-    std::string vfs_resolved;
-    const GuestPathResult vr = RedirectGuestPackagePath(raw, vfs_resolved);
-    if (vr == GuestPathResult::Resolved && std::filesystem::exists(vfs_resolved, ec)) {
-        const std::wstring wide = Utf8ToWide(vfs_resolved);
+    // 1. Check G:\ virtual package path if explicitly specified (both XVD VFS and host mount).
+    const GuestResolvedPath vr = ClassifyGuestPackagePath(raw);
+    if (vr.kind == GuestPathResult::ResolvedXvdVfs && !vr.vfs_info.is_directory) {
+        if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vr.vfs_path)) {
+            return vmod;
+        }
+    } else if (vr.kind == GuestPathResult::ResolvedHost &&
+               std::filesystem::exists(vr.host_path, ec)) {
+        const std::wstring wide = Utf8ToWide(vr.host_path);
         if (!wide.empty()) {
             const DWORD eff_flags = dwFlags ? dwFlags : LOAD_WITH_ALTERED_SEARCH_PATH;
             if (HMODULE mod = LoadLibraryExW(wide.c_str(), nullptr, eff_flags)) {
-                return AdoptHostModule(mod);
+                return AdoptHostModule(mod, /*force_package_module=*/true);
             }
         }
     }
 
-    // 2. Check package directory for ALL non-system DLLs (Oodle, Wwise, FMOD,
-    //    engine plugins, plus title-shipped middleware).
-    if (!pkg_dir.empty() && !IsCoreHostWindowsDll(base) && raw.find(':') == std::string::npos &&
+    // 2. Check PackageVfs G:\ and host package directory for ALL non-system DLLs
+    //    (GameAssembly.dll, Oodle, Wwise, FMOD, engine plugins, plus title-shipped
+    //    middleware / Microsoft.Xbox.Services.*.GDK.C.Thunks.dll).
+    //    Always prioritize the guest-requested filename BEFORE mw_target (e.g. xsapi.dll)!
+    if (!IsCoreHostWindowsDll(base) && raw.find(':') == std::string::npos &&
         !HasDotDotSegment(raw)) {
         std::vector<std::string> candidates;
-        if (mw_target) {
-            candidates.emplace_back(mw_target);
-        }
         candidates.push_back(raw);
+        if (raw.find('.') == std::string::npos) {
+            candidates.push_back(raw + ".dll");
+        }
         if (base != ToLowerAscii(raw)) {
             candidates.push_back(base);
         }
+        if (mw_target && ToLowerAscii(mw_target) == base) {
+            candidates.emplace_back(mw_target);
+        }
+
+        // 2a. Check mounted XVD in PackageVfs first (zero-staging .xvc / .msixvc).
         for (const std::string& rel : candidates) {
-            const auto pkg_candidate = std::filesystem::path(pkg_dir) / rel;
-            if (std::filesystem::exists(pkg_candidate, ec)) {
-                const std::wstring wide = pkg_candidate.wstring();
-                const DWORD eff_flags = dwFlags ? dwFlags : LOAD_WITH_ALTERED_SEARCH_PATH;
-                if (HMODULE mod = LoadLibraryExW(wide.c_str(), nullptr, eff_flags)) {
-                    return AdoptHostModule(mod);
+            const std::string vpath = "G:\\" + rel;
+            VfsEntryInfo vinfo{};
+            if (PackageVfs::Global().Stat(vpath, vinfo) && vinfo.exists &&
+                vinfo.is_xvd_backed && !vinfo.is_directory) {
+                if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vpath)) {
+                    return vmod;
+                }
+            }
+        }
+
+        // 2b. Check host package directory when directory-backed.
+        if (!pkg_dir.empty() && !IsVirtualGDriveRoot(pkg_dir)) {
+            for (const std::string& rel : candidates) {
+                const auto pkg_candidate = std::filesystem::path(pkg_dir) / rel;
+                if (std::filesystem::exists(pkg_candidate, ec)) {
+                    const std::wstring wide = pkg_candidate.wstring();
+                    const DWORD eff_flags = dwFlags ? dwFlags : LOAD_WITH_ALTERED_SEARCH_PATH;
+                    if (HMODULE mod = LoadLibraryExW(wide.c_str(), nullptr, eff_flags)) {
+                        return AdoptHostModule(mod, /*force_package_module=*/true);
+                    }
                 }
             }
         }
@@ -999,8 +2110,8 @@ HMODULE WINAPI GuestLoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwF
         return mod;
     }
     if (lpLibFileName) {
-        std::string host_path;
-        if (RedirectGuestPackagePath(lpLibFileName, host_path) == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(lpLibFileName);
+        if (r.kind == GuestPathResult::Blocked || r.kind == GuestPathResult::ResolvedXvdVfs) {
             SetLastError(ERROR_MOD_NOT_FOUND);
             return nullptr;
         }
@@ -1021,8 +2132,8 @@ HMODULE WINAPI GuestLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dw
         if (HMODULE mod = TryLoadPackageOrFallbackMiddlewareA(narrow.c_str(), dwFlags)) {
             return mod;
         }
-        std::string host_path;
-        if (RedirectGuestPackagePath(narrow, host_path) == GuestPathResult::Blocked) {
+        const GuestResolvedPath r = ClassifyGuestPackagePath(narrow);
+        if (r.kind == GuestPathResult::Blocked || r.kind == GuestPathResult::ResolvedXvdVfs) {
             SetLastError(ERROR_MOD_NOT_FOUND);
             return nullptr;
         }
@@ -1038,6 +2149,21 @@ BOOL WINAPI GuestFreeLibrary(HMODULE hLibModule) {
     if (!hLibModule) {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
+    }
+    {
+        std::shared_ptr<MappedPeImage> dynamic_dll;
+        {
+            std::lock_guard<std::mutex> lk(DynamicVfsDllMutex());
+            auto it = DynamicVfsDllTable().find(hLibModule);
+            if (it != DynamicVfsDllTable().end()) {
+                dynamic_dll = std::move(it->second);
+                DynamicVfsDllTable().erase(it);
+            }
+        }
+        if (dynamic_dll) {
+            dynamic_dll->Unmap();
+            return TRUE;
+        }
     }
     if (void* guest_base = guest::FindModuleBase(hLibModule)) {
         if (guest_base == reinterpret_cast<void*>(hLibModule)) {
@@ -1938,6 +3064,76 @@ HRESULT WINAPI GuestRoGetActivationFactory(void* activatableClassId, const GUID*
     return hr;
 }
 
+HRESULT WINAPI GuestWindowsCreateString(const wchar_t* sourceString,
+                                        uint32_t length,
+                                        void** string) {
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using Fn = HRESULT(WINAPI*)(const wchar_t*, uint32_t, void**);
+    static const Fn fn = combase ? reinterpret_cast<Fn>(reinterpret_cast<void*>(
+                                       GetProcAddress(combase, "WindowsCreateString")))
+                                 : nullptr;
+    return fn ? fn(sourceString, length, string) : E_NOTIMPL;
+}
+
+HRESULT WINAPI GuestWindowsCreateStringReference(const wchar_t* sourceString,
+                                                 uint32_t length,
+                                                 void* hstringHeader,
+                                                 void** string) {
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using Fn = HRESULT(WINAPI*)(const wchar_t*, uint32_t, void*, void**);
+    static const Fn fn = combase ? reinterpret_cast<Fn>(reinterpret_cast<void*>(
+                                       GetProcAddress(combase, "WindowsCreateStringReference")))
+                                 : nullptr;
+    return fn ? fn(sourceString, length, hstringHeader, string) : E_NOTIMPL;
+}
+
+HRESULT WINAPI GuestWindowsDeleteString(void* string) {
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using Fn = HRESULT(WINAPI*)(void*);
+    static const Fn fn = combase ? reinterpret_cast<Fn>(reinterpret_cast<void*>(
+                                       GetProcAddress(combase, "WindowsDeleteString")))
+                                 : nullptr;
+    return fn ? fn(string) : S_OK;
+}
+
+const wchar_t* WINAPI GuestWindowsGetStringRawBuffer(void* string, uint32_t* length) {
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using Fn = const wchar_t*(WINAPI*)(void*, uint32_t*);
+    static const Fn fn = combase ? reinterpret_cast<Fn>(reinterpret_cast<void*>(
+                                       GetProcAddress(combase, "WindowsGetStringRawBuffer")))
+                                 : nullptr;
+    if (fn) return fn(string, length);
+    if (length) *length = 0;
+    return L"";
+}
+
+uint32_t WINAPI GuestWindowsGetStringLen(void* string) {
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using Fn = uint32_t(WINAPI*)(void*);
+    static const Fn fn = combase ? reinterpret_cast<Fn>(reinterpret_cast<void*>(
+                                       GetProcAddress(combase, "WindowsGetStringLen")))
+                                 : nullptr;
+    return fn ? fn(string) : 0u;
+}
+
+BOOL WINAPI GuestWindowsIsStringEmpty(void* string) {
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using Fn = BOOL(WINAPI*)(void*);
+    static const Fn fn = combase ? reinterpret_cast<Fn>(reinterpret_cast<void*>(
+                                       GetProcAddress(combase, "WindowsIsStringEmpty")))
+                                 : nullptr;
+    return fn ? fn(string) : TRUE;
+}
+
+HRESULT WINAPI GuestWindowsDuplicateString(void* string, void** newString) {
+    static HMODULE combase = LoadLibraryW(L"combase.dll");
+    using Fn = HRESULT(WINAPI*)(void*, void**);
+    static const Fn fn = combase ? reinterpret_cast<Fn>(reinterpret_cast<void*>(
+                                       GetProcAddress(combase, "WindowsDuplicateString")))
+                                 : nullptr;
+    return fn ? fn(string, newString) : E_NOTIMPL;
+}
+
 }  // namespace
 
 extern "C" __declspec(dllexport) HRESULT WINAPI ScarlettX_GuestRoActivateInstance(
@@ -1951,6 +3147,79 @@ extern "C" __declspec(dllexport) HRESULT WINAPI ScarlettX_GuestRoGetActivationFa
 }
 
 namespace {
+
+void* LookupGuestCoreHook(const std::string& target_lower, const std::string& sym_name) {
+    if (target_lower == "kernel32.dll" || target_lower == "kernelbase.dll") {
+        if (sym_name == "LoadLibraryExA") return reinterpret_cast<void*>(&GuestLoadLibraryExA);
+        if (sym_name == "LoadLibraryA") return reinterpret_cast<void*>(&GuestLoadLibraryA);
+        if (sym_name == "LoadLibraryExW") return reinterpret_cast<void*>(&GuestLoadLibraryExW);
+        if (sym_name == "LoadLibraryW") return reinterpret_cast<void*>(&GuestLoadLibraryW);
+        if (sym_name == "FreeLibrary") return reinterpret_cast<void*>(&GuestFreeLibrary);
+        if (sym_name == "GetProcAddress") return reinterpret_cast<void*>(&GuestGetProcAddress);
+        if (sym_name == "GetCommandLineA") return reinterpret_cast<void*>(&GuestGetCommandLineA);
+        if (sym_name == "GetCommandLineW") return reinterpret_cast<void*>(&GuestGetCommandLineW);
+        if (sym_name == "ExitProcess") return reinterpret_cast<void*>(&GuestExitProcess);
+        if (sym_name == "VirtualAlloc") return reinterpret_cast<void*>(&GuestVirtualAlloc);
+        if (sym_name == "VirtualAllocEx") return reinterpret_cast<void*>(&GuestVirtualAllocEx);
+        if (sym_name == "VirtualFree") return reinterpret_cast<void*>(&GuestVirtualFree);
+        if (sym_name == "VirtualFreeEx") return reinterpret_cast<void*>(&GuestVirtualFreeEx);
+        if (sym_name == "CreateFileA") return reinterpret_cast<void*>(&GuestCreateFileA);
+        if (sym_name == "CreateFileW") return reinterpret_cast<void*>(&GuestCreateFileW);
+        if (sym_name == "CreateFile2") return reinterpret_cast<void*>(&GuestCreateFile2);
+        if (sym_name == "ReadFile") return reinterpret_cast<void*>(&GuestReadFile);
+        if (sym_name == "GetOverlappedResult") return reinterpret_cast<void*>(&GuestGetOverlappedResult);
+        if (sym_name == "GetOverlappedResultEx") return reinterpret_cast<void*>(&GuestGetOverlappedResultEx);
+        if (sym_name == "SetFilePointerEx") return reinterpret_cast<void*>(&GuestSetFilePointerEx);
+        if (sym_name == "SetFilePointer") return reinterpret_cast<void*>(&GuestSetFilePointer);
+        if (sym_name == "GetFileSizeEx") return reinterpret_cast<void*>(&GuestGetFileSizeEx);
+        if (sym_name == "GetFileSize") return reinterpret_cast<void*>(&GuestGetFileSize);
+        if (sym_name == "GetFileInformationByHandle") return reinterpret_cast<void*>(&GuestGetFileInformationByHandle);
+        if (sym_name == "GetFileInformationByHandleEx") return reinterpret_cast<void*>(&GuestGetFileInformationByHandleEx);
+        if (sym_name == "GetFileType") return reinterpret_cast<void*>(&GuestGetFileType);
+        if (sym_name == "DuplicateHandle") return reinterpret_cast<void*>(&GuestDuplicateHandle);
+        if (sym_name == "CloseHandle") return reinterpret_cast<void*>(&GuestCloseHandle);
+        if (sym_name == "GetFileAttributesA") return reinterpret_cast<void*>(&GuestGetFileAttributesA);
+        if (sym_name == "GetFileAttributesW") return reinterpret_cast<void*>(&GuestGetFileAttributesW);
+        if (sym_name == "GetFileAttributesExA") return reinterpret_cast<void*>(&GuestGetFileAttributesExA);
+        if (sym_name == "GetFileAttributesExW") return reinterpret_cast<void*>(&GuestGetFileAttributesExW);
+        if (sym_name == "FindFirstFileA") return reinterpret_cast<void*>(&GuestFindFirstFileA);
+        if (sym_name == "FindFirstFileW") return reinterpret_cast<void*>(&GuestFindFirstFileW);
+        if (sym_name == "FindFirstFileExA") return reinterpret_cast<void*>(&GuestFindFirstFileExA);
+        if (sym_name == "FindFirstFileExW") return reinterpret_cast<void*>(&GuestFindFirstFileExW);
+        if (sym_name == "FindNextFileA") return reinterpret_cast<void*>(&GuestFindNextFileA);
+        if (sym_name == "FindNextFileW") return reinterpret_cast<void*>(&GuestFindNextFileW);
+        if (sym_name == "FindClose") return reinterpret_cast<void*>(&GuestFindClose);
+        if (sym_name == "GetDiskFreeSpaceExA") return reinterpret_cast<void*>(&GuestGetDiskFreeSpaceExA);
+        if (sym_name == "GetDiskFreeSpaceExW") return reinterpret_cast<void*>(&GuestGetDiskFreeSpaceExW);
+        if (sym_name == "DeleteFileA") return reinterpret_cast<void*>(&GuestDeleteFileA);
+        if (sym_name == "DeleteFileW") return reinterpret_cast<void*>(&GuestDeleteFileW);
+        if (sym_name == "CreateDirectoryA") return reinterpret_cast<void*>(&GuestCreateDirectoryA);
+        if (sym_name == "CreateDirectoryW") return reinterpret_cast<void*>(&GuestCreateDirectoryW);
+        if (sym_name == "RemoveDirectoryA") return reinterpret_cast<void*>(&GuestRemoveDirectoryA);
+        if (sym_name == "RemoveDirectoryW") return reinterpret_cast<void*>(&GuestRemoveDirectoryW);
+        if (sym_name == "GetSystemInfo") return reinterpret_cast<void*>(&GuestGetSystemInfo);
+        if (sym_name == "GetNativeSystemInfo") return reinterpret_cast<void*>(&GuestGetNativeSystemInfo);
+        if (sym_name == "SetThreadAffinityMask") return reinterpret_cast<void*>(&GuestSetThreadAffinityMask);
+        if (sym_name == "FlsAlloc") return reinterpret_cast<void*>(&GuestFlsAlloc);
+        if (sym_name == "FlsFree") return reinterpret_cast<void*>(&GuestFlsFree);
+        if (sym_name == "FlsGetValue") return reinterpret_cast<void*>(&GuestFlsGetValue);
+        if (sym_name == "FlsSetValue") return reinterpret_cast<void*>(&GuestFlsSetValue);
+        return nullptr;
+    }
+    if (target_lower == "combase.dll") {
+        if (sym_name == "RoActivateInstance") return reinterpret_cast<void*>(&GuestRoActivateInstance);
+        if (sym_name == "RoGetActivationFactory") return reinterpret_cast<void*>(&GuestRoGetActivationFactory);
+        if (sym_name == "WindowsCreateString") return reinterpret_cast<void*>(&GuestWindowsCreateString);
+        if (sym_name == "WindowsCreateStringReference") return reinterpret_cast<void*>(&GuestWindowsCreateStringReference);
+        if (sym_name == "WindowsDeleteString") return reinterpret_cast<void*>(&GuestWindowsDeleteString);
+        if (sym_name == "WindowsGetStringRawBuffer") return reinterpret_cast<void*>(&GuestWindowsGetStringRawBuffer);
+        if (sym_name == "WindowsGetStringLen") return reinterpret_cast<void*>(&GuestWindowsGetStringLen);
+        if (sym_name == "WindowsIsStringEmpty") return reinterpret_cast<void*>(&GuestWindowsIsStringEmpty);
+        if (sym_name == "WindowsDuplicateString") return reinterpret_cast<void*>(&GuestWindowsDuplicateString);
+        return nullptr;
+    }
+    return nullptr;
+}
 
 void* LookupGuestRuntimeHook(const std::string& target_lower, const std::string& sym_name) {
     if (target_lower == "ucrtbase.dll" || target_lower == "msvcrt.dll") {
@@ -1971,42 +3240,7 @@ void* LookupGuestRuntimeHook(const std::string& target_lower, const std::string&
         }
         return nullptr;
     }
-    if (target_lower == "kernel32.dll" || target_lower == "kernelbase.dll") {
-        if (sym_name == "LoadLibraryExA") return reinterpret_cast<void*>(&GuestLoadLibraryExA);
-        if (sym_name == "LoadLibraryA") return reinterpret_cast<void*>(&GuestLoadLibraryA);
-        if (sym_name == "LoadLibraryExW") return reinterpret_cast<void*>(&GuestLoadLibraryExW);
-        if (sym_name == "LoadLibraryW") return reinterpret_cast<void*>(&GuestLoadLibraryW);
-        if (sym_name == "FreeLibrary") return reinterpret_cast<void*>(&GuestFreeLibrary);
-        if (sym_name == "GetProcAddress") return reinterpret_cast<void*>(&GuestGetProcAddress);
-        if (sym_name == "GetCommandLineA") return reinterpret_cast<void*>(&GuestGetCommandLineA);
-        if (sym_name == "GetCommandLineW") return reinterpret_cast<void*>(&GuestGetCommandLineW);
-        if (sym_name == "ExitProcess") return reinterpret_cast<void*>(&GuestExitProcess);
-        if (sym_name == "CreateFileA") return reinterpret_cast<void*>(&GuestCreateFileA);
-        if (sym_name == "CreateFileW") return reinterpret_cast<void*>(&GuestCreateFileW);
-        if (sym_name == "CreateFile2") return reinterpret_cast<void*>(&GuestCreateFile2);
-        if (sym_name == "GetFileAttributesA") return reinterpret_cast<void*>(&GuestGetFileAttributesA);
-        if (sym_name == "GetFileAttributesW") return reinterpret_cast<void*>(&GuestGetFileAttributesW);
-        if (sym_name == "GetFileAttributesExA") return reinterpret_cast<void*>(&GuestGetFileAttributesExA);
-        if (sym_name == "GetFileAttributesExW") return reinterpret_cast<void*>(&GuestGetFileAttributesExW);
-        if (sym_name == "FindFirstFileA") return reinterpret_cast<void*>(&GuestFindFirstFileA);
-        if (sym_name == "FindFirstFileW") return reinterpret_cast<void*>(&GuestFindFirstFileW);
-        if (sym_name == "FindFirstFileExA") return reinterpret_cast<void*>(&GuestFindFirstFileExA);
-        if (sym_name == "FindFirstFileExW") return reinterpret_cast<void*>(&GuestFindFirstFileExW);
-        if (sym_name == "GetDiskFreeSpaceExA") return reinterpret_cast<void*>(&GuestGetDiskFreeSpaceExA);
-        if (sym_name == "GetDiskFreeSpaceExW") return reinterpret_cast<void*>(&GuestGetDiskFreeSpaceExW);
-        if (sym_name == "GetSystemInfo") return reinterpret_cast<void*>(&GuestGetSystemInfo);
-        if (sym_name == "GetNativeSystemInfo") return reinterpret_cast<void*>(&GuestGetNativeSystemInfo);
-        if (sym_name == "SetThreadAffinityMask") return reinterpret_cast<void*>(&GuestSetThreadAffinityMask);
-        if (sym_name == "FlsAlloc") return reinterpret_cast<void*>(&GuestFlsAlloc);
-        if (sym_name == "FlsFree") return reinterpret_cast<void*>(&GuestFlsFree);
-        return nullptr;
-    }
-    if (target_lower == "combase.dll") {
-        if (sym_name == "RoActivateInstance") return reinterpret_cast<void*>(&GuestRoActivateInstance);
-        if (sym_name == "RoGetActivationFactory") return reinterpret_cast<void*>(&GuestRoGetActivationFactory);
-        return nullptr;
-    }
-    return nullptr;
+    return LookupGuestCoreHook(target_lower, sym_name);
 }
 
 FARPROC WINAPI GuestGetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
@@ -2114,6 +3348,55 @@ DWORD SectionCharsToPageProtect(uint32_t ch) {
 
 }  // namespace
 
+void* LookupGuestDllRuntimeHook(const std::string& target_dll_lower, const std::string& symbol) {
+#if defined(_WIN32)
+    if (target_dll_lower == "ucrtbase.dll" || target_dll_lower == "msvcrt.dll") {
+        if (symbol == "exit") return reinterpret_cast<void*>(&GuestCrtExit);
+        if (symbol == "_exit" || symbol == "quick_exit") return reinterpret_cast<void*>(&GuestCrtImmediateExit);
+        return nullptr;
+    }
+    return LookupGuestCoreHook(target_dll_lower, symbol);
+#else
+    (void)target_dll_lower;
+    (void)symbol;
+    return nullptr;
+#endif
+}
+
+std::string GetGuestPackageDirectoryForPatch() {
+#if defined(_WIN32)
+    return GetGuestPackageDirectory();
+#else
+    return {};
+#endif
+}
+
+std::string GetGuestShimDirectoryForPatch() {
+#if defined(_WIN32)
+    return GetGuestShimDirectory();
+#else
+    return {};
+#endif
+}
+
+bool IsGuestGraphicsAllocation(const void* address, size_t* out_size) noexcept {
+    if (out_size) *out_size = 0;
+#if defined(_WIN32)
+    if (!address) return false;
+    const uintptr_t va = reinterpret_cast<uintptr_t>(address);
+    std::shared_lock<std::shared_mutex> lk(GuestGraphicsMutex());
+    for (const auto& [base, reg] : GuestGraphicsTable()) {
+        if (va >= base && va < base + reg.size) {
+            if (out_size) *out_size = reg.size;
+            return true;
+        }
+    }
+#else
+    (void)address;
+#endif
+    return false;
+}
+
 std::string ResolveApiSetDll(const std::string& dll_name) {
     const std::string lower = ToLowerAscii(dll_name);
     if (StartsWith(lower, "api-ms-win-crt-")) {
@@ -2210,23 +3493,63 @@ void MappedPeImage::Unmap() {
         delete state;
         loader_state_ = nullptr;
     }
+    for (auto& gdll : mapped_guest_dlls_) {
+        if (gdll) {
+            gdll->Unmap();
+        }
+    }
+    mapped_guest_dlls_.clear();
+    if (!is_dll_) {
+        ClearDynamicVfsDlls();
+    }
+
+    const std::string shim_dir_str = GetGuestShimDirectory();
+    std::filesystem::path norm_shim_dir;
+    if (!shim_dir_str.empty()) {
+        std::error_code ec;
+        norm_shim_dir = std::filesystem::weakly_canonical(shim_dir_str, ec);
+        if (ec) norm_shim_dir = std::filesystem::path(shim_dir_str);
+    }
+
     for (void* mod : loaded_modules_) {
         if (!mod) continue;
-        // Keep ScarlettX HLE system/middleware shims and core host Windows DLLs
-        // pinned for process lifetime: HLE shims (xgameruntime, dstorage_xs, xaudio2_9,
-        // libHttpClient, etc.) own background worker threads and FLS callbacks that
-        // must never be unmapped while the host process is alive.
+        // Keep ScarlettX HLE system/middleware shims (in shim_directory) and core host
+        // Windows DLLs pinned for process lifetime: HLE shims own background worker
+        // threads and FLS callbacks that must never be unmapped while alive.
+        // Package-local DLLs loaded from the game directory are freed cleanly on Unmap().
         wchar_t mod_path[MAX_PATH + 1] = {};
         bool keep_pinned = true;
         if (GetModuleFileNameW(static_cast<HMODULE>(mod), mod_path, MAX_PATH) > 0) {
-            const std::string base = ExtractBasenameLower(WideToUtf8(mod_path));
-            if (!IsCoreHostWindowsDll(base) &&
-                ResolveSystemShimTarget(base) == nullptr &&
-                ResolveFallbackMiddlewareTarget(base) == nullptr) {
-                keep_pinned = false;
+            const std::string utf8_mod = WideToUtf8(mod_path);
+            const std::string base = ExtractBasenameLower(utf8_mod);
+            if (!IsCoreHostWindowsDll(base) && ResolveSystemShimTarget(base) == nullptr) {
+                if (ResolveFallbackMiddlewareTarget(base) == nullptr) {
+                    keep_pinned = false;
+                } else if (!norm_shim_dir.empty()) {
+                    std::error_code ec;
+                    const auto mod_parent =
+                        std::filesystem::weakly_canonical(std::filesystem::path(utf8_mod).parent_path(), ec);
+                    if (!ec && ToLowerAscii(mod_parent.string()) != ToLowerAscii(norm_shim_dir.string())) {
+                        keep_pinned = false;
+                    }
+                }
             }
         }
         if (!keep_pinned) {
+            size_t mod_image_size = 0;
+            const auto* mod_bytes = reinterpret_cast<const uint8_t*>(mod);
+            const auto* mod_dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod_bytes);
+            if (mod_dos->e_magic == IMAGE_DOS_SIGNATURE && mod_dos->e_lfanew > 0) {
+                const auto* mod_nt =
+                    reinterpret_cast<const IMAGE_NT_HEADERS64*>(mod_bytes + mod_dos->e_lfanew);
+                if (mod_nt->Signature == IMAGE_NT_SIGNATURE &&
+                    mod_nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+                    mod_image_size = mod_nt->OptionalHeader.SizeOfImage;
+                }
+            }
+            if (mod_image_size > 0) {
+                FreeGuestFlsInRange(mod_bytes, mod_image_size);
+            }
             FreeLibrary(static_cast<HMODULE>(mod));
         }
     }
@@ -2245,6 +3568,7 @@ void MappedPeImage::Unmap() {
     is_dll_ = false;
     dll_attached_ = false;
     resolutions_.clear();
+    stubs_.Reset();
 }
 
 Status MappedPeImage::MapFile(const std::string& pe_path,
@@ -2266,6 +3590,25 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
     }
     std::vector<uint8_t> raw((std::istreambuf_iterator<char>(ifs)),
                              std::istreambuf_iterator<char>());
+    return MapBytes(raw, pe_path, redirects, hle_registry, options);
+#endif
+}
+
+Status MappedPeImage::MapBytes(const std::vector<uint8_t>& raw,
+                               const std::string& pe_path,
+                               const DllRedirectionTable& redirects,
+                               const HleSymbolRegistry& hle_registry,
+                               const PeMapOptions& options) {
+    Unmap();
+#if !defined(_WIN32)
+    (void)raw;
+    (void)pe_path;
+    (void)redirects;
+    (void)hle_registry;
+    (void)options;
+    return Status::Error(StatusCode::NotImplemented,
+                         "In-process PE64 mapping currently requires Windows x64");
+#else
     if (raw.size() < sizeof(IMAGE_DOS_HEADER)) {
         return Status::Error(StatusCode::ParseError, "PE64 file smaller than DOS header");
     }
@@ -2465,18 +3808,88 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
     }
 
     // 4. Resolve Import Address Table (IAT) and Delay-Load Import Table:
-    const std::filesystem::path abs_pe = std::filesystem::absolute(pe_path);
-    const std::filesystem::path pkg_dir = abs_pe.parent_path();
-    SetGuestPackageDirectory(pkg_dir.string());
+    const bool is_virtual_g_pe =
+        pe_path.size() >= 2 && pe_path[1] == ':' &&
+        (pe_path[0] == 'G' || pe_path[0] == 'g' || pe_path[0] == 'D' || pe_path[0] == 'd');
+
+    std::string registered_pe_path = pe_path;
+    std::filesystem::path pkg_dir;
+    std::string exe_basename;
+    if (is_virtual_g_pe) {
+        std::replace(registered_pe_path.begin(), registered_pe_path.end(), '/', '\\');
+        const size_t last_sep = registered_pe_path.find_last_of('\\');
+        exe_basename = (last_sep == std::string::npos)
+                           ? registered_pe_path.substr(2)
+                           : registered_pe_path.substr(last_sep + 1);
+        const std::string vdir = (last_sep == std::string::npos || last_sep <= 2)
+                                     ? std::string("G:\\")
+                                     : registered_pe_path.substr(0, last_sep);
+        SetGuestPackageDirectory(options.package_directory_override.empty()
+                                     ? vdir
+                                     : options.package_directory_override);
+    } else {
+        const std::filesystem::path abs_pe = std::filesystem::absolute(pe_path);
+        registered_pe_path = abs_pe.string();
+        pkg_dir = options.package_directory_override.empty()
+                      ? abs_pe.parent_path()
+                      : std::filesystem::path(options.package_directory_override);
+        exe_basename = abs_pe.filename().string();
+        SetGuestPackageDirectory(pkg_dir.string());
+    }
     if (!options.shim_directory.empty()) {
         SetGuestShimDirectory(options.shim_directory);
     }
     if (!is_dll_) {
-        SetGuestCommandLineForExe(abs_pe.filename().string());
+        SetGuestCommandLineForExe(exe_basename);
     }
 
     stubs_.SetVerboseLogging(options.verbose_stub_logging);
     std::unordered_map<std::string, HMODULE> module_cache;
+    std::vector<HMODULE> package_host_modules;
+
+    auto try_load_from_package = [&](const std::string& guest_dll,
+                                     const std::string& target_dll,
+                                     bool allow_target_name) -> HMODULE {
+        std::vector<std::string> names;
+        names.push_back(guest_dll);
+        if (allow_target_name && ToLowerAscii(target_dll) != ToLowerAscii(guest_dll)) {
+            names.push_back(target_dll);
+        }
+        std::error_code ec;
+        // 1. Check PackageVfs embedded XVD files first (zero-staging .xvc / .msixvc).
+        for (const std::string& fname : names) {
+            if (fname.empty() || HasDotDotSegment(fname)) continue;
+            const std::string vpath = "G:\\" + fname;
+            VfsEntryInfo vinfo{};
+            if (PackageVfs::Global().Stat(vpath, vinfo) && vinfo.exists &&
+                vinfo.is_xvd_backed && !vinfo.is_directory) {
+                std::shared_ptr<MappedPeImage> owned_dll;
+                if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vpath, &owned_dll)) {
+                    if (owned_dll) {
+                        mapped_guest_dlls_.push_back(std::move(owned_dll));
+                    }
+                    return vmod;
+                }
+            }
+        }
+        // 2. Check host package directory when directory-backed.
+        if (!pkg_dir.empty()) {
+            for (const std::string& fname : names) {
+                if (fname.empty() || HasDotDotSegment(fname)) continue;
+                const auto pkg_candidate = pkg_dir / fname;
+                if (std::filesystem::exists(pkg_candidate, ec)) {
+                    HMODULE mod = LoadLibraryExW(
+                        pkg_candidate.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+                    if (mod) {
+                        package_host_modules.push_back(mod);
+                        loaded_modules_.push_back(mod);
+                        return mod;
+                    }
+                }
+            }
+        }
+        return nullptr;
+    };
 
     auto load_target_module = [&](const std::string& guest_dll,
                                   const std::string& target_dll,
@@ -2489,6 +3902,7 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
         }
 
         HMODULE mod = nullptr;
+        bool already_recorded = false;
         std::error_code ec;
         const bool is_apiset =
             StartsWith(guest_lower, "api-ms-win-") || StartsWith(guest_lower, "ext-ms-win-");
@@ -2504,13 +3918,12 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
                 mod = LoadLibraryA(target_dll.c_str());
             }
         } else if (is_fallback_mw) {
-            // Prioritize game-shipped middleware DLL inside the package directory.
-            for (const std::string& fname : {guest_dll, target_dll}) {
-                const auto pkg_candidate = pkg_dir / fname;
-                if (std::filesystem::exists(pkg_candidate, ec)) {
-                    mod = LoadLibraryExW(pkg_candidate.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-                    if (mod) break;
-                }
+            // Prioritize game-shipped middleware / GDK C thunk DLL inside the package/VFS.
+            // Only check target_dll in package when it has the same name (case variant), never
+            // hijacking Microsoft.Xbox.Services.*.GDK.C.Thunks.dll with a package xsapi.dll!
+            mod = try_load_from_package(guest_dll, target_dll, target_lower == guest_lower);
+            if (mod) {
+                already_recorded = true;
             }
             if (!mod && !options.shim_directory.empty()) {
                 const auto candidate = std::filesystem::path(options.shim_directory) / target_dll;
@@ -2533,15 +3946,12 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
                 mod = LoadLibraryA(target_dll.c_str());
             }
         } else {
-            // Non-HLE DLLs (Oodle, Wwise, FMOD, title engine DLLs): check package directory first!
+            // Non-HLE DLLs (GameAssembly.dll, Oodle, Wwise, FMOD, title engine DLLs):
+            // check PackageVfs and package directory first!
             if (!IsCoreHostWindowsDll(guest_lower)) {
-                for (const std::string& fname : {guest_dll, target_dll}) {
-                    if (fname.empty() || HasDotDotSegment(fname)) continue;
-                    const auto pkg_candidate = pkg_dir / fname;
-                    if (std::filesystem::exists(pkg_candidate, ec)) {
-                        mod = LoadLibraryExW(pkg_candidate.wstring().c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-                        if (mod) break;
-                    }
+                mod = try_load_from_package(guest_dll, target_dll, true);
+                if (mod) {
+                    already_recorded = true;
                 }
             }
             if (!mod) {
@@ -2549,7 +3959,7 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
             }
         }
 
-        if (mod) {
+        if (mod && !already_recorded) {
             loaded_modules_.push_back(mod);
         }
         module_cache[guest_lower] = mod;
@@ -2648,9 +4058,20 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
                     if (out_module_handle) {
                         *out_module_handle = mod;
                     }
-                    FARPROC proc = by_ordinal
-                                       ? ::GetProcAddress(mod, MAKEINTRESOURCEA(ordinal))
-                                       : ::GetProcAddress(mod, sym_name.c_str());
+                    FARPROC proc = nullptr;
+                    if (guest::FindModuleBase(mod) == reinterpret_cast<void*>(mod)) {
+                        auto* mbase = reinterpret_cast<uint8_t*>(mod);
+                        const auto* mdos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mbase);
+                        const auto* mnt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(mbase + mdos->e_lfanew);
+                        const auto& mexp = mnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+                        proc = reinterpret_cast<FARPROC>(ResolvePeExportFromImage(
+                            mbase, mnt->OptionalHeader.SizeOfImage, mexp.VirtualAddress, mexp.Size,
+                            by_ordinal ? MAKEINTRESOURCEA(ordinal) : sym_name.c_str(), 0));
+                    } else {
+                        proc = by_ordinal
+                                   ? ::GetProcAddress(mod, MAKEINTRESOURCEA(ordinal))
+                                   : ::GetProcAddress(mod, sym_name.c_str());
+                    }
                     if (proc) {
                         resolved = reinterpret_cast<void*>(proc);
                         res.kind = ImportResolutionKind::HostDll;
@@ -2811,10 +4232,13 @@ Status MappedPeImage::MapFile(const std::string& pe_path,
                 state->function_table = table;
             }
         }
-        guest::RegisterModule(mapped_base_, size_of_image_, abs_pe.string(), !is_dll_);
+        guest::RegisterModule(mapped_base_, size_of_image_, registered_pe_path, !is_dll_);
         state->registered_base = mapped_base_;
         for (void* mod : loaded_modules_) {
-            guest::PatchHostModuleForGuests(mod);
+            const bool force_pkg =
+                std::find(package_host_modules.begin(), package_host_modules.end(),
+                          static_cast<HMODULE>(mod)) != package_host_modules.end();
+            guest::PatchHostModuleForGuests(mod, force_pkg);
         }
     }
 

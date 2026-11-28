@@ -43,6 +43,14 @@ struct PeImageInfo {
     std::vector<PeImportModule> imports;
 };
 
+// Shared two-tier DLL precedence classifiers kept synchronized between static PE
+// inspection (pe_loader.cpp) and in-process mapping / dynamic loading (pe_mapper.cpp).
+//  - System HLE shims: ScarlettEdge HLE DLLs always take precedence over package/System32.
+//  - Fallback middleware: Title-shipped package DLLs take precedence when present, falling
+//    back to ScarlettEdge HLE middleware shims (e.g. xsapi.dll, Bink2Scarlett.dll) if absent.
+const char* LookupSystemShimTarget(const std::string& lower_dll_name) noexcept;
+const char* LookupFallbackMiddlewareTarget(const std::string& lower_dll_name) noexcept;
+
 class DllRedirectionTable {
 public:
     DllRedirectionTable();
@@ -57,6 +65,11 @@ private:
     };
     std::unordered_map<std::string, Entry> entries_;
 };
+
+Status InspectPeBytes(const std::vector<uint8_t>& data,
+                      const std::string& display_path,
+                      const DllRedirectionTable& redirects,
+                      PeImageInfo& out_info);
 
 Status InspectPeFile(const std::string& pe_path,
                      const DllRedirectionTable& redirects,

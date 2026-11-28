@@ -20,6 +20,12 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#ifndef BCRYPT_XTS_AES_ALGORITHM
+#define BCRYPT_XTS_AES_ALGORITHM L"XTS-AES"
+#endif
+#ifndef BCRYPT_MESSAGE_BLOCK_LENGTH
+#define BCRYPT_MESSAGE_BLOCK_LENGTH L"MessageBlockLength"
+#endif
 #endif
 
 namespace scarlettx::crypto {
@@ -62,10 +68,12 @@ struct BcryptApi {
     FnHashData hash_data = nullptr;
     FnFinishHash finish_hash = nullptr;
     FnDestroyHash destroy_hash = nullptr;
+    BCRYPT_ALG_HANDLE aes_xts_alg = nullptr;
     BCRYPT_ALG_HANDLE aes_ecb_alg = nullptr;
     BCRYPT_ALG_HANDLE aes_cbc_alg = nullptr;
     BCRYPT_ALG_HANDLE sha256_alg = nullptr;
     BCRYPT_ALG_HANDLE hmac_sha256_alg = nullptr;
+    bool xts_supports_16b_iv = false;
 
     BcryptApi() {
         dll = LoadLibraryW(L"bcrypt.dll");
@@ -83,6 +91,9 @@ struct BcryptApi {
         destroy_hash = reinterpret_cast<FnDestroyHash>(reinterpret_cast<void*>(GetProcAddress(dll, "BCryptDestroyHash")));
 
         if (open_alg && set_prop) {
+            if (open_alg(&aes_xts_alg, BCRYPT_XTS_AES_ALGORITHM, nullptr, 0) < 0) {
+                aes_xts_alg = nullptr;
+            }
             if (open_alg(&aes_ecb_alg, BCRYPT_AES_ALGORITHM, nullptr, 0) >= 0 && aes_ecb_alg) {
                 wchar_t ecb_mode[] = BCRYPT_CHAIN_MODE_ECB;
                 if (set_prop(aes_ecb_alg, BCRYPT_CHAINING_MODE,
@@ -101,6 +112,40 @@ struct BcryptApi {
             }
             open_alg(&sha256_alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
             open_alg(&hmac_sha256_alg, BCRYPT_SHA256_ALGORITHM, nullptr, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+
+            // Probe whether host CNG BCRYPT_XTS_AES_ALGORITHM honors all 128 bits of a 16-byte IV
+            // (needed when VDUID tweak_seed has non-zero upper 64 bits [8..15]).
+            if (aes_xts_alg && aes_ecb_alg && gen_key && destroy_key && encrypt) {
+                uint8_t test_key[32]{};
+                for (int i = 0; i < 32; ++i) test_key[i] = static_cast<uint8_t>(i + 1);
+                BCRYPT_KEY_HANDLE h_xts = nullptr;
+                BCRYPT_KEY_HANDLE h_k1 = nullptr;
+                BCRYPT_KEY_HANDLE h_k2 = nullptr;
+                ULONG unit_sz = 16u;
+                if (gen_key(aes_xts_alg, &h_xts, nullptr, 0, test_key, 32, 0) >= 0 && h_xts &&
+                    set_prop(h_xts, BCRYPT_MESSAGE_BLOCK_LENGTH, reinterpret_cast<PUCHAR>(&unit_sz), sizeof(unit_sz), 0) >= 0 &&
+                    gen_key(aes_ecb_alg, &h_k1, nullptr, 0, test_key, 16, 0) >= 0 && h_k1 &&
+                    gen_key(aes_ecb_alg, &h_k2, nullptr, 0, test_key + 16, 16, 0) >= 0 && h_k2) {
+                    uint8_t iv16[16] = {1, 2, 3, 4, 5, 6, 7, 8, 0xA5, 0x5A, 0xC3, 0x3C, 9, 10, 11, 12};
+                    uint8_t iv16_copy[16]{};
+                    std::memcpy(iv16_copy, iv16, 16);
+                    uint8_t zero16[16]{};
+                    uint8_t out_xts[16]{};
+                    ULONG cb = 0;
+                    if (encrypt(h_xts, zero16, 16, nullptr, iv16_copy, 16, out_xts, 16, &cb, 0) >= 0 && cb == 16) {
+                        uint8_t ref_twk[16]{};
+                        uint8_t ref_blk[16]{};
+                        if (encrypt(h_k2, iv16, 16, nullptr, nullptr, 0, ref_twk, 16, &cb, 0) >= 0 &&
+                            encrypt(h_k1, ref_twk, 16, nullptr, nullptr, 0, ref_blk, 16, &cb, 0) >= 0) {
+                            for (int i = 0; i < 16; ++i) ref_blk[i] ^= ref_twk[i];
+                            xts_supports_16b_iv = (std::memcmp(out_xts, ref_blk, 16) == 0);
+                        }
+                    }
+                }
+                if (h_k2) destroy_key(h_k2);
+                if (h_k1) destroy_key(h_k1);
+                if (h_xts) destroy_key(h_xts);
+            }
         }
     }
 
@@ -110,6 +155,7 @@ struct BcryptApi {
             if (sha256_alg) close_alg(sha256_alg, 0);
             if (aes_cbc_alg) close_alg(aes_cbc_alg, 0);
             if (aes_ecb_alg) close_alg(aes_ecb_alg, 0);
+            if (aes_xts_alg) close_alg(aes_xts_alg, 0);
         }
     }
 };
@@ -202,12 +248,16 @@ inline bool ComputeHmacSha256(
 #endif
 }
 
-// Cached CNG AES-XTS / AES-CBC key set (eliminates per-sector BCryptGenerateSymmetricKey overhead).
-// Supports 16B (AES-128), 32B (AES-128-XTS: 16B K1 + 16B K2), and 64B (AES-256-XTS: 32B K1 + 32B K2).
+// Cached CNG AES-XTS / AES-CBC key set.
+// Uses single-call 4 KiB Windows CNG BCRYPT_XTS_AES_ALGORITHM (BCRYPT_MESSAGE_BLOCK_LENGTH = 4096)
+// for sector encryption/decryption (data_key || tweak_key: 32B AES-128-XTS or 64B AES-256-XTS).
 struct AesXtsPreparedKey {
+    static constexpr ULONG kSectorUnitBytes = 4096u;
+
     std::array<uint8_t, 64> raw_key{};
     size_t raw_key_len = 0;
 #if defined(_WIN32)
+    BCRYPT_KEY_HANDLE hk_xts_4k = nullptr;
     BCRYPT_KEY_HANDLE hk1 = nullptr;
     BCRYPT_KEY_HANDLE hk2 = nullptr;
     BCRYPT_KEY_HANDLE hk_cbc = nullptr;
@@ -227,6 +277,7 @@ struct AesXtsPreparedKey {
             if (hk_cbc) { api.destroy_key(hk_cbc); hk_cbc = nullptr; }
             if (hk2) { api.destroy_key(hk2); hk2 = nullptr; }
             if (hk1) { api.destroy_key(hk1); hk1 = nullptr; }
+            if (hk_xts_4k) { api.destroy_key(hk_xts_4k); hk_xts_4k = nullptr; }
         }
         cng_ready = false;
 #endif
@@ -261,7 +312,27 @@ struct AesXtsPreparedKey {
             k2 = raw_key.data() + 16;
         }
 
+        // Combined XTS key material: data_key (K1) || tweak_key (K2), 32B (AES-128-XTS) or 64B (AES-256-XTS).
+        uint8_t xts_combined[64]{};
+        const ULONG xts_combined_bytes = aes_key_bytes * 2u;
+        std::memcpy(xts_combined, k1, aes_key_bytes);
+        std::memcpy(xts_combined + aes_key_bytes, k2, aes_key_bytes);
+
         const auto& api = Cng();
+        if (api.aes_xts_alg && api.gen_key && api.set_prop) {
+            ULONG unit_bytes = kSectorUnitBytes;
+            if (api.gen_key(api.aes_xts_alg, &hk_xts_4k, nullptr, 0,
+                            xts_combined, xts_combined_bytes, 0) < 0 ||
+                !hk_xts_4k ||
+                api.set_prop(hk_xts_4k, BCRYPT_MESSAGE_BLOCK_LENGTH,
+                             reinterpret_cast<PUCHAR>(&unit_bytes), sizeof(unit_bytes), 0) < 0) {
+                if (hk_xts_4k && api.destroy_key) {
+                    api.destroy_key(hk_xts_4k);
+                }
+                hk_xts_4k = nullptr;
+            }
+        }
+
         if (api.aes_ecb_alg && api.gen_key && api.destroy_key && api.encrypt && api.decrypt) {
             const bool ecb_ok =
                 api.gen_key(api.aes_ecb_alg, &hk1, nullptr, 0, const_cast<PUCHAR>(k1), aes_key_bytes, 0) >= 0 &&
@@ -294,6 +365,57 @@ struct AesXtsPreparedKey {
 #if defined(_WIN32)
         if (!cng_ready) return false;
         const auto& api = Cng();
+
+        // Single-call 4 KiB hardware-accelerated CNG BCRYPT_XTS_AES_ALGORITHM fast path:
+        if (len == kSectorUnitBytes && hk_xts_4k != nullptr) {
+            bool upper_seed_nonzero = false;
+            uint64_t seed_low64 = 0;
+            if (tweak_seed) {
+                for (int i = 0; i < 8; ++i) {
+                    seed_low64 |= static_cast<uint64_t>(tweak_seed[i]) << (i * 8);
+                }
+                for (int i = 8; i < 16; ++i) {
+                    if (tweak_seed[i] != 0) {
+                        upper_seed_nonzero = true;
+                        break;
+                    }
+                }
+            }
+            if (!upper_seed_nonzero) {
+                // Standard 64-bit little-endian sector tweak (cbIV = 8) in a single CNG call.
+                uint64_t tweak_u64 = sector_index ^ seed_low64;
+                uint8_t iv8[8]{};
+                for (int i = 0; i < 8; ++i) {
+                    iv8[i] = static_cast<uint8_t>((tweak_u64 >> (i * 8)) & 0xFFu);
+                }
+                ULONG cb_xts = 0;
+                const NTSTATUS xts_st = do_encrypt
+                    ? api.encrypt(hk_xts_4k, const_cast<PUCHAR>(in_buf), kSectorUnitBytes,
+                                  nullptr, iv8, sizeof(iv8), out_buf, kSectorUnitBytes, &cb_xts, 0)
+                    : api.decrypt(hk_xts_4k, const_cast<PUCHAR>(in_buf), kSectorUnitBytes,
+                                  nullptr, iv8, sizeof(iv8), out_buf, kSectorUnitBytes, &cb_xts, 0);
+                if (xts_st >= 0 && cb_xts == kSectorUnitBytes) {
+                    return true;
+                }
+            } else if (api.xts_supports_16b_iv) {
+                // Full 128-bit VDUID-seeded tweak in a single CNG call when verified on host OS.
+                uint8_t iv16[16]{};
+                std::memcpy(iv16, tweak_seed, 16);
+                for (int i = 0; i < 8; ++i) {
+                    iv16[i] ^= static_cast<uint8_t>((sector_index >> (i * 8)) & 0xFFu);
+                }
+                ULONG cb_xts = 0;
+                const NTSTATUS xts_st = do_encrypt
+                    ? api.encrypt(hk_xts_4k, const_cast<PUCHAR>(in_buf), kSectorUnitBytes,
+                                  nullptr, iv16, sizeof(iv16), out_buf, kSectorUnitBytes, &cb_xts, 0)
+                    : api.decrypt(hk_xts_4k, const_cast<PUCHAR>(in_buf), kSectorUnitBytes,
+                                  nullptr, iv16, sizeof(iv16), out_buf, kSectorUnitBytes, &cb_xts, 0);
+                if (xts_st >= 0 && cb_xts == kSectorUnitBytes) {
+                    return true;
+                }
+            }
+        }
+
         uint8_t tweak[16]{};
         if (tweak_seed) {
             std::memcpy(tweak, tweak_seed, 16);
@@ -310,18 +432,32 @@ struct AesXtsPreparedKey {
         const size_t rem = len % 16;
         uint8_t block[16]{};
 
-        // NIST SP 800-38E / IEEE 1619 ciphertext stealing (CTS) when len >= 16 and rem > 0
+        // NIST SP 800-38E / IEEE 1619 ciphertext stealing (CTS) when len >= 16 and rem > 0.
+        // Batch all full 16B blocks in 4 KiB (256-block) single-call CNG dispatches (never 256 per-16B calls).
         const size_t main_blocks = (rem > 0 && full_blocks >= 1) ? (full_blocks - 1) : full_blocks;
-        for (size_t b = 0; b < main_blocks; ++b) {
-            const uint8_t* src = in_buf + b * 16;
-            uint8_t* dst = out_buf + b * 16;
-            for (int i = 0; i < 16; ++i) block[i] = static_cast<uint8_t>(src[i] ^ tweak[i]);
+        size_t done_blocks = 0;
+        while (done_blocks < main_blocks) {
+            const size_t batch_blocks = (std::min)(main_blocks - done_blocks, size_t{256});
+            const ULONG batch_bytes = static_cast<ULONG>(batch_blocks * 16u);
+            alignas(16) uint8_t tweaks[4096];
+            alignas(16) uint8_t work[4096];
+            const uint8_t* src_batch = in_buf + done_blocks * 16u;
+            uint8_t* dst_batch = out_buf + done_blocks * 16u;
+            for (size_t b = 0; b < batch_blocks; ++b) {
+                std::memcpy(tweaks + b * 16u, tweak, 16u);
+                Gf128MulAlpha(tweak);
+            }
+            for (size_t i = 0; i < batch_bytes; ++i) {
+                work[i] = static_cast<uint8_t>(src_batch[i] ^ tweaks[i]);
+            }
             const NTSTATUS st = do_encrypt
-                ? api.encrypt(hk1, block, 16, nullptr, nullptr, 0, block, 16, &cb_out, 0)
-                : api.decrypt(hk1, block, 16, nullptr, nullptr, 0, block, 16, &cb_out, 0);
-            if (st < 0) return false;
-            for (int i = 0; i < 16; ++i) dst[i] = static_cast<uint8_t>(block[i] ^ tweak[i]);
-            Gf128MulAlpha(tweak);
+                ? api.encrypt(hk1, work, batch_bytes, nullptr, nullptr, 0, work, batch_bytes, &cb_out, 0)
+                : api.decrypt(hk1, work, batch_bytes, nullptr, nullptr, 0, work, batch_bytes, &cb_out, 0);
+            if (st < 0 || cb_out != batch_bytes) return false;
+            for (size_t i = 0; i < batch_bytes; ++i) {
+                dst_batch[i] = static_cast<uint8_t>(work[i] ^ tweaks[i]);
+            }
+            done_blocks += batch_blocks;
         }
 
         if (rem > 0) {

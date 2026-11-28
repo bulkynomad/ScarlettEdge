@@ -16,13 +16,18 @@
 #include "scarlettx/io/dstorage_abi.h"
 #include "scarlettx/loader/aes_xts_cng.h"
 #include "scarlettx/loader/package_vfs.h"
+#include "scarlettx/loader/pe_loader.h"
+#include "scarlettx/loader/pe_mapper.h"
 #include "scarlettx/loader/xvd_container.h"
 #include "scarlettx/media/codecs_abi.h"
 #include "scarlettx/runtime/emulator.h"
 #include "sx_check.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -34,6 +39,173 @@
 #include <d3d12.h>
 #include <windows.h>
 #endif
+
+namespace {
+
+size_t CountStageDirsInTemp() {
+    std::error_code ec;
+    const auto tmp = std::filesystem::temp_directory_path(ec);
+    if (ec) return 0;
+    size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(tmp, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("scarlettx_stage_", 0) == 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+#if defined(_WIN32)
+// Minimal x64 PE32+ forwarder DLL exporting CreateFileW / ReadFile / GetFileSizeEx / CloseHandle
+// through guest-hooked IAT entries so test_retail_parity verifies Win32 VFS G:\ streaming end-to-end.
+std::vector<uint8_t> BuildVfsProbeGuestDll() {
+    std::vector<uint8_t> img(0x4000, 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(img.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x80;
+
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(img.data() + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 3;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->FileHeader.Characteristics =
+        IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL;
+
+    auto& opt = nt->OptionalHeader;
+    opt.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    opt.MajorLinkerVersion = 14;
+    opt.SizeOfCode = 0x1000;
+    opt.SizeOfInitializedData = 0x2000;
+    opt.AddressOfEntryPoint = 0x1000;
+    opt.BaseOfCode = 0x1000;
+    opt.ImageBase = 0x0000000183000000ULL;
+    opt.SectionAlignment = 0x1000;
+    opt.FileAlignment = 0x1000;
+    opt.MajorOperatingSystemVersion = 6;
+    opt.MajorSubsystemVersion = 6;
+    opt.SizeOfImage = 0x4000;
+    opt.SizeOfHeaders = 0x1000;
+    opt.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    opt.DllCharacteristics =
+        IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
+    opt.SizeOfStackReserve = 0x100000;
+    opt.SizeOfStackCommit = 0x1000;
+    opt.SizeOfHeapReserve = 0x100000;
+    opt.SizeOfHeapCommit = 0x1000;
+    opt.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+
+    auto* secs = IMAGE_FIRST_SECTION(nt);
+    std::memcpy(secs[0].Name, ".text\0\0\0", 8);
+    secs[0].Misc.VirtualSize = 0x1000;
+    secs[0].VirtualAddress = 0x1000;
+    secs[0].SizeOfRawData = 0x1000;
+    secs[0].PointerToRawData = 0x1000;
+    secs[0].Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+
+    std::memcpy(secs[1].Name, ".rdata\0\0", 8);
+    secs[1].Misc.VirtualSize = 0x1000;
+    secs[1].VirtualAddress = 0x2000;
+    secs[1].SizeOfRawData = 0x1000;
+    secs[1].PointerToRawData = 0x2000;
+    secs[1].Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+
+    std::memcpy(secs[2].Name, ".reloc\0\0", 8);
+    secs[2].Misc.VirtualSize = 12;
+    secs[2].VirtualAddress = 0x3000;
+    secs[2].SizeOfRawData = 0x1000;
+    secs[2].PointerToRawData = 0x3000;
+    secs[2].Characteristics =
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE;
+
+    const uint8_t dll_main[] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
+    std::memcpy(img.data() + 0x1000, dll_main, sizeof(dll_main));
+
+    // Sorted alphabetically so Export Name Table binary search works directly.
+    const char* kSyms[4] = {"CloseHandle", "CreateFileW", "GetFileSizeEx", "ReadFile"};
+    uint32_t rcur = 0x2000;
+    const uint32_t iat_rva = rcur;
+    rcur += 5 * 8;
+    const uint32_t ilt_rva = rcur;
+    rcur += 5 * 8;
+    const uint32_t idesc_rva = rcur;
+    rcur += 2 * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+
+    opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT] = {iat_rva, 5 * 8};
+    opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = {
+        idesc_rva, static_cast<DWORD>(2 * sizeof(IMAGE_IMPORT_DESCRIPTOR))};
+
+    const uint32_t dll_str_rva = rcur;
+    const char kK32[] = "KERNEL32.dll";
+    std::memcpy(img.data() + rcur, kK32, sizeof(kK32));
+    rcur += sizeof(kK32);
+
+    auto* idesc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(img.data() + idesc_rva);
+    idesc->OriginalFirstThunk = ilt_rva;
+    idesc->Name = dll_str_rva;
+    idesc->FirstThunk = iat_rva;
+
+    uint32_t func_rvas[4]{};
+    for (uint32_t i = 0; i < 4; ++i) {
+        rcur = (rcur + 1u) & ~1u;
+        const uint32_t hn_rva = rcur;
+        const size_t slen = std::strlen(kSyms[i]) + 1;
+        std::memcpy(img.data() + rcur + 2, kSyms[i], slen);
+        rcur += static_cast<uint32_t>(2 + slen);
+        *reinterpret_cast<uint64_t*>(img.data() + iat_rva + i * 8) = hn_rva;
+        *reinterpret_cast<uint64_t*>(img.data() + ilt_rva + i * 8) = hn_rva;
+
+        const uint32_t stub_rva = 0x1010u + i * 16u;
+        const int32_t disp = static_cast<int32_t>(iat_rva + i * 8u) - static_cast<int32_t>(stub_rva + 6u);
+        img[stub_rva + 0] = 0xFF;
+        img[stub_rva + 1] = 0x25;
+        std::memcpy(img.data() + stub_rva + 2, &disp, 4);
+        func_rvas[i] = stub_rva;
+    }
+
+    rcur = (rcur + 15u) & ~15u;
+    const uint32_t exp_rva = rcur;
+    auto* edir = reinterpret_cast<IMAGE_EXPORT_DIRECTORY*>(img.data() + exp_rva);
+    rcur += sizeof(IMAGE_EXPORT_DIRECTORY);
+    const uint32_t eat_rva = rcur;
+    rcur += 4 * 4;
+    const uint32_t enames_rva = rcur;
+    rcur += 4 * 4;
+    const uint32_t eords_rva = rcur;
+    rcur += 4 * 2;
+    const uint32_t mod_str_rva = rcur;
+    const char kMod[] = "VfsProbe.dll";
+    std::memcpy(img.data() + rcur, kMod, sizeof(kMod));
+    rcur += sizeof(kMod);
+
+    for (uint32_t i = 0; i < 4; ++i) {
+        *reinterpret_cast<uint32_t*>(img.data() + eat_rva + i * 4) = func_rvas[i];
+        *reinterpret_cast<uint16_t*>(img.data() + eords_rva + i * 2) = static_cast<uint16_t>(i);
+        *reinterpret_cast<uint32_t*>(img.data() + enames_rva + i * 4) = rcur;
+        const size_t slen = std::strlen(kSyms[i]) + 1;
+        std::memcpy(img.data() + rcur, kSyms[i], slen);
+        rcur += static_cast<uint32_t>(slen);
+    }
+    edir->Name = mod_str_rva;
+    edir->Base = 1;
+    edir->NumberOfFunctions = 4;
+    edir->NumberOfNames = 4;
+    edir->AddressOfFunctions = eat_rva;
+    edir->AddressOfNames = enames_rva;
+    edir->AddressOfNameOrdinals = eords_rva;
+    opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] = {exp_rva, rcur - exp_rva};
+
+    auto* reloc = reinterpret_cast<IMAGE_BASE_RELOCATION*>(img.data() + 0x3000);
+    reloc->VirtualAddress = 0x1000;
+    reloc->SizeOfBlock = 12;
+    opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x3000, 12};
+    return img;
+}
+#endif
+
+}  // namespace
 
 int main() {
     sx_test::ScopedTempDir sandbox("test_retail_parity");
@@ -486,6 +658,353 @@ int main() {
         std::filesystem::remove(tmp_txt_cik, rm_ec);
     }
 
-    std::cout << "[PASS] test_retail_parity (XVD v3/Merkle/NTFS + makepkg .msixvc + 32-lane GPU GDeflate + WMA-Pro XMA2 + RDNA2 CFG + AcpHal/PIX)\n";
+    // -----------------------------------------------------------------------
+    // 7. Single-Call 4 KiB BCRYPT_XTS_AES_ALGORITHM Sector Parity (32B & 64B Keys)
+    // -----------------------------------------------------------------------
+    {
+        std::vector<uint8_t> plain_4k(4096);
+        for (size_t i = 0; i < plain_4k.size(); ++i) {
+            plain_4k[i] = static_cast<uint8_t>((i * 131u + 29u) & 0xFFu);
+        }
+
+        // AES-128-XTS (32B = 16B data_key || 16B tweak_key): verify single-call 4 KiB
+        // BCRYPT_XTS_AES_ALGORITHM matches block-by-block GF(2^128) XTS byte-for-byte
+        // across all initial blocks AND round-trips all 4096 bytes cleanly.
+        const uint8_t xts128_key[32] = {
+            0x27, 0x18, 0x28, 0x18, 0x28, 0x45, 0x90, 0x45,
+            0x23, 0x53, 0x60, 0x28, 0x74, 0x71, 0x35, 0x26,
+            0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93,
+            0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27, 0x95,
+        };
+        const uint8_t vduid_seed[16] = {
+            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18,
+            0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E, 0x8F, 0x90,
+        };
+
+        scarlettx::crypto::AesXtsPreparedKey prep128;
+        SX_CHECK(prep128.Init(xts128_key, sizeof(xts128_key)));
+        SX_CHECK(prep128.hk_xts_4k != nullptr);
+
+        std::vector<uint8_t> ct_4k(4096, 0);
+        std::vector<uint8_t> ct_ref_4080(4080, 0);
+        std::vector<uint8_t> rt_4k(4096, 0);
+        SX_CHECK(prep128.TransformSectorWithTweakSeed(
+            true, 0x0000000102030405ull, nullptr, plain_4k.data(), ct_4k.data(), 4096));
+        SX_CHECK(prep128.TransformSectorWithTweakSeed(
+            true, 0x0000000102030405ull, nullptr, plain_4k.data(), ct_ref_4080.data(), 4080));
+        SX_CHECK(std::memcmp(ct_4k.data(), ct_ref_4080.data(), 4080) == 0);
+        SX_CHECK(ct_4k != plain_4k);
+        SX_CHECK(prep128.TransformSectorWithTweakSeed(
+            false, 0x0000000102030405ull, nullptr, ct_4k.data(), rt_4k.data(), 4096));
+        SX_CHECK(rt_4k == plain_4k);
+
+        // Also verify VDUID tweak_seed 4 KiB sector path AND 64B AES-256-XTS prepared key.
+        std::vector<uint8_t> ct_vduid_4k(4096, 0);
+        std::vector<uint8_t> ct_vduid_4080(4080, 0);
+        SX_CHECK(prep128.TransformSectorWithTweakSeed(
+            true, 77ull, vduid_seed, plain_4k.data(), ct_vduid_4k.data(), 4096));
+        SX_CHECK(prep128.TransformSectorWithTweakSeed(
+            true, 77ull, vduid_seed, plain_4k.data(), ct_vduid_4080.data(), 4080));
+        SX_CHECK(std::memcmp(ct_vduid_4k.data(), ct_vduid_4080.data(), 4080) == 0);
+        SX_CHECK(prep128.TransformSectorWithTweakSeed(
+            false, 77ull, vduid_seed, ct_vduid_4k.data(), rt_4k.data(), 4096));
+        SX_CHECK(rt_4k == plain_4k);
+
+        uint8_t xts256_key[64]{};
+        for (size_t i = 0; i < sizeof(xts256_key); ++i) {
+            xts256_key[i] = static_cast<uint8_t>((i * 37u + 0x5Au) & 0xFFu);
+        }
+        scarlettx::crypto::AesXtsPreparedKey prep256;
+        SX_CHECK(prep256.Init(xts256_key, sizeof(xts256_key)));
+        std::vector<uint8_t> ct256_4k(4096, 0);
+        std::vector<uint8_t> ct256_4080(4080, 0);
+        SX_CHECK(prep256.TransformSectorWithTweakSeed(
+            true, 19ull, nullptr, plain_4k.data(), ct256_4k.data(), 4096));
+        SX_CHECK(prep256.TransformSectorWithTweakSeed(
+            true, 19ull, nullptr, plain_4k.data(), ct256_4080.data(), 4080));
+        SX_CHECK(std::memcmp(ct256_4k.data(), ct256_4080.data(), 4080) == 0);
+        SX_CHECK(prep256.TransformSectorWithTweakSeed(
+            false, 19ull, nullptr, ct256_4k.data(), rt_4k.data(), 4096));
+        SX_CHECK(rt_4k == plain_4k);
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. Multi-Key Encrypted v3 .msixvc + Out-of-Order .cik KeyId GUID Keyring +
+    //    Zero-Staging In-Process Boot + Win32 VFS & DirectStorage Streaming
+    //    (Asserting 0 scarlettx_stage_* directories in %TEMP%)
+    // -----------------------------------------------------------------------
+    {
+        const std::filesystem::path hello_exe_path =
+            std::filesystem::path(SCARLETTX_BINARY_DIR) / "packages" / "hello_scarlett" / "hello_scarlett.exe";
+        std::ifstream exe_ifs(hello_exe_path, std::ios::binary);
+        SX_CHECK(exe_ifs.good());
+        const std::vector<uint8_t> hello_exe_bytes(
+            (std::istreambuf_iterator<char>(exe_ifs)), std::istreambuf_iterator<char>());
+
+        // Keep MicrosoftGame.Config <= 192B so it resides inside unencrypted $MFT (FS-MD),
+        // while "hello_scarlett.exe" ('h') precedes "Streaming\region1_stream.bin" ('s') in
+        // non-resident cluster order (Region 0 = slot 0, Region 1 = slot 1).
+        const std::string game_cfg_xml =
+            "<Game configVersion=\"1\"><TitleId>778899AA</TitleId><ExecutableList>"
+            "<Executable Name=\"hello_scarlett.exe\" TargetDeviceFamily=\"XboxGen9\"/>"
+            "</ExecutableList></Game>";
+        SX_CHECK(game_cfg_xml.size() <= 192u);
+
+        std::vector<uint8_t> reg1_payload(24576);
+        for (size_t i = 0; i < reg1_payload.size(); ++i) {
+            reg1_payload[i] = static_cast<uint8_t>((i * 97u + 53u) & 0xFFu);
+        }
+        uint8_t expected_sha256[32]{};
+        SX_CHECK(scarlettx::crypto::ComputeSha256(
+            reg1_payload.data(), reg1_payload.size(), expected_sha256));
+
+        const std::vector<scarlettx::XvdInputFile> mk_files = {
+            {"MicrosoftGame.Config", std::vector<uint8_t>(game_cfg_xml.begin(), game_cfg_xml.end())},
+            {"hello_scarlett.exe", hello_exe_bytes},
+            {"Streaming\\region1_stream.bin", reg1_payload},
+        };
+        const std::vector<uint8_t> ntfs_vol = scarlettx::XvdContainer::BuildNtfsVolumeBytes(mk_files);
+        const uint64_t total_vol_bytes = ntfs_vol.size();
+
+        uint64_t exe_user_off = 0;
+        uint64_t reg1_user_off = 0;
+        {
+            scarlettx::XvdContainer layout_probe;
+            SX_CHECK(layout_probe.OpenBytes(scarlettx::XvdContainer::BuildSyntheticXvd(ntfs_vol)).ok());
+            std::vector<scarlettx::XvdEmbeddedFile> layout_entries;
+            SX_CHECK(layout_probe.ListEmbeddedFiles(layout_entries).ok());
+            for (const auto& e : layout_entries) {
+                if (e.relative_path == "hello_scarlett.exe") {
+                    exe_user_off = e.user_data_offset;
+                } else if (e.relative_path == "Streaming\\region1_stream.bin" ||
+                           e.relative_path == "Streaming/region1_stream.bin") {
+                    reg1_user_off = e.user_data_offset;
+                }
+            }
+        }
+        SX_CHECK(exe_user_off > 0 && reg1_user_off > exe_user_off && total_vol_bytes > reg1_user_off);
+        const uint64_t fs_md_bytes = exe_user_off;
+        const uint64_t reg0_bytes = reg1_user_off - exe_user_off;
+        const uint64_t reg1_bytes = total_vol_bytes - reg1_user_off;
+
+        // Distinct 16-byte KeyId GUIDs and 32-byte AES-128-XTS keys for slot 0 and slot 1.
+        // Slot 0 GUID: {11223344-5566-7788-99AA-BBCCDDEEFF01} stored in mixed-endian Win32 GUID layout
+        // in the XVC header while zz_real.cik stores raw big-endian GUID bytes -> tests endian-agnostic match!
+        const std::array<uint8_t, 16> guid_slot0_mixed = {
+            0x44, 0x33, 0x22, 0x11, 0x66, 0x55, 0x88, 0x77,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01,
+        };
+        const std::array<uint8_t, 16> guid_slot0_raw_be = {
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01,
+        };
+        // Slot 1 GUID: {A0B1C2D3-E4F5-4607-891A-2B3C4D5E6F70}
+        const std::array<uint8_t, 16> guid_slot1_raw_be = {
+            0xA0, 0xB1, 0xC2, 0xD3, 0xE4, 0xF5, 0x46, 0x07,
+            0x89, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F, 0x70,
+        };
+        const std::array<uint8_t, 16> guid_decoy = {
+            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+        };
+
+        std::array<uint8_t, 32> key_slot0{};
+        std::array<uint8_t, 32> key_slot1{};
+        std::array<uint8_t, 32> key_wrong{};
+        for (size_t i = 0; i < 32; ++i) {
+            key_slot0[i] = static_cast<uint8_t>(0x10u + i * 3u);
+            key_slot1[i] = static_cast<uint8_t>(0x80u + i * 5u);
+            key_wrong[i] = static_cast<uint8_t>(0xFFu - i);
+        }
+
+        const std::vector<scarlettx::XvcRegionInfo> regions = {
+            {0x40000002u, scarlettx::XvdContainer::kUnencryptedKeyId, 1u, 0ull, fs_md_bytes},
+            {1000u, 0u, 4u, fs_md_bytes, reg0_bytes},
+            {1001u, 1u, 4u, fs_md_bytes + reg0_bytes, reg1_bytes},
+        };
+        const std::vector<std::pair<std::array<uint8_t, 16>, std::vector<uint8_t>>> cik_guid_keys = {
+            {guid_slot0_mixed, std::vector<uint8_t>(key_slot0.begin(), key_slot0.end())},
+            {guid_slot1_raw_be, std::vector<uint8_t>(key_slot1.begin(), key_slot1.end())},
+        };
+
+        const auto msixvc_bytes = scarlettx::XvdContainer::BuildRetailV3XvcMultiKeyWithGuids(
+            ntfs_vol, cik_guid_keys, regions, /*enable_merkle_tree=*/true);
+        SX_CHECK(msixvc_bytes.size() > total_vol_bytes);
+
+        const auto msixvc_path = sandbox.path() / "multi_key_zero_stage.msixvc";
+        {
+            std::ofstream ofs(msixvc_path, std::ios::binary | std::ios::trunc);
+            ofs.write(reinterpret_cast<const char*>(msixvc_bytes.data()),
+                      static_cast<std::streamsize>(msixvc_bytes.size()));
+            SX_CHECK(ofs.good());
+        }
+
+        // Build keyring directory with decoy 00_wrong.cik alphabetically BEFORE 50_slot1.key and zz_real.cik!
+        const auto keyring_dir = sandbox.path() / "keyring";
+        const auto decoy_only_dir = sandbox.path() / "keyring_decoy_only";
+        std::filesystem::create_directories(keyring_dir);
+        std::filesystem::create_directories(decoy_only_dir);
+
+        auto write_cik48 = [](const std::filesystem::path& p,
+                              const std::array<uint8_t, 16>& guid,
+                              const std::array<uint8_t, 32>& k) {
+            uint8_t buf[48]{};
+            std::memcpy(buf, guid.data(), 16);
+            std::memcpy(buf + 16, k.data(), 32);
+            std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+            ofs.write(reinterpret_cast<const char*>(buf), sizeof(buf));
+            SX_CHECK(ofs.good());
+        };
+        write_cik48(keyring_dir / "00_wrong.cik", guid_decoy, key_wrong);
+        write_cik48(decoy_only_dir / "00_wrong.cik", guid_decoy, key_wrong);
+        write_cik48(keyring_dir / "zz_real.cik", guid_slot0_raw_be, key_slot0);
+
+        static constexpr char kHex[] = "0123456789abcdef";
+        std::string key1_hex;
+        for (uint8_t b : key_slot1) {
+            key1_hex.push_back(kHex[(b >> 4) & 0xFu]);
+            key1_hex.push_back(kHex[b & 0xFu]);
+        }
+        {
+            std::ofstream tofs(keyring_dir / "50_slot1.key", std::ios::trunc);
+            tofs << "A0B1C2D3-E4F5-4607-891A-2B3C4D5E6F70 = " << key1_hex << "\n";
+            SX_CHECK(tofs.good());
+        }
+
+        // Verify decoy-only keyring is strictly rejected when reading encrypted Region 0 / Region 1.
+        {
+            scarlettx::XvdContainer bad_xvd;
+            SX_CHECK(bad_xvd.OpenFile(msixvc_path.string()).ok());
+            SX_CHECK(bad_xvd.LoadKeyringDirectory(decoy_only_dir.string()).ok());
+            std::vector<uint8_t> fail_bytes;
+            SX_CHECK(!bad_xvd.ReadEmbeddedFile("Streaming\\region1_stream.bin", fail_bytes).ok());
+        }
+
+        // Assert 0 scarlettx_stage_* directories exist before and after InspectPackage + BootPackage!
+        SX_CHECK(CountStageDirsInTemp() == 0u);
+
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_MAX_FRAMES", "1");
+        scarlettx::EmulatorConfig boot_cfg{};
+        boot_cfg.in_process = true;
+        boot_cfg.force_relocate = true;
+        boot_cfg.shim_directory = SCARLETTX_BINARY_DIR;
+        boot_cfg.volume_key = keyring_dir.string();  // Keyring directory (same path used by --keyring)
+        scarlettx::Emulator boot_emu(boot_cfg);
+
+        scarlettx::PackageInspectionReport mk_rep{};
+        SX_CHECK(boot_emu.InspectPackage(msixvc_path.string(), mk_rep).ok());
+        SX_CHECK(mk_rep.config.title_id == "778899AA");
+        SX_CHECK(mk_rep.main_pe.is_pe64);
+        SX_CHECK(CountStageDirsInTemp() == 0u);
+
+        auto boot_st = boot_emu.BootPackage(msixvc_path.string());
+        if (!boot_st.ok()) {
+            std::cerr << "[test_retail_parity] Multi-key zero-staging BootPackage failed: "
+                      << boot_st.message << "\n";
+            return 1;
+        }
+        SX_CHECK(CountStageDirsInTemp() == 0u);
+
+        // Mount the multi-key .msixvc into PackageVfs::Global() using the out-of-order keyring_dir
+        // (BootPackage's RAII guard cleanly unmounts G: after guest exit) and stream Region 1 via
+        // both Win32 VFS guest hooks and DirectStorage!
+        SX_CHECK(scarlettx::PackageVfs::Global()
+                     .MountXvd("G:", msixvc_path.string(), keyring_dir.string())
+                     .ok());
+
+        // Stream G:\Streaming\region1_stream.bin via Win32 VFS guest hooks (CreateFileW + ReadFile)!
+        {
+            const auto probe_dll_bytes = BuildVfsProbeGuestDll();
+            scarlettx::DllRedirectionTable redirs;
+            scarlettx::HleSymbolRegistry hle_reg;
+            scarlettx::PeMapOptions map_opts{};
+            map_opts.force_relocate = true;
+            map_opts.shim_directory = SCARLETTX_BINARY_DIR;
+            scarlettx::MappedPeImage vfs_probe;
+            SX_CHECK(vfs_probe.MapBytes(probe_dll_bytes, "G:\\VfsProbe.dll", redirs, hle_reg, map_opts).ok());
+
+            using CreateFileWFn = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES,
+                                                  DWORD, DWORD, HANDLE);
+            using GetFileSizeExFn = BOOL(WINAPI*)(HANDLE, PLARGE_INTEGER);
+            using ReadFileFn = BOOL(WINAPI*)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
+            using CloseHandleFn = BOOL(WINAPI*)(HANDLE);
+
+            auto fn_create = reinterpret_cast<CreateFileWFn>(vfs_probe.GetExportAddress("CreateFileW"));
+            auto fn_size = reinterpret_cast<GetFileSizeExFn>(vfs_probe.GetExportAddress("GetFileSizeEx"));
+            auto fn_read = reinterpret_cast<ReadFileFn>(vfs_probe.GetExportAddress("ReadFile"));
+            auto fn_close = reinterpret_cast<CloseHandleFn>(vfs_probe.GetExportAddress("CloseHandle"));
+            SX_CHECK(fn_create && fn_size && fn_read && fn_close);
+
+            HANDLE hvfs = fn_create(L"G:\\Streaming\\region1_stream.bin", GENERIC_READ, FILE_SHARE_READ,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            SX_CHECK(hvfs != INVALID_HANDLE_VALUE);
+            LARGE_INTEGER sz{};
+            SX_CHECK(fn_size(hvfs, &sz) == TRUE && static_cast<size_t>(sz.QuadPart) == reg1_payload.size());
+            std::vector<uint8_t> win32_streamed(reg1_payload.size(), 0);
+            DWORD nread = 0;
+            SX_CHECK(fn_read(hvfs, win32_streamed.data(), static_cast<DWORD>(win32_streamed.size()),
+                             &nread, nullptr) == TRUE);
+            SX_CHECK(nread == reg1_payload.size());
+            SX_CHECK(fn_close(hvfs) == TRUE);
+
+            uint8_t win32_sha256[32]{};
+            SX_CHECK(scarlettx::crypto::ComputeSha256(
+                win32_streamed.data(), win32_streamed.size(), win32_sha256));
+            SX_CHECK(std::memcmp(win32_sha256, expected_sha256, 32) == 0);
+            SX_CHECK(win32_streamed == reg1_payload);
+        }
+
+        // Stream G:\Streaming\region1_stream.bin via DirectStorage (DStorageOpenFile + Queue)!
+        {
+            uint64_t ds_factory = 0;
+            SX_CHECK(DStorageGetFactory(&ds_factory) == 0 && ds_factory != 0);
+            uint64_t ds_file = 0;
+            SX_CHECK(DStorageOpenFile(ds_factory, "G:\\Streaming\\region1_stream.bin", &ds_file) == 0 &&
+                     ds_file != 0);
+            uint64_t ds_size = 0;
+            SX_CHECK(DStorageGetFileSize(ds_file, &ds_size) == 0 && ds_size == reg1_payload.size());
+
+            DSTORAGE_QUEUE_DESC qd{};
+            qd.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+            qd.Capacity = 64;
+            qd.Priority = DSTORAGE_PRIORITY_NORMAL;
+            qd.Name = "ZeroStageMultiKeyQueue";
+            uint64_t ds_queue = 0;
+            SX_CHECK(DStorageCreateQueue(ds_factory, &qd, &ds_queue) == 0 && ds_queue != 0);
+
+            std::vector<uint8_t> ds_streamed(reg1_payload.size(), 0);
+            DSTORAGE_REQUEST req{};
+            req.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+            req.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
+            req.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+            req.SourceFileHandle = ds_file;
+            req.SourceFileOffset = 0;
+            req.SourceSize = static_cast<uint32_t>(reg1_payload.size());
+            req.DestinationMemory = ds_streamed.data();
+            req.DestinationSize = static_cast<uint32_t>(ds_streamed.size());
+            req.UncompressedSize = static_cast<uint32_t>(ds_streamed.size());
+            req.Name = "Region1Read";
+            SX_CHECK(DStorageEnqueueRequest(ds_queue, &req) == 0);
+            SX_CHECK(DStorageSubmit(ds_queue) == 0);
+            SX_CHECK(DStorageWaitForIdle(ds_queue, 10000) == 0);
+
+            uint8_t ds_sha256[32]{};
+            SX_CHECK(scarlettx::crypto::ComputeSha256(
+                ds_streamed.data(), ds_streamed.size(), ds_sha256));
+            SX_CHECK(std::memcmp(ds_sha256, expected_sha256, 32) == 0);
+            SX_CHECK(ds_streamed == reg1_payload);
+
+            SX_CHECK(DStorageDestroyQueue(ds_queue) == 0);
+            SX_CHECK(DStorageCloseFile(ds_file) == 0);
+            SX_CHECK(DStorageDestroyFactory(ds_factory) == 0);
+        }
+
+        scarlettx::PackageVfs::Global().Reset();
+        SX_CHECK(CountStageDirsInTemp() == 0u);
+#endif
+    }
+
+    std::cout << "[PASS] test_retail_parity (XVD v3/Merkle/NTFS + Multi-Key .cik Keyring + Zero-Staging VFS/DStorage + 32-lane GPU GDeflate + WMA-Pro XMA2 + RDNA2 CFG + AcpHal/PIX)\n";
     return 0;
 }

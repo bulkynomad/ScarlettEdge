@@ -10,6 +10,13 @@
 #include "scarlettx/core/status.h"
 
 namespace scarlettx {
+
+// Resolves guest runtime IAT hooks for secondary package-loaded guest DLLs
+// (VFS G:\ I/O, VirtualAlloc MEM_GRAPHICS, LoadLibrary*, GetProcAddress, WinRT, FLS, etc.).
+void* LookupGuestDllRuntimeHook(const std::string& target_dll_lower, const std::string& symbol);
+std::string GetGuestPackageDirectoryForPatch();
+std::string GetGuestShimDirectoryForPatch();
+
 namespace guest {
 
 struct TlsBinding {
@@ -52,9 +59,10 @@ bool TryResolveGuestAddressLockFree(uint64_t address, GuestModuleAddrInfo* out) 
 // call directly. `target_dll_lower` is the resolved host DLL name in lower case.
 void* LookupImportOverride(const std::string& target_dll_lower, const std::string& symbol);
 
-// Redirects `RtlPcToFileHeader` in the import table of a host module, so MSVC C++
-// exception throw info inside guest images resolves to the guest's base.
-void PatchHostModuleForGuests(void* host_module);
+// Redirects `RtlPcToFileHeader` in vcruntime* and patches the full guest runtime IAT
+// hook table (VFS, VirtualAlloc MEM_GRAPHICS, LoadLibrary*, GetProcAddress, WinRT,
+// FLS, GetModuleHandle*, GetCommandLine*, CPU topology) into package-loaded guest DLLs.
+void PatchHostModuleForGuests(void* host_module, bool force_package_module = false);
 
 }  // namespace guest
 }  // namespace scarlettx

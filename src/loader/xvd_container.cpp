@@ -85,13 +85,51 @@ constexpr size_t kOffRetailEmbeddedXvdLen = 0x288;
 constexpr size_t kOffRetailUserDataLength = 0x28C;
 constexpr size_t kOffRetailXvcDataLength = 0x294;
 constexpr size_t kOffRetailMutableDataLength = 0x29C;
+constexpr size_t kOffRetailOdkKeySlot = 0x2A4;
 
 // XvcInfo + XvcRegionHeader binary constants.
 constexpr size_t kXvcInfoSize = 0xDC8;
+constexpr size_t kXvcInfoOffKeyGuids = 0x010;
+constexpr size_t kXvcInfoMaxKeyGuids = 192;
 constexpr size_t kXvcInfoOffVersion = 0xD10;
 constexpr size_t kXvcInfoOffRegionCount = 0xD14;
 constexpr size_t kXvcInfoOffKeyCount = 0xD1E;
 constexpr size_t kXvcRegionHeaderSize = 0x40;
+
+std::array<uint8_t, 16> SwapGuidEndian(const std::array<uint8_t, 16>& g) {
+    std::array<uint8_t, 16> out = g;
+    std::swap(out[0], out[3]);
+    std::swap(out[1], out[2]);
+    std::swap(out[4], out[5]);
+    std::swap(out[6], out[7]);
+    return out;
+}
+
+bool TryDecodeGuidString(const std::string& raw_text, std::array<uint8_t, 16>& out_raw16) {
+    out_raw16.fill(0);
+    size_t nibbles = 0;
+    int high = -1;
+    for (char c : raw_text) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+            c == '-' || c == '{' || c == '}' || c == '(' || c == ')') {
+            continue;
+        }
+        int nib = -1;
+        if (c >= '0' && c <= '9') nib = c - '0';
+        else if (c >= 'a' && c <= 'f') nib = 10 + (c - 'a');
+        else if (c >= 'A' && c <= 'F') nib = 10 + (c - 'A');
+        else return false;
+        if (high < 0) {
+            high = nib;
+        } else {
+            if (nibbles / 2u >= 16u) return false;
+            out_raw16[nibbles / 2u] = static_cast<uint8_t>((high << 4) | nib);
+            high = -1;
+        }
+        ++nibbles;
+    }
+    return high < 0 && nibbles == 32u;
+}
 
 int HexNibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -611,12 +649,16 @@ XvdContainer::XvdContainer(XvdContainer&& other) noexcept
       xvc_info_offset_(other.xvc_info_offset_),
       verify_integrity_on_read_(other.verify_integrity_on_read_),
       regions_(std::move(other.regions_)),
+      xvc_key_guids_(std::move(other.xvc_key_guids_)),
       volume_key_(other.volume_key_),
       volume_key_len_(other.volume_key_len_),
       has_volume_key_(other.has_volume_key_),
       prepared_key_(std::move(other.prepared_key_)),
-      cik_keys_(std::move(other.cik_keys_)) {
+      cik_keys_(std::move(other.cik_keys_)),
+      explicit_slot_keys_(std::move(other.explicit_slot_keys_)),
+      guid_key_entries_(std::move(other.guid_key_entries_)) {
     other.header_ = {};
+    other.ClearSectorCache();
 }
 
 XvdContainer& XvdContainer::operator=(XvdContainer&& other) noexcept {
@@ -641,11 +683,15 @@ XvdContainer& XvdContainer::operator=(XvdContainer&& other) noexcept {
         xvc_info_offset_ = other.xvc_info_offset_;
         verify_integrity_on_read_ = other.verify_integrity_on_read_;
         regions_ = std::move(other.regions_);
+        xvc_key_guids_ = std::move(other.xvc_key_guids_);
         volume_key_ = other.volume_key_;
         volume_key_len_ = other.volume_key_len_;
         has_volume_key_ = other.has_volume_key_;
         prepared_key_ = std::move(other.prepared_key_);
         cik_keys_ = std::move(other.cik_keys_);
+        explicit_slot_keys_ = std::move(other.explicit_slot_keys_);
+        guid_key_entries_ = std::move(other.guid_key_entries_);
+        other.ClearSectorCache();
     }
     return *this;
 }
@@ -662,7 +708,14 @@ void XvdContainer::CloseFileHandle() noexcept {
     file_size_ = 0;
 }
 
+void XvdContainer::ClearSectorCache() const {
+    std::lock_guard<std::mutex> lk(sector_cache_mu_);
+    sector_map_.clear();
+    sector_lru_.clear();
+}
+
 void XvdContainer::ResetFsCache() const {
+    ClearSectorCache();
     std::lock_guard<std::mutex> lk(fs_cache_mu_);
     fs_cached_ = false;
     cached_fs_entries_.clear();
@@ -742,10 +795,12 @@ Status XvdContainer::SetVolumeKey(const uint8_t* key, size_t key_len) {
         return Status::Error(StatusCode::InvalidArgument, "Failed to initialize XVD AES-XTS key");
     }
     prepared_key_ = prep;
+    explicit_slot_keys_[0] = prep;
     if (cik_keys_.find(0) == cik_keys_.end()) {
         cik_keys_[0] = prep;
     }
     has_volume_key_ = true;
+    RebindKeyringToXvcSlots();
     ResetFsCache();
     return Status::Ok();
 }
@@ -757,38 +812,152 @@ Status XvdContainer::SetVolumeKeyHex(const std::string& hex_key) {
     return SetVolumeKey(bytes.data(), bytes.size());
 }
 
-Status XvdContainer::LoadVolumeKeyFile(const std::string& key_file_path) {
-    std::ifstream ifs(key_file_path, std::ios::binary);
-    if (!ifs) {
-        return Status::Error(StatusCode::NotFound, "Failed to open XVD volume key file: " + key_file_path);
+const crypto::AesXtsPreparedKey* XvdContainer::LookupGuidKey(
+    const std::array<uint8_t, 16>& target_guid) const {
+    if (!IsAnyByteNonZero(target_guid.data(), 16)) {
+        return nullptr;
     }
-    std::vector<uint8_t> raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    if (raw.size() == 16 || raw.size() == 32 || raw.size() == 64) {
-        return SetVolumeKey(raw.data(), raw.size());
-    }
-    // Standard 48-byte binary .cik file or concatenated multi-entry binary keyring:
-    // each 48-byte record = [0..15] 16-byte KeyId GUID, [16..47] 32-byte AES-128-XTS key.
-    if (raw.size() >= 48 && (raw.size() % 48) == 0) {
-        const size_t count = raw.size() / 48;
-        if (count == 1) {
-            return SetVolumeKey(raw.data() + 16, 32);
+    const auto swapped_target = SwapGuidEndian(target_guid);
+    for (const auto& entry : guid_key_entries_) {
+        if (!entry.key) continue;
+        if (entry.raw_guid == target_guid || entry.swapped_guid == target_guid ||
+            entry.raw_guid == swapped_target) {
+            return entry.key.get();
         }
-        bool loaded_bin = false;
-        for (size_t i = 0; i < count && i < 0xFFFEu; ++i) {
-            const uint8_t* kptr = raw.data() + i * 48 + 16;
-            if (SetCikKey(static_cast<uint16_t>(i), kptr, 32).ok()) {
-                loaded_bin = true;
+    }
+    return nullptr;
+}
+
+void XvdContainer::RebindKeyringToXvcSlots() {
+    for (size_t s = 0; s < xvc_key_guids_.size() && s < 0xFFFEu; ++s) {
+        const auto& slot_guid = xvc_key_guids_[s];
+        if (!IsAnyByteNonZero(slot_guid.data(), 16)) {
+            continue;
+        }
+        const auto swapped_target = SwapGuidEndian(slot_guid);
+        for (const auto& entry : guid_key_entries_) {
+            if (!entry.key) continue;
+            if (entry.raw_guid == slot_guid || entry.swapped_guid == slot_guid ||
+                entry.raw_guid == swapped_target) {
+                cik_keys_[static_cast<uint16_t>(s)] = entry.key;
+                break;
             }
         }
-        if (loaded_bin) {
+    }
+}
+
+Status XvdContainer::SetCikKeyByGuid(const uint8_t key_guid[16],
+                                     const uint8_t* key,
+                                     size_t key_len) {
+    if (!key_guid || !key || key_len < 16) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "CIK GUID and key (>= 16 bytes) are required");
+    }
+    const size_t copy_len = (std::min)(key_len, size_t{64});
+    auto prep = std::make_shared<crypto::AesXtsPreparedKey>();
+    if (!prep->Init(key, copy_len)) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "Failed to initialize GUID-indexed XVC CIK AES-XTS key");
+    }
+
+    std::array<uint8_t, 16> g_raw{};
+    std::memcpy(g_raw.data(), key_guid, 16);
+    const auto g_swapped = SwapGuidEndian(g_raw);
+
+    if (IsAnyByteNonZero(g_raw.data(), 16)) {
+        bool updated = false;
+        for (auto& existing : guid_key_entries_) {
+            if (existing.raw_guid == g_raw || existing.swapped_guid == g_raw) {
+                existing.key = prep;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            guid_key_entries_.push_back(GuidKeyEntry{g_raw, g_swapped, prep});
+        }
+        RebindKeyringToXvcSlots();
+    } else {
+        const uint16_t next_slot = static_cast<uint16_t>(cik_keys_.size());
+        if (next_slot < kUnencryptedKeyId) {
+            cik_keys_[next_slot] = prep;
+        }
+    }
+    ResetFsCache();
+    return Status::Ok();
+}
+
+Status XvdContainer::ParseKeyBytesOrText(const std::vector<uint8_t>& raw,
+                                         bool allow_single_raw_volume_key,
+                                         size_t* out_loaded) {
+    if (out_loaded) *out_loaded = 0;
+    if (raw.empty()) {
+        return Status::Error(StatusCode::InvalidArgument, "Key file is empty");
+    }
+
+    // Raw 16B / 32B / 64B binary volume key (no 16B GUID prefix).
+    if (raw.size() == 16 || raw.size() == 32 || raw.size() == 64) {
+        if (allow_single_raw_volume_key) {
+            Status st = SetVolumeKey(raw.data(), raw.size());
+            if (st.ok() && out_loaded) *out_loaded = 1;
+            return st;
+        }
+        const uint16_t slot =
+            static_cast<uint16_t>((std::max)(explicit_slot_keys_.size(), cik_keys_.size()));
+        if (slot < kUnencryptedKeyId && SetCikKey(slot, raw.data(), raw.size()).ok()) {
+            if (out_loaded) *out_loaded = 1;
             return Status::Ok();
         }
     }
 
+    // Standard 48-byte binary .cik file or concatenated multi-entry binary keyring:
+    // each 48-byte record = [0..15] 16-byte KeyId GUID, [16..47] 32-byte AES-128-XTS key.
+    auto try_parse_binary_cik48 = [&]() -> bool {
+        if (raw.size() < 48 || (raw.size() % 48) != 0) {
+            return false;
+        }
+        const size_t count = raw.size() / 48;
+        size_t loaded_bin = 0;
+        for (size_t i = 0; i < count && i < 0xFFFEu; ++i) {
+            const uint8_t* gptr = raw.data() + i * 48;
+            const uint8_t* kptr = raw.data() + i * 48 + 16;
+            if (SetCikKeyByGuid(gptr, kptr, 32).ok()) {
+                // Also populate positional fallback slot ONLY if not already bound by GUID.
+                const uint16_t pos_slot = static_cast<uint16_t>(cik_keys_.size());
+                if (pos_slot < kUnencryptedKeyId && cik_keys_.find(pos_slot) == cik_keys_.end()) {
+                    cik_keys_[pos_slot] = guid_key_entries_.empty()
+                                              ? nullptr
+                                              : guid_key_entries_.back().key;
+                    if (!cik_keys_[pos_slot]) cik_keys_.erase(pos_slot);
+                }
+                ++loaded_bin;
+            }
+        }
+        RebindKeyringToXvcSlots();
+        if (loaded_bin > 0) {
+            if (out_loaded) *out_loaded = loaded_bin;
+            return true;
+        }
+        return false;
+    };
+
+    bool looks_like_text = true;
+    for (uint8_t b : raw) {
+        if (b == '\r' || b == '\n' || b == '\t' || (b >= 0x20u && b <= 0x7Eu)) {
+            continue;
+        }
+        looks_like_text = false;
+        break;
+    }
+
+    if (!looks_like_text && try_parse_binary_cik48()) {
+        return Status::Ok();
+    }
+
     std::string text(reinterpret_cast<const char*>(raw.data()), raw.size());
-    // Support text .cik / keyring lines formatted as "<GUID> = <HEXKEY>", "<GUID>:<HEXKEY>", or multi-line key lists.
-    uint16_t slot_idx = 0;
-    bool loaded_any = false;
+    // Support text .cik / keyring lines formatted as "<GUID> = <HEXKEY>", "<GUID>:<HEXKEY>",
+    // 96-hex-char concatenated GUID+KEY lines, or raw hex key lines.
+    size_t loaded_text = 0;
     size_t pos = 0;
     while (pos < text.size()) {
         size_t eol = text.find_first_of("\r\n", pos);
@@ -797,31 +966,75 @@ Status XvdContainer::LoadVolumeKeyFile(const std::string& key_file_path) {
         while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(line.begin());
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
 
+        std::string guid_part;
+        std::string key_part = line;
         const size_t eq_pos = line.find('=');
         if (eq_pos != std::string::npos) {
-            line = line.substr(eq_pos + 1);
+            guid_part = line.substr(0, eq_pos);
+            key_part = line.substr(eq_pos + 1);
         } else {
-            // Handle "<GUID>:<64-hex-key>" where GUID itself has no colons
             const size_t colon_pos = line.rfind(':');
             if (colon_pos != std::string::npos && colon_pos >= 32u) {
-                line = line.substr(colon_pos + 1);
+                guid_part = line.substr(0, colon_pos);
+                key_part = line.substr(colon_pos + 1);
             }
         }
+
         std::vector<uint8_t> decoded;
-        if (DecodeHexKeyString(line, decoded).ok()) {
-            // If 48 bytes of hex (16B GUID + 32B key) were concatenated on one line, slice the 32B key.
-            const uint8_t* kptr = (decoded.size() == 48u) ? (decoded.data() + 16u) : decoded.data();
-            const size_t klen = (decoded.size() == 48u) ? 32u : decoded.size();
-            if (SetCikKey(slot_idx, kptr, klen).ok()) {
-                ++slot_idx;
-                loaded_any = true;
+        if (DecodeHexKeyString(key_part, decoded).ok()) {
+            std::array<uint8_t, 16> parsed_guid{};
+            if (!guid_part.empty() && TryDecodeGuidString(guid_part, parsed_guid)) {
+                const uint8_t* kptr = (decoded.size() == 48u) ? (decoded.data() + 16u) : decoded.data();
+                const size_t klen = (decoded.size() == 48u) ? 32u : decoded.size();
+                if (SetCikKeyByGuid(parsed_guid.data(), kptr, klen).ok()) {
+                    const uint16_t pos_slot = static_cast<uint16_t>(cik_keys_.size());
+                    if (pos_slot < kUnencryptedKeyId && cik_keys_.find(pos_slot) == cik_keys_.end() &&
+                        !guid_key_entries_.empty()) {
+                        cik_keys_[pos_slot] = guid_key_entries_.back().key;
+                    }
+                    ++loaded_text;
+                }
+            } else if (decoded.size() == 48u) {
+                if (SetCikKeyByGuid(decoded.data(), decoded.data() + 16u, 32u).ok()) {
+                    ++loaded_text;
+                }
+            } else {
+                const uint16_t slot_idx = static_cast<uint16_t>(explicit_slot_keys_.size());
+                if (slot_idx < kUnencryptedKeyId && SetCikKey(slot_idx, decoded.data(), decoded.size()).ok()) {
+                    ++loaded_text;
+                }
             }
         }
     }
-    if (loaded_any) {
+    RebindKeyringToXvcSlots();
+    if (loaded_text > 0) {
+        if (out_loaded) *out_loaded = loaded_text;
         return Status::Ok();
     }
-    return SetVolumeKeyHex(text);
+    if (allow_single_raw_volume_key) {
+        Status st = SetVolumeKeyHex(text);
+        if (st.ok()) {
+            if (out_loaded) *out_loaded = 1;
+            return st;
+        }
+    }
+    if (looks_like_text && try_parse_binary_cik48()) {
+        return Status::Ok();
+    }
+    return Status::Error(StatusCode::InvalidArgument, "Unrecognized XVD/CIK key file format");
+}
+
+Status XvdContainer::LoadVolumeKeyFile(const std::string& key_file_path) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(key_file_path, ec)) {
+        return LoadKeyringDirectory(key_file_path);
+    }
+    std::ifstream ifs(key_file_path, std::ios::binary);
+    if (!ifs) {
+        return Status::Error(StatusCode::NotFound, "Failed to open XVD volume key file: " + key_file_path);
+    }
+    std::vector<uint8_t> raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    return ParseKeyBytesOrText(raw, /*allow_single_raw_volume_key=*/true, nullptr);
 }
 
 Status XvdContainer::SetCikKey(uint16_t slot, const uint8_t* key, size_t key_len) {
@@ -836,6 +1049,7 @@ Status XvdContainer::SetCikKey(uint16_t slot, const uint8_t* key, size_t key_len
     if (!prep->Init(key, copy_len)) {
         return Status::Error(StatusCode::InvalidArgument, "Failed to initialize XVC CIK AES-XTS key");
     }
+    explicit_slot_keys_[slot] = prep;
     cik_keys_[slot] = prep;
     if (slot == 0 && !has_volume_key_) {
         volume_key_.fill(0);
@@ -867,33 +1081,24 @@ Status XvdContainer::LoadKeyringDirectory(const std::string& dir_path, size_t* o
         if (!entry.is_regular_file(ec)) continue;
         std::string ext = entry.path().extension().string();
         for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (ext == ".cik" || ext == ".key") {
+        if (ext == ".cik" || ext == ".key" || ext == ".txt") {
             key_files.push_back(entry.path());
         }
     }
     std::sort(key_files.begin(), key_files.end());
 
-    uint16_t slot = static_cast<uint16_t>(cik_keys_.size());
     size_t loaded = 0;
     for (const auto& kf : key_files) {
         std::ifstream ifs(kf, std::ios::binary);
         if (!ifs) continue;
         std::vector<uint8_t> raw((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-        if (raw.size() >= 48 && (raw.size() % 48) == 0) {
-            const size_t n = raw.size() / 48;
-            for (size_t i = 0; i < n && slot < 0xFFFEu; ++i) {
-                if (SetCikKey(slot, raw.data() + i * 48 + 16, 32).ok()) {
-                    ++slot;
-                    ++loaded;
-                }
-            }
-        } else if (raw.size() == 16 || raw.size() == 32 || raw.size() == 64) {
-            if (slot < 0xFFFEu && SetCikKey(slot, raw.data(), raw.size()).ok()) {
-                ++slot;
-                ++loaded;
-            }
+        size_t file_loaded = 0;
+        if (ParseKeyBytesOrText(raw, /*allow_single_raw_volume_key=*/false, &file_loaded).ok()) {
+            loaded += file_loaded;
         }
     }
+    RebindKeyringToXvcSlots();
+    ResetFsCache();
     if (out_keys_loaded) *out_keys_loaded = loaded;
     if (loaded == 0) {
         return Status::Error(StatusCode::NotFound, "No valid .cik/.key files found in: " + dir_path);
@@ -908,6 +1113,7 @@ Status XvdContainer::LoadKeyringDirectory(const std::string& dir_path, size_t* o
 Status XvdContainer::ParseHeaderFromBytes(const uint8_t* data, size_t size, uint64_t total_container_size) {
     header_ = {};
     regions_.clear();
+    xvc_key_guids_.clear();
     base_data_offset_ = kMinHeaderSize;
     user_data_pages_ = 0;
     total_hashed_pages_ = 0;
@@ -957,6 +1163,9 @@ Status XvdContainer::ParseHeaderFromBytes(const uint8_t* data, size_t size, uint
         std::memcpy(header_.original_xvc_data_hash.data(), data + kOffRetailOrigXvcHash, 32);
         header_.content_type = ReadU32LE(data + kOffRetailContentType);
         header_.embedded_xvd_length = ReadU32LE(data + kOffRetailEmbeddedXvdLen);
+        if (size >= kOffRetailOdkKeySlot + 4u) {
+            header_.odk_key_slot = ReadU32LE(data + kOffRetailOdkKeySlot);
+        }
 
         // Authentic Microsoft makepkg (.msixvc / .xvc) containers store 32-bit PDU/XvcData lengths
         // at 0x28C / 0x290, BlockSize = 0xAA000 (170 * 4096) at 0x298, and a contiguous Merkle hash tree
@@ -1059,6 +1268,33 @@ Status XvdContainer::FinalizeOpenMetadata() {
 
     const uint64_t total_size = memory_backed_ ? static_cast<uint64_t>(backing_bytes_.size()) : file_size_;
 
+    auto extract_xvc_key_guids = [&](const std::vector<uint8_t>& xvc_buf) {
+        xvc_key_guids_.clear();
+        if (xvc_buf.size() < kXvcInfoOffKeyCount + 2u) {
+            return;
+        }
+        const uint16_t header_key_count = ReadU16LE(xvc_buf.data() + kXvcInfoOffKeyCount);
+        size_t needed_slots = header_key_count;
+        for (const auto& reg : regions_) {
+            if (reg.key_id != kUnencryptedKeyId) {
+                needed_slots = (std::max)(needed_slots, static_cast<size_t>(reg.key_id) + 1u);
+            }
+        }
+        needed_slots = (std::min)(needed_slots, kXvcInfoMaxKeyGuids);
+        if (kXvcInfoOffKeyGuids + needed_slots * 16u > xvc_buf.size()) {
+            needed_slots = (xvc_buf.size() > kXvcInfoOffKeyGuids)
+                               ? ((xvc_buf.size() - kXvcInfoOffKeyGuids) / 16u)
+                               : 0u;
+        }
+        xvc_key_guids_.resize(needed_slots);
+        for (size_t s = 0; s < needed_slots; ++s) {
+            std::memcpy(xvc_key_guids_[s].data(),
+                        xvc_buf.data() + kXvcInfoOffKeyGuids + s * 16u,
+                        16u);
+        }
+        RebindKeyringToXvcSlots();
+    };
+
     if (contiguous_merkle_layout_) {
         header_.user_data_offset = base_data_offset_;
         constexpr size_t kMakepkgXvcInfoSize = 0xDA8u;
@@ -1094,6 +1330,7 @@ Status XvdContainer::FinalizeOpenMetadata() {
                         });
                     }
                 }
+                extract_xvc_key_guids(xvc_buf);
             }
         }
         return Status::Ok();
@@ -1148,8 +1385,9 @@ Status XvdContainer::FinalizeOpenMetadata() {
                 uint64_t reg_off = ReadU64LE(rp + 0x20);
                 const uint64_t reg_len = ReadU64LE(rp + 0x28);
 
-                // Ignore container header metadata pseudo-regions (0x40000001..0x40000005).
-                if (reg_id >= 0x40000000u || reg_len == 0) {
+                // Ignore non-drive container metadata pseudo-regions (0x40000001, 0x40000003..0x40000005),
+                // while preserving 0x40000002 (FS-MD unencrypted NTFS $MFT/Boot metadata region).
+                if ((reg_id >= 0x40000000u && reg_id != 0x40000002u) || reg_len == 0) {
                     continue;
                 }
                 if (reg_off > header_.user_data_length && reg_off >= base_data_offset_) {
@@ -1160,6 +1398,7 @@ Status XvdContainer::FinalizeOpenMetadata() {
                 }
                 regions_.push_back(XvcRegionInfo{reg_id, key_id, reg_flags, reg_off, reg_len});
             }
+            extract_xvc_key_guids(xvc_buf);
         }
     }
 
@@ -1410,6 +1649,27 @@ Status XvdContainer::ReadUserData(
                 if (reg.key_id == kUnencryptedKeyId) {
                     return Status::Ok();  // Unencrypted region (KeyId == 0xFFFF)
                 }
+                if (reg.key_id < xvc_key_guids_.size() &&
+                    IsAnyByteNonZero(xvc_key_guids_[reg.key_id].data(), 16)) {
+                    if (const auto* gk = LookupGuidKey(xvc_key_guids_[reg.key_id])) {
+                        out_key = gk;
+                        return Status::Ok();
+                    }
+                    auto exp_it = explicit_slot_keys_.find(reg.key_id);
+                    if (exp_it != explicit_slot_keys_.end() && exp_it->second) {
+                        out_key = exp_it->second.get();
+                        return Status::Ok();
+                    }
+                    return Status::Error(
+                        StatusCode::NotImplemented,
+                        "Missing CIK key matching KeyId GUID for encrypted XVC region slot " +
+                            std::to_string(reg.key_id));
+                }
+                auto exp_it = explicit_slot_keys_.find(reg.key_id);
+                if (exp_it != explicit_slot_keys_.end() && exp_it->second) {
+                    out_key = exp_it->second.get();
+                    return Status::Ok();
+                }
                 auto it = cik_keys_.find(reg.key_id);
                 if (it != cik_keys_.end() && it->second) {
                     out_key = it->second.get();
@@ -1419,10 +1679,18 @@ Status XvdContainer::ReadUserData(
                     out_key = prepared_key_.get();
                     return Status::Ok();
                 }
+                if (reg.key_id == 0u && !guid_key_entries_.empty() && guid_key_entries_.front().key) {
+                    out_key = guid_key_entries_.front().key.get();
+                    return Status::Ok();
+                }
                 return Status::Error(
                     StatusCode::NotImplemented,
                     "Missing CIK key for encrypted XVC region slot " + std::to_string(reg.key_id));
             }
+        }
+        if (const auto* hdr_gk = LookupGuidKey(header_.content_id)) {
+            out_key = hdr_gk;
+            return Status::Ok();
         }
         if (prepared_key_) {
             out_key = prepared_key_.get();
@@ -1431,6 +1699,10 @@ Status XvdContainer::ReadUserData(
         auto it0 = cik_keys_.find(0);
         if (it0 != cik_keys_.end() && it0->second) {
             out_key = it0->second.get();
+            return Status::Ok();
+        }
+        if (!guid_key_entries_.empty() && guid_key_entries_.front().key) {
+            out_key = guid_key_entries_.front().key.get();
             return Status::Ok();
         }
         return Status::Error(
@@ -1454,14 +1726,52 @@ Status XvdContainer::ReadUserData(
             return st;
         }
 
+        const uint64_t copy_start = (std::max)(offset, sector_start);
+        const uint64_t copy_end = (std::min)(offset + size, sector_start + sector_avail);
+        const size_t src_off = static_cast<size_t>(copy_start - sector_start);
+        const size_t dst_off = static_cast<size_t>(copy_start - offset);
+        const size_t copy_len = static_cast<size_t>(copy_end - copy_start);
+
+        bool cache_hit = false;
+        bool cached_verified = false;
+        {
+            std::lock_guard<std::mutex> cache_lk(sector_cache_mu_);
+            auto cit = sector_map_.find(sector);
+            if (cit != sector_map_.end()) {
+                sector_lru_.splice(sector_lru_.begin(), sector_lru_, cit->second);
+                std::memcpy(out_data.data() + dst_off, cit->second->plain.data() + src_off, copy_len);
+                cached_verified = cit->second->integrity_verified;
+                cache_hit = true;
+            }
+        }
+
+        if (cache_hit) {
+            if (verify_integrity_on_read_ && header_.is_retail_v3_layout &&
+                header_.has_data_integrity && !cached_verified) {
+                st = VerifyDataPageHash(sector);
+                if (!st.ok()) {
+                    return st;
+                }
+                std::lock_guard<std::mutex> cache_lk(sector_cache_mu_);
+                auto cit = sector_map_.find(sector);
+                if (cit != sector_map_.end()) {
+                    cit->second->integrity_verified = true;
+                }
+            }
+            continue;
+        }
+
+        bool did_verify = false;
         if (verify_integrity_on_read_ && header_.is_retail_v3_layout && header_.has_data_integrity) {
             st = VerifyDataPageHash(sector);
             if (!st.ok()) {
                 return st;
             }
+            did_verify = true;
         }
 
         const size_t phys_read_len = header_.is_retail_v3_layout ? kSectorSize : sector_avail;
+        raw_sector.fill(0);
         st = ReadRawContainerBytes(LogicalUserPageToPhysicalOffset(sector), raw_sector.data(), phys_read_len);
         if (!st.ok()) {
             return st;
@@ -1471,6 +1781,7 @@ Status XvdContainer::ReadUserData(
         if (sector_key != nullptr) {
             const uint8_t* tweak_seed = header_.is_retail_v3_layout ? header_.content_id.data() : nullptr;
             const size_t xts_len = header_.is_retail_v3_layout ? kSectorSize : sector_avail;
+            plain_sector.fill(0);
             if (!sector_key->TransformSectorWithTweakSeed(
                     false, sector, tweak_seed, raw_sector.data(), plain_sector.data(), xts_len)) {
                 return Status::Error(StatusCode::IoError, "CNG AES-XTS sector decryption failed");
@@ -1478,12 +1789,29 @@ Status XvdContainer::ReadUserData(
             src_sector = plain_sector.data();
         }
 
-        const uint64_t copy_start = (std::max)(offset, sector_start);
-        const uint64_t copy_end = (std::min)(offset + size, sector_start + sector_avail);
-        const size_t src_off = static_cast<size_t>(copy_start - sector_start);
-        const size_t dst_off = static_cast<size_t>(copy_start - offset);
-        const size_t copy_len = static_cast<size_t>(copy_end - copy_start);
         std::memcpy(out_data.data() + dst_off, src_sector + src_off, copy_len);
+
+        {
+            std::lock_guard<std::mutex> cache_lk(sector_cache_mu_);
+            auto cit = sector_map_.find(sector);
+            if (cit != sector_map_.end()) {
+                if (did_verify) {
+                    cit->second->integrity_verified = true;
+                }
+                sector_lru_.splice(sector_lru_.begin(), sector_lru_, cit->second);
+            } else {
+                if (sector_lru_.size() >= kMaxCachedSectors) {
+                    sector_map_.erase(sector_lru_.back().sector_idx);
+                    sector_lru_.pop_back();
+                }
+                CachedSectorEntry entry{};
+                entry.sector_idx = sector;
+                entry.integrity_verified = did_verify;
+                std::memcpy(entry.plain.data(), src_sector, kSectorSize);
+                sector_lru_.push_front(entry);
+                sector_map_[sector] = sector_lru_.begin();
+            }
+        }
     }
     return Status::Ok();
 }
@@ -2451,21 +2779,22 @@ std::vector<uint8_t> XvdContainer::BuildEncryptedGdfxXvc(
     return BuildEncryptedSyntheticXvd(gdfx_vol, volume_key, key_len, content_type);
 }
 
-std::vector<uint8_t> XvdContainer::BuildRetailV3XvcMultiKey(
+std::vector<uint8_t> XvdContainer::BuildRetailV3XvcMultiKeyWithGuids(
     const std::vector<uint8_t>& user_data,
-    const std::vector<std::vector<uint8_t>>& cik_keys,
+    const std::vector<std::pair<std::array<uint8_t, 16>, std::vector<uint8_t>>>& cik_guid_keys,
     const std::vector<XvcRegionInfo>& regions,
     bool enable_merkle_tree,
     uint32_t content_type) {
-    const bool is_encrypted = !cik_keys.empty();
+    const bool is_encrypted = !cik_guid_keys.empty();
     std::array<uint8_t, 16> vduid{};
     for (size_t i = 0; i < 16; ++i) {
         vduid[i] = static_cast<uint8_t>(0xB0u + i);
     }
 
     std::vector<std::unique_ptr<crypto::AesXtsPreparedKey>> prepped_keys;
-    prepped_keys.reserve(cik_keys.size());
-    for (const auto& k : cik_keys) {
+    prepped_keys.reserve(cik_guid_keys.size());
+    for (const auto& [guid, k] : cik_guid_keys) {
+        (void)guid;
         auto pk = std::make_unique<crypto::AesXtsPreparedKey>();
         if (k.size() >= 16) {
             pk->Init(k.data(), k.size());
@@ -2524,9 +2853,15 @@ std::vector<uint8_t> XvdContainer::BuildRetailV3XvcMultiKey(
     const size_t xvc_pages = (raw_xvc_len + kSectorSize - 1u) / kSectorSize;
     std::vector<uint8_t> xvc_bytes(xvc_pages * kSectorSize, 0);
     std::memcpy(xvc_bytes.data() + 0x00, vduid.data(), 16);
+    const size_t guid_slots = (std::min)(cik_guid_keys.size(), kXvcInfoMaxKeyGuids);
+    for (size_t s = 0; s < guid_slots; ++s) {
+        std::memcpy(xvc_bytes.data() + kXvcInfoOffKeyGuids + s * 16u,
+                    cik_guid_keys[s].first.data(),
+                    16u);
+    }
     WriteU32LE(xvc_bytes.data() + kXvcInfoOffVersion, 2u);
     WriteU32LE(xvc_bytes.data() + kXvcInfoOffRegionCount, static_cast<uint32_t>(eff_regions.size()));
-    WriteU16LE(xvc_bytes.data() + kXvcInfoOffKeyCount, static_cast<uint16_t>(cik_keys.size()));
+    WriteU16LE(xvc_bytes.data() + kXvcInfoOffKeyCount, static_cast<uint16_t>(cik_guid_keys.size()));
     for (size_t r = 0; r < eff_regions.size(); ++r) {
         uint8_t* rp = xvc_bytes.data() + kXvcInfoSize + r * kXvcRegionHeaderSize;
         WriteU32LE(rp + 0x00, eff_regions[r].id);
@@ -2599,7 +2934,7 @@ std::vector<uint8_t> XvdContainer::BuildRetailV3XvcMultiKey(
             top_hash_sha);
     }
 
-    // Populate retail msft-xvd v3 header at 0x200..0x2A3.
+    // Populate retail msft-xvd v3 header at 0x200..0x2A7.
     std::memcpy(img.data() + kMagicOffset, kMagic, 8);
     uint32_t vol_flags = kFlagReadOnly;
     if (!is_encrypted) vol_flags |= kFlagEncryptionDisabled;
@@ -2616,10 +2951,26 @@ std::vector<uint8_t> XvdContainer::BuildRetailV3XvcMultiKey(
     WriteU64LE(img.data() + kOffRetailUserDataLength, user_data.size());
     WriteU64LE(img.data() + kOffRetailXvcDataLength, xvc_bytes.size());
     WriteU64LE(img.data() + kOffRetailMutableDataLength, 0ull);
+    WriteU32LE(img.data() + kOffRetailOdkKeySlot, is_encrypted ? 0u : 0xFFFFFFFFu);
 
     // Embed SHA-256 header digest at 0x000..0x01F for container signature verification.
     crypto::ComputeSha256(img.data() + kMagicOffset, kRetailHeaderSize - kMagicOffset, img.data());
     return img;
+}
+
+std::vector<uint8_t> XvdContainer::BuildRetailV3XvcMultiKey(
+    const std::vector<uint8_t>& user_data,
+    const std::vector<std::vector<uint8_t>>& cik_keys,
+    const std::vector<XvcRegionInfo>& regions,
+    bool enable_merkle_tree,
+    uint32_t content_type) {
+    std::vector<std::pair<std::array<uint8_t, 16>, std::vector<uint8_t>>> guid_keys;
+    guid_keys.reserve(cik_keys.size());
+    for (const auto& k : cik_keys) {
+        guid_keys.emplace_back(std::array<uint8_t, 16>{}, k);
+    }
+    return BuildRetailV3XvcMultiKeyWithGuids(
+        user_data, guid_keys, regions, enable_merkle_tree, content_type);
 }
 
 std::vector<uint8_t> XvdContainer::BuildRetailV3Xvc(
