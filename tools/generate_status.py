@@ -791,48 +791,64 @@ def render_svg(
     total_target = sum(s.target for s in subsystems)
     overall_pct = (total_impl / total_target * 100.0) if total_target else 0.0
 
-    ROWS = 7
-    CELL = 14
-    CELL_GAP = 3
-    GROUP_GAP = 14
     BOX_PAD_X = 24
     BOX_PAD_TOP = 24
     BOX_PAD_BOT = 18
     LABEL_H = 14
     LABEL_GAP = 10
 
-    def _group_width(sub: Subsystem, cell: int, cgap: int) -> tuple[int, int]:
-        cols = max(2, math.ceil(sub.target / ROWS))
-        cells_w = cols * cell + (cols - 1) * cgap
-        label_w = int(math.ceil(len(sub.short_name) * 6.5)) + 6
-        return cols, max(cells_w, label_w)
-
-    groups: list[tuple[Subsystem, int, int]] = []
-    for s in subsystems:
-        cols, gw = _group_width(s, CELL, CELL_GAP)
-        groups.append((s, cols, gw))
+    def _build_groups(rows: int, cell: int, cgap: int) -> list[tuple[Subsystem, int, int]]:
+        built: list[tuple[Subsystem, int, int]] = []
+        for sub in subsystems:
+            slot_cnt = max(sub.target, sub.implemented)
+            cols = max(2, math.ceil(slot_cnt / rows))
+            cells_w = cols * cell + (cols - 1) * cgap
+            label_w = int(math.ceil(len(sub.short_name) * 6.5)) + 6
+            built.append((sub, cols, max(cells_w, label_w)))
+        return built
 
     avail_graph_w = INNER_W - 2 * BOX_PAD_X
+    ROWS = 7
+    CELL = 14
+    CELL_GAP = 3
+    GROUP_GAP = 14
+    groups = _build_groups(ROWS, CELL, CELL_GAP)
     raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
+
     if raw_graph_w > avail_graph_w:
-        scale = avail_graph_w / raw_graph_w
-        CELL = max(8, int(math.floor(CELL * scale)))
-        CELL_GAP = max(2, int(math.floor(CELL_GAP * scale)))
-        GROUP_GAP = max(8, int(math.floor(GROUP_GAP * scale)))
-        groups = []
-        for s in subsystems:
-            cols = max(2, math.ceil(s.target / ROWS))
-            cells_w = cols * CELL + (cols - 1) * CELL_GAP
-            label_w = int(math.ceil(len(s.short_name) * 6.5)) + 6
-            groups.append((s, cols, max(cells_w, label_w)))
-        raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
-        if raw_graph_w > avail_graph_w and len(groups) > 1:
-            GROUP_GAP = max(4, GROUP_GAP - int(math.ceil((raw_graph_w - avail_graph_w) / (len(groups) - 1))))
-            raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
-    elif len(groups) > 1:
+        for cand_rows in (7, 8, 9, 10, 11, 12, 14):
+            min_cell = 9 if cand_rows <= 10 else 8
+            cand_groups = _build_groups(cand_rows, 14, 3)
+            cand_w = sum(gw for _, _, gw in cand_groups) + 14 * max(0, len(cand_groups) - 1)
+            scale = min(1.0, avail_graph_w / cand_w) if cand_w > 0 else 1.0
+            c_cell = max(min_cell, int(math.floor(14 * scale)))
+            c_cgap = max(2, int(math.floor(3 * scale)))
+            c_ggap = max(8, int(math.floor(14 * scale)))
+            cand_groups = _build_groups(cand_rows, c_cell, c_cgap)
+            cand_w = sum(gw for _, _, gw in cand_groups) + c_ggap * max(0, len(cand_groups) - 1)
+            while cand_w > avail_graph_w and c_cell > min_cell:
+                c_cell -= 1
+                cand_groups = _build_groups(cand_rows, c_cell, c_cgap)
+                cand_w = sum(gw for _, _, gw in cand_groups) + c_ggap * max(0, len(cand_groups) - 1)
+            if cand_w > avail_graph_w and len(cand_groups) > 1:
+                needed = int(math.ceil((cand_w - avail_graph_w) / (len(cand_groups) - 1)))
+                c_ggap = max(6, c_ggap - needed)
+                cand_w = sum(gw for _, _, gw in cand_groups) + c_ggap * max(0, len(cand_groups) - 1)
+            ROWS, CELL, CELL_GAP, GROUP_GAP = cand_rows, c_cell, c_cgap, c_ggap
+            groups = cand_groups
+            raw_graph_w = cand_w
+            if raw_graph_w <= avail_graph_w:
+                break
+
+    if raw_graph_w <= avail_graph_w and len(groups) > 1:
         extra_per_gap = int((avail_graph_w - raw_graph_w) // (len(groups) - 1))
-        GROUP_GAP = min(38, GROUP_GAP + min(24, extra_per_gap))
-        raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
+        if extra_per_gap > 0:
+            GROUP_GAP = min(38, GROUP_GAP + min(24, extra_per_gap))
+            raw_graph_w = sum(gw for _, _, gw in groups) + GROUP_GAP * max(0, len(groups) - 1)
+    elif raw_graph_w > avail_graph_w:
+        W = int(math.ceil(raw_graph_w)) + 2 * (PAD_X + BOX_PAD_X)
+        INNER_W = W - 2 * PAD_X
+        avail_graph_w = INNER_W - 2 * BOX_PAD_X
 
     grid_h = ROWS * CELL + (ROWS - 1) * CELL_GAP
     legend_gap = 14
@@ -866,9 +882,34 @@ def render_svg(
     ROW_H = 34
     list_h = list_rows_per_col * ROW_H
 
+    def _wrap_words(text: str, limit: int) -> list[str]:
+        words = text.split()
+        if not words:
+            return []
+        out = [words[0]]
+        for w in words[1:]:
+            if len(out[-1]) + 1 + len(w) <= limit:
+                out[-1] += " " + w
+            else:
+                out.append(w)
+        return out
+
     has_callout = bool(callout_line1)
     callout_accent = FORK_GREEN if overall_pct >= 99.9 else WARN
-    callout_h = 46 if has_callout else 0
+    max_callout_chars = max(60, int((W - 2 * PAD_X - 46) // 6.9))
+    first_callout_body = ""
+    extra_callout_lines: list[str] = []
+    if has_callout:
+        first_lim = max(36, max_callout_chars - len(callout_lead) - 1)
+        l1_parts = _wrap_words(callout_line1, first_lim)
+        if l1_parts:
+            first_callout_body = l1_parts[0]
+            if len(l1_parts) > 1:
+                extra_callout_lines.extend(_wrap_words(" ".join(l1_parts[1:]), max_callout_chars))
+        if callout_line2:
+            extra_callout_lines.extend(_wrap_words(callout_line2, max_callout_chars))
+    callout_total_lines = (1 + len(extra_callout_lines)) if has_callout else 0
+    callout_h = max(46, 12 + callout_total_lines * 17) if has_callout else 0
     y_callout = y_list + list_h + (20 if has_callout else 0)
     H = (y_callout + callout_h if has_callout else y_list + list_h) + PAD_Y
 
@@ -1032,12 +1073,12 @@ def render_svg(
         lines.append(
             f'  <text class="callout-txt" x="{tx}" y="{y_callout + 19}">'
             f'<tspan class="callout-lead">{html.escape(callout_lead)}</tspan> '
-            f'{html.escape(callout_line1)}</text>'
+            f'{html.escape(first_callout_body)}</text>'
         )
-        if callout_line2:
+        for c_idx, extra_line in enumerate(extra_callout_lines, start=1):
             lines.append(
-                f'  <text class="callout-txt" x="{tx}" y="{y_callout + 36}">'
-                f'{html.escape(callout_line2)}</text>'
+                f'  <text class="callout-txt" x="{tx}" y="{y_callout + 19 + 17 * c_idx}">'
+                f'{html.escape(extra_line)}</text>'
             )
 
     lines.append("</svg>")
@@ -1178,7 +1219,7 @@ def render_html(
     gap: 14px;
     overflow-x: auto;
   }}
-  .graph {{ display: flex; gap: 8px; justify-content: center; }}
+  .graph {{ display: flex; gap: 8px; width: max-content; margin: 0 auto; }}
   .group {{ display: flex; flex-direction: column; gap: 6px; }}
   .group-label {{ font-size: 10px; color: var(--fg-muted); white-space: nowrap; }}
   .cells {{

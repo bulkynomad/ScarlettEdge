@@ -24,7 +24,7 @@ Metrics below separate **Retail Xbox DLL Exports & Wired COM Vtable Slots** (`SC
 | :--- | :---: | :--- |
 | **Retail Xbox DLL Exports** | `261` | Real GDK / Xbox Gen9 imports (`xgameruntime`, `d3d12_xs`, `xg_xs`, `xcrdapi`, `xaudio2_9`, `AcpHal`, `GameInput`, `Bink2`, `FFX`, `libHttpClient`, `XCurl`, `PIX`) |
 | **Wired Retail COM Vtable Slots** | `235` | Guest-facing COM proxy slots across `d3d12_xs`, `QueryApiImpl` tables, `xcrdapi`, `GameInput`, and `XAudio2` |
-| **Synthetic Test-Harness Exports** | `253` | Non-retail `uint64_t`-handle / test-only exports (`NOT retail Xbox ABI` helpers, `dstorage.dll` C handles, `xs2_lifting`, `vulkan_backend`, `xvc_crypto`, `kernelx` helpers) |
+| **Synthetic Test-Harness Exports** | `256` | Non-retail `uint64_t`-handle / test-only exports (`NOT retail Xbox ABI` helpers, `dstorage.dll` C handles, `xs2_lifting`, `vulkan_backend`, `xvc_crypto`, `kernelx` helpers) |
 | **Automated CTest Suite** | `43/43` passing | Isolated per-test `%TEMP%` sandboxes, event/fence-driven synchronization |
 
 In the charts below, **purple (`#a371f7`)** credits original work from **[Freminet/ScarlettX](https://github.com/Freminet/ScarlettX)** (`39.6%` retail ABI / `91.3%` Concept Destruction), while **emerald green (`#39d353`)** marks **ScarlettEdge** additions (`+24.3%` retail ABI / `+8.7%` Concept Destruction):
@@ -38,7 +38,7 @@ In the charts below, **purple (`#a371f7`)** credits original work from **[Fremin
 | ![Concept Destruction main menu running in ScarlettX](docs/image_00_01.png) | ![Concept Destruction gameplay running in ScarlettX](docs/image_00_02.png) |
 | Max FPS: 1189<br>Average FPS: 1082<br>Minimum FPS: 264 | Max FPS: 247<br>Average FPS: 188<br>Minimum FPS: 91 |
 
-**Retail ABI & COM Surface:** `63.9%` (`366` of `573` tracked retail surfaces: `227` upstream + `139` fork) · **Retail Exports:** `261` · **Wired COM Slots:** `235` · **Synthetic Test Exports:** `253` · **Concept Destruction:** `100.0%` · **Tests:** `43/43` passing
+**Retail ABI & COM Surface:** `63.9%` (`366` of `573` tracked retail surfaces: `227` upstream + `139` fork) · **Retail Exports:** `261` · **Wired COM Slots:** `235` · **Synthetic Test Exports:** `256` · **Concept Destruction:** `100.0%` · **Tests:** `43/43` passing
 
 | Subsystem | Category | Retail Progress | Origin Split | Empirical Details |
 | :--- | :--- | :---: | :---: | :--- |
@@ -57,7 +57,7 @@ In the charts below, **purple (`#a371f7`)** credits original work from **[Fremin
 | **DXR (d3d12_xs COM)** | `Graphics` | `6 of 14` (`43%`) | `6 ScarlettEdge` | 6 wired d3d12_xs DXR 1.1 COM proxy slots (StateObject, BuildRTAS, DispatchRays); XboxBvhBuilder (11 synthetic exports) has 0 retail ABI parity |
 | **RDNA2 XS2 & DXIL Shader IR** | `Graphics` | `4 of 16` (`25%`) | `1 upstream + 3 fork` | DXBC/DXIL Xbox chunk stripping + dxil.dll signing verified; full fail-closed RDNA2 ISA -> SSA -> DXIL compiler pending (17 isolated xs2_lifting.dll synthetic exports) |
 | **Live Xbox Services & WinRT** | `Platform` | `4 of 23` (`17%`) | `4 ScarlettEdge` | In-process WinRT RoGetActivationFactory broker (Gaming.Input/AnalyticsInfo/Package); package-first XSAPI thunk routing queued (+35 synthetic Xbl* exports) |
-| **Xbox Unified Memory & KernelX** | `Platform` | `2 of 16` (`12%`) | `2 ScarlettEdge` | 0 retail kernelx.dll exports (AllocateTitlePhysicalPages/MapTitlePhysicalPages unimplemented; 2 internal VirtualAlloc2 aliasing helpers + 19 synthetic test exports) |
+| **Xbox Unified Memory & KernelX** | `Platform` | `2 of 16` (`12%`) | `2 ScarlettEdge` | 0 retail kernelx.dll exports (AllocateTitlePhysicalPages/MapTitlePhysicalPages unimplemented; 2 internal VirtualAlloc2 aliasing helpers + 22 synthetic test exports) |
 | **DirectStorage (xcrdapi) & XVD** | `Storage` | `2 of 28` (`7%`) | `2 upstream` | 1 xcrdapi.dll!DStorageGetFactory export + 1 COM vtable slots + XVD/NTFS VFS (missing SetStagingBufferSize & BTYPE=2 GDeflate; +25 synthetic handles) |
 
 ---
