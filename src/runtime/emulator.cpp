@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <unordered_set>
 #include <vector>
 
@@ -386,6 +387,39 @@ Status Emulator::BootPackage(const std::string& package_input) {
 
     // Zero-file DLC metadata directory stub ONLY when an XVD contains embedded DLC/<stem>
     // entries and SCARLETTX_DLC_ROOT was not explicitly set by the caller.
+    // Includes dead-PID stale sweep + atexit cleanup so abnormal guest exit never leaks dirs.
+    static std::mutex s_dlc_atexit_mu;
+    static std::vector<std::filesystem::path>* s_dlc_atexit_dirs = nullptr;
+    static bool s_dlc_atexit_registered = false;
+    auto sweep_stale_dlc_meta_dirs = [](const std::filesystem::path& tmp_root) {
+#if defined(_WIN32)
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(tmp_root, ec)) {
+            if (ec) break;
+            const std::string fname = entry.path().filename().string();
+            if (fname.rfind("scarlettx_dlc_meta_", 0) != 0) continue;
+            const size_t pid_pos = 19u;
+            const size_t us_pos = fname.find('_', pid_pos);
+            if (us_pos == std::string::npos) continue;
+            const DWORD pid = static_cast<DWORD>(std::strtoul(fname.c_str() + pid_pos, nullptr, 10));
+            if (pid == 0 || pid == GetCurrentProcessId()) continue;
+            HANDLE hp = ::OpenProcess(SYNCHRONIZE, FALSE, pid);
+            bool alive = false;
+            if (hp) {
+                alive = (::WaitForSingleObject(hp, 0) == WAIT_TIMEOUT);
+                ::CloseHandle(hp);
+            } else if (::GetLastError() == ERROR_ACCESS_DENIED) {
+                alive = true;
+            }
+            if (!alive) {
+                std::filesystem::remove_all(entry.path(), ec);
+            }
+        }
+#else
+        (void)tmp_root;
+#endif
+    };
+
     struct ScopedDlcMetaGuard {
         std::filesystem::path dir;
         bool restore_env = false;
@@ -395,6 +429,14 @@ Status Emulator::BootPackage(const std::string& package_input) {
                 _putenv_s("SCARLETTX_DLC_ROOT", "");
             }
             if (!dir.empty()) {
+                {
+                    std::lock_guard<std::mutex> lk(s_dlc_atexit_mu);
+                    if (s_dlc_atexit_dirs) {
+                        s_dlc_atexit_dirs->erase(
+                            std::remove(s_dlc_atexit_dirs->begin(), s_dlc_atexit_dirs->end(), dir),
+                            s_dlc_atexit_dirs->end());
+                    }
+                }
                 std::error_code ec;
                 std::filesystem::remove_all(dir, ec);
             }
@@ -404,12 +446,33 @@ Status Emulator::BootPackage(const std::string& package_input) {
     const char* existing_dlc_env = std::getenv("SCARLETTX_DLC_ROOT");
     if (is_xvd_boot && !xvd_dlc_stems.empty() && (!existing_dlc_env || !*existing_dlc_env)) {
         std::error_code ec;
+        const auto tmp_root = std::filesystem::temp_directory_path(ec);
+        sweep_stale_dlc_meta_dirs(tmp_root);
         dlc_meta_guard.dir =
-            std::filesystem::temp_directory_path(ec) /
+            tmp_root /
             ("scarlettx_dlc_meta_" + std::to_string(CurrentProcessIdPortable()) + "_" +
              std::to_string(g_temp_seq.fetch_add(1)));
         for (const auto& stem : xvd_dlc_stems) {
             std::filesystem::create_directories(dlc_meta_guard.dir / stem, ec);
+        }
+        {
+            std::lock_guard<std::mutex> lk(s_dlc_atexit_mu);
+            if (!s_dlc_atexit_dirs) {
+                s_dlc_atexit_dirs = new std::vector<std::filesystem::path>();
+            }
+            s_dlc_atexit_dirs->push_back(dlc_meta_guard.dir);
+            if (!s_dlc_atexit_registered) {
+                s_dlc_atexit_registered = true;
+                std::atexit([]() {
+                    std::lock_guard<std::mutex> lk2(s_dlc_atexit_mu);
+                    if (!s_dlc_atexit_dirs) return;
+                    std::error_code ec2;
+                    for (const auto& p : *s_dlc_atexit_dirs) {
+                        std::filesystem::remove_all(p, ec2);
+                    }
+                    s_dlc_atexit_dirs->clear();
+                });
+            }
         }
         set_env("SCARLETTX_DLC_ROOT", dlc_meta_guard.dir.string().c_str());
         dlc_meta_guard.restore_env = true;

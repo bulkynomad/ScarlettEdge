@@ -33,6 +33,7 @@ struct LoaderState {
     guest::TlsBinding tls;
     PRUNTIME_FUNCTION function_table = nullptr;
     uint8_t* registered_base = nullptr;
+    std::vector<HMODULE> vfs_dep_handles;
 };
 #endif
 
@@ -233,9 +234,8 @@ void NotifyKernelXExternalAlloc(void* va, size_t size, bool register_alloc) {
     } else {
         FARPROC proc = ::GetProcAddress(kx, "KernelXUnregisterExternalAllocation");
         if (!proc) return;
-        using UnregFn = int32_t(__stdcall*)(void*, uint64_t);
-        (void)reinterpret_cast<UnregFn>(reinterpret_cast<void*>(proc))(
-            va, static_cast<uint64_t>(size));
+        using UnregFn = int32_t(__stdcall*)(void*);
+        (void)reinterpret_cast<UnregFn>(reinterpret_cast<void*>(proc))(va);
     }
 }
 
@@ -331,19 +331,22 @@ BOOL WINAPI GuestVirtualFreeEx(HANDLE hProcess,
                                LPVOID lpAddress,
                                SIZE_T dwSize,
                                DWORD dwFreeType) {
-    size_t tracked_size = 0;
-    if (lpAddress && (dwFreeType & MEM_RELEASE) != 0u) {
+    const BOOL ok =
+        ::VirtualFreeEx(hProcess, lpAddress, (dwFreeType & MEM_RELEASE) ? 0 : dwSize, dwFreeType);
+    if (ok && lpAddress && (dwFreeType & MEM_RELEASE) != 0u) {
+        size_t tracked_size = 0;
         const uintptr_t base = reinterpret_cast<uintptr_t>(lpAddress);
-        std::unique_lock<std::shared_mutex> lk(GuestGraphicsMutex());
-        auto it = GuestGraphicsTable().find(base);
-        if (it != GuestGraphicsTable().end()) {
-            tracked_size = it->second.size;
-            GuestGraphicsTable().erase(it);
+        {
+            std::unique_lock<std::shared_mutex> lk(GuestGraphicsMutex());
+            auto it = GuestGraphicsTable().find(base);
+            if (it != GuestGraphicsTable().end()) {
+                tracked_size = it->second.size;
+                GuestGraphicsTable().erase(it);
+            }
         }
-    }
-    const BOOL ok = ::VirtualFreeEx(hProcess, lpAddress, (dwFreeType & MEM_RELEASE) ? 0 : dwSize, dwFreeType);
-    if (ok && tracked_size > 0) {
-        NotifyKernelXExternalAlloc(lpAddress, tracked_size, false);
+        if (tracked_size > 0) {
+            NotifyKernelXExternalAlloc(lpAddress, tracked_size, false);
+        }
     }
     return ok;
 }
@@ -1388,13 +1391,23 @@ BOOL WINAPI GuestDuplicateHandle(HANDLE hSourceProcessHandle,
                                  DWORD dwDesiredAccess,
                                  BOOL bInheritHandle,
                                  DWORD dwOptions) {
+    const auto vf = LookupVfsFileHandle(hSourceHandle);
     const BOOL ok = ::DuplicateHandle(hSourceProcessHandle, hSourceHandle, hTargetProcessHandle,
                                       lpTargetHandle, dwDesiredAccess, bInheritHandle, dwOptions);
-    if (ok && lpTargetHandle && *lpTargetHandle) {
-        if (auto vf = LookupVfsFileHandle(hSourceHandle)) {
-            std::unique_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+    if (vf) {
+        std::unique_lock<std::shared_mutex> lk(GuestVfsHandlesMutex());
+        if (ok && lpTargetHandle && *lpTargetHandle) {
             GuestVfsFileMap()[*lpTargetHandle] = vf;
             g_active_vfs_files.fetch_add(1, std::memory_order_release);
+        }
+        if ((dwOptions & DUPLICATE_CLOSE_SOURCE) != 0u &&
+            (hSourceProcessHandle == ::GetCurrentProcess() ||
+             hSourceProcessHandle == reinterpret_cast<HANDLE>(static_cast<intptr_t>(-1)))) {
+            auto it = GuestVfsFileMap().find(hSourceHandle);
+            if (it != GuestVfsFileMap().end()) {
+                GuestVfsFileMap().erase(it);
+                g_active_vfs_files.fetch_sub(1, std::memory_order_release);
+            }
         }
     }
     return ok;
@@ -1925,35 +1938,175 @@ HMODULE AdoptHostModule(HMODULE mod, bool force_package_module = false) {
     return mod;
 }
 
-std::mutex& DynamicVfsDllMutex() {
-    static std::mutex m;
+struct VfsLoadedDllEntry {
+    std::string norm_key;
+    std::string basename_lower;
+    std::shared_ptr<MappedPeImage> image;
+    uint32_t ref_count = 1;
+    bool in_progress = false;
+};
+
+struct VfsDatafileEntry {
+    std::string norm_key;
+    void* alloc_base = nullptr;
+    HMODULE handle = nullptr;
+    uint32_t ref_count = 1;
+};
+
+std::string NormalizeVfsDllKey(const std::string& vfs_path) {
+    std::string out = ToLowerAscii(vfs_path);
+    for (char& c : out) {
+        if (c == '\\') c = '/';
+    }
+    return out;
+}
+
+std::recursive_mutex& VfsDllMutex() {
+    static std::recursive_mutex m;
     return m;
 }
 
-std::unordered_map<HMODULE, std::shared_ptr<MappedPeImage>>& DynamicVfsDllTable() {
-    static std::unordered_map<HMODULE, std::shared_ptr<MappedPeImage>> t;
-    return t;
+std::vector<std::shared_ptr<VfsLoadedDllEntry>>& VfsDllList() {
+    static std::vector<std::shared_ptr<VfsLoadedDllEntry>> list;
+    return list;
+}
+
+std::vector<VfsDatafileEntry>& VfsDatafileList() {
+    static std::vector<VfsDatafileEntry> list;
+    return list;
+}
+
+bool ReleaseVfsGuestDll(HMODULE hmod) {
+    if (!hmod) return false;
+    std::shared_ptr<MappedPeImage> dying_image;
+    void* dying_datafile = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lk(VfsDllMutex());
+        if ((reinterpret_cast<uintptr_t>(hmod) & 0x3ull) != 0) {
+            auto& dlist = VfsDatafileList();
+            for (auto it = dlist.begin(); it != dlist.end(); ++it) {
+                if (it->handle == hmod) {
+                    if (it->ref_count > 1) {
+                        --it->ref_count;
+                        return true;
+                    }
+                    dying_datafile = it->alloc_base;
+                    dlist.erase(it);
+                    break;
+                }
+            }
+        } else {
+            auto& vlist = VfsDllList();
+            for (auto it = vlist.begin(); it != vlist.end(); ++it) {
+                auto& rec = *it;
+                if (!rec || rec->in_progress || !rec->image) continue;
+                if (reinterpret_cast<HMODULE>(rec->image->MappedBase()) == hmod) {
+                    if (rec->ref_count > 1) {
+                        --rec->ref_count;
+                        return true;
+                    }
+                    dying_image = std::move(rec->image);
+                    vlist.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+    if (dying_datafile) {
+        VirtualFree(dying_datafile, 0, MEM_RELEASE);
+        return true;
+    }
+    if (dying_image) {
+        dying_image->Unmap();
+        return true;
+    }
+    return false;
 }
 
 void ClearDynamicVfsDlls() {
-    std::unordered_map<HMODULE, std::shared_ptr<MappedPeImage>> local;
+    std::vector<std::shared_ptr<VfsLoadedDllEntry>> local_dlls;
+    std::vector<VfsDatafileEntry> local_datafiles;
     {
-        std::lock_guard<std::mutex> lk(DynamicVfsDllMutex());
-        local.swap(DynamicVfsDllTable());
+        std::lock_guard<std::recursive_mutex> lk(VfsDllMutex());
+        local_dlls.swap(VfsDllList());
+        local_datafiles.swap(VfsDatafileList());
     }
-    local.clear();
+    for (auto& rec : local_dlls) {
+        if (rec && rec->image) {
+            rec->image->Unmap();
+        }
+    }
+    for (const auto& df : local_datafiles) {
+        if (df.alloc_base) {
+            VirtualFree(df.alloc_base, 0, MEM_RELEASE);
+        }
+    }
 }
 
-// Loads/maps a guest DLL directly from PackageVfs (zero-staging XVD/MSIXVC streaming!).
+// Loads/maps a guest DLL directly from PackageVfs (zero-staging XVD/MSIXVC streaming),
+// with recursive-mutex serialization, reference counting, cyclic A->B->A import support,
+// and read-only LOAD_LIBRARY_AS_DATAFILE / LOAD_LIBRARY_AS_IMAGE_RESOURCE support.
 HMODULE TryMapGuestDllFromPackageVfs(const std::string& vfs_path,
-                                     std::shared_ptr<MappedPeImage>* out_owned = nullptr) {
+                                     DWORD dwFlags = 0,
+                                     bool* out_acquired_ref = nullptr) {
+    if (out_acquired_ref) *out_acquired_ref = false;
     if (vfs_path.empty()) return nullptr;
+
+    constexpr DWORD kDatafileMask =
+        LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+    const std::string norm_key = NormalizeVfsDllKey(vfs_path);
+    const std::string base_lower = ExtractBasenameLower(vfs_path);
+
+    if ((dwFlags & kDatafileMask) != 0) {
+        std::lock_guard<std::recursive_mutex> lk(VfsDllMutex());
+        for (auto& df : VfsDatafileList()) {
+            if (df.norm_key == norm_key) {
+                ++df.ref_count;
+                return df.handle;
+            }
+        }
+        std::vector<uint8_t> raw_bytes;
+        if (!PackageVfs::Global().ReadFileBytes(vfs_path, raw_bytes).ok() || raw_bytes.empty()) {
+            return nullptr;
+        }
+        void* mem = VirtualAlloc(nullptr, raw_bytes.size(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!mem) return nullptr;
+        std::memcpy(mem, raw_bytes.data(), raw_bytes.size());
+        DWORD old_prot = 0;
+        VirtualProtect(mem, raw_bytes.size(), PAGE_READONLY, &old_prot);
+        const HMODULE hdata =
+            reinterpret_cast<HMODULE>(reinterpret_cast<uintptr_t>(mem) | uintptr_t{0x2ull});
+        VfsDatafileList().push_back(VfsDatafileEntry{norm_key, mem, hdata, 1});
+        return hdata;
+    }
+
+    std::lock_guard<std::recursive_mutex> lk(VfsDllMutex());
+    for (auto& rec : VfsDllList()) {
+        if (!rec) continue;
+        if (rec->norm_key == norm_key || (!base_lower.empty() && rec->basename_lower == base_lower)) {
+            if (rec->in_progress) {
+                // Cyclic VFS DLL import (A -> B -> A) on the active loader thread:
+                // A's image is already allocated, relocated, and registered; return its base
+                // without bumping ref_count so A and B do not form an unfreeable ref cycle.
+                if (rec->image && rec->image->IsMapped()) {
+                    return reinterpret_cast<HMODULE>(rec->image->MappedBase());
+                }
+                return nullptr;
+            }
+            if (rec->image && rec->image->IsMapped()) {
+                ++rec->ref_count;
+                if (out_acquired_ref) *out_acquired_ref = true;
+                return reinterpret_cast<HMODULE>(rec->image->MappedBase());
+            }
+        }
+    }
+
+    // Also reuse any caller-owned MappedPeImage already registered in guest::g_modules.
     using GetModHandleAFn = HMODULE(WINAPI*)(LPCSTR);
     const auto guest_gmh = reinterpret_cast<GetModHandleAFn>(
         guest::LookupImportOverride("kernel32.dll", "GetModuleHandleA"));
-    if (guest_gmh) {
-        const std::string base = ExtractBasenameLower(vfs_path);
-        if (HMODULE already = guest_gmh(base.c_str())) {
+    if (guest_gmh && !base_lower.empty()) {
+        if (HMODULE already = guest_gmh(base_lower.c_str())) {
             if (guest::FindModuleBase(already) == reinterpret_cast<void*>(already)) {
                 return already;
             }
@@ -1965,24 +2118,28 @@ HMODULE TryMapGuestDllFromPackageVfs(const std::string& vfs_path,
         return nullptr;
     }
 
-    auto img = std::make_shared<MappedPeImage>();
+    auto rec = std::make_shared<VfsLoadedDllEntry>();
+    rec->norm_key = norm_key;
+    rec->basename_lower = base_lower;
+    rec->image = std::make_shared<MappedPeImage>();
+    rec->ref_count = 1;
+    rec->in_progress = true;
+    VfsDllList().push_back(rec);
+
     DllRedirectionTable redirects;
     HleSymbolRegistry empty_reg;
     PeMapOptions opts;
     opts.auto_stub_missing = true;
     opts.shim_directory = GetGuestShimDirectory();
     opts.package_directory_override = GetGuestPackageDirectory();
-    if (!img->MapBytes(dll_bytes, vfs_path, redirects, empty_reg, opts).ok()) {
+    if (!rec->image->MapBytes(dll_bytes, vfs_path, redirects, empty_reg, opts).ok()) {
+        auto& vlist = VfsDllList();
+        vlist.erase(std::remove(vlist.begin(), vlist.end(), rec), vlist.end());
         return nullptr;
     }
-    HMODULE hmod = reinterpret_cast<HMODULE>(img->MappedBase());
-    if (out_owned) {
-        *out_owned = std::move(img);
-    } else {
-        std::lock_guard<std::mutex> lk(DynamicVfsDllMutex());
-        DynamicVfsDllTable()[hmod] = std::move(img);
-    }
-    return hmod;
+    rec->in_progress = false;
+    if (out_acquired_ref) *out_acquired_ref = true;
+    return reinterpret_cast<HMODULE>(rec->image->MappedBase());
 }
 
 HMODULE TryLoadSystemShimA(const char* name) {
@@ -2029,7 +2186,7 @@ HMODULE TryLoadPackageOrFallbackMiddlewareA(const char* name, DWORD dwFlags = 0)
     // 1. Check G:\ virtual package path if explicitly specified (both XVD VFS and host mount).
     const GuestResolvedPath vr = ClassifyGuestPackagePath(raw);
     if (vr.kind == GuestPathResult::ResolvedXvdVfs && !vr.vfs_info.is_directory) {
-        if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vr.vfs_path)) {
+        if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vr.vfs_path, dwFlags)) {
             return vmod;
         }
     } else if (vr.kind == GuestPathResult::ResolvedHost &&
@@ -2067,7 +2224,7 @@ HMODULE TryLoadPackageOrFallbackMiddlewareA(const char* name, DWORD dwFlags = 0)
             VfsEntryInfo vinfo{};
             if (PackageVfs::Global().Stat(vpath, vinfo) && vinfo.exists &&
                 vinfo.is_xvd_backed && !vinfo.is_directory) {
-                if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vpath)) {
+                if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vpath, dwFlags)) {
                     return vmod;
                 }
             }
@@ -2150,20 +2307,8 @@ BOOL WINAPI GuestFreeLibrary(HMODULE hLibModule) {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    {
-        std::shared_ptr<MappedPeImage> dynamic_dll;
-        {
-            std::lock_guard<std::mutex> lk(DynamicVfsDllMutex());
-            auto it = DynamicVfsDllTable().find(hLibModule);
-            if (it != DynamicVfsDllTable().end()) {
-                dynamic_dll = std::move(it->second);
-                DynamicVfsDllTable().erase(it);
-            }
-        }
-        if (dynamic_dll) {
-            dynamic_dll->Unmap();
-            return TRUE;
-        }
+    if (ReleaseVfsGuestDll(hLibModule)) {
+        return TRUE;
     }
     if (void* guest_base = guest::FindModuleBase(hLibModule)) {
         if (guest_base == reinterpret_cast<void*>(hLibModule)) {
@@ -3472,6 +3617,7 @@ MappedPeImage::~MappedPeImage() {
 
 void MappedPeImage::Unmap() {
 #if defined(_WIN32)
+    const bool was_mapped_exe = (mapped_base_ != nullptr && !is_dll_);
     if (mapped_base_ && size_of_image_ > 0) {
         RunAndClearGuestAtExitInRange(mapped_base_, size_of_image_);
         FreeGuestFlsInRange(mapped_base_, size_of_image_);
@@ -3482,6 +3628,7 @@ void MappedPeImage::Unmap() {
         fn(reinterpret_cast<HINSTANCE>(mapped_base_), DLL_PROCESS_DETACH, nullptr);
         dll_attached_ = false;
     }
+    std::vector<HMODULE> vfs_deps_to_release;
     if (auto* state = static_cast<LoaderState*>(loader_state_)) {
         if (state->registered_base) {
             guest::UnregisterModule(state->registered_base);
@@ -3490,8 +3637,12 @@ void MappedPeImage::Unmap() {
             RtlDeleteFunctionTable(state->function_table);
         }
         guest::DetachTls(&state->tls);
+        vfs_deps_to_release = std::move(state->vfs_dep_handles);
         delete state;
         loader_state_ = nullptr;
+    }
+    for (HMODULE vdep : vfs_deps_to_release) {
+        ReleaseVfsGuestDll(vdep);
     }
     for (auto& gdll : mapped_guest_dlls_) {
         if (gdll) {
@@ -3499,7 +3650,7 @@ void MappedPeImage::Unmap() {
         }
     }
     mapped_guest_dlls_.clear();
-    if (!is_dll_) {
+    if (was_mapped_exe) {
         ClearDynamicVfsDlls();
     }
 
@@ -3812,8 +3963,15 @@ Status MappedPeImage::MapBytes(const std::vector<uint8_t>& raw,
         pe_path.size() >= 2 && pe_path[1] == ':' &&
         (pe_path[0] == 'G' || pe_path[0] == 'g' || pe_path[0] == 'D' || pe_path[0] == 'd');
 
+    using GetModHandleWFn = HMODULE(WINAPI*)(LPCWSTR);
+    const auto gmh_w = reinterpret_cast<GetModHandleWFn>(
+        guest::LookupImportOverride("kernel32.dll", "GetModuleHandleW"));
+    const bool has_active_guest_exe =
+        (gmh_w != nullptr && gmh_w(nullptr) != ::GetModuleHandleW(nullptr));
+
     std::string registered_pe_path = pe_path;
     std::filesystem::path pkg_dir;
+    std::string local_vfs_dir;
     std::string exe_basename;
     if (is_virtual_g_pe) {
         std::replace(registered_pe_path.begin(), registered_pe_path.end(), '/', '\\');
@@ -3821,12 +3979,14 @@ Status MappedPeImage::MapBytes(const std::vector<uint8_t>& raw,
         exe_basename = (last_sep == std::string::npos)
                            ? registered_pe_path.substr(2)
                            : registered_pe_path.substr(last_sep + 1);
-        const std::string vdir = (last_sep == std::string::npos || last_sep <= 2)
-                                     ? std::string("G:\\")
-                                     : registered_pe_path.substr(0, last_sep);
-        SetGuestPackageDirectory(options.package_directory_override.empty()
-                                     ? vdir
-                                     : options.package_directory_override);
+        local_vfs_dir = (last_sep == std::string::npos || last_sep <= 2)
+                            ? std::string("G:")
+                            : registered_pe_path.substr(0, last_sep);
+        if (!is_dll_ || GetGuestPackageDirectory().empty()) {
+            SetGuestPackageDirectory(options.package_directory_override.empty()
+                                         ? std::string("G:")
+                                         : options.package_directory_override);
+        }
     } else {
         const std::filesystem::path abs_pe = std::filesystem::absolute(pe_path);
         registered_pe_path = abs_pe.string();
@@ -3834,7 +3994,9 @@ Status MappedPeImage::MapBytes(const std::vector<uint8_t>& raw,
                       ? abs_pe.parent_path()
                       : std::filesystem::path(options.package_directory_override);
         exe_basename = abs_pe.filename().string();
-        SetGuestPackageDirectory(pkg_dir.string());
+        if (!is_dll_ || !has_active_guest_exe || !options.package_directory_override.empty()) {
+            SetGuestPackageDirectory(pkg_dir.string());
+        }
     }
     if (!options.shim_directory.empty()) {
         SetGuestShimDirectory(options.shim_directory);
@@ -3842,6 +4004,13 @@ Status MappedPeImage::MapBytes(const std::vector<uint8_t>& raw,
     if (!is_dll_) {
         SetGuestCommandLineForExe(exe_basename);
     }
+
+    // Register mapped image before resolving imports so cyclic VFS DLL imports (A -> B -> A)
+    // and GetModuleHandle* lookups during dependency loading see this module immediately.
+    auto* loader_state_ptr = new LoaderState();
+    loader_state_ = loader_state_ptr;
+    guest::RegisterModule(mapped_base_, size_of_image_, registered_pe_path, !is_dll_);
+    loader_state_ptr->registered_base = mapped_base_;
 
     stubs_.SetVerboseLogging(options.verbose_stub_logging);
     std::unordered_map<std::string, HMODULE> module_cache;
@@ -3855,20 +4024,34 @@ Status MappedPeImage::MapBytes(const std::vector<uint8_t>& raw,
         if (allow_target_name && ToLowerAscii(target_dll) != ToLowerAscii(guest_dll)) {
             names.push_back(target_dll);
         }
+        std::vector<std::string> vfs_prefixes;
+        if (!local_vfs_dir.empty()) {
+            std::string dir_slash = local_vfs_dir;
+            if (dir_slash.back() != '\\' && dir_slash.back() != '/') {
+                dir_slash.push_back('\\');
+            }
+            vfs_prefixes.push_back(dir_slash);
+        }
+        if (vfs_prefixes.empty() || ToLowerAscii(vfs_prefixes.front()) != "g:\\") {
+            vfs_prefixes.emplace_back("G:\\");
+        }
+
         std::error_code ec;
-        // 1. Check PackageVfs embedded XVD files first (zero-staging .xvc / .msixvc).
+        // 1. Check PackageVfs embedded XVD files first (importing DLL's VFS subdir, then G:\ root).
         for (const std::string& fname : names) {
             if (fname.empty() || HasDotDotSegment(fname)) continue;
-            const std::string vpath = "G:\\" + fname;
-            VfsEntryInfo vinfo{};
-            if (PackageVfs::Global().Stat(vpath, vinfo) && vinfo.exists &&
-                vinfo.is_xvd_backed && !vinfo.is_directory) {
-                std::shared_ptr<MappedPeImage> owned_dll;
-                if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vpath, &owned_dll)) {
-                    if (owned_dll) {
-                        mapped_guest_dlls_.push_back(std::move(owned_dll));
+            for (const std::string& vprefix : vfs_prefixes) {
+                const std::string vpath = vprefix + fname;
+                VfsEntryInfo vinfo{};
+                if (PackageVfs::Global().Stat(vpath, vinfo) && vinfo.exists &&
+                    vinfo.is_xvd_backed && !vinfo.is_directory) {
+                    bool acquired_ref = false;
+                    if (HMODULE vmod = TryMapGuestDllFromPackageVfs(vpath, 0, &acquired_ref)) {
+                        if (acquired_ref) {
+                            loader_state_ptr->vfs_dep_handles.push_back(vmod);
+                        }
+                        return vmod;
                     }
-                    return vmod;
                 }
             }
         }
@@ -4189,10 +4372,9 @@ Status MappedPeImage::MapBytes(const std::vector<uint8_t>& raw,
     }
 
     // 4.5 Host-process registrations: implicit TLS (while the index variable is
-    //     still writable), unwind tables, and the guest module registry.
+    //     still writable), unwind tables, and transitive package host module IAT patching.
     {
-        auto* state = new LoaderState();
-        loader_state_ = state;
+        auto* state = loader_state_ptr;
         const auto& dirs = nt->OptionalHeader.DataDirectory;
         const DWORD dir_count = nt->OptionalHeader.NumberOfRvaAndSizes;
         if (dir_count > IMAGE_DIRECTORY_ENTRY_TLS && dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress != 0) {
@@ -4232,8 +4414,6 @@ Status MappedPeImage::MapBytes(const std::vector<uint8_t>& raw,
                 state->function_table = table;
             }
         }
-        guest::RegisterModule(mapped_base_, size_of_image_, registered_pe_path, !is_dll_);
-        state->registered_base = mapped_base_;
         for (void* mod : loaded_modules_) {
             const bool force_pkg =
                 std::find(package_host_modules.begin(), package_host_modules.end(),

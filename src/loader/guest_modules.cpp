@@ -1,10 +1,12 @@
 #include "guest_modules.h"
+#include "scarlettx/loader/pe_loader.h"
 #include "scarlettx/loader/pe_mapper.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -986,8 +988,12 @@ std::wstring EnsureTrailingBackslashLower(const std::wstring& raw_dir) {
     return dir;
 }
 
-bool IsSystem32OrShimModule(const std::wstring& mod_path_lower) {
+bool IsSystem32OrShimModule(const std::wstring& mod_path_lower,
+                            const std::string& mod_base_lower) {
     if (mod_path_lower.empty()) {
+        return true;
+    }
+    if (!mod_base_lower.empty() && LookupSystemShimTarget(mod_base_lower) != nullptr) {
         return true;
     }
     wchar_t sys_buf[MAX_PATH + 1] = {};
@@ -1011,9 +1017,12 @@ bool IsSystem32OrShimModule(const std::wstring& mod_path_lower) {
     if (!shim_utf8.empty()) {
         const std::wstring shim_dir = EnsureTrailingBackslashLower(Widen(shim_utf8));
         const std::wstring pkg_dir = EnsureTrailingBackslashLower(Widen(pkg_utf8));
-        if (!shim_dir.empty() && shim_dir != pkg_dir &&
-            mod_path_lower.compare(0, shim_dir.size(), shim_dir) == 0) {
-            return true;
+        if (!shim_dir.empty() && mod_path_lower.compare(0, shim_dir.size(), shim_dir) == 0) {
+            if (shim_dir != pkg_dir ||
+                (!mod_base_lower.empty() &&
+                 LookupFallbackMiddlewareTarget(mod_base_lower) != nullptr)) {
+                return true;
+            }
         }
     }
     return false;
@@ -1021,8 +1030,8 @@ bool IsSystem32OrShimModule(const std::wstring& mod_path_lower) {
 
 // True for a host-loaded DLL that lives in the guest executable's or configured
 // guest package's directory tree, i.e. one that shipped with the title.
-bool IsPackageModule(const std::wstring& mod_path_lower) {
-    if (mod_path_lower.empty() || IsSystem32OrShimModule(mod_path_lower)) {
+bool IsPackageModule(const std::wstring& mod_path_lower, const std::string& mod_base_lower) {
+    if (mod_path_lower.empty() || IsSystem32OrShimModule(mod_path_lower, mod_base_lower)) {
         return false;
     }
     const std::string pkg_utf8 = GetGuestPackageDirectoryForPatch();
@@ -1098,25 +1107,30 @@ void PatchThunkArray(uint8_t* base,
     }
 }
 
-}  // namespace
+std::mutex& HostModulePatchMutex() {
+    static std::mutex m;
+    return m;
+}
 
-void PatchHostModuleForGuests(void* host_module, bool force_package_module) {
+void PatchHostModuleTreeLocked(void* host_module,
+                               bool force_package_module,
+                               HMODULE self_module,
+                               HMODULE host_exe_module,
+                               std::unordered_set<void*>& visited) {
     auto* base = static_cast<uint8_t*>(host_module);
     // Low bits are set on data-file and image-resource handles.
     if (!base || (reinterpret_cast<uintptr_t>(base) & 0xFFFF) != 0) {
+        return;
+    }
+    if (!visited.insert(host_module).second) {
         return;
     }
     // If host_module is actually a manually mapped guest PE image, its IAT was already bound.
     if (FindModuleBase(host_module) == host_module) {
         return;
     }
-    // The overrides fall back to the real functions through this module's own
-    // imports, so those must stay as they are.
-    HMODULE self = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCWSTR>(&GuestRtlPcToFileHeader), &self) &&
-        self == host_module) {
+    // Never patch the host emulator executable or scarlettx_core.dll itself.
+    if (host_module == self_module || host_module == host_exe_module) {
         return;
     }
     const std::wstring module_path = GetHostModulePathWide(static_cast<HMODULE>(host_module));
@@ -1128,8 +1142,8 @@ void PatchHostModuleForGuests(void* host_module, bool force_package_module) {
 
     // Never hook OS system DLLs (except vcruntime's RtlPcToFileHeader) or ScarlettEdge HLE shims.
     const bool package_module =
-        !IsSystem32OrShimModule(mod_path_lower) &&
-        (force_package_module || IsPackageModule(mod_path_lower));
+        !IsSystem32OrShimModule(mod_path_lower, mod_base_lower) &&
+        (force_package_module || IsPackageModule(mod_path_lower, mod_base_lower));
     if (!package_module && !runtime_module) {
         return;
     }
@@ -1144,6 +1158,7 @@ void PatchHostModuleForGuests(void* host_module, bool force_package_module) {
         return;
     }
     const uint32_t size_of_image = nt->OptionalHeader.SizeOfImage;
+    std::vector<std::string> imported_dll_names;
 
     if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
         const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -1158,6 +1173,9 @@ void PatchHostModuleForGuests(void* host_module, bool force_package_module) {
                     desc->OriginalFirstThunk != 0 ? desc->OriginalFirstThunk : desc->FirstThunk;
                 const std::string dll_name(reinterpret_cast<const char*>(base + desc->Name));
                 PatchThunkArray(base, size_of_image, dll_name, orig_rva, desc->FirstThunk, package_module);
+                if (package_module) {
+                    imported_dll_names.push_back(dll_name);
+                }
             }
         }
     }
@@ -1178,9 +1196,39 @@ void PatchHostModuleForGuests(void* host_module, bool force_package_module) {
                 const std::string dll_name(reinterpret_cast<const char*>(base + ddesc->DllNameRVA));
                 PatchThunkArray(base, size_of_image, dll_name,
                                 ddesc->ImportNameTableRVA, ddesc->ImportAddressTableRVA, true);
+                imported_dll_names.push_back(dll_name);
             }
         }
     }
+
+    // Recursively walk transitive static dependencies that the OS loader pulled in alongside
+    // this package DLL so nested package-resident DLLs also receive full guest runtime hooks.
+    if (package_module) {
+        for (const std::string& dep_name : imported_dll_names) {
+            if (dep_name.empty()) continue;
+            HMODULE dep_mod = ::GetModuleHandleA(dep_name.c_str());
+            if (dep_mod && !visited.count(dep_mod)) {
+                PatchHostModuleTreeLocked(
+                    dep_mod, /*force_package_module=*/false, self_module, host_exe_module, visited);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void PatchHostModuleForGuests(void* host_module, bool force_package_module) {
+    if (!host_module || (reinterpret_cast<uintptr_t>(host_module) & 0xFFFF) != 0) {
+        return;
+    }
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&GuestRtlPcToFileHeader), &self);
+    const HMODULE host_exe = ::GetModuleHandleW(nullptr);
+    std::lock_guard<std::mutex> lk(HostModulePatchMutex());
+    std::unordered_set<void*> visited;
+    PatchHostModuleTreeLocked(host_module, force_package_module, self, host_exe, visited);
 }
 
 #else  // !_WIN32

@@ -748,11 +748,32 @@ int main() {
         };
 
         const auto sec_dll_bytes =
-            BuildSyntheticPe64Dll("SecondaryGuest.dll", 0x0000000181100000ULL, guest_dll_imports, {});
+            BuildSyntheticPe64Dll("SecondaryGuest.dll", 0x0000000181100000ULL,
+                                  {guest_dll_imports[0], guest_dll_imports[1],
+                                   {"TransitivePkgDep.dll", {{"Fwd_VirtualAlloc", "Sec_TransitiveVAlloc"}}}},
+                                  {});
+        const auto trans_dep_bytes =
+            BuildSyntheticPe64Dll("TransitivePkgDep.dll", 0x0000000181180000ULL, guest_dll_imports, {});
         const auto tert_dll_bytes =
             BuildSyntheticPe64Dll("TertiaryPlugin.dll", 0x0000000181200000ULL, guest_dll_imports, {});
         const auto vfs_dll_bytes =
-            BuildSyntheticPe64Dll("VfsPlugin.dll", 0x0000000181300000ULL, guest_dll_imports, {});
+            BuildSyntheticPe64Dll("VfsPlugin.dll", 0x0000000181300000ULL,
+                                  {guest_dll_imports[0], guest_dll_imports[1],
+                                   {"KERNEL32.dll", {{"FreeLibrary", "Fwd_FreeLibrary"},
+                                                     {"LoadLibraryExW", "Fwd_LoadLibraryExW"}}}},
+                                  {});
+        const auto vfs_dll2_bytes =
+            BuildSyntheticPe64Dll("VfsPlugin2.dll", 0x0000000181380000ULL, guest_dll_imports,
+                                  {{"Plugin2Ping", 0x22229999u}});
+        // Cyclic VFS DLL pair: VfsCycleA.dll <-> VfsCycleB.dll
+        const auto vfs_cycle_a_bytes = BuildSyntheticPe64Dll(
+            "VfsCycleA.dll", 0x0000000181400000ULL,
+            {{"VfsCycleB.dll", {{"CycleBVal", "CallCycleBFromA"}}}},
+            {{"CycleAVal", 0xAAAA1111u}});
+        const auto vfs_cycle_b_bytes = BuildSyntheticPe64Dll(
+            "VfsCycleB.dll", 0x0000000181480000ULL,
+            {{"VfsCycleA.dll", {{"CycleAVal", "CallCycleAFromB"}}}},
+            {{"CycleBVal", 0xBBBB2222u}});
 
         const std::vector<SynthImportGroup> main_host_imports = {
             {"SecondaryGuest.dll", {{"Fwd_LoadLibraryW", "Main_CallSecondaryLoadLibraryW"}}},
@@ -769,10 +790,11 @@ int main() {
         };
         write_bin(sec_pkg_dir / "MainGuestEntry.dll", main_dll_bytes);
         write_bin(sec_pkg_dir / "SecondaryGuest.dll", sec_dll_bytes);
+        write_bin(sec_pkg_dir / "TransitivePkgDep.dll", trans_dep_bytes);
         write_bin(sec_pkg_dir / "TertiaryPlugin.dll", tert_dll_bytes);
 
         // Mount an encrypted NTFS XVD on PackageVfs::Global() at G: containing Assets\stream_test.bin
-        // and Plugins\VfsPlugin.dll so secondary guest DLLs stream directly from XVD without staging.
+        // and multiple VFS plugins (including cyclic VfsCycleA <-> VfsCycleB).
         const uint8_t vfs_key[32] = {
             0x42, 0x13, 0x37, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
             0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -786,6 +808,9 @@ int main() {
         const std::vector<scarlettx::XvdInputFile> vfs_files = {
             {"Assets\\stream_test.bin", stream_payload},
             {"Plugins\\VfsPlugin.dll", vfs_dll_bytes},
+            {"Plugins\\VfsPlugin2.dll", vfs_dll2_bytes},
+            {"Plugins\\VfsCycleA.dll", vfs_cycle_a_bytes},
+            {"Plugins\\VfsCycleB.dll", vfs_cycle_b_bytes},
         };
         const auto xvc_img = scarlettx::XvdContainer::BuildSyntheticNtfsXvc(
             vfs_files, vfs_key, sizeof(vfs_key), /*enable_merkle_tree=*/true);
@@ -903,23 +928,86 @@ int main() {
             SX_REQUIRE(fn_fls_free(fls) == TRUE);
         };
 
-        // Verify statically-imported SecondaryGuest.dll.
+        // Verify statically-imported SecondaryGuest.dll AND its OS-loaded transitive static
+        // dependency TransitivePkgDep.dll (never passed directly to GuestLoadLibraryW!).
         verify_hooked_module(hSec, /*is_mapped_guest_pe=*/false);
+        HMODULE hTransDep = GetModuleHandleW(L"TransitivePkgDep.dll");
+        SX_REQUIRE(hTransDep != nullptr);
+        verify_hooked_module(hTransDep, /*is_mapped_guest_pe=*/false);
 
         // Verify recursive LoadLibraryW from SecondaryGuest.dll -> TertiaryPlugin.dll (host pkg)
-        // AND VfsPlugin.dll (streamed directly from encrypted XVD at G:\Plugins\VfsPlugin.dll!).
+        // AND VFS DLLs (including sequential multi-DLL UAF regression, LoadLibraryx2 + FreeLibraryx1
+        // refcount, concurrent multithreaded LoadLibraryW, LOAD_LIBRARY_AS_DATAFILE, and cyclic A<->B!).
         using LoadLibWFn = HMODULE(WINAPI*)(LPCWSTR);
+        using FreeLibFn = BOOL(WINAPI*)(HMODULE);
+        using LoadLibExWFn = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
+        using GetProcFn = FARPROC(WINAPI*)(HMODULE, LPCSTR);
         auto call_sec_loadlib =
             reinterpret_cast<LoadLibWFn>(main_guest.GetExportAddress("Main_CallSecondaryLoadLibraryW"));
-        SX_REQUIRE(call_sec_loadlib != nullptr);
+        auto guest_gp = reinterpret_cast<GetProcFn>(
+            reinterpret_cast<void*>(GetProcAddress(hSec, "Fwd_GetProcAddress")));
+        SX_REQUIRE(call_sec_loadlib != nullptr && guest_gp != nullptr);
 
         HMODULE hTert = call_sec_loadlib(L"TertiaryPlugin.dll");
         SX_REQUIRE(hTert != nullptr);
         verify_hooked_module(hTert, /*is_mapped_guest_pe=*/false);
 
+        // Load VfsPlugin.dll FIRST, then load VfsPlugin2.dll SECOND, and verify VfsPlugin.dll
+        // remains alive and callable (regression check for MapBytes -> Unmap ClearDynamicVfsDlls).
         HMODULE hVfsPlugin = call_sec_loadlib(L"G:\\Plugins\\VfsPlugin.dll");
         SX_REQUIRE(hVfsPlugin != nullptr);
+        HMODULE hVfsPlugin2 = call_sec_loadlib(L"G:\\Plugins\\VfsPlugin2.dll");
+        SX_REQUIRE(hVfsPlugin2 != nullptr && hVfsPlugin2 != hVfsPlugin);
         verify_hooked_module(hVfsPlugin, /*is_mapped_guest_pe=*/true);
+        verify_hooked_module(hVfsPlugin2, /*is_mapped_guest_pe=*/true);
+
+        auto guest_freelib = reinterpret_cast<FreeLibFn>(
+            reinterpret_cast<void*>(guest_gp(hVfsPlugin, "Fwd_FreeLibrary")));
+        auto guest_loadlib_ex = reinterpret_cast<LoadLibExWFn>(
+            reinterpret_cast<void*>(guest_gp(hVfsPlugin, "Fwd_LoadLibraryExW")));
+        SX_REQUIRE(guest_freelib != nullptr && guest_loadlib_ex != nullptr);
+
+        // Concurrent LoadLibraryW x 2 -> ref_count becomes 3; FreeLibrary x 2 leaves VfsPlugin alive!
+        HMODULE hDup1 = nullptr;
+        HMODULE hDup2 = nullptr;
+        std::thread t1([&] { hDup1 = call_sec_loadlib(L"G:\\Plugins\\VfsPlugin.dll"); });
+        std::thread t2([&] { hDup2 = call_sec_loadlib(L"G:\\Plugins\\VfsPlugin.dll"); });
+        t1.join();
+        t2.join();
+        SX_REQUIRE(hDup1 == hVfsPlugin && hDup2 == hVfsPlugin);
+        SX_REQUIRE(guest_freelib(hDup1) == TRUE);
+        SX_REQUIRE(guest_freelib(hDup2) == TRUE);
+        // VfsPlugin still has ref_count == 1 and MUST remain callable!
+        verify_hooked_module(hVfsPlugin, /*is_mapped_guest_pe=*/true);
+
+        // LOAD_LIBRARY_AS_DATAFILE returns tagged read-only datafile handle without mapping as code.
+        HMODULE hDatafile =
+            guest_loadlib_ex(L"G:\\Plugins\\VfsPlugin2.dll", nullptr, LOAD_LIBRARY_AS_DATAFILE);
+        SX_REQUIRE(hDatafile != nullptr && hDatafile != hVfsPlugin2);
+        SX_REQUIRE((reinterpret_cast<uintptr_t>(hDatafile) & 0x3ull) != 0);
+        const auto* df_mz = reinterpret_cast<const uint8_t*>(
+            reinterpret_cast<uintptr_t>(hDatafile) & ~uintptr_t{0x3ull});
+        SX_REQUIRE(df_mz[0] == 'M' && df_mz[1] == 'Z');
+        SX_REQUIRE(guest_freelib(hDatafile) == TRUE);
+
+        // Cyclic VFS imports: VfsCycleA.dll <-> VfsCycleB.dll resolve without infinite recursion!
+        HMODULE hCycleA = call_sec_loadlib(L"G:\\Plugins\\VfsCycleA.dll");
+        SX_REQUIRE(hCycleA != nullptr);
+        using PingU32Fn = uint32_t (*)();
+        auto fn_b_from_a =
+            reinterpret_cast<PingU32Fn>(reinterpret_cast<void*>(guest_gp(hCycleA, "CallCycleBFromA")));
+        SX_REQUIRE(fn_b_from_a != nullptr && fn_b_from_a() == 0xBBBB2222u);
+        HMODULE hCycleB = call_sec_loadlib(L"G:\\Plugins\\VfsCycleB.dll");
+        SX_REQUIRE(hCycleB != nullptr);
+        auto fn_a_from_b =
+            reinterpret_cast<PingU32Fn>(reinterpret_cast<void*>(guest_gp(hCycleB, "CallCycleAFromB")));
+        SX_REQUIRE(fn_a_from_b != nullptr && fn_a_from_b() == 0xAAAA1111u);
+        SX_REQUIRE(guest_freelib(hCycleB) == TRUE);
+        SX_REQUIRE(guest_freelib(hCycleA) == TRUE);
+
+        // Final FreeLibrary drops ref_count 1 -> 0 and unmaps VfsPlugin2 and VfsPlugin cleanly.
+        SX_REQUIRE(guest_freelib(hVfsPlugin2) == TRUE);
+        SX_REQUIRE(guest_freelib(hVfsPlugin) == TRUE);
 
         FreeLibrary(hTert);
         main_guest.Unmap();

@@ -107,6 +107,53 @@ Status StubThunkTable::Initialize() {
     code_buffer_ = static_cast<uint8_t*>(mem);
     std::memset(code_buffer_, 0xCC, code_region_size_);
 
+    // Pre-emit all max_stubs_ x64 trampolines once during Initialize() while the slab
+    // is PAGE_READWRITE, then transition permanently to PAGE_EXECUTE_READ (strict W^X:
+    // AllocateStub never toggles live executable pages back to RW).
+    static constexpr uint8_t kPrologue[] = {
+        0x48, 0x83, 0xEC, 0x48,              // sub rsp, 0x48
+        0x48, 0x89, 0x4C, 0x24, 0x20,        // mov [rsp+0x20], rcx
+        0x48, 0x89, 0x54, 0x24, 0x28,        // mov [rsp+0x28], rdx
+        0x4C, 0x89, 0x44, 0x24, 0x30,        // mov [rsp+0x30], r8
+        0x4C, 0x89, 0x4C, 0x24, 0x38,        // mov [rsp+0x38], r9
+    };
+    static constexpr uint8_t kLeaR8[] = {0x4C, 0x8D, 0x44, 0x24, 0x20};  // lea r8, [rsp+0x20]
+    static constexpr uint8_t kEpilogue[] = {
+        0xFF, 0xD0,              // call rax
+        0x0F, 0x57, 0xC0,        // xorps xmm0, xmm0
+        0x48, 0x83, 0xC4, 0x48,  // add rsp, 0x48
+        0xC3,                    // ret
+    };
+    static_assert(sizeof(kPrologue) + 10 + 5 + sizeof(kLeaR8) + 10 + sizeof(kEpilogue) <= kSlotSize,
+                  "StubThunkTable x64 trampoline exceeds kSlotSize");
+
+    const uint64_t self_addr = reinterpret_cast<uint64_t>(this);
+    const uint64_t dispatch_addr = reinterpret_cast<uint64_t>(&ScarlettxStubDispatchEntry);
+    for (size_t i = 0; i < max_stubs_; ++i) {
+        uint8_t* p = code_buffer_ + i * kSlotSize;
+        std::memcpy(p, kPrologue, sizeof(kPrologue));
+        p += sizeof(kPrologue);
+
+        *p++ = 0x48;
+        *p++ = 0xB9;  // mov rcx, imm64
+        WriteU64LE(p, self_addr);
+        p += 8;
+
+        *p++ = 0xBA;  // mov edx, imm32
+        WriteU32LE(p, static_cast<uint32_t>(i));
+        p += 4;
+
+        std::memcpy(p, kLeaR8, sizeof(kLeaR8));
+        p += sizeof(kLeaR8);
+
+        *p++ = 0x48;
+        *p++ = 0xB8;  // mov rax, imm64
+        WriteU64LE(p, dispatch_addr);
+        p += 8;
+
+        std::memcpy(p, kEpilogue, sizeof(kEpilogue));
+    }
+
     // Emit shared x64 UNWIND_INFO matching `sub rsp, 0x48` (4-byte prologue at +0..+4):
     //   Version = 1, Flags = 0 (UNW_FLAG_NHANDLER)
     //   SizeOfProlog = 4
@@ -181,76 +228,6 @@ Status StubThunkTable::AllocateStub(const std::string& dll_name,
 
     const uint32_t stub_id = static_cast<uint32_t>(records_.size());
     uint8_t* slot = code_buffer_ + static_cast<size_t>(stub_id) * kSlotSize;
-    uint8_t* page_base = reinterpret_cast<uint8_t*>(
-        reinterpret_cast<uintptr_t>(slot) & ~(kPageSize - 1u));
-
-    DWORD old_prot = 0;
-    if (!VirtualProtect(page_base, kPageSize, PAGE_READWRITE, &old_prot)) {
-        return Status::Error(StatusCode::DeviceError,
-                             "VirtualProtect(PAGE_READWRITE) failed while emitting StubThunk");
-    }
-
-    uint8_t* p = slot;
-
-    // Windows x64 ABI trampoline (64 bytes, canonical prologue + epilogue):
-    //   sub rsp, 0x48              ; 32B shadow + 32B saved args + 8B alignment
-    //   mov [rsp+0x20], rcx
-    //   mov [rsp+0x28], rdx
-    //   mov [rsp+0x30], r8
-    //   mov [rsp+0x38], r9
-    //   mov rcx, <this>
-    //   mov edx, <stub_id>
-    //   lea r8, [rsp+0x20]
-    //   mov rax, <&ScarlettxStubDispatchEntry>
-    //   call rax
-    //   xorps xmm0, xmm0           ; deterministic 0.0f/0.0 for float/double stubs
-    //   add rsp, 0x48              ; canonical x64 epilogue immediately preceding ret
-    //   ret
-    static constexpr uint8_t kPrologue[] = {
-        0x48, 0x83, 0xEC, 0x48,              // sub rsp, 0x48
-        0x48, 0x89, 0x4C, 0x24, 0x20,        // mov [rsp+0x20], rcx
-        0x48, 0x89, 0x54, 0x24, 0x28,        // mov [rsp+0x28], rdx
-        0x4C, 0x89, 0x44, 0x24, 0x30,        // mov [rsp+0x30], r8
-        0x4C, 0x89, 0x4C, 0x24, 0x38,        // mov [rsp+0x38], r9
-    };
-    std::memcpy(p, kPrologue, sizeof(kPrologue));
-    p += sizeof(kPrologue);
-
-    *p++ = 0x48;
-    *p++ = 0xB9;  // mov rcx, imm64
-    WriteU64LE(p, reinterpret_cast<uint64_t>(this));
-    p += 8;
-
-    *p++ = 0xBA;  // mov edx, imm32
-    WriteU32LE(p, stub_id);
-    p += 4;
-
-    static constexpr uint8_t kLeaR8[] = {0x4C, 0x8D, 0x44, 0x24, 0x20};  // lea r8, [rsp+0x20]
-    std::memcpy(p, kLeaR8, sizeof(kLeaR8));
-    p += sizeof(kLeaR8);
-
-    *p++ = 0x48;
-    *p++ = 0xB8;  // mov rax, imm64
-    WriteU64LE(p, reinterpret_cast<uint64_t>(&ScarlettxStubDispatchEntry));
-    p += 8;
-
-    static constexpr uint8_t kEpilogue[] = {
-        0xFF, 0xD0,              // call rax
-        0x0F, 0x57, 0xC0,        // xorps xmm0, xmm0
-        0x48, 0x83, 0xC4, 0x48,  // add rsp, 0x48
-        0xC3,                    // ret
-    };
-    static_assert(sizeof(kPrologue) + 10 + 5 + sizeof(kLeaR8) + 10 + sizeof(kEpilogue) <= kSlotSize,
-                  "StubThunkTable x64 trampoline exceeds kSlotSize");
-    std::memcpy(p, kEpilogue, sizeof(kEpilogue));
-    p += sizeof(kEpilogue);
-
-    FlushInstructionCache(GetCurrentProcess(), slot, kSlotSize);
-    DWORD rx_prot = 0;
-    if (!VirtualProtect(page_base, kPageSize, PAGE_EXECUTE_READ, &rx_prot)) {
-        return Status::Error(StatusCode::DeviceError,
-                             "VirtualProtect(PAGE_EXECUTE_READ) failed after emitting StubThunk");
-    }
 
     StubCallRecord rec;
     rec.stub_id = stub_id;
