@@ -124,6 +124,24 @@ SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXQueryPerformanceFreq
 SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXGetSystemInfo(
     KERNELX_SYSTEM_INFO* outInfo);
 
+typedef struct XBOX_TITLE_MEMORY_STATUS {
+    uint32_t dwLength;
+    uint32_t dwReserved;
+    uint64_t ullTotalMem;
+    uint64_t ullAvailMem;
+    uint64_t ullLegacyUsed;
+    uint64_t ullLegacyPeak;
+    uint64_t ullLegacyAvail;
+    uint64_t ullTitleUsed;
+    uint64_t ullTitleAvail;
+} XBOX_TITLE_MEMORY_STATUS;
+
+SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL TitleMemoryStatus(XBOX_TITLE_MEMORY_STATUS* status);
+SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL JobTitleMemoryStatus(XBOX_TITLE_MEMORY_STATUS* status);
+SCARLETTX_KERNELX_API int32_t SCARLETTX_KERNELX_CALL KernelXWaitOnAddress(volatile void* address, void* compareAddress, size_t addressSize, uint32_t dwMilliseconds);
+SCARLETTX_KERNELX_API void SCARLETTX_KERNELX_CALL KernelXWakeByAddressSingle(void* address);
+SCARLETTX_KERNELX_API void SCARLETTX_KERNELX_CALL KernelXWakeByAddressAll(void* address);
+
 #ifdef __cplusplus
 }
 #endif

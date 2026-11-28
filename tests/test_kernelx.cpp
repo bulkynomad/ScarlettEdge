@@ -4,6 +4,10 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <atomic>
+#include <thread>
+#include <atomic>
+#include <thread>
 
 int main() {
     std::cout << "[test_kernelx] Testing KernelX unified memory & Game OS services...\n";
@@ -90,9 +94,34 @@ int main() {
     SX_CHECK(sys_info.computeUnitCount == 52);
     SX_CHECK(sys_info.cpuCoreCount == 8);
 
+    // 6b. Retail GameOS TitleMemoryStatus / JobTitleMemoryStatus & WaitOnAddress
+    SX_CHECK(TitleMemoryStatus(nullptr) == 0);
+    XBOX_TITLE_MEMORY_STATUS title_mem{};
+    title_mem.dwLength = sizeof(XBOX_TITLE_MEMORY_STATUS);
+    SX_CHECK(TitleMemoryStatus(&title_mem) == 1);
+    SX_CHECK(title_mem.ullTotalMem == 14495514624ull);
+    SX_CHECK(title_mem.ullTitleUsed >= 65536ull);
+    SX_CHECK(title_mem.ullTitleAvail == title_mem.ullTotalMem - title_mem.ullTitleUsed);
+
+    XBOX_TITLE_MEMORY_STATUS job_mem{};
+    SX_CHECK(JobTitleMemoryStatus(&job_mem) == 1);
+    SX_CHECK(job_mem.ullTotalMem == title_mem.ullTotalMem);
+
+    alignas(4) std::atomic<uint32_t> futex_word{0u};
+    std::thread waker([&futex_word]() {
+        futex_word.store(0x42u, std::memory_order_release);
+        KernelXWakeByAddressSingle(&futex_word);
+    });
+    while (futex_word.load(std::memory_order_acquire) == 0u) {
+        uint32_t expected_zero = 0u;
+        (void)KernelXWaitOnAddress(&futex_word, &expected_zero, sizeof(uint32_t), 2000u);
+    }
+    waker.join();
+    SX_CHECK(futex_word.load(std::memory_order_relaxed) == 0x42u);
+
     // 7. Cleanup
     SX_CHECK(KernelXFreeMemory(va1) == 0);
 
-    std::cout << "[test_kernelx] All 14 KernelX APIs verified successfully!\n";
+    std::cout << "[test_kernelx] All 19 KernelX & GameOS APIs verified successfully!\n";
     return 0;
 }

@@ -587,6 +587,107 @@ int32_t SCARLETTX_KERNELX_CALL KernelXQueryPerformanceFrequency(uint64_t* outFre
     return kSuccess;
 }
 
+int32_t SCARLETTX_KERNELX_CALL TitleMemoryStatus(XBOX_TITLE_MEMORY_STATUS* status) {
+    if (!status || (status->dwLength != 0 && status->dwLength < sizeof(XBOX_TITLE_MEMORY_STATUS))) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(State().mu);
+    const uint64_t total = IsLockhartMode() ? 8589934592ull : 14495514624ull;
+    const uint64_t used = State().total_allocated;
+    const uint64_t avail = (total > used) ? (total - used) : 0ull;
+    status->dwLength = sizeof(XBOX_TITLE_MEMORY_STATUS);
+    status->dwReserved = 0;
+    status->ullTotalMem = total;
+    status->ullAvailMem = avail;
+    status->ullLegacyUsed = used;
+    status->ullLegacyPeak = State().peak_allocated;
+    status->ullLegacyAvail = avail;
+    status->ullTitleUsed = used;
+    status->ullTitleAvail = avail;
+    return 1;
+}
+
+int32_t SCARLETTX_KERNELX_CALL JobTitleMemoryStatus(XBOX_TITLE_MEMORY_STATUS* status) {
+    return TitleMemoryStatus(status);
+}
+
+#if defined(_MSC_VER)
+#  pragma comment(linker, "/export:WaitOnAddress=KernelXWaitOnAddress")
+#  pragma comment(linker, "/export:WakeByAddressSingle=KernelXWakeByAddressSingle")
+#  pragma comment(linker, "/export:WakeByAddressAll=KernelXWakeByAddressAll")
+#endif
+
+int32_t SCARLETTX_KERNELX_CALL KernelXWaitOnAddress(
+    volatile void* address, void* compareAddress, size_t addressSize, uint32_t dwMilliseconds) {
+    if (!address || !compareAddress ||
+        (addressSize != 1 && addressSize != 2 && addressSize != 4 && addressSize != 8)) {
+        return 0;
+    }
+#if defined(_WIN32)
+    static const auto fnWait = []() -> decltype(&WaitOnAddress) {
+        if (HMODULE m = GetModuleHandleW(L"api-ms-win-core-synch-l1-2-0.dll")) {
+            if (auto p = GetProcAddress(m, "WaitOnAddress")) {
+                return reinterpret_cast<decltype(&WaitOnAddress)>(reinterpret_cast<void*>(p));
+            }
+        }
+        if (HMODULE kb = GetModuleHandleW(L"kernelbase.dll")) {
+            if (auto p = GetProcAddress(kb, "WaitOnAddress")) {
+                return reinterpret_cast<decltype(&WaitOnAddress)>(reinterpret_cast<void*>(p));
+            }
+        }
+        return nullptr;
+    }();
+    if (fnWait) {
+        return fnWait(address, compareAddress, addressSize, dwMilliseconds) ? 1 : 0;
+    }
+#endif
+    return 0;
+}
+
+void SCARLETTX_KERNELX_CALL KernelXWakeByAddressSingle(void* address) {
+    if (!address) return;
+#if defined(_WIN32)
+    static const auto fnWake = []() -> decltype(&WakeByAddressSingle) {
+        if (HMODULE m = GetModuleHandleW(L"api-ms-win-core-synch-l1-2-0.dll")) {
+            if (auto p = GetProcAddress(m, "WakeByAddressSingle")) {
+                return reinterpret_cast<decltype(&WakeByAddressSingle)>(reinterpret_cast<void*>(p));
+            }
+        }
+        if (HMODULE kb = GetModuleHandleW(L"kernelbase.dll")) {
+            if (auto p = GetProcAddress(kb, "WakeByAddressSingle")) {
+                return reinterpret_cast<decltype(&WakeByAddressSingle)>(reinterpret_cast<void*>(p));
+            }
+        }
+        return nullptr;
+    }();
+    if (fnWake) {
+        fnWake(address);
+    }
+#endif
+}
+
+void SCARLETTX_KERNELX_CALL KernelXWakeByAddressAll(void* address) {
+    if (!address) return;
+#if defined(_WIN32)
+    static const auto fnWakeAll = []() -> decltype(&WakeByAddressAll) {
+        if (HMODULE m = GetModuleHandleW(L"api-ms-win-core-synch-l1-2-0.dll")) {
+            if (auto p = GetProcAddress(m, "WakeByAddressAll")) {
+                return reinterpret_cast<decltype(&WakeByAddressAll)>(reinterpret_cast<void*>(p));
+            }
+        }
+        if (HMODULE kb = GetModuleHandleW(L"kernelbase.dll")) {
+            if (auto p = GetProcAddress(kb, "WakeByAddressAll")) {
+                return reinterpret_cast<decltype(&WakeByAddressAll)>(reinterpret_cast<void*>(p));
+            }
+        }
+        return nullptr;
+    }();
+    if (fnWakeAll) {
+        fnWakeAll(address);
+    }
+#endif
+}
+
 int32_t SCARLETTX_KERNELX_CALL KernelXGetSystemInfo(KERNELX_SYSTEM_INFO* outInfo) {
     if (!outInfo) return kInvalidArg;
     if (IsLockhartMode()) {
