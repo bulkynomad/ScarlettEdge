@@ -1,4 +1,11 @@
 #define SCARLETTX_BUILDING_CODECS 1
+#if defined(_WIN32) && !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+
 #include "scarlettx/media/codecs_abi.h"
 #include "scarlettx/audio/xma2_decoder.h"
 #include "scarlettx/io/deflate_rfc1951.h"
@@ -63,6 +70,8 @@ static constexpr uint16_t kDeflateDistBase[30] = {
 static constexpr uint8_t kDeflateDistExtra[30] = {
     0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
     6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+static constexpr uint8_t kDeflateCodeLenOrder[19] = {
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
 
 uint32_t FindLenCode(uint32_t match_len, uint32_t& out_extra_val, uint32_t& out_extra_bits) {
     for (uint32_t i = 28u; i > 0u; --i) {
@@ -90,9 +99,277 @@ uint32_t FindDistCode(uint32_t match_dist, uint32_t& out_extra_val, uint32_t& ou
     return 0u;
 }
 
+// Strict RFC 1951 Canonical Huffman table with O(1) 10-bit primary table and fail-closed
+// Kraft-equality validation (rejects oversubscribed AND incomplete/corrupt Huffman trees).
+struct GDeflateHuffmanTable {
+    static constexpr uint32_t kFastBits = 10u;
+    static constexpr uint32_t kFastSize = 1u << kFastBits;
+    static constexpr uint16_t kInvalidEntry = 0xFFFFu;
+
+    std::array<uint16_t, kFastSize> fast{};
+    std::array<int16_t, 16> count{};
+    std::array<int16_t, 288> symbol{};
+    uint32_t max_bits = 15u;
+    int16_t single_sym = -1;
+    bool is_empty = false;
+
+    bool Build(const uint8_t* lengths, size_t num_syms, uint32_t max_len, bool allow_empty) {
+        if (!lengths || num_syms == 0u || num_syms > 288u || max_len == 0u || max_len > 15u) {
+            return false;
+        }
+        fast.fill(kInvalidEntry);
+        count.fill(0);
+        symbol.fill(0);
+        max_bits = max_len;
+        single_sym = -1;
+        is_empty = false;
+
+        uint32_t total_codes = 0u;
+        for (size_t i = 0; i < num_syms; ++i) {
+            const uint8_t l = lengths[i];
+            if (l > max_len) return false;
+            if (l > 0u) {
+                ++count[l];
+                ++total_codes;
+            }
+        }
+
+        if (total_codes == 0u) {
+            if (!allow_empty) return false;
+            is_empty = true;
+            return true;
+        }
+
+        if (total_codes == 1u) {
+            // A 1-symbol RFC 1951 tree is valid ONLY when its sole code has length 1 (code bit 0; bit 1 is invalid).
+            if (count[1] != 1) return false;
+            for (size_t s = 0; s < num_syms; ++s) {
+                if (lengths[s] == 1u) {
+                    single_sym = static_cast<int16_t>(s);
+                    break;
+                }
+            }
+            if (single_sym < 0) return false;
+            const uint16_t packed = static_cast<uint16_t>((1u << 9u) | static_cast<uint32_t>(single_sym));
+            for (uint32_t idx = 0u; idx < kFastSize; idx += 2u) {
+                fast[idx] = packed;
+            }
+            symbol[0] = single_sym;
+            return true;
+        }
+
+        int32_t left = 1;
+        for (uint32_t bits = 1u; bits <= max_len; ++bits) {
+            left <<= 1;
+            left -= count[bits];
+            if (left < 0) return false;  // Oversubscribed tree
+        }
+        if (left != 0) return false;     // Incomplete / under-subscribed tree
+
+        std::array<uint32_t, 16> next_code{};
+        std::array<int16_t, 16> offs{};
+        uint32_t code = 0u;
+        offs[1] = 0;
+        for (uint32_t bits = 1u; bits <= max_len; ++bits) {
+            code = (code + static_cast<uint32_t>(count[bits - 1u])) << 1u;
+            next_code[bits] = code;
+            if (bits < max_len) {
+                offs[bits + 1u] = static_cast<int16_t>(offs[bits] + count[bits]);
+            }
+        }
+
+        for (size_t s = 0; s < num_syms; ++s) {
+            const uint8_t len = lengths[s];
+            if (len == 0u) continue;
+            symbol[static_cast<size_t>(offs[len]++)] = static_cast<int16_t>(s);
+            const uint32_t canon = next_code[len]++;
+            if (len <= kFastBits) {
+                const uint32_t rev = ReverseBits(canon, len);
+                const uint16_t packed = static_cast<uint16_t>((static_cast<uint32_t>(len) << 9u) | static_cast<uint32_t>(s));
+                const uint32_t step = 1u << len;
+                for (uint32_t idx = rev; idx < kFastSize; idx += step) {
+                    fast[idx] = packed;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool Decode(uint32_t peek_bits, uint32_t& out_sym, uint32_t& out_len) const {
+        if (is_empty) return false;
+        const uint16_t hit = fast[peek_bits & (kFastSize - 1u)];
+        if (hit != kInvalidEntry) {
+            out_sym = static_cast<uint32_t>(hit & 0x1FFu);
+            out_len = static_cast<uint32_t>(hit >> 9u);
+            return true;
+        }
+        if (single_sym >= 0 || max_bits <= kFastBits) {
+            return false;
+        }
+        int32_t c = 0;
+        int32_t first = 0;
+        int32_t index = 0;
+        for (uint32_t len = 1u; len <= max_bits; ++len) {
+            c |= static_cast<int32_t>((peek_bits >> (len - 1u)) & 1u);
+            const int32_t cnt = count[len];
+            if (c - cnt < first) {
+                out_sym = static_cast<uint32_t>(symbol[static_cast<size_t>(index + (c - first))]);
+                out_len = len;
+                return true;
+            }
+            index += cnt;
+            first = (first + cnt) << 1;
+            c <<= 1;
+        }
+        return false;
+    }
+};
+
+void BuildLengthLimitedCodeLengths(
+    const uint32_t* freqs,
+    size_t num_syms,
+    uint32_t max_bits,
+    uint8_t* out_lens) {
+    std::memset(out_lens, 0, num_syms);
+    struct SymFreq {
+        uint64_t freq;
+        uint32_t sym;
+    };
+    std::array<SymFreq, 288> active{};
+    size_t m = 0u;
+    for (size_t s = 0; s < num_syms; ++s) {
+        if (freqs[s] > 0u) {
+            active[m++] = {freqs[s], static_cast<uint32_t>(s)};
+        }
+    }
+    if (m == 0u) return;
+    if (m == 1u) {
+        const uint32_t s0 = active[0].sym;
+        const uint32_t s1 = (s0 == 0u) ? 1u : 0u;
+        out_lens[s0] = 1u;
+        if (s1 < num_syms) out_lens[s1] = 1u;
+        return;
+    }
+
+    std::sort(active.begin(), active.begin() + static_cast<ptrdiff_t>(m),
+              [](const SymFreq& a, const SymFreq& b) {
+                  return (a.freq != b.freq) ? (a.freq < b.freq) : (a.sym < b.sym);
+              });
+
+    // Two-queue O(m) Huffman tree construction
+    std::array<uint64_t, 576> node_freq{};
+    std::array<int32_t, 576> parent{};
+    parent.fill(-1);
+    for (size_t i = 0; i < m; ++i) node_freq[i] = active[i].freq;
+
+    size_t leaf_pos = 0u;
+    size_t int_pos = m;
+    size_t int_end = m;
+    auto pop_min = [&]() -> size_t {
+        if (leaf_pos < m && (int_pos >= int_end || node_freq[leaf_pos] <= node_freq[int_pos])) {
+            return leaf_pos++;
+        }
+        return int_pos++;
+    };
+
+    for (size_t step = 0; step + 1u < m; ++step) {
+        const size_t c0 = pop_min();
+        const size_t c1 = pop_min();
+        const size_t p = int_end++;
+        node_freq[p] = node_freq[c0] + node_freq[c1];
+        parent[c0] = static_cast<int32_t>(p);
+        parent[c1] = static_cast<int32_t>(p);
+    }
+
+    std::array<uint32_t, 288> lens{};
+    bool needs_clamp = false;
+    for (size_t i = 0; i < m; ++i) {
+        uint32_t d = 0u;
+        int32_t cur = parent[i];
+        while (cur >= 0) {
+            ++d;
+            cur = parent[static_cast<size_t>(cur)];
+        }
+        if (d > max_bits) {
+            d = max_bits;
+            needs_clamp = true;
+        }
+        lens[i] = d;
+    }
+
+    if (needs_clamp) {
+        const uint32_t target = 1u << max_bits;
+        uint32_t kraft = 0u;
+        for (size_t i = 0; i < m; ++i) {
+            kraft += 1u << (max_bits - lens[i]);
+        }
+        while (kraft > target) {
+            size_t best_i = m;
+            uint32_t best_len = 0u;
+            for (size_t i = 0; i < m; ++i) {
+                if (lens[i] < max_bits && lens[i] > best_len) {
+                    best_len = lens[i];
+                    best_i = i;
+                }
+            }
+            if (best_i >= m) break;
+            kraft -= 1u << (max_bits - lens[best_i]);
+            ++lens[best_i];
+            kraft += 1u << (max_bits - lens[best_i]);
+        }
+        while (kraft < target) {
+            const uint32_t deficit = target - kraft;
+            size_t best_i = m;
+            for (size_t idx = m; idx > 0u; --idx) {
+                const size_t i = idx - 1u;
+                if (lens[i] > 1u) {
+                    const uint32_t delta = 1u << (max_bits - lens[i]);
+                    if (delta <= deficit) {
+                        best_i = i;
+                        break;
+                    }
+                }
+            }
+            if (best_i >= m) break;
+            const uint32_t delta = 1u << (max_bits - lens[best_i]);
+            --lens[best_i];
+            kraft += delta;
+        }
+    }
+
+    for (size_t i = 0; i < m; ++i) {
+        out_lens[active[i].sym] = static_cast<uint8_t>(lens[i]);
+    }
+}
+
+void BuildCanonicalEncodeCodes(
+    const uint8_t* lengths,
+    size_t num_syms,
+    uint32_t max_bits,
+    uint32_t* out_rev_codes) {
+    std::memset(out_rev_codes, 0, num_syms * sizeof(uint32_t));
+    std::array<uint32_t, 16> count{};
+    for (size_t i = 0; i < num_syms; ++i) {
+        if (lengths[i] > 0u && lengths[i] <= max_bits) {
+            ++count[lengths[i]];
+        }
+    }
+    std::array<uint32_t, 16> next_code{};
+    uint32_t code = 0u;
+    for (uint32_t bits = 1u; bits <= max_bits; ++bits) {
+        code = (code + count[bits - 1u]) << 1u;
+        next_code[bits] = code;
+    }
+    for (size_t s = 0; s < num_syms; ++s) {
+        const uint8_t len = lengths[s];
+        if (len > 0u) {
+            out_rev_codes[s] = ReverseBits(next_code[len]++, len);
+        }
+    }
+}
+
 struct LaneBitPacker {
     std::vector<uint32_t> words;
-    std::vector<uint8_t> step_bits;
     uint32_t cur_bit = 0u;
 
     void PutBitsLsb(uint32_t val, uint32_t nbits) {
@@ -124,16 +401,78 @@ struct LaneBitPacker {
     }
 };
 
+// Synchronized 32-lane wavefront bit packer that emits interleaved 32-bit words in exact
+// lane 0..31 refill order whenever a wave advances a lane's bit offset across 32.
+struct WavefrontBitPacker {
+    std::array<LaneBitPacker, kGDeflateLanes> lanes{};
+    std::array<uint32_t, kGDeflateLanes> wave_bits{};
+    std::vector<std::array<uint8_t, kGDeflateLanes>> waves;
+
+    void AddBits(uint32_t lane, uint32_t val, uint32_t nbits) {
+        lanes[lane].PutBitsLsb(val, nbits);
+        wave_bits[lane] += nbits;
+    }
+
+    void AddFixedLitLen(uint32_t lane, uint32_t sym) {
+        wave_bits[lane] += lanes[lane].EmitFixedLitLen(sym);
+    }
+
+    void EndRefillWave() {
+        std::array<uint8_t, kGDeflateLanes> w{};
+        bool any_non_zero = false;
+        for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+            w[l] = static_cast<uint8_t>(wave_bits[l]);
+            if (wave_bits[l] != 0u) any_non_zero = true;
+            wave_bits[l] = 0u;
+        }
+        if (any_non_zero) {
+            waves.push_back(w);
+        }
+    }
+
+    void Finalize(std::vector<uint8_t>& out_bytes) {
+        for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+            while (lanes[l].words.size() < 2u) lanes[l].words.push_back(0u);
+        }
+
+        std::vector<uint32_t> interleaved;
+        interleaved.reserve(64u + waves.size() * 4u);
+        for (uint32_t l = 0; l < kGDeflateLanes; ++l) interleaved.push_back(lanes[l].words[0]);
+        for (uint32_t l = 0; l < kGDeflateLanes; ++l) interleaved.push_back(lanes[l].words[1]);
+
+        std::array<size_t, kGDeflateLanes> next_word_idx{};
+        std::array<uint32_t, kGDeflateLanes> sim_bit_off{};
+        next_word_idx.fill(2u);
+        sim_bit_off.fill(0u);
+
+        for (const auto& w : waves) {
+            for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                sim_bit_off[l] += w[l];
+                if (sim_bit_off[l] >= 32u) {
+                    sim_bit_off[l] -= 32u;
+                    const uint32_t word = (next_word_idx[l] < lanes[l].words.size())
+                                              ? lanes[l].words[next_word_idx[l]++]
+                                              : 0u;
+                    interleaved.push_back(word);
+                }
+            }
+        }
+
+        out_bytes.resize(interleaved.size() * sizeof(uint32_t));
+        for (size_t i = 0; i < interleaved.size(); ++i) {
+            WriteU32LE(out_bytes.data() + i * 4u, interleaved[i]);
+        }
+    }
+};
+
 struct GDeflateToken {
     uint16_t lit_or_len = 0;
     uint16_t dist = 0;
     bool is_match = false;
 };
 
-// Real 32-lane SIMD bit-interleaved RFC 1951 Fixed-Huffman + LZ77 GDeflate tile encoder.
-// All 32 lanes read 32-bit words from a shared interleaved word stream in wavefront lockstep.
-void GDeflate32LaneCompressTile(const uint8_t* src, size_t src_len, std::vector<uint8_t>& out_bytes) {
-    std::vector<GDeflateToken> tokens;
+void TokenizeGDeflateLz77(const uint8_t* src, size_t src_len, std::vector<GDeflateToken>& tokens) {
+    tokens.clear();
     tokens.reserve(src_len);
 
     std::array<int32_t, 4096> head;
@@ -191,105 +530,347 @@ void GDeflate32LaneCompressTile(const uint8_t* src, size_t src_len, std::vector<
             ++pos;
         }
     }
+}
 
-    std::array<LaneBitPacker, kGDeflateLanes> lanes;
+// 32-lane SIMD bit-interleaved BTYPE=0 (Stored/Uncompressed) GDeflate tile encoder.
+void GDeflate32LaneCompressTileStored(const uint8_t* src, size_t src_len, std::vector<uint8_t>& out_bytes) {
+    WavefrontBitPacker wb;
+    wb.waves.reserve(4u + (src_len + kGDeflateLanes - 1u) / kGDeflateLanes);
+
+    for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+        // BFINAL=1 (bit 0), BTYPE=00 Stored (bits 1..2) -> 0b001 = 1u
+        wb.AddBits(l, 0x1u, 3u);
+    }
+    wb.EndRefillWave();
+
+    for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+        const uint32_t pad = (8u - (wb.lanes[l].cur_bit & 7u)) & 7u;
+        wb.AddBits(l, 0u, pad);
+    }
+    wb.EndRefillWave();
+
+    std::array<uint16_t, kGDeflateLanes> lane_lens{};
+    const size_t base_len = src_len / kGDeflateLanes;
+    const size_t rem_len = src_len % kGDeflateLanes;
+    for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+        const uint16_t len_l = static_cast<uint16_t>(base_len + (l < rem_len ? 1u : 0u));
+        const uint16_t nlen_l = static_cast<uint16_t>(~len_l);
+        lane_lens[l] = len_l;
+        wb.AddBits(l, static_cast<uint32_t>(len_l) | (static_cast<uint32_t>(nlen_l) << 16u), 32u);
+    }
+    wb.EndRefillWave();
+
+    const uint16_t max_lane_len = lane_lens[0];
+    for (uint16_t w = 0; w < max_lane_len; ++w) {
+        for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+            if (w < lane_lens[l]) {
+                wb.AddBits(l, src[static_cast<size_t>(w) * kGDeflateLanes + l], 8u);
+            }
+        }
+        wb.EndRefillWave();
+    }
+
+    wb.Finalize(out_bytes);
+}
+
+// Real 32-lane SIMD bit-interleaved RFC 1951 Fixed-Huffman (BTYPE=1) + LZ77 GDeflate tile encoder.
+// All 32 lanes read 32-bit words from a shared interleaved word stream in wavefront lockstep.
+void GDeflate32LaneCompressTile(const uint8_t* src, size_t src_len, std::vector<uint8_t>& out_bytes) {
+    std::vector<GDeflateToken> tokens;
+    TokenizeGDeflateLz77(src, src_len, tokens);
+
+    WavefrontBitPacker wb;
+    wb.waves.reserve(4u + tokens.size() / kGDeflateLanes);
     for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
         // 3-bit block header per lane: BFINAL=1 (bit 0), BTYPE=01 Fixed Huffman (bits 1..2) -> 0b011 = 3u
-        lanes[l].PutBitsLsb(0x3u, 3u);
+        wb.AddBits(l, 0x3u, 3u);
     }
+    wb.EndRefillWave();
 
     const size_t full_waves = tokens.size() / kGDeflateLanes;
     const size_t rem = tokens.size() % kGDeflateLanes;
 
-    auto encode_token = [](LaneBitPacker& lp, const GDeflateToken& tok) {
+    auto encode_token = [&](uint32_t lane, const GDeflateToken& tok) {
         if (!tok.is_match) {
-            const uint32_t b = lp.EmitFixedLitLen(tok.lit_or_len);
-            lp.step_bits.push_back(static_cast<uint8_t>(b));
+            wb.AddFixedLitLen(lane, tok.lit_or_len);
         } else {
             uint32_t lex_val = 0, lex_bits = 0;
             const uint32_t lsym = FindLenCode(tok.lit_or_len, lex_val, lex_bits);
             uint32_t dex_val = 0, dex_bits = 0;
             const uint32_t dsym = FindDistCode(tok.dist, dex_val, dex_bits);
 
-            uint32_t used = lp.EmitFixedLitLen(lsym);
-            if (lex_bits > 0u) {
-                lp.PutBitsLsb(lex_val, lex_bits);
-                used += lex_bits;
-            }
-            lp.PutBitsLsb(ReverseBits(dsym, 5u), 5u);
-            used += 5u;
-            if (dex_bits > 0u) {
-                lp.PutBitsLsb(dex_val, dex_bits);
-                used += dex_bits;
-            }
-            lp.step_bits.push_back(static_cast<uint8_t>(used));
+            wb.AddFixedLitLen(lane, lsym);
+            if (lex_bits > 0u) wb.AddBits(lane, lex_val, lex_bits);
+            wb.AddBits(lane, ReverseBits(dsym, 5u), 5u);
+            if (dex_bits > 0u) wb.AddBits(lane, dex_val, dex_bits);
         }
     };
 
     for (size_t w = 0; w < full_waves; ++w) {
         for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
-            encode_token(lanes[l], tokens[w * kGDeflateLanes + l]);
+            encode_token(l, tokens[w * kGDeflateLanes + l]);
         }
+        wb.EndRefillWave();
     }
     if (rem > 0u) {
         for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
             if (l < rem) {
-                encode_token(lanes[l], tokens[full_waves * kGDeflateLanes + l]);
+                encode_token(l, tokens[full_waves * kGDeflateLanes + l]);
             } else {
-                const uint32_t b = lanes[l].EmitFixedLitLen(256u);
-                lanes[l].step_bits.push_back(static_cast<uint8_t>(b));
+                wb.AddFixedLitLen(l, 256u);
             }
         }
+        wb.EndRefillWave();
         for (uint32_t l = 0; l < rem; ++l) {
-            const uint32_t b = lanes[l].EmitFixedLitLen(256u);
-            lanes[l].step_bits.push_back(static_cast<uint8_t>(b));
+            wb.AddFixedLitLen(l, 256u);
         }
+        wb.EndRefillWave();
     } else {
         for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
-            const uint32_t b = lanes[l].EmitFixedLitLen(256u);
-            lanes[l].step_bits.push_back(static_cast<uint8_t>(b));
+            wb.AddFixedLitLen(l, 256u);
+        }
+        wb.EndRefillWave();
+    }
+
+    wb.Finalize(out_bytes);
+}
+
+// Real 32-lane SIMD bit-interleaved RFC 1951 Dynamic-Huffman (BTYPE=2) + LZ77 GDeflate tile encoder.
+void GDeflate32LaneCompressTileDynamic(const uint8_t* src, size_t src_len, std::vector<uint8_t>& out_bytes) {
+    std::vector<GDeflateToken> tokens;
+    TokenizeGDeflateLz77(src, src_len, tokens);
+
+    std::array<uint32_t, 286> lit_freqs{};
+    std::array<uint32_t, 30> dist_freqs{};
+    lit_freqs[256] = kGDeflateLanes;  // One EOB symbol per lane
+    for (const auto& tok : tokens) {
+        if (!tok.is_match) {
+            ++lit_freqs[tok.lit_or_len];
+        } else {
+            uint32_t lex_val = 0, lex_bits = 0;
+            const uint32_t lsym = FindLenCode(tok.lit_or_len, lex_val, lex_bits);
+            uint32_t dex_val = 0, dex_bits = 0;
+            const uint32_t dsym = FindDistCode(tok.dist, dex_val, dex_bits);
+            ++lit_freqs[lsym];
+            ++dist_freqs[dsym];
         }
     }
 
-    size_t max_steps = 0;
-    for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
-        while (lanes[l].words.size() < 2u) lanes[l].words.push_back(0u);
-        max_steps = std::max(max_steps, lanes[l].step_bits.size());
-    }
+    std::array<uint8_t, 286> lit_lens{};
+    std::array<uint8_t, 30> dist_lens{};
+    BuildLengthLimitedCodeLengths(lit_freqs.data(), lit_lens.size(), 15u, lit_lens.data());
+    BuildLengthLimitedCodeLengths(dist_freqs.data(), dist_lens.size(), 15u, dist_lens.data());
 
-    // Interleave 32-bit words in exact wavefront consumption order:
-    // words[0..31]  = initial cur_word for lanes 0..31
-    // words[32..63] = initial next_word for lanes 0..31
-    // subsequent words = on-demand refills as each lane's bit_off crosses 32
-    std::vector<uint32_t> interleaved;
-    interleaved.reserve(64u + tokens.size() / 2u);
-    for (uint32_t l = 0; l < kGDeflateLanes; ++l) interleaved.push_back(lanes[l].words[0]);
-    for (uint32_t l = 0; l < kGDeflateLanes; ++l) interleaved.push_back(lanes[l].words[1]);
+    std::array<uint32_t, 286> lit_codes{};
+    std::array<uint32_t, 30> dist_codes{};
+    BuildCanonicalEncodeCodes(lit_lens.data(), lit_lens.size(), 15u, lit_codes.data());
+    BuildCanonicalEncodeCodes(dist_lens.data(), dist_lens.size(), 15u, dist_codes.data());
 
-    std::array<size_t, kGDeflateLanes> next_word_idx{};
-    std::array<uint32_t, kGDeflateLanes> sim_bit_off{};
-    next_word_idx.fill(2u);
-    sim_bit_off.fill(3u);
+    uint32_t hlit = 286u;
+    while (hlit > 257u && lit_lens[hlit - 1u] == 0u) --hlit;
+    uint32_t hdist = 30u;
+    while (hdist > 1u && dist_lens[hdist - 1u] == 0u) --hdist;
 
-    for (size_t step = 0; step < max_steps; ++step) {
-        for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
-            if (step >= lanes[l].step_bits.size()) continue;
-            sim_bit_off[l] += lanes[l].step_bits[step];
-            if (sim_bit_off[l] >= 32u) {
-                sim_bit_off[l] -= 32u;
-                const uint32_t w = (next_word_idx[l] < lanes[l].words.size())
-                                       ? lanes[l].words[next_word_idx[l]++]
-                                       : 0u;
-                interleaved.push_back(w);
+    std::array<uint8_t, 316> combined{};
+    std::memcpy(combined.data(), lit_lens.data(), hlit);
+    std::memcpy(combined.data() + hlit, dist_lens.data(), hdist);
+    const uint32_t total_lens = hlit + hdist;
+
+    struct RleSym {
+        uint8_t sym;
+        uint8_t extra_val;
+        uint8_t extra_bits;
+    };
+    std::vector<RleSym> rle_stream;
+    rle_stream.reserve(total_lens);
+    std::array<uint32_t, 19> cl_freqs{};
+
+    uint32_t idx = 0u;
+    while (idx < total_lens) {
+        const uint8_t v = combined[idx];
+        if (v == 0u) {
+            uint32_t run = 1u;
+            while (idx + run < total_lens && combined[idx + run] == 0u) ++run;
+            idx += run;
+            while (run >= 11u) {
+                const uint32_t chunk = std::min<uint32_t>(138u, run);
+                rle_stream.push_back({18u, static_cast<uint8_t>(chunk - 11u), 7u});
+                ++cl_freqs[18];
+                run -= chunk;
+            }
+            if (run >= 3u) {
+                rle_stream.push_back({17u, static_cast<uint8_t>(run - 3u), 3u});
+                ++cl_freqs[17];
+                run = 0u;
+            }
+            while (run > 0u) {
+                rle_stream.push_back({0u, 0u, 0u});
+                ++cl_freqs[0];
+                --run;
+            }
+        } else {
+            rle_stream.push_back({v, 0u, 0u});
+            ++cl_freqs[v];
+            ++idx;
+            uint32_t run = 0u;
+            while (idx + run < total_lens && combined[idx + run] == v) ++run;
+            idx += run;
+            while (run >= 3u) {
+                const uint32_t chunk = std::min<uint32_t>(6u, run);
+                rle_stream.push_back({16u, static_cast<uint8_t>(chunk - 3u), 2u});
+                ++cl_freqs[16];
+                run -= chunk;
+            }
+            while (run > 0u) {
+                rle_stream.push_back({v, 0u, 0u});
+                ++cl_freqs[v];
+                --run;
             }
         }
     }
 
-    out_bytes.resize(interleaved.size() * sizeof(uint32_t));
-    for (size_t i = 0; i < interleaved.size(); ++i) {
-        WriteU32LE(out_bytes.data() + i * 4u, interleaved[i]);
+    std::array<uint8_t, 19> cl_lens{};
+    std::array<uint32_t, 19> cl_codes{};
+    BuildLengthLimitedCodeLengths(cl_freqs.data(), cl_lens.size(), 7u, cl_lens.data());
+    BuildCanonicalEncodeCodes(cl_lens.data(), cl_lens.size(), 7u, cl_codes.data());
+
+    uint32_t hclen = 19u;
+    while (hclen > 4u && cl_lens[kDeflateCodeLenOrder[hclen - 1u]] == 0u) --hclen;
+
+    WavefrontBitPacker wb;
+    wb.waves.reserve(16u + (tokens.size() / kGDeflateLanes) * 2u);
+
+    // Block header on all 32 lanes: BFINAL=1 (bit 0), BTYPE=10 Dynamic Huffman (bits 1..2) -> 0b101 = 5u
+    for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+        wb.AddBits(l, 0x5u, 3u);
     }
+    wb.EndRefillWave();
+
+    // Dynamic table header: HLIT (5b) | HDIST (5b) | HCLEN (4b) on lane 0
+    wb.AddBits(0u, (hlit - 257u) | ((hdist - 1u) << 5u) | ((hclen - 4u) << 10u), 14u);
+    wb.EndRefillWave();
+
+    // Code-length code lengths (3b each, hclen <= 19 < 32) striped across lanes 0..hclen-1
+    for (uint32_t i = 0; i < hclen; ++i) {
+        wb.AddBits(i, cl_lens[kDeflateCodeLenOrder[i]], 3u);
+    }
+    wb.EndRefillWave();
+
+    // RLE-encoded literal/length + distance code lengths striped round-robin across lanes 0..31
+    uint32_t rle_lane = 0u;
+    for (const auto& rs : rle_stream) {
+        wb.AddBits(rle_lane, cl_codes[rs.sym], cl_lens[rs.sym]);
+        if (rs.extra_bits > 0u) {
+            wb.AddBits(rle_lane, rs.extra_val, rs.extra_bits);
+        }
+        ++rle_lane;
+        if (rle_lane == kGDeflateLanes) {
+            wb.EndRefillWave();
+            rle_lane = 0u;
+        }
+    }
+    if (rle_lane > 0u) {
+        wb.EndRefillWave();
+    }
+
+    // Encode token waves in 2 sub-waves (Sub-wave A: Lit/Len + LenExtra <= 20b; Sub-wave B: Dist + DistExtra <= 28b)
+    const size_t full_waves = tokens.size() / kGDeflateLanes;
+    const size_t rem = tokens.size() % kGDeflateLanes;
+
+    auto emit_wave = [&](size_t token_base, uint32_t active_tok_lanes, uint32_t eob_start_lane, uint32_t eob_end_lane) {
+        // Sub-wave A: Literal / Length + LenExtra / EOB
+        for (uint32_t l = 0; l < active_tok_lanes; ++l) {
+            const GDeflateToken& tok = tokens[token_base + l];
+            if (!tok.is_match) {
+                wb.AddBits(l, lit_codes[tok.lit_or_len], lit_lens[tok.lit_or_len]);
+            } else {
+                uint32_t lex_val = 0, lex_bits = 0;
+                const uint32_t lsym = FindLenCode(tok.lit_or_len, lex_val, lex_bits);
+                wb.AddBits(l, lit_codes[lsym], lit_lens[lsym]);
+                if (lex_bits > 0u) wb.AddBits(l, lex_val, lex_bits);
+            }
+        }
+        for (uint32_t l = eob_start_lane; l < eob_end_lane; ++l) {
+            wb.AddBits(l, lit_codes[256], lit_lens[256]);
+        }
+        wb.EndRefillWave();
+
+        // Sub-wave B: Distance + DistExtra for match lanes
+        for (uint32_t l = 0; l < active_tok_lanes; ++l) {
+            const GDeflateToken& tok = tokens[token_base + l];
+            if (tok.is_match) {
+                uint32_t dex_val = 0, dex_bits = 0;
+                const uint32_t dsym = FindDistCode(tok.dist, dex_val, dex_bits);
+                wb.AddBits(l, dist_codes[dsym], dist_lens[dsym]);
+                if (dex_bits > 0u) wb.AddBits(l, dex_val, dex_bits);
+            }
+        }
+        wb.EndRefillWave();
+    };
+
+    for (size_t w = 0; w < full_waves; ++w) {
+        emit_wave(w * kGDeflateLanes, kGDeflateLanes, 0u, 0u);
+    }
+    if (rem > 0u) {
+        emit_wave(full_waves * kGDeflateLanes, static_cast<uint32_t>(rem), static_cast<uint32_t>(rem), kGDeflateLanes);
+        emit_wave(0u, 0u, 0u, static_cast<uint32_t>(rem));
+    } else {
+        emit_wave(0u, 0u, 0u, kGDeflateLanes);
+    }
+
+    wb.Finalize(out_bytes);
 }
+
+struct LaneWavefrontReader {
+    const uint8_t* src = nullptr;
+    size_t total_words = 0u;
+    size_t word_cursor = 64u;
+    std::array<uint32_t, kGDeflateLanes> cur_word{};
+    std::array<uint32_t, kGDeflateLanes> next_word{};
+    std::array<uint32_t, kGDeflateLanes> bit_off{};
+    std::array<uint32_t, kGDeflateLanes> valid_bits{};
+
+    bool Init(const uint8_t* s, size_t byte_len) {
+        if (!s || byte_len < 256u || (byte_len % 4u) != 0u) return false;
+        src = s;
+        total_words = byte_len / 4u;
+        word_cursor = 64u;
+        for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+            cur_word[l] = ReadU32LE(src + l * 4u);
+            next_word[l] = ReadU32LE(src + (kGDeflateLanes + l) * 4u);
+            bit_off[l] = 0u;
+            valid_bits[l] = 64u;
+        }
+        return true;
+    }
+
+    uint32_t Peek32(uint32_t l) const {
+        const uint32_t bo = bit_off[l];
+        return (bo == 0u) ? cur_word[l] : ((cur_word[l] >> bo) | (next_word[l] << (32u - bo)));
+    }
+
+    bool ConsumeInWave(uint32_t l, uint32_t nbits) {
+        if (nbits > 32u || nbits > valid_bits[l]) return false;
+        bit_off[l] += nbits;
+        valid_bits[l] -= nbits;
+        return true;
+    }
+
+    bool EndRefillWave() {
+        for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+            if (bit_off[l] >= 32u) {
+                if (word_cursor >= total_words) return false;
+                cur_word[l] = next_word[l];
+                next_word[l] = ReadU32LE(src + word_cursor * 4u);
+                ++word_cursor;
+                valid_bits[l] += 32u;
+                bit_off[l] -= 32u;
+                if (bit_off[l] >= 32u) return false;
+            }
+        }
+        return true;
+    }
+};
 
 bool GDeflate32LaneDecompressTile(
     const uint8_t* src,
@@ -298,143 +879,320 @@ bool GDeflate32LaneDecompressTile(
     size_t dst_cap,
     size_t& out_written) {
     out_written = 0;
-    if (!src || src_len < 256u || (src_len % 4u) != 0u || !dst || dst_cap == 0u) {
-        return false;
-    }
+    if (!dst || dst_cap == 0u) return false;
 
-    const size_t total_words = src_len / 4u;
-    auto read_word = [&](size_t idx) -> uint32_t {
-        return (idx < total_words) ? ReadU32LE(src + idx * 4u) : 0u;
-    };
+    LaneWavefrontReader rd;
+    if (!rd.Init(src, src_len)) return false;
 
-    std::array<uint32_t, kGDeflateLanes> cur_word{};
-    std::array<uint32_t, kGDeflateLanes> next_word{};
-    std::array<uint32_t, kGDeflateLanes> bit_off{};
-    std::array<bool, kGDeflateLanes> lane_done{};
-
-    for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
-        cur_word[l] = read_word(l);
-        next_word[l] = read_word(kGDeflateLanes + l);
-        const uint32_t hdr = cur_word[l] & 0x7u;
-        const uint32_t bfinal = hdr & 1u;
-        const uint32_t btype = (hdr >> 1u) & 0x3u;
-        if (bfinal != 1u || btype != 1u) {
-            return false;
-        }
-        bit_off[l] = 3u;
-        lane_done[l] = false;
-    }
-
-    size_t word_cursor = 64u;
     size_t out_pos = 0u;
-    uint32_t active_lanes = kGDeflateLanes;
+    uint32_t bfinal = 0u;
 
     struct DecodedLaneCmd {
         uint32_t lit_or_len = 0;
         uint32_t dist = 0;
         bool is_match = false;
         bool has_output = false;
-        bool needs_refill = false;
     };
 
-    const size_t max_waves = dst_cap + 2u;
-    for (size_t wave = 0; wave < max_waves && active_lanes > 0u; ++wave) {
-        std::array<DecodedLaneCmd, kGDeflateLanes> cmds{};
+    do {
+        uint32_t btype = 0u;
         for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
-            if (lane_done[l]) continue;
-
-            const uint32_t bo = bit_off[l];
-            const uint32_t bits = (bo == 0u) ? cur_word[l] : ((cur_word[l] >> bo) | (next_word[l] << (32u - bo)));
-            const uint32_t rev9 = ReverseBits(bits & 0x1FFu, 9u);
-            const uint32_t rev7 = rev9 >> 2u;
-            const uint32_t rev8 = rev9 >> 1u;
-
-            uint32_t sym = 256u;
-            uint32_t cbits = 7u;
-            if (rev7 <= 23u) {
-                sym = 256u + rev7;
-                cbits = 7u;
-            } else if (rev8 >= 48u && rev8 <= 191u) {
-                sym = rev8 - 48u;
-                cbits = 8u;
-            } else if (rev8 >= 192u && rev8 <= 199u) {
-                sym = 280u + (rev8 - 192u);
-                cbits = 8u;
-            } else {
-                sym = 144u + (rev9 - 400u);
-                cbits = 9u;
+            const uint32_t hdr = rd.Peek32(l) & 0x7u;
+            const uint32_t lane_bfinal = hdr & 1u;
+            const uint32_t lane_btype = (hdr >> 1u) & 0x3u;
+            if (lane_btype == 3u) return false;
+            if (l == 0u) {
+                bfinal = lane_bfinal;
+                btype = lane_btype;
+            } else if (lane_bfinal != bfinal || lane_btype != btype) {
+                return false;
             }
+            if (!rd.ConsumeInWave(l, 3u)) return false;
+        }
+        if (!rd.EndRefillWave()) return false;
 
-            uint32_t nbits = 0u;
-            if (sym < 256u) {
-                cmds[l].lit_or_len = sym;
-                cmds[l].is_match = false;
-                cmds[l].has_output = true;
-                nbits = cbits;
-            } else if (sym == 256u) {
-                lane_done[l] = true;
-                --active_lanes;
-                nbits = 7u;
-            } else if (sym <= 285u) {
-                const uint32_t len_idx = sym - 257u;
-                const uint32_t lex_bits = kDeflateLenExtra[len_idx];
-                const uint32_t lex_val = lex_bits > 0u ? ((bits >> cbits) & ((1u << lex_bits) - 1u)) : 0u;
-                const uint32_t match_len = static_cast<uint32_t>(kDeflateLenBase[len_idx]) + lex_val;
+        if (btype == 0u) {
+            // BTYPE=0: Uncompressed/Stored block across 32 bit-interleaved lanes
+            for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                const uint32_t pad = (8u - (rd.bit_off[l] & 7u)) & 7u;
+                if (!rd.ConsumeInWave(l, pad)) return false;
+            }
+            if (!rd.EndRefillWave()) return false;
 
-                const uint32_t pos_after_len = cbits + lex_bits;
-                const uint32_t dist_sym = ReverseBits((bits >> pos_after_len) & 0x1Fu, 5u);
-                if (dist_sym >= 30u) return false;
-                const uint32_t dex_bits = kDeflateDistExtra[dist_sym];
-                const uint32_t dex_val =
-                    dex_bits > 0u ? ((bits >> (pos_after_len + 5u)) & ((1u << dex_bits) - 1u)) : 0u;
-                const uint32_t match_dist = static_cast<uint32_t>(kDeflateDistBase[dist_sym]) + dex_val;
+            std::array<uint16_t, kGDeflateLanes> lane_lens{};
+            size_t block_total = 0u;
+            for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                const uint32_t ln = rd.Peek32(l);
+                if (!rd.ConsumeInWave(l, 32u)) return false;
+                const uint16_t len_l = static_cast<uint16_t>(ln & 0xFFFFu);
+                const uint16_t nlen_l = static_cast<uint16_t>(ln >> 16u);
+                if ((len_l ^ nlen_l) != 0xFFFFu) return false;
+                if (l > 0u && (len_l > lane_lens[l - 1u] || (lane_lens[0] - len_l) > 1u)) {
+                    return false;
+                }
+                lane_lens[l] = len_l;
+                block_total += len_l;
+            }
+            if (!rd.EndRefillWave()) return false;
+            if (out_pos + block_total > dst_cap) return false;
 
-                cmds[l].lit_or_len = match_len;
-                cmds[l].dist = match_dist;
-                cmds[l].is_match = true;
-                cmds[l].has_output = true;
-                nbits = pos_after_len + 5u + dex_bits;
-            } else {
+            const uint16_t max_lane_len = lane_lens[0];
+            std::array<uint8_t, kGDeflateLanes> wave_bytes{};
+            for (uint16_t w = 0; w < max_lane_len; ++w) {
+                for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                    if (w < lane_lens[l]) {
+                        wave_bytes[l] = static_cast<uint8_t>(rd.Peek32(l) & 0xFFu);
+                        if (!rd.ConsumeInWave(l, 8u)) return false;
+                    }
+                }
+                if (!rd.EndRefillWave()) return false;
+                for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                    if (w < lane_lens[l]) {
+                        dst[out_pos++] = wave_bytes[l];
+                    }
+                }
+            }
+        } else if (btype == 1u) {
+            // BTYPE=1: Fixed Huffman 32-lane wavefront decode
+            std::array<bool, kGDeflateLanes> lane_done{};
+            uint32_t active_lanes = kGDeflateLanes;
+            const size_t max_waves = (dst_cap - out_pos) + 2u;
+
+            for (size_t wave = 0; wave < max_waves && active_lanes > 0u; ++wave) {
+                std::array<DecodedLaneCmd, kGDeflateLanes> cmds{};
+                for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                    if (lane_done[l]) continue;
+
+                    const uint32_t bits = rd.Peek32(l);
+                    const uint32_t rev9 = ReverseBits(bits & 0x1FFu, 9u);
+                    const uint32_t rev7 = rev9 >> 2u;
+                    const uint32_t rev8 = rev9 >> 1u;
+
+                    uint32_t sym = 256u;
+                    uint32_t cbits = 7u;
+                    if (rev7 <= 23u) {
+                        sym = 256u + rev7;
+                        cbits = 7u;
+                    } else if (rev8 >= 48u && rev8 <= 191u) {
+                        sym = rev8 - 48u;
+                        cbits = 8u;
+                    } else if (rev8 >= 192u && rev8 <= 199u) {
+                        sym = 280u + (rev8 - 192u);
+                        cbits = 8u;
+                    } else {
+                        sym = 144u + (rev9 - 400u);
+                        cbits = 9u;
+                    }
+
+                    uint32_t nbits = 0u;
+                    if (sym < 256u) {
+                        cmds[l].lit_or_len = sym;
+                        cmds[l].is_match = false;
+                        cmds[l].has_output = true;
+                        nbits = cbits;
+                    } else if (sym == 256u) {
+                        lane_done[l] = true;
+                        --active_lanes;
+                        nbits = 7u;
+                    } else if (sym <= 285u) {
+                        const uint32_t len_idx = sym - 257u;
+                        const uint32_t lex_bits = kDeflateLenExtra[len_idx];
+                        const uint32_t lex_val = lex_bits > 0u ? ((bits >> cbits) & ((1u << lex_bits) - 1u)) : 0u;
+                        const uint32_t match_len = static_cast<uint32_t>(kDeflateLenBase[len_idx]) + lex_val;
+
+                        const uint32_t pos_after_len = cbits + lex_bits;
+                        const uint32_t dist_sym = ReverseBits((bits >> pos_after_len) & 0x1Fu, 5u);
+                        if (dist_sym >= 30u) return false;
+                        const uint32_t dex_bits = kDeflateDistExtra[dist_sym];
+                        const uint32_t dex_val =
+                            dex_bits > 0u ? ((bits >> (pos_after_len + 5u)) & ((1u << dex_bits) - 1u)) : 0u;
+                        const uint32_t match_dist = static_cast<uint32_t>(kDeflateDistBase[dist_sym]) + dex_val;
+
+                        cmds[l].lit_or_len = match_len;
+                        cmds[l].dist = match_dist;
+                        cmds[l].is_match = true;
+                        cmds[l].has_output = true;
+                        nbits = pos_after_len + 5u + dex_bits;
+                    } else {
+                        return false;
+                    }
+
+                    if (!rd.ConsumeInWave(l, nbits)) return false;
+                }
+
+                if (!rd.EndRefillWave()) return false;
+
+                for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                    if (!cmds[l].has_output) continue;
+                    if (!cmds[l].is_match) {
+                        if (out_pos >= dst_cap) return false;
+                        dst[out_pos++] = static_cast<uint8_t>(cmds[l].lit_or_len);
+                    } else {
+                        const size_t mlen = cmds[l].lit_or_len;
+                        const size_t mdist = cmds[l].dist;
+                        if (mdist == 0u || mdist > out_pos || out_pos + mlen > dst_cap) {
+                            return false;
+                        }
+                        for (size_t k = 0; k < mlen; ++k) {
+                            dst[out_pos] = dst[out_pos - mdist];
+                            ++out_pos;
+                        }
+                    }
+                }
+            }
+            if (active_lanes != 0u) return false;
+        } else {
+            // BTYPE=2: Spec-complete Dynamic Huffman 32-lane wavefront decode
+            const uint32_t hbits = rd.Peek32(0u);
+            if (!rd.ConsumeInWave(0u, 14u) || !rd.EndRefillWave()) return false;
+            const uint32_t hlit = (hbits & 0x1Fu) + 257u;
+            const uint32_t hdist = ((hbits >> 5u) & 0x1Fu) + 1u;
+            const uint32_t hclen = ((hbits >> 10u) & 0xFu) + 4u;
+            if (hlit > 286u || hdist > 30u) return false;
+
+            std::array<uint8_t, 19> cl_lens{};
+            for (uint32_t i = 0; i < hclen; ++i) {
+                cl_lens[kDeflateCodeLenOrder[i]] = static_cast<uint8_t>(rd.Peek32(i) & 0x7u);
+                if (!rd.ConsumeInWave(i, 3u)) return false;
+            }
+            if (!rd.EndRefillWave()) return false;
+
+            GDeflateHuffmanTable cl_tree{};
+            if (!cl_tree.Build(cl_lens.data(), cl_lens.size(), 7u, /*allow_empty=*/false)) {
                 return false;
             }
 
-            bit_off[l] += nbits;
-            if (bit_off[l] >= 32u) {
-                cmds[l].needs_refill = true;
-            }
-        }
+            std::array<uint8_t, 320> combined_lens{};
+            const uint32_t total_lens = hlit + hdist;
+            uint32_t idx = 0u;
+            uint32_t rle_lane = 0u;
+            while (idx < total_lens) {
+                const uint32_t bits = rd.Peek32(rle_lane);
+                uint32_t sym = 0u, cbits = 0u;
+                if (!cl_tree.Decode(bits, sym, cbits)) return false;
 
-        // Refill 32-bit words in deterministic lane 0..31 order
-        for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
-            if (cmds[l].needs_refill) {
-                if (word_cursor > total_words + kGDeflateLanes) return false;
-                cur_word[l] = next_word[l];
-                next_word[l] = read_word(word_cursor++);
-                bit_off[l] -= 32u;
-            }
-        }
-
-        // Emit decoded literals & sliding-window LZ77 matches
-        for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
-            if (!cmds[l].has_output) continue;
-            if (!cmds[l].is_match) {
-                if (out_pos >= dst_cap) return false;
-                dst[out_pos++] = static_cast<uint8_t>(cmds[l].lit_or_len);
-            } else {
-                const size_t mlen = cmds[l].lit_or_len;
-                const size_t mdist = cmds[l].dist;
-                if (mdist == 0u || mdist > out_pos || out_pos + mlen > dst_cap) {
-                    return false;
+                uint32_t extra_bits = 0u;
+                uint8_t rep_val = 0u;
+                uint32_t rep_cnt = 0u;
+                if (sym < 16u) {
+                    combined_lens[idx++] = static_cast<uint8_t>(sym);
+                } else {
+                    if (sym == 16u) {
+                        if (idx == 0u) return false;
+                        extra_bits = 2u;
+                        rep_val = combined_lens[idx - 1u];
+                        rep_cnt = 3u + ((bits >> cbits) & 0x3u);
+                    } else if (sym == 17u) {
+                        extra_bits = 3u;
+                        rep_val = 0u;
+                        rep_cnt = 3u + ((bits >> cbits) & 0x7u);
+                    } else if (sym == 18u) {
+                        extra_bits = 7u;
+                        rep_val = 0u;
+                        rep_cnt = 11u + ((bits >> cbits) & 0x7Fu);
+                    } else {
+                        return false;
+                    }
+                    if (idx + rep_cnt > total_lens) return false;
+                    for (uint32_t r = 0; r < rep_cnt; ++r) {
+                        combined_lens[idx++] = rep_val;
+                    }
                 }
-                for (size_t k = 0; k < mlen; ++k) {
-                    dst[out_pos] = dst[out_pos - mdist];
-                    ++out_pos;
+
+                if (!rd.ConsumeInWave(rle_lane, cbits + extra_bits)) return false;
+                ++rle_lane;
+                if (rle_lane == kGDeflateLanes) {
+                    if (!rd.EndRefillWave()) return false;
+                    rle_lane = 0u;
                 }
             }
-        }
-    }
+            if (rle_lane > 0u && !rd.EndRefillWave()) return false;
+            if (combined_lens[256] == 0u) return false;  // End-of-block symbol must be present
 
-    if (active_lanes != 0u) {
+            GDeflateHuffmanTable lit_tree{};
+            GDeflateHuffmanTable dist_tree{};
+            if (!lit_tree.Build(combined_lens.data(), hlit, 15u, /*allow_empty=*/false) ||
+                !dist_tree.Build(combined_lens.data() + hlit, hdist, 15u, /*allow_empty=*/true)) {
+                return false;
+            }
+
+            std::array<bool, kGDeflateLanes> lane_done{};
+            uint32_t active_lanes = kGDeflateLanes;
+            const size_t max_waves = (dst_cap - out_pos) + 2u;
+
+            for (size_t wave = 0; wave < max_waves && active_lanes > 0u; ++wave) {
+                std::array<DecodedLaneCmd, kGDeflateLanes> cmds{};
+                bool any_match = false;
+
+                // Sub-wave A: Decode literal/length + length extra bits (max 15 + 5 = 20 bits)
+                for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                    if (lane_done[l]) continue;
+                    const uint32_t bits = rd.Peek32(l);
+                    uint32_t sym = 0u, cbits = 0u;
+                    if (!lit_tree.Decode(bits, sym, cbits)) return false;
+
+                    if (sym < 256u) {
+                        cmds[l].lit_or_len = sym;
+                        cmds[l].is_match = false;
+                        cmds[l].has_output = true;
+                        if (!rd.ConsumeInWave(l, cbits)) return false;
+                    } else if (sym == 256u) {
+                        lane_done[l] = true;
+                        --active_lanes;
+                        if (!rd.ConsumeInWave(l, cbits)) return false;
+                    } else if (sym <= 285u) {
+                        const uint32_t len_idx = sym - 257u;
+                        const uint32_t lex_bits = kDeflateLenExtra[len_idx];
+                        const uint32_t lex_val = lex_bits > 0u ? ((bits >> cbits) & ((1u << lex_bits) - 1u)) : 0u;
+                        cmds[l].lit_or_len = static_cast<uint32_t>(kDeflateLenBase[len_idx]) + lex_val;
+                        cmds[l].is_match = true;
+                        cmds[l].has_output = true;
+                        any_match = true;
+                        if (!rd.ConsumeInWave(l, cbits + lex_bits)) return false;
+                    } else {
+                        return false;
+                    }
+                }
+                if (!rd.EndRefillWave()) return false;
+
+                // Sub-wave B: Decode distance + distance extra bits (max 15 + 13 = 28 bits)
+                if (any_match) {
+                    for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                        if (!cmds[l].is_match) continue;
+                        const uint32_t bits = rd.Peek32(l);
+                        uint32_t dist_sym = 0u, dbits = 0u;
+                        if (!dist_tree.Decode(bits, dist_sym, dbits) || dist_sym >= 30u) return false;
+                        const uint32_t dex_bits = kDeflateDistExtra[dist_sym];
+                        const uint32_t dex_val = dex_bits > 0u ? ((bits >> dbits) & ((1u << dex_bits) - 1u)) : 0u;
+                        cmds[l].dist = static_cast<uint32_t>(kDeflateDistBase[dist_sym]) + dex_val;
+                        if (!rd.ConsumeInWave(l, dbits + dex_bits)) return false;
+                    }
+                    if (!rd.EndRefillWave()) return false;
+                }
+
+                for (uint32_t l = 0; l < kGDeflateLanes; ++l) {
+                    if (!cmds[l].has_output) continue;
+                    if (!cmds[l].is_match) {
+                        if (out_pos >= dst_cap) return false;
+                        dst[out_pos++] = static_cast<uint8_t>(cmds[l].lit_or_len);
+                    } else {
+                        const size_t mlen = cmds[l].lit_or_len;
+                        const size_t mdist = cmds[l].dist;
+                        if (mdist == 0u || mdist > out_pos || out_pos + mlen > dst_cap) {
+                            return false;
+                        }
+                        for (size_t k = 0; k < mlen; ++k) {
+                            dst[out_pos] = dst[out_pos - mdist];
+                            ++out_pos;
+                        }
+                    }
+                }
+            }
+            if (active_lanes != 0u) return false;
+        }
+    } while (bfinal == 0u);
+
+    if (rd.word_cursor != rd.total_words) {
         return false;
     }
     out_written = out_pos;
@@ -583,6 +1341,41 @@ bool Lz77DecompressTile(const uint8_t* src, size_t src_len, uint8_t* dst, size_t
     return true;
 }
 
+#if defined(_WIN32)
+uint32_t MaxGDeflatePoolWorkers() {
+    static const uint32_t kMax = []() -> uint32_t {
+        const unsigned hc = std::thread::hardware_concurrency();
+        return std::clamp<uint32_t>(hc > 0u ? hc : 4u, 2u, 16u);
+    }();
+    return kMax;
+}
+
+std::atomic<uint32_t>& ActiveGDeflatePoolWorkers() {
+    static std::atomic<uint32_t> s_active{0u};
+    return s_active;
+}
+
+uint32_t ReserveGDeflatePoolSlots(uint32_t desired) {
+    if (desired == 0u) return 0u;
+    const uint32_t cap = MaxGDeflatePoolWorkers();
+    auto& active = ActiveGDeflatePoolWorkers();
+    uint32_t cur = active.load(std::memory_order_relaxed);
+    while (cur < cap) {
+        const uint32_t grant = std::min<uint32_t>(desired, cap - cur);
+        if (active.compare_exchange_weak(cur, cur + grant, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return grant;
+        }
+    }
+    return 0u;
+}
+
+void ReleaseGDeflatePoolSlots(uint32_t granted) {
+    if (granted > 0u) {
+        ActiveGDeflatePoolWorkers().fetch_sub(granted, std::memory_order_acq_rel);
+    }
+}
+#endif
+
 template <typename TileFn>
 bool ExecuteParallelTileDecompress(
     const uint8_t* in,
@@ -600,31 +1393,78 @@ bool ExecuteParallelTileDecompress(
                tw == expected_total;
     }
 
-    std::atomic<bool> all_ok{true};
-    std::atomic<size_t> total_written{0};
-    const size_t num_workers =
-        std::min<size_t>(num_tiles, std::max<size_t>(2u, std::thread::hardware_concurrency()));
-    std::atomic<uint16_t> next_tile{0};
-    std::vector<std::thread> pool;
-    pool.reserve(num_workers);
-    for (size_t w = 0; w < num_workers; ++w) {
-        pool.emplace_back([&]() {
+    struct BatchWorkState {
+        const uint8_t* in_ptr;
+        uint8_t* out_ptr;
+        uint16_t tiles;
+        const std::vector<size_t>* in_off;
+        const std::vector<uint32_t>* comp_sz;
+        const std::vector<size_t>* out_off;
+        const std::vector<size_t>* out_cap;
+        typename std::remove_reference<TileFn>::type* fn_ptr;
+        std::atomic<uint16_t> next_tile{0u};
+        std::atomic<bool> all_ok{true};
+        std::atomic<size_t> total_written{0u};
+
+        void RunWorker() {
             for (;;) {
-                const uint16_t t = next_tile.fetch_add(1, std::memory_order_relaxed);
-                if (t >= num_tiles) break;
+                if (!all_ok.load(std::memory_order_acquire)) break;
+                const uint16_t t = next_tile.fetch_add(1u, std::memory_order_relaxed);
+                if (t >= tiles) break;
                 size_t tw = 0;
-                if (fn(in + tile_in_off[t], tile_comp_sz[t], out + tile_out_off[t], tile_out_cap[t], tw) &&
-                    tw == tile_out_cap[t]) {
-                    total_written.fetch_add(tw, std::memory_order_relaxed);
+                if ((*fn_ptr)(in_ptr + (*in_off)[t], (*comp_sz)[t], out_ptr + (*out_off)[t], (*out_cap)[t], tw) &&
+                    tw == (*out_cap)[t]) {
+                    total_written.fetch_add(tw, std::memory_order_acq_rel);
                 } else {
-                    all_ok.store(false, std::memory_order_relaxed);
+                    all_ok.store(false, std::memory_order_release);
+                    break;
                 }
             }
-        });
+        }
+    };
+
+    BatchWorkState state{
+        in, out, num_tiles, &tile_in_off, &tile_comp_sz, &tile_out_off, &tile_out_cap, &fn};
+
+#if defined(_WIN32)
+    // Dispatch onto the persistent OS-managed Win32 Threadpool (zero per-call thread spawning
+    // and zero DllMain loader-lock shutdown deadlock risk).
+    const uint32_t max_helpers = std::min<uint32_t>(
+        static_cast<uint32_t>(num_tiles - 1u), MaxGDeflatePoolWorkers() - 1u);
+    const uint32_t reserved = ReserveGDeflatePoolSlots(max_helpers);
+    if (reserved > 0u) {
+        auto tp_cb = [](PTP_CALLBACK_INSTANCE /*inst*/, PVOID ctx, PTP_WORK /*work*/) noexcept -> VOID {
+            static_cast<BatchWorkState*>(ctx)->RunWorker();
+        };
+        PTP_WORK work = CreateThreadpoolWork(tp_cb, &state, nullptr);
+        if (work != nullptr) {
+            for (uint32_t w = 0; w < reserved; ++w) {
+                SubmitThreadpoolWork(work);
+            }
+            state.RunWorker();
+            WaitForThreadpoolWorkCallbacks(work, FALSE);
+            CloseThreadpoolWork(work);
+            ReleaseGDeflatePoolSlots(reserved);
+            return state.all_ok.load(std::memory_order_acquire) &&
+                   state.total_written.load(std::memory_order_acquire) == expected_total;
+        }
+        ReleaseGDeflatePoolSlots(reserved);
     }
+    state.RunWorker();
+#else
+    const size_t num_workers =
+        std::min<size_t>(num_tiles, std::clamp<size_t>(std::thread::hardware_concurrency(), 2u, 16u));
+    std::vector<std::thread> pool;
+    pool.reserve(num_workers - 1u);
+    for (size_t w = 1; w < num_workers; ++w) {
+        pool.emplace_back([&state]() { state.RunWorker(); });
+    }
+    state.RunWorker();
     for (auto& th : pool) th.join();
-    return all_ok.load(std::memory_order_relaxed) &&
-           total_written.load(std::memory_order_relaxed) == expected_total;
+#endif
+
+    return state.all_ok.load(std::memory_order_acquire) &&
+           state.total_written.load(std::memory_order_acquire) == expected_total;
 }
 
 uint32_t BcFormatBlockBytes(uint32_t format) {
@@ -875,8 +1715,17 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateDecompress(
     return kFail;
 }
 
-int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompressRetail(
-    const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten) {
+}  // extern "C"
+
+namespace {
+
+int32_t PackOfficialGDeflateStream(
+    const void* srcRaw,
+    size_t rawSize,
+    void* dstCompressed,
+    size_t maxCompressedSize,
+    size_t* bytesWritten,
+    void (*encode_tile)(const uint8_t*, size_t, std::vector<uint8_t>&)) {
     if (!srcRaw || rawSize == 0) return kInvalidArg;
     const size_t num_tiles_sz = (rawSize + kGDeflateTileSize - 1u) / kGDeflateTileSize;
     if (num_tiles_sz == 0u || num_tiles_sz > 0xFFFFu) return kInvalidArg;
@@ -888,7 +1737,7 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompressRetail(
     for (uint16_t t = 0; t < num_tiles; ++t) {
         const size_t start = static_cast<size_t>(t) * kGDeflateTileSize;
         const size_t len = std::min<size_t>(kGDeflateTileSize, rawSize - start);
-        GDeflate32LaneCompressTile(in + start, len, tiles[t]);
+        encode_tile(in + start, len, tiles[t]);
         payload_bytes += tiles[t].size();
     }
 
@@ -925,9 +1774,31 @@ int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompressRetail(
     return kSuccess;
 }
 
+}  // namespace
+
+extern "C" {
+
+int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompressRetail(
+    const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten) {
+    return PackOfficialGDeflateStream(
+        srcRaw, rawSize, dstCompressed, maxCompressedSize, bytesWritten, GDeflate32LaneCompressTile);
+}
+
 int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress32Lane(
     const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten) {
     return XboxCodecGDeflateCompressRetail(srcRaw, rawSize, dstCompressed, maxCompressedSize, bytesWritten);
+}
+
+int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress32LaneDynamic(
+    const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten) {
+    return PackOfficialGDeflateStream(
+        srcRaw, rawSize, dstCompressed, maxCompressedSize, bytesWritten, GDeflate32LaneCompressTileDynamic);
+}
+
+int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress32LaneStored(
+    const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten) {
+    return PackOfficialGDeflateStream(
+        srcRaw, rawSize, dstCompressed, maxCompressedSize, bytesWritten, GDeflate32LaneCompressTileStored);
 }
 
 int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress(

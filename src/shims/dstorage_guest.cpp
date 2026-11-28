@@ -28,6 +28,12 @@
 #include <vector>
 
 #if defined(_WIN32)
+#if !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <winioctl.h>
 
@@ -51,6 +57,9 @@ constexpr uint64_t kOptSwizzle = 0xFFFFull << 5;
 constexpr uint64_t kOptDestinationPhysical = 1ull << 21;
 constexpr uint64_t kOptSourceMemory = 1ull << 22;
 constexpr uint64_t kOptSourcePhysical = 1ull << 23;
+constexpr uint64_t kOptCompressionFormatMask = 0xFFull << 24;
+constexpr uint8_t kCompressionFormatNone = 0u;
+constexpr uint8_t kCompressionFormatGDeflate = 1u;
 constexpr uint64_t kOptUnsupported = kOptDestinationPhysical | kOptSourcePhysical;
 
 bool TraceEnabled() {
@@ -182,6 +191,8 @@ const char* const kInterfaceNames[] = {"IDStorageFactoryX", "IDStorageQueueX", "
 
 template <int Interface, int Slot>
 intptr_t WINAPI UnnamedSlot(Object* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+    scarlettx::FlightRecorder::Instance().RecordVtableSlotMiss(
+        kInterfaceNames[Interface], Slot, static_cast<uint64_t>(a1), SCARLETTX_CALLER_RIP());
     static std::atomic<int> calls{0};
     if (calls.fetch_add(1) < 4) {
         DS_LOG("%s slot %d is not implemented (0x%llx, 0x%llx, 0x%llx)", kInterfaceNames[Interface], Slot,
@@ -366,9 +377,14 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
     if (from_memory != (queue->source_type == 1)) return kInvalidArg;
     if (r.source_size == 0) return kOk;
     const bool is_zlib = (r.options & kOptZlib) != 0;
+    const uint8_t comp_fmt = static_cast<uint8_t>((r.options & kOptCompressionFormatMask) >> 24);
+    if (comp_fmt != kCompressionFormatNone && comp_fmt != kCompressionFormatGDeflate) {
+        return kNotImpl;
+    }
+    const bool is_gdeflate = (comp_fmt == kCompressionFormatGDeflate);
     const uint32_t bcpack_fmt = static_cast<uint32_t>((r.options & kOptBcpack) >> 1);
     const uint32_t swizzle_opt = static_cast<uint32_t>((r.options & kOptSwizzle) >> 5);
-    const bool compressed = is_zlib || (bcpack_fmt != 0);
+    const bool compressed = is_zlib || is_gdeflate || (bcpack_fmt != 0);
     if (!r.destination || !r.source || (!compressed && swizzle_opt == 0 && r.destination_size < r.source_size)) {
         return kInvalidArg;
     }
@@ -448,24 +464,42 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
     }
 
     size_t decoded_bytes = r.source_size;
-    if (is_zlib) {
-        if (raw_buf.size() >= 8 && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu) {
+    if (is_gdeflate || is_zlib) {
+        const bool is_gdeflate_magic =
+            raw_buf.size() >= 12u && raw_buf[0] == 0x04u && raw_buf[1] == 0xFBu;
+        const bool is_rfc1950_zlib =
+            scarlettx::io::LooksLikeRfc1950ZlibHeader(raw_buf.data(), raw_buf.size());
+
+        std::vector<uint8_t> intermediate_buf;
+        uint8_t* stage_dst = decode_dst;
+        uint32_t stage_cap = decode_cap;
+        if (bcpack_fmt != 0) {
+            stage_cap = (r.intermediate_size != 0u) ? r.intermediate_size : decode_cap;
+            intermediate_buf.assign(stage_cap, 0u);
+            stage_dst = intermediate_buf.data();
+        }
+
+        if (is_gdeflate || is_gdeflate_magic) {
             size_t written = 0;
             const int32_t gd_hr = XboxCodecGDeflateDecompress(
-                raw_buf.data(), raw_buf.size(), decode_dst, decode_cap, &written);
+                raw_buf.data(), raw_buf.size(), stage_dst, stage_cap, &written);
             if (gd_hr < 0) return gd_hr;
             decoded_bytes = written;
-        } else if (scarlettx::io::LooksLikeRfc1950ZlibHeader(raw_buf.data(), raw_buf.size())) {
-            std::vector<uint8_t> staged(decode_cap, 0u);
+        } else if (is_rfc1950_zlib) {
             size_t written = 0;
-            if (!scarlettx::io::InflateZlibRfc1950(
-                    raw_buf.data(), raw_buf.size(), staged.data(), staged.size(), written)) {
-                return kNotImpl;
-            }
-            decoded_bytes = std::min<size_t>(written, decode_cap);
-            std::memcpy(decode_dst, staged.data(), decoded_bytes);
+            const int32_t zl_hr = XboxCodecGDeflateDecompress(
+                raw_buf.data(), raw_buf.size(), stage_dst, stage_cap, &written);
+            if (zl_hr < 0) return kNotImpl;
+            decoded_bytes = std::min<size_t>(written, stage_cap);
         } else {
             return kNotImpl;
+        }
+
+        if (bcpack_fmt != 0) {
+            const int32_t bc_hr = XboxCodecBcPackDecompress(
+                stage_dst, decoded_bytes, decode_dst, decode_cap, bcpack_fmt);
+            if (bc_hr < 0) return bc_hr;
+            decoded_bytes = decode_cap;
         }
     } else if (bcpack_fmt != 0) {
         const bool is_framed_bcpack =
@@ -837,12 +871,24 @@ int32_t WINAPI FactoryCreateStatusArray(Object* /*self*/, uint32_t capacity, con
     return kOk;
 }
 
+std::atomic<uint32_t> g_staging_buffer_size{32u * 1024u * 1024u};
+
+int32_t WINAPI FactorySetStagingBufferSize(Object* /*self*/, uint32_t size) {
+    g_staging_buffer_size.store(size, std::memory_order_release);
+    DS_TRACE(8, "SetStagingBufferSize size=%u", size);
+    return kOk;
+}
+
 void* const kFactoryVtbl[] = {
-    DS_SLOT(ObjectQueryInterface), DS_SLOT(ObjectAddRef), DS_SLOT(ObjectRelease),
-    DS_SLOT(FactoryCreateQueue),        // 3, confirmed
-    DS_SLOT(FactoryOpenFile),           // 4, confirmed
-    DS_SLOT(FactoryCreateStatusArray),  // 5, confirmed
-    DS_SLOT((UnnamedSlot<0, 6>)),  DS_SLOT((UnnamedSlot<0, 7>)),  DS_SLOT((UnnamedSlot<0, 8>)),
+    DS_SLOT(ObjectQueryInterface),
+    DS_SLOT(ObjectAddRef),
+    DS_SLOT(ObjectRelease),
+    DS_SLOT(FactoryCreateQueue),           // 3, confirmed
+    DS_SLOT(FactoryOpenFile),              // 4, confirmed
+    DS_SLOT(FactoryCreateStatusArray),     // 5, confirmed
+    DS_SLOT((UnnamedSlot<0, 6>)),          // 6, SetDebugFlags
+    DS_SLOT(FactorySetStagingBufferSize),  // 7, SetStagingBufferSize
+    DS_SLOT((UnnamedSlot<0, 8>)),
     DS_SLOT((UnnamedSlot<0, 9>)),  DS_SLOT((UnnamedSlot<0, 10>)), DS_SLOT((UnnamedSlot<0, 11>)),
 };
 

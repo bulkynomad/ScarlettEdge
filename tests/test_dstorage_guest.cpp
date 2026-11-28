@@ -7,9 +7,16 @@
 #include <string>
 #include <vector>
 
+#include "scarlettx/core/flight_recorder.h"
 #include "scarlettx/gpu/xg_layout.h"
 
 #if defined(_WIN32)
+#if !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN
+#endif
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #include <windows.h>
 
 extern "C" __declspec(dllimport) int32_t WINAPI DStorageGetFactory(const void* riid, void** out);
@@ -22,6 +29,8 @@ extern "C" __declspec(dllimport) int32_t WINAPI DStorageGetFactory(const void* r
             return 1;                                                           \
         }                                                                       \
     } while (0)
+
+#include "sx_check.h"
 
 namespace {
 
@@ -58,7 +67,8 @@ struct Request {
 
 constexpr uint64_t kSourceMemory = 1ull << 22;
 constexpr uint64_t kZlib = 1ull << 0;
-constexpr int kCreateQueue = 3, kOpenFile = 4, kCreateStatusArray = 5;
+constexpr uint64_t kGDeflateOpt = 1ull << 24;
+constexpr int kCreateQueue = 3, kOpenFile = 4, kCreateStatusArray = 5, kSetStagingBufferSize = 7;
 constexpr int kEnqueueRequest = 3, kEnqueueStatus = 4, kEnqueueSignal = 5, kSubmit = 6, kCancelRequestsWithTag = 7;
 constexpr int kFileClose = 3, kFileGetHandle = 4;
 constexpr int kIsComplete = 3, kGetHResult = 4;
@@ -141,14 +151,13 @@ bool Matches(const std::vector<uint8_t>& got, size_t offset) {
 }  // namespace
 
 int main() {
+    sx_test::ScopedTempDir sandbox("test_dstorage_guest");
     constexpr size_t kFileSize = 200000;
-    wchar_t dir[MAX_PATH], path[MAX_PATH];
-    SX_CHECK(GetTempPathW(MAX_PATH, dir) != 0);
-    SX_CHECK(GetTempFileNameW(dir, L"sxd", 0, path) != 0);
+    const std::wstring path = (sandbox.path() / L"raw_stream.bin").wstring();
     {
         std::vector<uint8_t> content(kFileSize);
         for (size_t i = 0; i < kFileSize; ++i) content[i] = Pattern(i);
-        const HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         SX_CHECK(h != INVALID_HANDLE_VALUE);
         DWORD written = 0;
         SX_CHECK(WriteFile(h, content.data(), static_cast<DWORD>(kFileSize), &written, nullptr) && written == kFileSize);
@@ -178,7 +187,7 @@ int main() {
     SX_CHECK(VCall<int32_t>(status, kGetHResult, 0u) == 0);
 
     void* file = nullptr;
-    SX_CHECK(VCall<int32_t>(factory, kOpenFile, static_cast<const wchar_t*>(path), &kAnyIid, &file) == 0 && file != nullptr);
+    SX_CHECK(VCall<int32_t>(factory, kOpenFile, path.c_str(), &kAnyIid, &file) == 0 && file != nullptr);
     void* missing = &bad;
     SX_CHECK(VCall<int32_t>(factory, kOpenFile, L"Z:\\no\\such\\file.bin", &kAnyIid, &missing) < 0 && missing == nullptr);
 
@@ -366,13 +375,158 @@ int main() {
         SX_CHECK(unswizzled == linear_tex);
     }
 
+    // Verify IDStorageFactoryX::SetStagingBufferSize (slot 7) returns S_OK with zero FlightRecorder vtable misses!
+    {
+        scarlettx::FlightRecorderOptions fro{};
+        fro.output_dir = (sandbox.path() / "flight").string();
+        fro.hang_timeout_ms = 0;
+        fro.install_veh = false;
+        fro.enable_dred = false;
+        fro.dump_failing_shaders = false;
+        fro.reset_history = true;
+        scarlettx::FlightRecorder::Instance().Enable(fro);
+        const uint32_t misses_before = scarlettx::FlightRecorder::Instance().GetStats().unique_vtable_misses;
+        SX_CHECK(VCall<int32_t>(factory, kSetStagingBufferSize, 64u * 1024u * 1024u) == 0);
+        SX_CHECK(VCall<int32_t>(factory, kSetStagingBufferSize, 128u * 1024u * 1024u) == 0);
+        const uint32_t misses_after = scarlettx::FlightRecorder::Instance().GetStats().unique_vtable_misses;
+        SX_CHECK(misses_after == misses_before);
+        scarlettx::FlightRecorder::Instance().Disable();
+    }
+
+    // Dynamically load dstorage_xs.dll & xbox_codecs.dll from SCARLETTX_BINARY_DIR:
+    //  1) Verify dstorage_xs.dll!DStorageGetFactory(&guid_with_canaries, &fac) with SCARLETTX_REAL_TITLE
+    //     unset, "0", and "1" NEVER corrupts stack-allocated GUIDs or surrounding stack canaries!
+    //  2) Stream a multi-tile (> 64 KiB) BTYPE=2 Dynamic-Huffman 32-lane GDeflate file through
+    //     xcrdapi.dll!DStorageGetFactory (IDStorageQueueX), synchronized purely via MockFence Win32 event!
+    {
+        const std::filesystem::path bin_dir = SCARLETTX_BINARY_DIR;
+        HMODULE hCodecs = LoadLibraryW((bin_dir / L"xbox_codecs.dll").c_str());
+        HMODULE hDsXs = LoadLibraryW((bin_dir / L"dstorage_xs.dll").c_str());
+        SX_CHECK(hCodecs != nullptr && hDsXs != nullptr);
+
+        using FnGetFactory = int32_t(WINAPI*)(const void*, void**);
+        using FnCompressDyn = int32_t(__stdcall*)(const void*, size_t, void*, size_t, size_t*);
+        auto fn_xs_get_factory = reinterpret_cast<FnGetFactory>(
+            reinterpret_cast<void*>(GetProcAddress(hDsXs, "DStorageGetFactory")));
+        auto fn_comp_dyn = reinterpret_cast<FnCompressDyn>(
+            reinterpret_cast<void*>(GetProcAddress(hCodecs, "XboxCodecGDeflateCompress32LaneDynamic")));
+        SX_CHECK(fn_xs_get_factory != nullptr && fn_comp_dyn != nullptr);
+
+        struct GuardedStackGuid {
+            uint64_t canary_lo;
+            Guid iid;
+            uint64_t canary_hi;
+        };
+        const Guid expected_iid = {0x6f26ea0cu, 0xc3cdu, 0x48bcu, {0xb1, 0x99, 0x70, 0x0d, 0x52, 0x97, 0x53, 0xf5}};
+
+        auto verify_stack_guid_safe = [&](const char* env_val) -> bool {
+            if (env_val) {
+                _putenv_s("SCARLETTX_REAL_TITLE", env_val);
+                SetEnvironmentVariableA("SCARLETTX_REAL_TITLE", env_val[0] ? env_val : nullptr);
+            } else {
+                _putenv_s("SCARLETTX_REAL_TITLE", "");
+                SetEnvironmentVariableA("SCARLETTX_REAL_TITLE", nullptr);
+            }
+
+            GuardedStackGuid stack_box{
+                0xDEADBEEFCAFEBABEull,
+                expected_iid,
+                0x0123456789ABCDEFull,
+            };
+            void* xs_fac = nullptr;
+            if (fn_xs_get_factory(&stack_box.iid, &xs_fac) != 0 || xs_fac != factory) {
+                return false;
+            }
+            if (stack_box.canary_lo != 0xDEADBEEFCAFEBABEull ||
+                stack_box.canary_hi != 0x0123456789ABCDEFull ||
+                std::memcmp(&stack_box.iid, &expected_iid, sizeof(Guid)) != 0) {
+                return false;
+            }
+            VCall<uint32_t>(xs_fac, kRelease);
+
+            if (fn_xs_get_factory(&stack_box.iid, nullptr) >= 0) {
+                return false;
+            }
+            return stack_box.canary_lo == 0xDEADBEEFCAFEBABEull &&
+                   stack_box.canary_hi == 0x0123456789ABCDEFull &&
+                   std::memcmp(&stack_box.iid, &expected_iid, sizeof(Guid)) == 0;
+        };
+
+        SX_CHECK(verify_stack_guid_safe(nullptr));
+        SX_CHECK(verify_stack_guid_safe("0"));
+        SX_CHECK(verify_stack_guid_safe("1"));
+        _putenv_s("SCARLETTX_REAL_TITLE", "");
+        SetEnvironmentVariableA("SCARLETTX_REAL_TITLE", nullptr);
+
+        // Multi-tile (> 64 KiB, 3 tiles = 150,000 B) BTYPE=2 Dynamic-Huffman 32-lane GDeflate file streaming
+        std::vector<uint8_t> dyn_plain(150000);
+        for (size_t i = 0; i < dyn_plain.size(); ++i) {
+            dyn_plain[i] = (i % 40u < 28u) ? static_cast<uint8_t>('A' + ((i / 40u + (i % 7u)) & 0x1Fu))
+                                           : Pattern(i * 3u + 17u);
+        }
+        std::vector<uint8_t> dyn_compressed(dyn_plain.size() + 8192, 0);
+        size_t dyn_comp_bytes = 0;
+        SX_CHECK(fn_comp_dyn(
+                     dyn_plain.data(), dyn_plain.size(), dyn_compressed.data(), dyn_compressed.size(), &dyn_comp_bytes) == 0);
+        SX_CHECK(dyn_comp_bytes > 24u && dyn_comp_bytes < dyn_plain.size() / 2u);
+        dyn_compressed.resize(dyn_comp_bytes);
+        SX_CHECK(dyn_compressed[0] == 0x04u && dyn_compressed[1] == 0xFBu);
+        // 3 tiles -> offset table ends at byte 20; lane 0 word 0 low 3 bits == 0b101 (BFINAL=1, BTYPE=2)
+        SX_CHECK((dyn_compressed[20] & 0x7u) == 0x5u);
+
+        const std::wstring gd_path = (sandbox.path() / L"btype2_multitile.gdeflate").wstring();
+        {
+            const HANDLE hg = CreateFileW(gd_path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            SX_CHECK(hg != INVALID_HANDLE_VALUE);
+            DWORD wr = 0;
+            SX_CHECK(WriteFile(hg, dyn_compressed.data(), static_cast<DWORD>(dyn_compressed.size()), &wr, nullptr) &&
+                     wr == dyn_compressed.size());
+            CloseHandle(hg);
+        }
+
+        void* gd_file = nullptr;
+        SX_CHECK(VCall<int32_t>(factory, kOpenFile, gd_path.c_str(), &kAnyIid, &gd_file) == 0 && gd_file != nullptr);
+
+        // Stream 1: kZlib (0x04 0xFB GDeflate auto-dispatch)
+        std::vector<uint8_t> out_zlib_opt(dyn_plain.size(), 0);
+        Request r_gd1{};
+        r_gd1.options = kZlib;
+        r_gd1.destination = out_zlib_opt.data();
+        r_gd1.destination_size = static_cast<uint32_t>(out_zlib_opt.size());
+        r_gd1.source = gd_file;
+        r_gd1.file_offset = 0;
+        r_gd1.source_size = static_cast<uint32_t>(dyn_compressed.size());
+        r_gd1.name = "btype2_file_zlib_opt";
+        VCall<void>(queue, kEnqueueRequest, &r_gd1);
+        VCall<void>(queue, kEnqueueStatus, status, 0u);
+        SX_CHECK(SubmitAndWaitStatus(queue, status, 0u, wait_fence, wait_seq));
+        SX_CHECK(VCall<int32_t>(status, kGetHResult, 0u) == 0);
+        SX_CHECK(out_zlib_opt == dyn_plain);
+
+        // Stream 2: Explicit Xbox DirectStorage GDeflate compression option (kGDeflateOpt)
+        std::vector<uint8_t> out_gdef_opt(dyn_plain.size(), 0);
+        Request r_gd2 = r_gd1;
+        r_gd2.options = kGDeflateOpt;
+        r_gd2.destination = out_gdef_opt.data();
+        r_gd2.name = "btype2_file_gdeflate_opt";
+        VCall<void>(queue, kEnqueueRequest, &r_gd2);
+        VCall<void>(queue, kEnqueueStatus, status, 1u);
+        SX_CHECK(SubmitAndWaitStatus(queue, status, 1u, wait_fence, wait_seq));
+        SX_CHECK(VCall<int32_t>(status, kGetHResult, 1u) == 0);
+        SX_CHECK(out_gdef_opt == dyn_plain);
+
+        VCall<void>(gd_file, kFileClose);
+        SX_CHECK(VCall<uint32_t>(gd_file, kRelease) == 0);
+        FreeLibrary(hDsXs);
+        FreeLibrary(hCodecs);
+    }
+
     SX_CHECK(VCall<uint32_t>(mem_queue, kRelease) == 0);
     SX_CHECK(VCall<uint32_t>(queue, kRelease) == 0);
     SX_CHECK(VCall<uint32_t>(status, kRelease) == 0);
     VCall<uint32_t>(factory, kRelease);
-    SX_CHECK(DeleteFileW(path));
 
-    std::cout << "[PASS] test_dstorage_guest (factory, file, queues, status array, signal, cancellation)\n";
+    std::cout << "[PASS] test_dstorage_guest (factory, SetStagingBufferSize, dstorage_xs stack-GUID safety, BTYPE=2 GDeflate)\n";
     return 0;
 }
 

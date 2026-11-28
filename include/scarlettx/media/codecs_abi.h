@@ -58,6 +58,12 @@ SCARLETTX_CODEC_API int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompressRetail
 SCARLETTX_CODEC_API int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress32Lane(
     const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten);
 
+SCARLETTX_CODEC_API int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress32LaneDynamic(
+    const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten);
+
+SCARLETTX_CODEC_API int32_t SCARLETTX_CODEC_CALL XboxCodecGDeflateCompress32LaneStored(
+    const void* srcRaw, size_t rawSize, void* dstCompressed, size_t maxCompressedSize, size_t* bytesWritten);
+
 SCARLETTX_CODEC_API int32_t SCARLETTX_CODEC_CALL XboxCodecBcPackDecompress(
     const void* srcCompressed, size_t compressedSize, void* dstBlocks, size_t decompressedSize, uint32_t format);
 
