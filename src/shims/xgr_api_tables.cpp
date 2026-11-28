@@ -21,16 +21,6 @@
 #include <unordered_set>
 #include <utility>
 
-#if defined(_WIN32)
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  include <windows.h>
-#endif
-
 namespace scarlettx::xgr {
 namespace {
 
@@ -193,21 +183,7 @@ bool SCARLETTX_GDK_CALLBACK SystemIsHandleValidSlot(void* /*self*/, void* handle
     return XSystemIsHandleValid(handle);
 }
 
-XGameResult SCARLETTX_GDK_CALLBACK SystemHandleTrackSlot(void* /*self*/, void* /*cb*/, void* /*ctx*/,
-                                                         XTaskQueueRegistrationToken* out_token) {
-#if defined(_WIN32)
-    if (out_token && reinterpret_cast<uintptr_t>(out_token) > 0x10000u &&
-        (reinterpret_cast<uintptr_t>(out_token) & 7u) == 0u) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(out_token, &mbi, sizeof(mbi)) == sizeof(mbi) &&
-            mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0 &&
-            ((mbi.Protect & 0xFFu) == PAGE_READWRITE || (mbi.Protect & 0xFFu) == PAGE_WRITECOPY)) {
-            out_token->token = 0;
-        }
-    }
-#else
-    if (out_token) out_token->token = 0;
-#endif
+XGameResult SCARLETTX_GDK_CALLBACK SystemHandleTrackSlot(void* /*self*/, void* /*cb*/, void* /*ctx*/) {
     return XGR_S_OK;
 }
 
@@ -1435,87 +1411,28 @@ XGameResult SCARLETTX_GDK_CALLBACK StoreQueryCurrentGameAsyncSlot(void* /*self*/
     return XStoreQueryEntitledProductsAsync(ctx, 0xFFFFFFFFu, 25u, async);
 }
 
-#if defined(_WIN32)
-bool IsExecutableCallbackPtr(uintptr_t candidate) {
-    if (candidate <= 0x10000u) return false;
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(reinterpret_cast<const void*>(candidate), &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
-    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
-    const DWORD prot = mbi.Protect & 0xFFu;
-    return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
-           prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
-}
-
-bool LooksLikeComVtablePtr(const void* ptr) {
-    if (!ptr || (reinterpret_cast<uintptr_t>(ptr) & (sizeof(void*) - 1u)) != 0u) return false;
-    void* const* vtbl = *static_cast<void* const* const*>(ptr);
-    if (!vtbl || reinterpret_cast<uintptr_t>(vtbl) <= 0x10000u ||
-        (reinterpret_cast<uintptr_t>(vtbl) & (sizeof(void*) - 1u)) != 0u) {
-        return false;
-    }
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(vtbl, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT ||
-        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
-        return false;
-    }
-    const auto* region_end = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-    if (region_end < reinterpret_cast<const uint8_t*>(vtbl) + sizeof(void*) * 3u) return false;
-    return IsExecutableCallbackPtr(reinterpret_cast<uintptr_t>(vtbl[0])) &&
-           IsExecutableCallbackPtr(reinterpret_cast<uintptr_t>(vtbl[1])) &&
-           IsExecutableCallbackPtr(reinterpret_cast<uintptr_t>(vtbl[2]));
-}
-
-bool IsSafeWritableOutTokenPtr(uintptr_t candidate) {
-    if (candidate <= 0x10000u || (candidate & (alignof(uint64_t) - 1u)) != 0u) return false;
-    const void* ptr = reinterpret_cast<const void*>(candidate);
-    if (XSystemIsHandleValid(const_cast<void*>(ptr))) return false;
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(ptr, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
-    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) return false;
-    const DWORD prot = mbi.Protect & 0xFFu;
-    if (prot != PAGE_READWRITE && prot != PAGE_WRITECOPY) return false;
-    const auto* region_end = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
-    if (region_end < static_cast<const uint8_t*>(ptr) + sizeof(uint64_t)) return false;
-    return !LooksLikeComVtablePtr(ptr);
-}
-#endif
-
+// XStore2510 slot 66: XStoreRegisterGameLicenseChanged / XStoreRegisterPackageLicenseLost
+// Exact 5-guest-arg Win64 COM signature (self, handle, queue, context, callback, token).
 XGameResult SCARLETTX_GDK_CALLBACK StoreSlot66SafeOffline(
-    void* /*self*/, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5) {
+    void* /*self*/,
+    void* handle,
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    void* callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!token) return XGR_E_POINTER;
+    token->token = 0;
+    if (!callback) return XGR_E_INVALIDARG;
     if (Trace()) {
         std::fprintf(stderr,
-                     "[ScarlettX][xgameruntime] XStore2510 (ApiImpl{0DD112AC} slot 66)(0x%llx, 0x%llx, 0x%llx) -> S_OK\n",
-                     static_cast<unsigned long long>(a1),
-                     static_cast<unsigned long long>(a2),
-                     static_cast<unsigned long long>(a3));
+                     "[ScarlettX][xgameruntime] XStore2510 (ApiImpl{0DD112AC} slot 66)(handle=%p, cb=%p) -> S_OK\n",
+                     handle, callback);
     }
-    // Zero-initialize guest output token/pointer cleanly across both 5-arg callback registration
-    // (ctx, queue, cb_ctx, callback, XTaskQueueRegistrationToken* out_token) and 2/3-arg offline queries.
-#if defined(_WIN32)
-    if (IsExecutableCallbackPtr(a4) && IsSafeWritableOutTokenPtr(a5)) {
-        *reinterpret_cast<uint64_t*>(a5) = 0ull;
-        return XGR_S_OK;
-    }
-    if (IsSafeWritableOutTokenPtr(a3)) {
-        *reinterpret_cast<uint64_t*>(a3) = 0ull;
-    } else if (a3 == 0u && IsSafeWritableOutTokenPtr(a2)) {
-        *reinterpret_cast<uint64_t*>(a2) = 0ull;
-    }
-#else
-    (void)a1;
-    (void)a4;
-    (void)a5;
-    if (a3 > 0x10000u && (a3 & (alignof(uint64_t) - 1u)) == 0u) {
-        *reinterpret_cast<uint64_t*>(a3) = 0ull;
-    } else if (a3 == 0u && a2 > 0x10000u && (a2 & (alignof(uint64_t) - 1u)) == 0u) {
-        *reinterpret_cast<uint64_t*>(a2) = 0ull;
-    }
-#endif
     return XGR_S_OK;
 }
 
 bool SCARLETTX_GDK_CALLBACK StoreSlot67UnregisterSafeOffline(
-    void* /*self*/, uintptr_t /*ctx*/, uint64_t /*token*/, bool /*wait*/) {
+    void* /*self*/, void* /*handle*/, XTaskQueueRegistrationToken /*token*/, bool /*wait*/) {
     return true;
 }
 

@@ -896,7 +896,7 @@ int main() {
         CHECK(LoadVtableSlot<FnRelease>(pkg2510, 0x10)(pkg2510) == 0u);
 
         // 5) Real XStore 2510 ({0DD112AC} / {B09D803C}): slot 3 CreateContext, slot 28/29 QueryGameLicense,
-        //    slot 66 StoreSlot66SafeOffline out-token zeroing (both 3-arg and 5-arg registration shapes), slot 4 Close
+        //    slot 66 StoreSlot66SafeOffline out-token zeroing (5-guest-arg registration signature), slot 4 Close
         void* rstore = nullptr;
         CHECK(QueryApiImpl(&kGuidStoreReal, &kGuidStore2510, &rstore) == XGR_S_OK && rstore != nullptr);
         XStoreContextHandle rs_ctx = nullptr;
@@ -911,39 +911,45 @@ int main() {
             constexpr uint64_t kCanary64 = 0xDEADBEEFCAFEBABEull;
             struct GuardedStoreToken {
                 uint64_t pre[4];
-                uint64_t token;
+                XTaskQueueRegistrationToken token;
                 uint64_t post[4];
             };
-            GuardedStoreToken st3{};
-            for (int i = 0; i < 4; ++i) {
-                st3.pre[i] = kCanary64;
-                st3.post[i] = kCanary64;
-            }
-            st3.token = 0xCCCCCCCCCCCCCCCCull;
-            using FnStoreSlot66_3Arg = XGameResult (SCARLETTX_GDK_CALLBACK*)(
-                void*, XStoreContextHandle, uintptr_t, uint64_t*);
-            CHECK(LoadVtableSlot<FnStoreSlot66_3Arg>(rstore, 66 * 8)(rstore, rs_ctx, 0u, &st3.token) == XGR_S_OK);
-            CHECK(st3.token == 0ull);
-            for (int i = 0; i < 4; ++i) {
-                CHECK(st3.pre[i] == kCanary64 && st3.post[i] == kCanary64);
-            }
+            using FnStoreSlot66 = XGameResult (SCARLETTX_GDK_CALLBACK*)(
+                void*, XStoreContextHandle, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+            using FnStoreSlot67_Unreg = bool (SCARLETTX_GDK_CALLBACK*)(
+                void*, XStoreContextHandle, XTaskQueueRegistrationToken, bool);
 
-            // 5-guest-arg callback registration shape: verify cb_ctx is untouched and out_token is zeroed
+            uint64_t cb_ctx_sentinel[2] = {0xA5A5A5A55A5A5A5Aull, 0x1122334455667788ull};
+
+            // Null out-token -> E_POINTER without touching cb_ctx
+            CHECK(LoadVtableSlot<FnStoreSlot66>(rstore, 66 * 8)(
+                      rstore, rs_ctx, nullptr, cb_ctx_sentinel,
+                      reinterpret_cast<void*>(&SampleAsyncCompletion), nullptr) == XGR_E_POINTER);
+            CHECK(cb_ctx_sentinel[0] == 0xA5A5A5A55A5A5A5Aull && cb_ctx_sentinel[1] == 0x1122334455667788ull);
+
+            // Null callback -> E_INVALIDARG and still zeros *token
+            GuardedStoreToken st_bad_cb{};
+            for (int i = 0; i < 4; ++i) {
+                st_bad_cb.pre[i] = kCanary64;
+                st_bad_cb.post[i] = kCanary64;
+            }
+            st_bad_cb.token.token = 0xCCCCCCCCCCCCCCCCull;
+            CHECK(LoadVtableSlot<FnStoreSlot66>(rstore, 66 * 8)(
+                      rstore, rs_ctx, nullptr, cb_ctx_sentinel, nullptr, &st_bad_cb.token) == XGR_E_INVALIDARG);
+            CHECK(st_bad_cb.token.token == 0ull);
+            CHECK(cb_ctx_sentinel[0] == 0xA5A5A5A55A5A5A5Aull && cb_ctx_sentinel[1] == 0x1122334455667788ull);
+
+            // Valid 5-arg call -> S_OK, *token zeroed, cb_ctx and stack canaries intact
             GuardedStoreToken st5{};
             for (int i = 0; i < 4; ++i) {
                 st5.pre[i] = kCanary64;
                 st5.post[i] = kCanary64;
             }
-            st5.token = 0xBADC0FFEE0DDF00Dull;
-            uint64_t cb_ctx_sentinel[2] = {0xA5A5A5A55A5A5A5Aull, 0x1122334455667788ull};
-            using FnStoreSlot66_5Arg = XGameResult (SCARLETTX_GDK_CALLBACK*)(
-                void*, XStoreContextHandle, XTaskQueueHandle, void*, void*, uint64_t*);
-            using FnStoreSlot67_Unreg = bool (SCARLETTX_GDK_CALLBACK*)(
-                void*, XStoreContextHandle, uint64_t, bool);
-            CHECK(LoadVtableSlot<FnStoreSlot66_5Arg>(rstore, 66 * 8)(
+            st5.token.token = 0xBADC0FFEE0DDF00Dull;
+            CHECK(LoadVtableSlot<FnStoreSlot66>(rstore, 66 * 8)(
                       rstore, rs_ctx, nullptr, cb_ctx_sentinel,
                       reinterpret_cast<void*>(&SampleAsyncCompletion), &st5.token) == XGR_S_OK);
-            CHECK(st5.token == 0ull);
+            CHECK(st5.token.token == 0ull);
             CHECK(cb_ctx_sentinel[0] == 0xA5A5A5A55A5A5A5Aull && cb_ctx_sentinel[1] == 0x1122334455667788ull);
             for (int i = 0; i < 4; ++i) {
                 CHECK(st5.pre[i] == kCanary64 && st5.post[i] == kCanary64);

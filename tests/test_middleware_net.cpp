@@ -227,11 +227,41 @@ int main() {
         SX_CHECK(ffxCreateContext(&ctx, &cdesc.header, nullptr) == FFX_API_RETURN_OK);
         SX_CHECK(ctx != nullptr);
 
-        ffxConfigureDescUpscale cfg{};
-        cfg.header.type = FFX_API_DESC_TYPE_UPSCALE_CONFIGURE;
-        cfg.sharpness = 0.75f;
-        cfg.enableSharpening = 1;
-        SX_CHECK(ffxConfigure(&ctx, &cfg.header) == FFX_API_RETURN_OK);
+        // Configure via official ffxConfigureDescUpscaleKeyValue (0x00010007): keys 0..4 via float* ptr
+        for (uint64_t key = 0; key <= 4u; ++key) {
+            float kv_val = 0.75f;
+            ffxConfigureDescUpscaleKeyValue kv{};
+            kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+            kv.key = key;
+            kv.ptr = &kv_val;
+            SX_CHECK(ffxConfigure(&ctx, &kv.header) == FFX_API_RETURN_OK);
+        }
+        {
+            float kv_val = 0.5f;
+            ffxConfigureDescUpscaleKeyValue bad_kv{};
+            bad_kv.header.type = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE;
+            bad_kv.key = 0u;
+            bad_kv.ptr = nullptr;
+            SX_CHECK(ffxConfigure(&ctx, &bad_kv.header) == FFX_API_RETURN_ERROR_PARAMETER);
+            bad_kv.key = 99u;
+            bad_kv.ptr = &kv_val;
+            SX_CHECK(ffxConfigure(&ctx, &bad_kv.header) == FFX_API_RETURN_ERROR_PARAMETER);
+        }
+
+        // Unimplemented descriptors (0x00010006 GENERATEREACTIVEMASK, 0x00010008 GPU_MEMORY_USAGE)
+        // must honestly return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE (never silent no-op / fabricated numbers)
+        {
+            ffxApiHeader reactive_hdr{FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK, nullptr};
+            SX_CHECK(ffxDispatch(&ctx, &reactive_hdr) == FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE);
+
+            FfxApiEffectMemoryUsage mem_usage{0xAAAAAAAAull, 0xBBBBBBBBull};
+            ffxQueryDescUpscaleGetGPUMemoryUsage mem_q{};
+            mem_q.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
+            mem_q.gpuMemoryUsageUpscaler = &mem_usage;
+            SX_CHECK(ffxQuery(&ctx, &mem_q.header) == FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE);
+            SX_CHECK(mem_usage.totalUsageInBytes == 0xAAAAAAAAull &&
+                     mem_usage.aliasableUsageInBytes == 0xBBBBBBBBull);
+        }
 
         std::vector<uint8_t> src(32 * 32 * 4, 0);
         for (uint32_t y = 0; y < 32; ++y) {

@@ -136,11 +136,13 @@ typedef struct ffxQueryDescUpscaleGetJitterOffset {
     float* pOutY;
 } ffxQueryDescUpscaleGetJitterOffset;
 
-typedef struct ffxConfigureDescUpscale {
-    ffxApiHeader header;
-    float sharpness;
-    uint32_t enableSharpening;
-} ffxConfigureDescUpscale;
+enum FfxApiConfigureUpscaleKey {
+    FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR = 0,
+    FFX_API_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE = 1,
+    FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE = 2,
+    FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME = 3,
+    FFX_API_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION = 4
+};
 
 typedef struct ffxConfigureDescUpscaleKeyValue {
     ffxApiHeader header;
@@ -179,6 +181,8 @@ static_assert(sizeof(ffxQueryDescUpscaleGetJitterPhaseCount) == 0x20,
               "ffxQueryDescUpscaleGetJitterPhaseCount must be 32 bytes");
 static_assert(sizeof(ffxQueryDescUpscaleGetJitterOffset) == 0x28,
               "ffxQueryDescUpscaleGetJitterOffset must be 40 bytes");
+static_assert(sizeof(ffxConfigureDescUpscaleKeyValue) == 0x28,
+              "ffxConfigureDescUpscaleKeyValue must be 40 bytes");
 static_assert(offsetof(ffxQueryDescUpscaleGetJitterOffset, pOutY) == 0x20,
               "ffxQueryDescUpscaleGetJitterOffset::pOutY must be at +0x20");
 #endif

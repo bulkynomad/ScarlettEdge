@@ -1,14 +1,22 @@
 #define SCARLETTX_BUILDING_FFX_UPSCALER 1
 #include "scarlettx/middleware/ffx_abi.h"
+#include "scarlettx/core/flight_recorder.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <d3d12.h>
 #endif
@@ -23,10 +31,29 @@ struct FfxUpscalerContextState {
     uint32_t max_render_h = 0;
     uint32_t max_upscale_w = 0;
     uint32_t max_upscale_h = 0;
-    float sharpness = 0.0f;
-    bool enable_sharpening = false;
+    float velocity_factor = 1.0f;
+    float reactiveness_scale = 1.0f;
+    float shading_change_scale = 1.0f;
+    float accumulation_added_per_frame = 0.333f;
+    float min_disocclusion_accumulation = -0.333f;
     uint64_t dispatch_count = 0;
 };
+
+void RecordFfxDescMiss(const char* entry_point, uint64_t desc_type, uint64_t caller_rip) {
+    char sym[64] = {};
+    std::snprintf(sym, sizeof(sym), "%s(type=0x%llX)",
+                  entry_point ? entry_point : "ffxUpscaler",
+                  static_cast<unsigned long long>(desc_type));
+    const uint64_t args4[4] = {desc_type, 0ull, 0ull, 0ull};
+    scarlettx::FlightRecorder::Instance().RecordStubHit(
+        "amd_fidelityfx_upscaler_xbox.dll",
+        sym,
+        false,
+        0,
+        args4,
+        FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE,
+        caller_rip);
+}
 
 std::mutex g_mutex;
 std::unordered_map<void*, std::unique_ptr<FfxUpscalerContextState>> g_contexts;
@@ -211,12 +238,35 @@ ffxReturnCode_t ffxUpscalerConfigure(ffxContext* context, const ffxApiHeader* de
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
     if (desc->type == FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE) {
-        const auto* cfg = reinterpret_cast<const ffxConfigureDescUpscale*>(desc);
-        const float s = std::isfinite(cfg->sharpness) ? std::clamp(cfg->sharpness, 0.0f, 1.0f) : 0.0f;
-        it->second->sharpness = s;
-        it->second->enable_sharpening = (cfg->enableSharpening != 0);
-        return FFX_API_RETURN_OK;
+        const auto* kv = reinterpret_cast<const ffxConfigureDescUpscaleKeyValue*>(desc);
+        if (!kv->ptr) {
+            return FFX_API_RETURN_ERROR_PARAMETER;
+        }
+        const float val = *static_cast<const float*>(kv->ptr);
+        if (!std::isfinite(val)) {
+            return FFX_API_RETURN_ERROR_PARAMETER;
+        }
+        switch (kv->key) {
+            case FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR:
+                it->second->velocity_factor = std::clamp(val, 0.0f, 1.0f);
+                return FFX_API_RETURN_OK;
+            case FFX_API_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE:
+                it->second->reactiveness_scale = std::max(0.0f, val);
+                return FFX_API_RETURN_OK;
+            case FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE:
+                it->second->shading_change_scale = std::max(0.0f, val);
+                return FFX_API_RETURN_OK;
+            case FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME:
+                it->second->accumulation_added_per_frame = std::clamp(val, 0.0f, 1.0f);
+                return FFX_API_RETURN_OK;
+            case FFX_API_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION:
+                it->second->min_disocclusion_accumulation = std::clamp(val, -1.0f, 1.0f);
+                return FFX_API_RETURN_OK;
+            default:
+                return FFX_API_RETURN_ERROR_PARAMETER;
+        }
     }
+    RecordFfxDescMiss("ffxUpscalerConfigure", desc->type, SCARLETTX_CALLER_RIP());
     return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
 }
 
@@ -280,14 +330,8 @@ ffxReturnCode_t ffxUpscalerQuery(ffxContext* context, ffxApiHeader* desc) {
             *q->pOutY = Halton(idx, 3) - 0.5f;
             return FFX_API_RETURN_OK;
         }
-        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE: {
-            auto* q = reinterpret_cast<ffxQueryDescUpscaleGetGPUMemoryUsage*>(desc);
-            if (!q->gpuMemoryUsageUpscaler) return FFX_API_RETURN_ERROR_PARAMETER;
-            q->gpuMemoryUsageUpscaler->totalUsageInBytes = 16ull * 1024ull * 1024ull;
-            q->gpuMemoryUsageUpscaler->aliasableUsageInBytes = 8ull * 1024ull * 1024ull;
-            return FFX_API_RETURN_OK;
-        }
         default:
+            RecordFfxDescMiss("ffxUpscalerQuery", desc->type, SCARLETTX_CALLER_RIP());
             return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     }
 }
@@ -296,8 +340,8 @@ ffxReturnCode_t ffxUpscalerDispatch(ffxContext* context, const ffxApiHeader* des
     if (!context || !*context || !desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    if (desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE &&
-        desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK) {
+    if (desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
+        RecordFfxDescMiss("ffxUpscalerDispatch", desc->type, SCARLETTX_CALLER_RIP());
         return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     }
 
@@ -308,10 +352,6 @@ ffxReturnCode_t ffxUpscalerDispatch(ffxContext* context, const ffxApiHeader* des
             return FFX_API_RETURN_ERROR_PARAMETER;
         }
         ++it->second->dispatch_count;
-    }
-
-    if (desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK) {
-        return FFX_API_RETURN_OK;
     }
 
     const auto* d = reinterpret_cast<const ffxDispatchDescUpscale*>(desc);
