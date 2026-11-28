@@ -108,7 +108,11 @@ target_precompile_headers(scarlettx_core PRIVATE
 # ---------------------------------------------------------------------------
 # Scarlett HLE System DLL Shims
 # ---------------------------------------------------------------------------
-add_library(d3d12_xs SHARED src/shims/d3d12_xs_shim.cpp src/shims/d3d12_xs_exports.cpp)
+add_library(d3d12_xs SHARED
+    src/shims/d3d12_xs_shim.cpp
+    src/shims/d3d12_xs_synthetic.cpp
+    src/shims/d3d12_xs_exports.cpp
+)
 set_target_properties(d3d12_xs PROPERTIES PREFIX "" OUTPUT_NAME "d3d12_xs")
 target_link_libraries(d3d12_xs PRIVATE scarlettx_core $<$<BOOL:${WIN32}>:dxgi> $<$<BOOL:${WIN32}>:user32>)
 target_compile_definitions(d3d12_xs PRIVATE SCARLETTX_BUILDING_D3D12_XS=1)
@@ -471,6 +475,14 @@ set_tests_properties(test_d3d12_present_window PROPERTIES ENVIRONMENT "SCARLETTX
 scarlettx_add_test(test_d3d12_frame_pacing tests/test_d3d12_frame_pacing.cpp)
 target_link_libraries(test_d3d12_frame_pacing PRIVATE d3d12_xs)
 set_tests_properties(test_d3d12_frame_pacing PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
+scarlettx_add_test(test_d3d12_xs_com_sync tests/test_d3d12_xs_com_sync.cpp)
+target_link_libraries(test_d3d12_xs_com_sync PRIVATE
+    d3d12_xs
+    $<$<BOOL:${WIN32}>:dxgi>
+    $<$<BOOL:${WIN32}>:user32>
+    $<$<BOOL:${WIN32}>:$<IF:$<CXX_COMPILER_ID:MSVC>,d3dcompiler,d3dcompiler_47>>
+)
+set_tests_properties(test_d3d12_xs_com_sync PROPERTIES ENVIRONMENT "SCARLETTX_REAL_TITLE=1")
 scarlettx_add_test(test_d3d12_xs_abi tests/test_d3d12_xs_abi.cpp)
 target_link_libraries(test_d3d12_xs_abi PRIVATE
     d3d12_xs

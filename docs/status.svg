@@ -50,14 +50,14 @@
     <rect x="761" y="86" width="155" height="20" fill="#555555"/>
     <rect x="916" y="86" width="33" height="20" fill="#d29922"/>
     <text class="badge-txt" x="838.5" y="100" text-anchor="middle">synthetic test exports</text>
-    <text class="badge-txt-dark" x="932.5" y="100" text-anchor="middle">251</text>
+    <text class="badge-txt-dark" x="932.5" y="100" text-anchor="middle">253</text>
   </g>
   <clipPath id="bclip5"><rect x="36" y="112" width="143" height="20" rx="3"/></clipPath>
   <g clip-path="url(#bclip5)">
     <rect x="36" y="112" width="46" height="20" fill="#555555"/>
     <rect x="82" y="112" width="97" height="20" fill="#26a641"/>
     <text class="badge-txt" x="59.0" y="126" text-anchor="middle">tests</text>
-    <text class="badge-txt" x="130.5" y="126" text-anchor="middle">42/42 passing</text>
+    <text class="badge-txt" x="130.5" y="126" text-anchor="middle">43/43 passing</text>
   </g>
   <rect x="36" y="152" width="968" height="164" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
   <text class="g-label" x="60.0" y="186">d3d12</text>
@@ -755,6 +755,6 @@
   <line x1="40.0" y1="642" x2="500.0" y2="642" stroke="#21262d" stroke-width="1"/>
   <rect x="36" y="662" width="4" height="46" fill="#d29922"/>
   <g transform="translate(56,672)"><path d="M8 1.5 15 14H1z" fill="none" stroke="#d29922" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v3.5M8 11.6v.4" stroke="#d29922" stroke-width="1.5" stroke-linecap="round"/></g>
-  <text class="callout-txt" x="82" y="681"><tspan class="callout-lead">Empirical baseline:</tspan> Retail Xbox DLL exports (261) + wired COM vtable slots (235) reported separately from synthetic test exports (251).</text>
-  <text class="callout-txt" x="82" y="698">Zero target self-clamping (366/573 retail surfaces; 42/42 passing CTest suites).</text>
+  <text class="callout-txt" x="82" y="681"><tspan class="callout-lead">Empirical baseline:</tspan> Retail Xbox DLL exports (261) + wired COM vtable slots (235) reported separately from synthetic test exports (253).</text>
+  <text class="callout-txt" x="82" y="698">Zero target self-clamping (366/573 retail surfaces; 43/43 passing CTest suites).</text>
 </svg>

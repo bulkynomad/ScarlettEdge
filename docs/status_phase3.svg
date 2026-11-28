@@ -29,7 +29,7 @@
     <rect x="255" y="86" width="65" height="20" fill="#555555"/>
     <rect x="320" y="86" width="97" height="20" fill="#26a641"/>
     <text class="badge-txt" x="287.5" y="100" text-anchor="middle">CI tests</text>
-    <text class="badge-txt" x="368.5" y="100" text-anchor="middle">42/42 passing</text>
+    <text class="badge-txt" x="368.5" y="100" text-anchor="middle">43/43 passing</text>
   </g>
   <rect x="36" y="126" width="968" height="212" rx="6" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
   <text class="g-label" x="377.0" y="160">Core/FR</text>
