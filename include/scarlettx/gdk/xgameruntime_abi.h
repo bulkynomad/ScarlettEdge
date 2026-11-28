@@ -249,6 +249,18 @@ struct XSystemRuntimeInfo {
     XVersion availableVersion;
 };
 
+enum XSystemDeviceType : uint32_t {
+    XSystemDeviceType_Unknown = 0x00,
+    XSystemDeviceType_Pc = 0x01,
+    XSystemDeviceType_XboxOne = 0x02,
+    XSystemDeviceType_XboxOneS = 0x03,
+    XSystemDeviceType_XboxOneX = 0x04,
+    XSystemDeviceType_XboxOneXDevkit = 0x05,
+    XSystemDeviceType_XboxScarlettLockhart = 0x06,
+    XSystemDeviceType_XboxScarlettAnaconda = 0x07,
+    XSystemDeviceType_XboxScarlettDevkit = 0x08,
+};
+
 SCARLETTX_XGR_API uint32_t XSystemGetDeviceType();
 SCARLETTX_XGR_API XSystemAnalyticsInfo XSystemGetAnalyticsInfo();
 SCARLETTX_XGR_API XSystemRuntimeInfo XSystemGetRuntimeInfo();
@@ -649,7 +661,16 @@ struct XPackageDetails {
     const char* publisher;
     const char* storeId;
     bool installing;
+    uint32_t index;
+    uint32_t count;
+    bool ageRestricted;
+    const char* titleId;
 };
+
+#if defined(__cplusplus) && INTPTR_MAX == INT64_MAX
+static_assert(sizeof(XPackageDetails) == 0x50, "XPackageDetails must be 0x50 bytes on 64-bit");
+static_assert(offsetof(XPackageDetails, titleId) == 0x48, "XPackageDetails::titleId must be at +0x48");
+#endif
 
 typedef struct XPackageMountObject* XPackageMountHandle;
 typedef bool(SCARLETTX_GDK_CALLBACK XPackageEnumerationCallback)(

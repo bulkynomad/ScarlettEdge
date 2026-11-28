@@ -37,20 +37,36 @@ enum {
 };
 
 enum {
-    FFX_API_DESC_TYPE_UPSCALE_CREATE = 0x00010000u,
-    FFX_API_DESC_TYPE_UPSCALE_DISPATCH = 0x00010001u,
-    FFX_API_DESC_TYPE_UPSCALE_GET_UPSCALERATIO = 0x00010002u,
-    FFX_API_DESC_TYPE_UPSCALE_GET_RENDERRESOLUTION = 0x00010003u,
-    FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_PHASE_COUNT = 0x00010004u,
-    FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_OFFSET = 0x00010005u,
-    FFX_API_DESC_TYPE_UPSCALE_CONFIGURE = 0x00010006u,
-    FFX_API_DESC_TYPE_GET_PROVIDER_VERSION = 0x00000001u,
+    FFX_API_EFFECT_ID_UPSCALE = 0x00010000u,
 
     // Official AMD FidelityFX SDK ffx_api / ffx_upscale descriptor IDs
+    FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE = 0x00010000u,
+    FFX_API_DISPATCH_DESC_TYPE_UPSCALE = 0x00010001u,
+    FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE = 0x00010002u,
+    FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE = 0x00010003u,
+    FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT = 0x00010004u,
+    FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET = 0x00010005u,
+    FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK = 0x00010006u,
+    FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE = 0x00010007u,
+    FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE = 0x00010008u,
+    FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE_V2 = 0x00010009u,
+    FFX_API_QUERY_DESC_TYPE_UPSCALE_GET_RESOURCE_REQUIREMENTS = 0x0001000Au,
+    FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION = 0x0001000Bu,
+
+    // ScarlettX convenience aliases (1:1 aligned with official AMD FidelityFX API IDs)
+    FFX_API_DESC_TYPE_UPSCALE_CREATE = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,
+    FFX_API_DESC_TYPE_UPSCALE_DISPATCH = FFX_API_DISPATCH_DESC_TYPE_UPSCALE,
+    FFX_API_DESC_TYPE_UPSCALE_GET_UPSCALERATIO = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE,
+    FFX_API_DESC_TYPE_UPSCALE_GET_RENDERRESOLUTION = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE,
+    FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_PHASE_COUNT = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT,
+    FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_OFFSET = FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET,
+    FFX_API_DESC_TYPE_UPSCALE_CONFIGURE = FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE,
+
+    // Global ffx_api descriptor IDs
+    FFX_API_DESC_TYPE_GET_PROVIDER_VERSION = 0x00000001u,
     FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG1 = 0x00000001u,
     FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12 = 0x00000002u,
-    FFX_API_QUERY_DESC_TYPE_GET_VERSIONS = 0x00000004u,
-    FFX_API_DISPATCH_DESC_TYPE_UPSCALE = 0x00010004u
+    FFX_API_QUERY_DESC_TYPE_GET_VERSIONS = 0x00000004u
 };
 
 enum {
@@ -107,8 +123,8 @@ typedef struct ffxQueryDescUpscaleGetRenderResolutionFromQualityMode {
 
 typedef struct ffxQueryDescUpscaleGetJitterPhaseCount {
     ffxApiHeader header;
-    int32_t renderWidth;
-    int32_t displayWidth;
+    uint32_t renderWidth;
+    uint32_t displayWidth;
     int32_t* pOutPhaseCount;
 } ffxQueryDescUpscaleGetJitterPhaseCount;
 
@@ -125,6 +141,47 @@ typedef struct ffxConfigureDescUpscale {
     float sharpness;
     uint32_t enableSharpening;
 } ffxConfigureDescUpscale;
+
+typedef struct ffxConfigureDescUpscaleKeyValue {
+    ffxApiHeader header;
+    uint64_t key;
+    uint64_t u64;
+    void* ptr;
+} ffxConfigureDescUpscaleKeyValue;
+
+typedef struct FfxApiEffectMemoryUsage {
+    uint64_t totalUsageInBytes;
+    uint64_t aliasableUsageInBytes;
+} FfxApiEffectMemoryUsage;
+
+typedef struct ffxQueryDescUpscaleGetGPUMemoryUsage {
+    ffxApiHeader header;
+    FfxApiEffectMemoryUsage* gpuMemoryUsageUpscaler;
+} ffxQueryDescUpscaleGetGPUMemoryUsage;
+
+#if defined(__cplusplus) && INTPTR_MAX == INT64_MAX
+static_assert(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE == 0x00010000u, "FFX CREATE_CONTEXT ID mismatch");
+static_assert(FFX_API_DISPATCH_DESC_TYPE_UPSCALE == 0x00010001u, "FFX DISPATCH ID mismatch");
+static_assert(FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE == 0x00010002u,
+              "FFX GET_UPSCALE_RATIO ID mismatch");
+static_assert(FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE == 0x00010003u,
+              "FFX GET_RENDER_RESOLUTION ID mismatch");
+static_assert(FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT == 0x00010004u,
+              "FFX GET_JITTER_PHASE_COUNT ID mismatch");
+static_assert(FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET == 0x00010005u,
+              "FFX GET_JITTER_OFFSET ID mismatch");
+static_assert(sizeof(ffxApiHeader) == 0x10, "ffxApiHeader must be 16 bytes");
+static_assert(sizeof(ffxQueryDescUpscaleGetUpscaleRatioFromQualityMode) == 0x20,
+              "ffxQueryDescUpscaleGetUpscaleRatioFromQualityMode must be 32 bytes");
+static_assert(sizeof(ffxQueryDescUpscaleGetRenderResolutionFromQualityMode) == 0x30,
+              "ffxQueryDescUpscaleGetRenderResolutionFromQualityMode must be 48 bytes");
+static_assert(sizeof(ffxQueryDescUpscaleGetJitterPhaseCount) == 0x20,
+              "ffxQueryDescUpscaleGetJitterPhaseCount must be 32 bytes");
+static_assert(sizeof(ffxQueryDescUpscaleGetJitterOffset) == 0x28,
+              "ffxQueryDescUpscaleGetJitterOffset must be 40 bytes");
+static_assert(offsetof(ffxQueryDescUpscaleGetJitterOffset, pOutY) == 0x20,
+              "ffxQueryDescUpscaleGetJitterOffset::pOutY must be at +0x20");
+#endif
 
 typedef struct ffxQueryDescGetProviderVersion {
     ffxApiHeader header;

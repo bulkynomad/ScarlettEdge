@@ -399,6 +399,67 @@ bool GetCurrentThreadFlsTimeSensitive() { return g_posix_time_sensitive; }
 void SetCurrentThreadFlsTimeSensitive(bool is_ts) { g_posix_time_sensitive = is_ts; }
 #endif
 
+bool IsLockhartEnvEnabled() {
+    if (const char* v = std::getenv("SCARLETTX_LOCKHART")) {
+        return v[0] != '\0' && v[0] != '0';
+    }
+#if defined(_WIN32)
+    char buf[8] = {};
+    const DWORD n = GetEnvironmentVariableA("SCARLETTX_LOCKHART", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) {
+        return buf[0] != '\0' && buf[0] != '0';
+    }
+#endif
+    return false;
+}
+
+bool IsActiveRuntimeLockhart() {
+    auto& hle = scarlettx::XGameRuntimeHle::Instance();
+    if (hle.IsInitialized()) {
+        return hle.GetDeviceType() == scarlettx::DeviceType::XboxScarlettLockhart;
+    }
+    return IsLockhartEnvEnabled();
+}
+
+const char* ResolvePersistentTitleIdCString() {
+    std::string raw_env;
+    if (const char* env_tid = std::getenv("SCARLETTX_TITLE_ID"); env_tid && *env_tid) {
+        raw_env = env_tid;
+    }
+#if defined(_WIN32)
+    else {
+        char win_buf[64] = {};
+        const DWORD n = GetEnvironmentVariableA("SCARLETTX_TITLE_ID", win_buf, sizeof(win_buf));
+        if (n > 0 && n < sizeof(win_buf) && win_buf[0] != '\0') {
+            raw_env.assign(win_buf, n);
+        }
+    }
+#endif
+    std::string tid_str;
+    if (!raw_env.empty()) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(raw_env.c_str(), &end, 16);
+        if (end && end != raw_env.c_str() && *end == '\0') {
+            char hex_buf[16] = {};
+            std::snprintf(hex_buf, sizeof(hex_buf), "%08X", static_cast<unsigned>(static_cast<uint32_t>(parsed)));
+            tid_str = hex_buf;
+        } else {
+            tid_str = raw_env;
+        }
+    }
+    if (tid_str.empty()) {
+        uint32_t tid = 0x5CA00001u;
+        (void)XGameGetXboxTitleId(&tid);
+        char hex_buf[16] = {};
+        std::snprintf(hex_buf, sizeof(hex_buf), "%08X", static_cast<unsigned>(tid));
+        tid_str = hex_buf;
+    }
+    static std::mutex s_intern_mutex;
+    static std::unordered_set<std::string> s_interned_title_ids;
+    std::lock_guard<std::mutex> lock(s_intern_mutex);
+    return s_interned_title_ids.emplace(std::move(tid_str)).first->c_str();
+}
+
 }  // namespace
 
 std::string scarlettx::xgr::StoredSaveName(const std::string& name) { return SanitizeSaveName(name); }
@@ -409,8 +470,10 @@ extern "C" {
 // XGameRuntimeInit.h
 // ===========================================================================
 XGameResult XGameRuntimeInitialize() {
-    auto st = scarlettx::XGameRuntimeHle::Instance().Initialize(
-        scarlettx::DeviceType::XboxScarlettAnaconda);
+    const auto dev_type = IsLockhartEnvEnabled()
+                              ? scarlettx::DeviceType::XboxScarlettLockhart
+                              : scarlettx::DeviceType::XboxScarlettAnaconda;
+    auto st = scarlettx::XGameRuntimeHle::Instance().Initialize(dev_type);
     if (!st.ok()) {
         return XGR_E_FAIL;
     }
@@ -439,7 +502,13 @@ XGameResult XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature feature, bool* is
 // XSystem.h
 // ===========================================================================
 uint32_t XSystemGetDeviceType() {
-    return static_cast<uint32_t>(scarlettx::XGameRuntimeHle::Instance().GetDeviceType());
+    auto& hle = scarlettx::XGameRuntimeHle::Instance();
+    if (!hle.IsInitialized()) {
+        return static_cast<uint32_t>(IsLockhartEnvEnabled()
+                                         ? scarlettx::DeviceType::XboxScarlettLockhart
+                                         : scarlettx::DeviceType::XboxScarlettAnaconda);
+    }
+    return static_cast<uint32_t>(hle.GetDeviceType());
 }
 
 XSystemAnalyticsInfo XSystemGetAnalyticsInfo() {
@@ -450,7 +519,8 @@ XSystemAnalyticsInfo XSystemGetAnalyticsInfo() {
     info.osVersion.revision = 2499;
     info.hostingOsVersion = info.osVersion;
     std::strncpy(info.family, "Xbox", sizeof(info.family) - 1);
-    std::strncpy(info.form, "Xbox Series X", sizeof(info.form) - 1);
+    const char* form_str = IsActiveRuntimeLockhart() ? "Xbox Series S" : "Xbox Series X";
+    std::strncpy(info.form, form_str, sizeof(info.form) - 1);
     return info;
 }
 
@@ -469,7 +539,7 @@ XGameResult XSystemGetAppSpecificDeviceId(
     char* appSpecificDeviceId,
     size_t* appSpecificDeviceIdUsed) {
     return CopyStringToBuffer(
-        "SCARLETTX-DEV-00000001-ANACONDA",
+        IsActiveRuntimeLockhart() ? "SCARLETTX-DEV-00000001-LOCKHART" : "SCARLETTX-DEV-00000001-ANACONDA",
         appSpecificDeviceIdSize,
         appSpecificDeviceId,
         appSpecificDeviceIdUsed);
@@ -2315,6 +2385,7 @@ XGameResult XPackageEnumeratePackages(
     if (kind != XPackageKind_Game && kind != XPackageKind_Content) {
         return XGR_E_INVALIDARG;
     }
+    const char* persistent_title_id = ResolvePersistentTitleIdCString();
     if (kind == XPackageKind_Game) {
         std::string game_name = "ScarlettX Game";
         if (const char* pkg_env = std::getenv("SCARLETTX_PACKAGE_ROOT"); pkg_env && *pkg_env) {
@@ -2332,11 +2403,17 @@ XGameResult XPackageEnumeratePackages(
         game_det.publisher = "ScarlettEdge";
         game_det.storeId = "9N5CA0000100";
         game_det.installing = false;
+        game_det.index = 0u;
+        game_det.count = 1u;
+        game_det.ageRestricted = false;
+        game_det.titleId = persistent_title_id;
         (void)callback(context, &game_det);
         return XGR_S_OK;
     }
     const auto dlcs = DiscoverInstalledDlcPackages();
-    for (const auto& dlc : dlcs) {
+    const uint32_t dlc_count = static_cast<uint32_t>(dlcs.size());
+    for (uint32_t i = 0; i < dlc_count; ++i) {
+        const auto& dlc = dlcs[i];
         XPackageDetails det{};
         det.packageIdentifier = dlc.package_id.c_str();
         det.version.major = 1;
@@ -2346,6 +2423,10 @@ XGameResult XPackageEnumeratePackages(
         det.publisher = "ScarlettEdge";
         det.storeId = dlc.store_id.c_str();
         det.installing = false;
+        det.index = i;
+        det.count = dlc_count;
+        det.ageRestricted = false;
+        det.titleId = persistent_title_id;
         if (!callback(context, &det)) {
             break;
         }

@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include "scarlettx/gdk/xgameruntime_abi.h"
+#include "sx_check.h"
 
 #define CHECK(cond)                                                              \
     do {                                                                         \
@@ -117,13 +119,13 @@ void SCARLETTX_GDK_CALLBACK CustomFree(void* ptr, uint64_t attr) {
 }  // namespace
 
 int main() {
-    // Isolate GameSave directory for this test run.
+    // Isolate GameSave directory for this test run using ScopedTempDir.
     namespace fs = std::filesystem;
-    fs::path sandbox = fs::temp_directory_path() / "scarlettx_test_gamesave_abi";
+    sx_test::ScopedTempDir sandbox_guard("test_gamesave_abi");
+    const fs::path& sandbox = sandbox_guard.path();
     // Nested so that a name escaping the save root still lands in the sandbox.
     fs::path save_root = sandbox / "a" / "b" / "saves";
     std::error_code ec;
-    fs::remove_all(sandbox, ec);
 #if defined(_WIN32)
     _putenv_s("SCARLETTX_SAVE_ROOT", save_root.string().c_str());
 #else
@@ -365,9 +367,50 @@ int main() {
         CHECK(prod_cnt == 1);
         XStoreCloseProductsQueryHandle(pq);
         XStoreCloseContextHandle(sctx);
+        // Also verify 0x50B XPackageDetails layout & persistent non-null titleId in XPackageEnumeratePackages
+        static_assert(sizeof(XPackageDetails) == 0x50, "XPackageDetails must be 0x50 bytes");
+        static_assert(offsetof(XPackageDetails, titleId) == 0x48, "XPackageDetails::titleId must be at +0x48");
 #if defined(_WIN32)
-        _putenv_s("SCARLETTX_DLC_ROOT", "");
+        _putenv_s("SCARLETTX_TITLE_ID", "4D530914");
+#else
+        setenv("SCARLETTX_TITLE_ID", "4D530914", 1);
 #endif
+        struct EnumTitleCapture {
+            int count = 0;
+            const char* persistent_title_ptr = nullptr;
+            std::string title_copy;
+            uint32_t total_count = 0;
+        } game_cap, dlc_cap;
+        auto pkg_cb = [](void* ctx, const XPackageDetails* det) -> bool {
+            if (!det || !det->packageIdentifier || !det->titleId) return false;
+            auto* c = static_cast<EnumTitleCapture*>(ctx);
+            ++c->count;
+            c->persistent_title_ptr = det->titleId;
+            c->title_copy = det->titleId;
+            c->total_count = det->count;
+            return true;
+        };
+        CHECK(XPackageEnumeratePackages(
+                  XPackageKind_Game, XPackageEnumerationScope_ThisOnly, &game_cap, pkg_cb) == XGR_S_OK);
+        CHECK(game_cap.count == 1 && game_cap.total_count == 1u);
+        CHECK(game_cap.persistent_title_ptr != nullptr);
+        CHECK(game_cap.title_copy == "4D530914");
+        CHECK(std::strcmp(game_cap.persistent_title_ptr, "4D530914") == 0);
+
+        CHECK(XPackageEnumeratePackages(
+                  XPackageKind_Content, XPackageEnumerationScope_ThisAndRelated, &dlc_cap, pkg_cb) == XGR_S_OK);
+        CHECK(dlc_cap.count == 1 && dlc_cap.total_count == 1u);
+        CHECK(dlc_cap.persistent_title_ptr != nullptr);
+        CHECK(std::strcmp(dlc_cap.persistent_title_ptr, "4D530914") == 0);
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_TITLE_ID", "");
+        _putenv_s("SCARLETTX_DLC_ROOT", "");
+#else
+        unsetenv("SCARLETTX_TITLE_ID");
+        unsetenv("SCARLETTX_DLC_ROOT");
+#endif
+        // Pointer from previous SCARLETTX_TITLE_ID remains valid after env reset!
+        CHECK(std::strcmp(game_cap.persistent_title_ptr, "4D530914") == 0);
     }
 
     // 6. XGameSave (async init, write, sync + async read, enumerate, delete)
@@ -562,7 +605,40 @@ int main() {
     XTaskQueueCloseHandle(tp_q);
     XGameRuntimeUninitialize();
 
-    fs::remove_all(sandbox, ec);
+    // 9. SCARLETTX_LOCKHART=1 vs "0" dynamic re-evaluation across Uninitialize -> Initialize
+    {
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_LOCKHART", "1");
+#else
+        setenv("SCARLETTX_LOCKHART", "1", 1);
+#endif
+        CHECK(XGameRuntimeInitialize() == XGR_S_OK);
+        CHECK(XSystemGetDeviceType() == XSystemDeviceType_XboxScarlettLockhart);
+        XSystemAnalyticsInfo lockhart_info = XSystemGetAnalyticsInfo();
+        CHECK(std::strcmp(lockhart_info.form, "Xbox Series S") == 0);
+        char lockhart_dev_id[64]{};
+        size_t lockhart_dev_used = 0;
+        CHECK(XSystemGetAppSpecificDeviceId(sizeof(lockhart_dev_id), lockhart_dev_id, &lockhart_dev_used) == XGR_S_OK);
+        CHECK(std::strstr(lockhart_dev_id, "LOCKHART") != nullptr);
+        XGameRuntimeUninitialize();
+
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_LOCKHART", "0");
+#else
+        setenv("SCARLETTX_LOCKHART", "0", 1);
+#endif
+        CHECK(XGameRuntimeInitialize() == XGR_S_OK);
+        CHECK(XSystemGetDeviceType() == XSystemDeviceType_XboxScarlettAnaconda);
+        XSystemAnalyticsInfo anaconda_info = XSystemGetAnalyticsInfo();
+        CHECK(std::strcmp(anaconda_info.form, "Xbox Series X") == 0);
+        XGameRuntimeUninitialize();
+
+#if defined(_WIN32)
+        _putenv_s("SCARLETTX_LOCKHART", "");
+#else
+        unsetenv("SCARLETTX_LOCKHART");
+#endif
+    }
 
     std::cout << "[test_xgameruntime_abi] PASSED (XTaskQueue, XAsync, XSystem, XUser, XGameSave, XMem, XThread)\n";
     return 0;

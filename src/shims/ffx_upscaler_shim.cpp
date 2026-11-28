@@ -210,9 +210,10 @@ ffxReturnCode_t ffxUpscalerConfigure(ffxContext* context, const ffxApiHeader* de
     if (it == g_contexts.end()) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    if (desc->type == FFX_API_DESC_TYPE_UPSCALE_CONFIGURE) {
+    if (desc->type == FFX_API_CONFIGURE_DESC_TYPE_UPSCALE_KEYVALUE) {
         const auto* cfg = reinterpret_cast<const ffxConfigureDescUpscale*>(desc);
-        it->second->sharpness = std::clamp(cfg->sharpness, 0.0f, 1.0f);
+        const float s = std::isfinite(cfg->sharpness) ? std::clamp(cfg->sharpness, 0.0f, 1.0f) : 0.0f;
+        it->second->sharpness = s;
         it->second->enable_sharpening = (cfg->enableSharpening != 0);
         return FFX_API_RETURN_OK;
     }
@@ -241,14 +242,13 @@ ffxReturnCode_t ffxUpscalerQuery(ffxContext* context, ffxApiHeader* desc) {
             *q->outputCount = 1u;
             return FFX_API_RETURN_OK;
         }
-        case 0x00010001u:  // Official AMD FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE
-        case FFX_API_DESC_TYPE_UPSCALE_GET_UPSCALERATIO: {
+        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETUPSCALERATIOFROMQUALITYMODE: {
             auto* q = reinterpret_cast<ffxQueryDescUpscaleGetUpscaleRatioFromQualityMode*>(desc);
             if (!q->pOutUpscaleRatio) return FFX_API_RETURN_ERROR_PARAMETER;
             *q->pOutUpscaleRatio = QualityModeToRatio(q->qualityMode);
             return FFX_API_RETURN_OK;
         }
-        case FFX_API_DESC_TYPE_UPSCALE_GET_RENDERRESOLUTION: {
+        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETRENDERRESOLUTIONFROMQUALITYMODE: {
             auto* q = reinterpret_cast<ffxQueryDescUpscaleGetRenderResolutionFromQualityMode*>(desc);
             if (!q->pOutRenderWidth || !q->pOutRenderHeight ||
                 q->displayWidth == 0 || q->displayHeight == 0) {
@@ -259,23 +259,32 @@ ffxReturnCode_t ffxUpscalerQuery(ffxContext* context, ffxApiHeader* desc) {
             *q->pOutRenderHeight = std::max(1u, static_cast<uint32_t>(std::round(q->displayHeight / ratio)));
             return FFX_API_RETURN_OK;
         }
-        case FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_PHASE_COUNT: {
+        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT: {
             auto* q = reinterpret_cast<ffxQueryDescUpscaleGetJitterPhaseCount*>(desc);
-            if (!q->pOutPhaseCount || q->renderWidth <= 0 || q->displayWidth <= 0) {
+            if (!q->pOutPhaseCount || q->renderWidth == 0 || q->displayWidth == 0 ||
+                q->renderWidth > 0x7FFFFFFFu || q->displayWidth > 0x7FFFFFFFu) {
                 return FFX_API_RETURN_ERROR_PARAMETER;
             }
             const float ratio = static_cast<float>(q->displayWidth) / static_cast<float>(q->renderWidth);
             *q->pOutPhaseCount = static_cast<int32_t>(std::ceil(8.0f * ratio * ratio));
             return FFX_API_RETURN_OK;
         }
-        case FFX_API_DESC_TYPE_UPSCALE_GET_JITTER_OFFSET: {
+        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET: {
             auto* q = reinterpret_cast<ffxQueryDescUpscaleGetJitterOffset*>(desc);
             if (!q->pOutX || !q->pOutY || q->phaseCount <= 0) {
                 return FFX_API_RETURN_ERROR_PARAMETER;
             }
-            const int32_t idx = (q->index % q->phaseCount) + 1;
+            const int32_t wrapped = ((q->index % q->phaseCount) + q->phaseCount) % q->phaseCount;
+            const int32_t idx = wrapped + 1;
             *q->pOutX = Halton(idx, 2) - 0.5f;
             *q->pOutY = Halton(idx, 3) - 0.5f;
+            return FFX_API_RETURN_OK;
+        }
+        case FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE: {
+            auto* q = reinterpret_cast<ffxQueryDescUpscaleGetGPUMemoryUsage*>(desc);
+            if (!q->gpuMemoryUsageUpscaler) return FFX_API_RETURN_ERROR_PARAMETER;
+            q->gpuMemoryUsageUpscaler->totalUsageInBytes = 16ull * 1024ull * 1024ull;
+            q->gpuMemoryUsageUpscaler->aliasableUsageInBytes = 8ull * 1024ull * 1024ull;
             return FFX_API_RETURN_OK;
         }
         default:
@@ -287,8 +296,8 @@ ffxReturnCode_t ffxUpscalerDispatch(ffxContext* context, const ffxApiHeader* des
     if (!context || !*context || !desc) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
-    if (desc->type != FFX_API_DESC_TYPE_UPSCALE_DISPATCH &&
-        desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE) {
+    if (desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE &&
+        desc->type != FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK) {
         return FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE;
     }
 
@@ -301,13 +310,17 @@ ffxReturnCode_t ffxUpscalerDispatch(ffxContext* context, const ffxApiHeader* des
         ++it->second->dispatch_count;
     }
 
+    if (desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE_GENERATEREACTIVEMASK) {
+        return FFX_API_RETURN_OK;
+    }
+
     const auto* d = reinterpret_cast<const ffxDispatchDescUpscale*>(desc);
 
-    // Official AMD ffx_api GPU dispatch (0x10004) or COM resource/commandList pointers at +0x10 / +0x18:
-    // NEVER treat ID3D12Resource* as a CPU RGBA8 buffer!
-    bool is_gpu_com_dispatch = (desc->type == FFX_API_DISPATCH_DESC_TYPE_UPSCALE);
+    // Official AMD ffx_api GPU dispatch (0x00010001) passes ID3D12GraphicsCommandList* at +0x10
+    // and FfxApiResource (ID3D12Resource*) at +0x18: NEVER treat COM objects as CPU RGBA8 buffers!
+    bool is_gpu_com_dispatch = false;
 #if defined(_WIN32)
-    if (!is_gpu_com_dispatch && (LooksLikeComObject(d->colorRgba8) || LooksLikeComObject(d->outputRgba8))) {
+    if (LooksLikeComObject(d->colorRgba8) || LooksLikeComObject(d->outputRgba8)) {
         is_gpu_com_dispatch = true;
     }
 #endif
