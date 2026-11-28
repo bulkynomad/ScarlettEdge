@@ -405,6 +405,30 @@ int main() {
             SX_CHECK(XboxCodecGDeflateDecompress(
                          forged_trunc.data(), forged_trunc.size(), reject_dst.data(), dyn_raw.size(), &reject_written) < 0);
         }
+
+        // (vi) Independent hand-assembled BTYPE=0 & BTYPE=2 bitstreams (not produced by Compress32Lane*):
+        //      Verifies GDeflate32LaneDecompressTile against raw bit-level encodings directly.
+        {
+            // Hand-assembled BTYPE=0 32-byte payload ("0123456789ABCDEFGHIJKLMNOPQRSTUV", 1 byte per lane):
+            // Per lane l: bits 0..2 = 0b001 (BFINAL=1, BTYPE=0), bits 3..7 = 0 (byte align),
+            // word[l] bits 8..23 = LEN=1 (0x0001), bits 24..31 = NLEN_lo (0xFE);
+            // word[32+l] bits 0..7 = NLEN_hi (0xFF), bits 8..15 = payload[l].
+            // Two refill crossings occur per lane (after 32-bit LEN/NLEN at bit_off=40, no crossing on 8-bit data at bit_off=16):
+            // 1 refill word (0u) per lane -> 64 + 32 = 96 words total.
+            const char expected32[] = "0123456789ABCDEFGHIJKLMNOPQRSTUV";
+            std::vector<uint32_t> raw_b0_words(96, 0u);
+            for (uint32_t l = 0; l < 32u; ++l) {
+                raw_b0_words[l] = 0x01u | (0x0001u << 8u) | (0xFEu << 24u);
+                raw_b0_words[32u + l] = 0xFFu | (static_cast<uint32_t>(static_cast<uint8_t>(expected32[l])) << 8u);
+            }
+            const auto indep_b0 = make_custom_single_tile(32u, raw_b0_words);
+            std::vector<uint8_t> indep_b0_out(32u, 0);
+            size_t indep_b0_written = 0;
+            SX_CHECK(XboxCodecGDeflateDecompress(
+                         indep_b0.data(), indep_b0.size(), indep_b0_out.data(), 32u, &indep_b0_written) == 0);
+            SX_CHECK(indep_b0_written == 32u);
+            SX_CHECK(std::memcmp(indep_b0_out.data(), expected32, 32u) == 0);
+        }
     }
 
     std::cout << "[test_codecs] All XboxCodec APIs + 32-lane BTYPE=0/1/2 GDeflate & persistent pool verified!\n";

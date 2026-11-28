@@ -375,7 +375,11 @@ int main() {
         SX_CHECK(unswizzled == linear_tex);
     }
 
-    // Verify IDStorageFactoryX::SetStagingBufferSize (slot 7) returns S_OK with zero FlightRecorder vtable misses!
+    // Verify IDStorageFactoryX::SetStagingBufferSize (slot 7):
+    //  - rejects size == 0 with E_INVALIDARG (< 0)
+    //  - records zero FlightRecorder vtable misses
+    //  - enforces staging capacity on compressed file requests (E_DSTORAGE_STAGING_BUFFER_TOO_SMALL = 0x89240007)
+    //    while chunking uncompressed file reads cleanly across staging_limit slices!
     {
         scarlettx::FlightRecorderOptions fro{};
         fro.output_dir = (sandbox.path() / "flight").string();
@@ -386,8 +390,8 @@ int main() {
         fro.reset_history = true;
         scarlettx::FlightRecorder::Instance().Enable(fro);
         const uint32_t misses_before = scarlettx::FlightRecorder::Instance().GetStats().unique_vtable_misses;
+        SX_CHECK(VCall<int32_t>(factory, kSetStagingBufferSize, 0u) == static_cast<int32_t>(0x80070057u));
         SX_CHECK(VCall<int32_t>(factory, kSetStagingBufferSize, 64u * 1024u * 1024u) == 0);
-        SX_CHECK(VCall<int32_t>(factory, kSetStagingBufferSize, 128u * 1024u * 1024u) == 0);
         const uint32_t misses_after = scarlettx::FlightRecorder::Instance().GetStats().unique_vtable_misses;
         SX_CHECK(misses_after == misses_before);
         scarlettx::FlightRecorder::Instance().Disable();
@@ -486,6 +490,42 @@ int main() {
 
         void* gd_file = nullptr;
         SX_CHECK(VCall<int32_t>(factory, kOpenFile, gd_path.c_str(), &kAnyIid, &gd_file) == 0 && gd_file != nullptr);
+
+        // Enforce SetStagingBufferSize (1024 B):
+        //  a) Compressed request larger than staging buffer fails with E_DSTORAGE_STAGING_BUFFER_TOO_SMALL (0x89240007).
+        //  b) Uncompressed file read (8192 B > 1024 B) streams cleanly in 1024-byte chunks!
+        SX_CHECK(VCall<int32_t>(factory, kSetStagingBufferSize, 1024u) == 0);
+        {
+            std::vector<uint8_t> reject_buf(dyn_plain.size(), 0xEEu);
+            Request r_too_big{};
+            r_too_big.options = kGDeflateOpt;
+            r_too_big.destination = reject_buf.data();
+            r_too_big.destination_size = static_cast<uint32_t>(reject_buf.size());
+            r_too_big.source = gd_file;
+            r_too_big.file_offset = 0;
+            r_too_big.source_size = static_cast<uint32_t>(dyn_compressed.size());
+            r_too_big.name = "btype2_exceeds_staging";
+            VCall<void>(queue, kEnqueueRequest, &r_too_big);
+            VCall<void>(queue, kEnqueueStatus, status, 2u);
+            SX_CHECK(SubmitAndWaitStatus(queue, status, 2u, wait_fence, wait_seq));
+            SX_CHECK(VCall<int32_t>(status, kGetHResult, 2u) == static_cast<int32_t>(0x89240007u));
+            SX_CHECK(reject_buf[0] == 0xEEu);
+
+            void* raw_reopen = nullptr;
+            SX_CHECK(VCall<int32_t>(factory, kOpenFile, path.c_str(), &kAnyIid, &raw_reopen) == 0 && raw_reopen != nullptr);
+            std::vector<uint8_t> chunked_dst(8192, 0);
+            Request r_chunked = FileRead(raw_reopen, 4096, chunked_dst.data(), static_cast<uint32_t>(chunked_dst.size()));
+            VCall<void>(queue, kEnqueueRequest, &r_chunked);
+            VCall<void>(queue, kEnqueueStatus, status, 3u);
+            SX_CHECK(SubmitAndWaitStatus(queue, status, 3u, wait_fence, wait_seq));
+            SX_CHECK(VCall<int32_t>(status, kGetHResult, 3u) == 0);
+            SX_CHECK(Matches(chunked_dst, 4096));
+            VCall<void>(raw_reopen, kFileClose);
+            SX_CHECK(VCall<uint32_t>(raw_reopen, kRelease) == 0);
+        }
+
+        // Restore staging buffer to 32 MiB -> compressed BTYPE=2 file streams now succeed!
+        SX_CHECK(VCall<int32_t>(factory, kSetStagingBufferSize, 32u * 1024u * 1024u) == 0);
 
         // Stream 1: kZlib (0x04 0xFB GDeflate auto-dispatch)
         std::vector<uint8_t> out_zlib_opt(dyn_plain.size(), 0);

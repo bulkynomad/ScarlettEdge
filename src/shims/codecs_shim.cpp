@@ -1442,7 +1442,8 @@ bool ExecuteParallelTileDecompress(
                 SubmitThreadpoolWork(work);
             }
             state.RunWorker();
-            WaitForThreadpoolWorkCallbacks(work, FALSE);
+            // Cancel not-yet-started callbacks since state.RunWorker() already drained next_tile.
+            WaitForThreadpoolWorkCallbacks(work, TRUE);
             CloseThreadpoolWork(work);
             ReleaseGDeflatePoolSlots(reserved);
             return state.all_ok.load(std::memory_order_acquire) &&

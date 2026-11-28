@@ -46,6 +46,7 @@ constexpr int32_t kPointer = static_cast<int32_t>(0x80004003u);
 constexpr int32_t kAbort = static_cast<int32_t>(0x80004004u);
 constexpr int32_t kPending = static_cast<int32_t>(0x8000000Au);
 constexpr int32_t kOutOfMemory = static_cast<int32_t>(0x8007000Eu);
+constexpr int32_t kStagingBufferTooSmall = static_cast<int32_t>(0x89240007u);
 
 constexpr uint16_t kMinQueueCapacity = 0x80;
 constexpr uint16_t kMaxQueueCapacity = 0x2000;
@@ -370,6 +371,8 @@ struct Queue : Object {
     GuestErrorRecord error_record{0u, {kOk, -1, {}}};
 };
 
+std::atomic<uint32_t> g_staging_buffer_size{32u * 1024u * 1024u};
+
 int32_t RunRequest(const Queue* queue, const Entry& entry) {
     const Request& r = entry.request;
     if (r.options & kOptUnsupported) return kNotImpl;
@@ -387,6 +390,22 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
     const bool compressed = is_zlib || is_gdeflate || (bcpack_fmt != 0);
     if (!r.destination || !r.source || (!compressed && swizzle_opt == 0 && r.destination_size < r.source_size)) {
         return kInvalidArg;
+    }
+
+    const uint32_t staging_limit = g_staging_buffer_size.load(std::memory_order_acquire);
+    if (!from_memory) {
+        if (staging_limit == 0u) {
+            return kStagingBufferTooSmall;
+        }
+        if (compressed || swizzle_opt != 0) {
+            const uint32_t needed_intermediate =
+                (bcpack_fmt != 0u && (is_gdeflate || is_zlib))
+                    ? ((r.intermediate_size != 0u) ? r.intermediate_size : r.destination_size)
+                    : 0u;
+            if (r.source_size > staging_limit || needed_intermediate > staging_limit) {
+                return kStagingBufferTooSmall;
+            }
+        }
     }
 
     // Only apply destination_page_offset when DestinationIsPhysicalPages is set;
@@ -438,28 +457,50 @@ int32_t RunRequest(const Queue* queue, const Entry& entry) {
                 return HresultFromWin32(ERROR_HANDLE_EOF);
             }
             std::vector<uint8_t> vfs_slice;
-            auto st = scarlettx::PackageVfs::Global().ReadFileRange(vfs_path, r.file_offset, r.source_size, vfs_slice);
-            if (!st.ok()) return HresultFromWin32(ERROR_READ_FAULT);
-            if (vfs_slice.size() != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
-            std::memcpy(io_target, vfs_slice.data(), r.source_size);
-        } else {
-            OVERLAPPED at{};
-            at.Offset = static_cast<DWORD>(r.file_offset);
-            at.OffsetHigh = static_cast<DWORD>(r.file_offset >> 32);
-            at.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            DWORD read = 0;
-            BOOL ok = ReadFile(dup_handle, io_target, r.source_size, &read, &at);
-            if (!ok) {
-                const DWORD err = GetLastError();
-                if (err == ERROR_IO_PENDING) {
-                    ok = GetOverlappedResult(dup_handle, &at, &read, TRUE);
-                }
+            uint32_t done = 0u;
+            while (done < r.source_size) {
+                const uint32_t chunk = std::min<uint32_t>(r.source_size - done, staging_limit);
+                auto st = scarlettx::PackageVfs::Global().ReadFileRange(
+                    vfs_path, r.file_offset + done, chunk, vfs_slice);
+                if (!st.ok()) return HresultFromWin32(ERROR_READ_FAULT);
+                if (vfs_slice.size() != chunk) return HresultFromWin32(ERROR_HANDLE_EOF);
+                std::memcpy(io_target + done, vfs_slice.data(), chunk);
+                done += chunk;
             }
-            const DWORD final_err = ok ? 0 : GetLastError();
-            if (at.hEvent) CloseHandle(at.hEvent);
+        } else {
+            HANDLE io_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            uint32_t done = 0u;
+            int32_t read_hr = kOk;
+            while (done < r.source_size) {
+                const uint32_t chunk = std::min<uint32_t>(r.source_size - done, staging_limit);
+                const uint64_t cur_off = r.file_offset + done;
+                if (io_ev) ResetEvent(io_ev);
+                OVERLAPPED at{};
+                at.Offset = static_cast<DWORD>(cur_off);
+                at.OffsetHigh = static_cast<DWORD>(cur_off >> 32);
+                at.hEvent = io_ev;
+                DWORD read = 0;
+                BOOL ok = ReadFile(dup_handle, io_target + done, chunk, &read, &at);
+                if (!ok) {
+                    const DWORD err = GetLastError();
+                    if (err == ERROR_IO_PENDING) {
+                        ok = GetOverlappedResult(dup_handle, &at, &read, TRUE);
+                    }
+                }
+                if (!ok) {
+                    const DWORD final_err = GetLastError();
+                    read_hr = HresultFromWin32(final_err != 0 ? final_err : ERROR_READ_FAULT);
+                    break;
+                }
+                if (read != chunk) {
+                    read_hr = HresultFromWin32(ERROR_HANDLE_EOF);
+                    break;
+                }
+                done += chunk;
+            }
+            if (io_ev) CloseHandle(io_ev);
             CloseHandle(dup_handle);
-            if (!ok) return HresultFromWin32(final_err);
-            if (read != r.source_size) return HresultFromWin32(ERROR_HANDLE_EOF);
+            if (read_hr < 0) return read_hr;
         }
     }
 
@@ -871,9 +912,8 @@ int32_t WINAPI FactoryCreateStatusArray(Object* /*self*/, uint32_t capacity, con
     return kOk;
 }
 
-std::atomic<uint32_t> g_staging_buffer_size{32u * 1024u * 1024u};
-
 int32_t WINAPI FactorySetStagingBufferSize(Object* /*self*/, uint32_t size) {
+    if (size == 0u) return kInvalidArg;
     g_staging_buffer_size.store(size, std::memory_order_release);
     DS_TRACE(8, "SetStagingBufferSize size=%u", size);
     return kOk;
