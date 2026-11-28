@@ -1582,10 +1582,20 @@ struct DeviceUploadRing {
     ~DeviceUploadRing() {
         device_staging_page.reset();
         pending_device_pages.clear();
+        HANDLE drain_ev = nullptr;
         for (auto& inf : in_flight_pages) {
-            if (inf.fence) inf.fence->Release();
+            if (inf.fence) {
+                if (inf.fence->GetCompletedValue() < inf.fence_val) {
+                    if (!drain_ev) drain_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    if (drain_ev && SUCCEEDED(inf.fence->SetEventOnCompletion(inf.fence_val, drain_ev))) {
+                        WaitForSingleObject(drain_ev, 5000);
+                    }
+                }
+                inf.fence->Release();
+            }
             inf.page.reset();
         }
+        if (drain_ev) CloseHandle(drain_ev);
         in_flight_pages.clear();
         free_pages.clear();
     }
@@ -4565,6 +4575,26 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyRelease(void* self, uintptr_t, uintptr
     const uint32_t rem = obj->ref_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (rem == 0) {
 #if defined(_WIN32)
+        if (obj->pc_queue && obj->pc_device) {
+            ID3D12Fence* drain_fence = nullptr;
+            if (SUCCEEDED(obj->pc_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&drain_fence))) &&
+                drain_fence) {
+                HANDLE drain_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (SUCCEEDED(obj->pc_queue->Signal(drain_fence, 1ull)) &&
+                    drain_fence->GetCompletedValue() < 1ull && drain_ev &&
+                    SUCCEEDED(drain_fence->SetEventOnCompletion(1ull, drain_ev))) {
+                    WaitForSingleObject(drain_ev, 5000);
+                }
+                if (drain_ev) CloseHandle(drain_ev);
+                drain_fence->Release();
+            }
+        }
+        if (obj->pc_device) {
+            if (DeviceUploadRing* ring = GetOrCreateDeviceUploadRing(obj->pc_device)) {
+                std::lock_guard<std::mutex> lk(ring->mu);
+                ring->ReclaimCompletedLocked();
+            }
+        }
         if (obj->staging_list) obj->staging_list->Release();
         for (auto& kv : obj->staging_alloc_pool) {
             if (kv.first) kv.first->Release();
@@ -4577,8 +4607,8 @@ intptr_t SCARLETTX_GDK_CALLBACK QueueProxyRelease(void* self, uintptr_t, uintptr
         if (obj->present_alloc) obj->present_alloc->Release();
         if (obj->swapchain) obj->swapchain->Release();
         StopPresentWindow(obj);
-        if (obj->pc_device) obj->pc_device->Release();
         if (obj->pc_queue) obj->pc_queue->Release();
+        if (obj->pc_device) obj->pc_device->Release();
 #endif
         delete obj;
     }

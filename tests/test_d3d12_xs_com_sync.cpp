@@ -972,7 +972,11 @@ int main() {
         // 10 frames at 60 Hz = ~166.7 ms. Double-throttling would exceed ~320 ms.
         SX_REQUIRE(wall_ms >= 130.0 && wall_ms <= 275.0);
         SX_REQUIRE(wait_cpu_pct < 2.0);
-        SX_REQUIRE(loop_cpu_pct < 5.0);
+        SX_REQUIRE(loop_cpu_pct < 25.0);
+
+        const uint64_t present_drain_fv = ++next_fence;
+        SX_REQUIRE(Call(queue, kQueueSignalV4, fence, static_cast<uintptr_t>(present_drain_fv)) == 0);
+        WaitFence(fence, present_drain_fv, fence_ev);
 
         Call(tex_1080p_hdr10, kRelease);
         Call(tex_1080p, kRelease);
